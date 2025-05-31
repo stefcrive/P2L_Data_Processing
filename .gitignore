@@ -1,3 +1,11 @@
+# Large data files
+all_physical.tab
+all_isotopes.tab
+
+# Excluded files
+Pangea_paleorecord_visualizer.py
+Browser_use.py
+
 # Python
 __pycache__/
 *.py[cod]
