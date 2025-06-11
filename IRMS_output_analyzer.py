@@ -901,10 +901,11 @@ def main():
             # Format the percentage column
             count_df['Measurements %'] = count_df['Measurements %'].map('{:,.1f}%'.format)
             st.dataframe(count_df, hide_index=True)
-            col1, col2 = st.columns(2)
-            col1.metric("Total Unique Samples", total_unique)
-            col2.metric("Total Measurements", total_measurements)
-            
+            # Display metrics
+            metrics_col1, metrics_col2 = st.columns(2)
+            metrics_col1.metric("Total Unique Samples", total_unique)
+            metrics_col2.metric("Total Measurements", total_measurements)
+
         with col2:
             st.subheader('Parameter Selection')
             # Dropdown for selecting color parameter
@@ -1735,6 +1736,7 @@ def main():
             # New dropdown selector in Tab 3 for color parameter
             selected_color_param_tab3 = st.selectbox("Choose a parameter to color the dots in Tab 3:", color_param_names, index='Date' in color_param_names)
             color_param_tab3 = color_options[selected_color_param_tab3]
+
             show_statistical_outliers = st.checkbox("Show statistical outliers on chart", value=False, key="show_statistical_outliers")
             show_range_outliers = st.checkbox("Show range outliers on chart", value=False, key="show_range_outliers")
 
@@ -1742,6 +1744,50 @@ def main():
         if selected_identifier == 'All':
             subset_data = df_filtered
             subset_data_unfiltered = df_unfiltered
+            
+            # Get the actual data range for the selected parameter
+            param_min = df_filtered[color_param_tab3].min()
+            param_max = df_filtered[color_param_tab3].max()
+            
+            # Create a shared colorbar figure
+            colorbar_fig = go.Figure(go.Scatter(
+                x=[0],  # Dummy data
+                y=[0],
+                mode='markers',
+                marker=dict(
+                    size=1,
+                    color=[param_min, param_max],  # Use actual data range
+                    cmin=param_min,
+                    cmax=param_max,
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(
+                        title=dict(
+                            text=selected_color_param_tab3,
+                            side='top'  # Move title above the colorbar
+                        ),
+                        len=0.6,  # Make colorbar wider
+                        thickness=20,  # Make colorbar taller
+                        x=0.5,  # Center horizontally
+                        xanchor='center',
+                        y=0.5,  # Center vertically
+                        yanchor='middle',
+                        orientation='h'  # Horizontal orientation
+                    )
+                ),
+                showlegend=False
+            ))
+            colorbar_fig.update_layout(
+                margin=dict(t=30, b=0, l=50, r=50),  # Adjust margins for better spacing
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                yaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                height=100,  # Taller height for better visibility
+                width=None  # Let width be determined by container
+            )
+            with col2:
+                st.plotly_chart(colorbar_fig, use_container_width=True)
         else:
             subset_data = df_filtered[df_filtered['Identifier 1'] == selected_identifier]
             subset_data_unfiltered = df_unfiltered[df_unfiltered['Identifier 1'] == selected_identifier]
@@ -1790,22 +1836,24 @@ def main():
                 (species_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
+            # Store statistical outliers
             statistical_outliers = species_data[outlier_mask].copy()
-            data_to_plot = species_data[~outlier_mask].copy()
-            
-            # Calculate range outliers
+
+            # Calculate range outliers mask (always calculate to filter data)
+            range_mask = (
+                (species_data['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
+                (species_data['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
+                (species_data['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
+                (species_data['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
+                (species_data['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
+                (species_data['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
+                (species_data['leak_rate'] < st.session_state.leak_range[0]) |
+                (species_data['leak_rate'] > st.session_state.leak_range[1])
+            )
+
+            # Store range outliers if showing them
             if show_range_outliers:
-                range_mask = (
-                    (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
-                    (species_data_unfiltered['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
-                    (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
-                    (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
-                    (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                    (species_data_unfiltered['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
-                    (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
-                    (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
-                )
-                range_outliers = species_data_unfiltered[range_mask].copy()
+                range_outliers = species_data[range_mask].copy()
                 # Add x_axis values to range outliers
                 if x_axis_option == "By Identifier 2":
                     range_outliers['x_axis'] = range_outliers['Identifier 2'].apply(
@@ -1816,15 +1864,27 @@ def main():
                     range_outliers['x_axis'] = range(len(range_outliers))
             else:
                 range_outliers = pd.DataFrame(columns=species_data.columns)
+                
+            # Filter data to plot - exclude both statistical and range outliers
+            data_to_plot = species_data[~(outlier_mask | range_mask)].copy()
 
             # Plot main data
+            # Generate unique color based on species/comment
+            species_color = f'rgb({hash(species) % 255}, {(hash(species) >> 8) % 255}, {(hash(species) >> 16) % 255})'
+            
             d13c_summary.add_trace(go.Scatter(
                 x=data_to_plot['x_axis'],
                 y=data_to_plot['d 13C/12C  Mean'],
                 mode='lines+markers',
                 name=species,
-                marker=dict(size=8),
-                line=dict(width=1)
+                marker=dict(
+                    size=8,
+                    color=data_to_plot[color_param_tab3],
+                    colorscale="Viridis",
+                    showscale=False
+                ),
+                line=dict(width=1, color=species_color),
+                legendgroup=species
             ))
 
             # Plot statistical outliers if enabled
@@ -1833,29 +1893,90 @@ def main():
                     x=statistical_outliers['x_axis'],
                     y=statistical_outliers['d 13C/12C  Mean'],
                     mode='markers',
-                    name=f'{species} (Statistical Outliers)',
+                    name='Statistical Outliers',
                     marker=dict(
-                        size=10,
+                        size=12,
                         symbol='x',
-                        color='red'
+                        color=species_color,
+                        line=dict(width=2, color=species_color)
                     ),
-                    showlegend=False
+                    showlegend=True,
+                    legendgroup='outliers'
                 ))
 
-            # Plot range outliers if enabled
+            # Plot range outliers by type if enabled
             if show_range_outliers and not range_outliers.empty:
-                d13c_summary.add_trace(go.Scatter(
-                    x=range_outliers['x_axis'],
-                    y=range_outliers['d 13C/12C  Mean'],
-                    mode='markers',
-                    name=f'{species} (Range Outliers)',
-                    marker=dict(
-                        size=10,
-                        symbol='circle-x',
-                        color='orange'
-                    ),
-                    showlegend=False
-                ))
+                # Signal intensity outliers
+                signal_mask = (range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (range_outliers['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
+                if signal_mask.any():
+                    d13c_summary.add_trace(go.Scatter(
+                        x=range_outliers[signal_mask]['x_axis'],
+                        y=range_outliers[signal_mask]['d 13C/12C  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color=species_color,
+                            symbol='diamond',
+                            size=12,
+                            line=dict(width=2, color=species_color)
+                        ),
+                        name='Signal Intensity Range',
+                        showlegend=True,
+                        legendgroup='outliers'
+                    ))
+
+                # Leak rate outliers
+                leak_mask = (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])
+                if leak_mask.any():
+                    d13c_summary.add_trace(go.Scatter(
+                        x=range_outliers[leak_mask]['x_axis'],
+                        y=range_outliers[leak_mask]['d 13C/12C  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color=species_color,
+                            symbol='star',
+                            size=12,
+                            line=dict(width=2, color=species_color)
+                        ),
+                        name='Leak Rate Range',
+                        showlegend=True,
+                        legendgroup='outliers'
+                    ))
+
+                # δ13C range outliers
+                d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
+                if d13c_mask.any():
+                    d13c_summary.add_trace(go.Scatter(
+                        x=range_outliers[d13c_mask]['x_axis'],
+                        y=range_outliers[d13c_mask]['d 13C/12C  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color=species_color,
+                            symbol='cross',
+                            size=12,
+                            line=dict(width=2, color=species_color)
+                        ),
+                        name='δ13C Range',
+                        showlegend=True,
+                        legendgroup='outliers'
+                    ))
+
+                # δ18O range outliers
+                d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
+                if d18o_mask.any():
+                    d13c_summary.add_trace(go.Scatter(
+                        x=range_outliers[d18o_mask]['x_axis'],
+                        y=range_outliers[d18o_mask]['d 13C/12C  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color=species_color,
+                            symbol='x',
+                            size=12,
+                            line=dict(width=2, color=species_color)
+                        ),
+                        name='δ18O Range',
+                        showlegend=True,
+                        legendgroup='outliers'
+                    ))
         d13c_summary.update_layout(
             title="δ13C Summary by Species",
             xaxis_title="Sample Number" if x_axis_option == "By Sequence" else "Identifier 2",
@@ -1914,13 +2035,23 @@ def main():
                 range_outliers = pd.DataFrame(columns=species_data.columns)
 
             # Plot main data
+            # Generate unique color for this species
+            species_color = f'rgb({hash(species) % 255}, {(hash(species) >> 8) % 255}, {(hash(species) >> 16) % 255})'
+            
+            # Plot main data with consistent color
             d18o_summary.add_trace(go.Scatter(
                 x=data_to_plot['x_axis'],
                 y=data_to_plot['d 18O/16O  Mean'],
                 mode='lines+markers',
                 name=species,
-                marker=dict(size=8),
-                line=dict(width=1)
+                marker=dict(
+                    size=8,
+                    color=data_to_plot[color_param_tab3],
+                    colorscale="Viridis",
+                    showscale=False
+                ),
+                line=dict(width=1, color=species_color),
+                legendgroup=species
             ))
 
             # Plot statistical outliers if enabled
@@ -1929,29 +2060,90 @@ def main():
                     x=statistical_outliers['x_axis'],
                     y=statistical_outliers['d 18O/16O  Mean'],
                     mode='markers',
-                    name=f'{species} (Statistical Outliers)',
+                    name='Statistical Outliers',
                     marker=dict(
-                        size=10,
+                        size=12,
                         symbol='x',
-                        color='red'
+                        color=species_color,
+                        line=dict(width=2, color=species_color)
                     ),
-                    showlegend=False
+                    showlegend=True,
+                    legendgroup='outliers'
                 ))
 
-            # Plot range outliers if enabled
+            # Plot range outliers by type if enabled
             if show_range_outliers and not range_outliers.empty:
-                d18o_summary.add_trace(go.Scatter(
-                    x=range_outliers['x_axis'],
-                    y=range_outliers['d 18O/16O  Mean'],
-                    mode='markers',
-                    name=f'{species} (Range Outliers)',
-                    marker=dict(
-                        size=10,
-                        symbol='circle-x',
-                        color='orange'
-                    ),
-                    showlegend=False
-                ))
+                # Signal intensity outliers
+                signal_mask = (range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (range_outliers['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
+                if signal_mask.any():
+                    d18o_summary.add_trace(go.Scatter(
+                        x=range_outliers[signal_mask]['x_axis'],
+                        y=range_outliers[signal_mask]['d 18O/16O  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color=species_color,
+                            symbol='diamond',
+                            size=12,
+                            line=dict(width=2, color=species_color)
+                        ),
+                        name='Signal Intensity Range',
+                        showlegend=True,
+                        legendgroup='outliers'
+                    ))
+
+                # Leak rate outliers
+                leak_mask = (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])
+                if leak_mask.any():
+                    d18o_summary.add_trace(go.Scatter(
+                        x=range_outliers[leak_mask]['x_axis'],
+                        y=range_outliers[leak_mask]['d 18O/16O  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color=species_color,
+                            symbol='star',
+                            size=12,
+                            line=dict(width=2, color=species_color)
+                        ),
+                        name='Leak Rate Range',
+                        showlegend=True,
+                        legendgroup='outliers'
+                    ))
+
+                # δ13C range outliers
+                d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
+                if d13c_mask.any():
+                    d18o_summary.add_trace(go.Scatter(
+                        x=range_outliers[d13c_mask]['x_axis'],
+                        y=range_outliers[d13c_mask]['d 18O/16O  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color=species_color,
+                            symbol='cross',
+                            size=12,
+                            line=dict(width=2, color=species_color)
+                        ),
+                        name='δ13C Range',
+                        showlegend=True,
+                        legendgroup='outliers'
+                    ))
+
+                # δ18O range outliers
+                d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
+                if d18o_mask.any():
+                    d18o_summary.add_trace(go.Scatter(
+                        x=range_outliers[d18o_mask]['x_axis'],
+                        y=range_outliers[d18o_mask]['d 18O/16O  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color=species_color,
+                            symbol='x',
+                            size=12,
+                            line=dict(width=2, color=species_color)
+                        ),
+                        name='δ18O Range',
+                        showlegend=True,
+                        legendgroup='outliers'
+                    ))
         d18o_summary.update_layout(
             title="δ18O Summary by Species",
             xaxis_title="Sample Number" if x_axis_option == "By Sequence" else "Identifier 2",
@@ -2046,12 +2238,8 @@ def main():
             if not show_range_outliers:
                 data_to_plot = data_to_plot[~data_to_plot.index.isin(range_bar_outliers.index)]
             
-            # Create a DataFrame for displaying points including any enabled outliers
+            # Create a DataFrame for displaying points, always excluding outliers for the main curve
             display_data = data_to_plot.copy()
-            
-            # Add statistical outliers back if enabled
-            if show_statistical_outliers and not statistical_outliers.empty:
-                display_data = pd.concat([display_data, statistical_outliers])
                 
             # Sort the data by x_axis to ensure proper line connections
             display_data = display_data.sort_values(by='x_axis', na_position='last')
@@ -2145,17 +2333,10 @@ def main():
                     line=dict(color='blue', dash='dot', width=2),
                     marker=dict(
                         color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3],
-                        colorbar=dict(
-                            title=selected_color_param_tab3,
-                            len=0.3,  # Shorter colorbar
-                            x=1.15,
-                            xanchor='left',
-                            y=0.8,  # Position at top
-                            yanchor='top'
-                        ),
                         colorscale="Viridis",
                         symbol='circle',
-                        size=8
+                        size=8,
+                        showscale=False  # Hide individual colorbar
                     ),
                     name=f'Raw δ13C - {identifier}'
                 ))
@@ -2170,7 +2351,8 @@ def main():
                             color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3],
                             colorscale="Viridis",
                             symbol='square',
-                            size=8
+                            size=8,
+                            showscale=False  # Hide individual colorbar
                         ),
                         name=f'Calibrated δ13C - {identifier}'
                     ))
@@ -2180,16 +2362,16 @@ def main():
                     xaxis_title='X Axis',
                     yaxis_title='δ13C (‰)',
                     legend_title='Data Type',
-                    margin=dict(r=150),  # Increased right margin
+                    margin=dict(r=100, t=100),  # Reduced right margin
                     xaxis=dict(
                         # Show ~10 ticks across the axis
                         nticks=10,
                         tickmode='auto'
                     ),
                     legend=dict(
-                        x=1.15,  # Align with colorbar
+                        x=1.05,  # Move legend closer to chart
                         xanchor='left',
-                        y=0.5,  # Center vertically below colorbar
+                        y=0.8,  # Keep consistent position
                         yanchor='middle'
                     )
                 )
@@ -2259,17 +2441,10 @@ def main():
                         line=dict(color='blue', dash='dot', width=2),
                         marker=dict(
                             color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3],
-                            colorbar=dict(
-                                title=selected_color_param_tab3,
-                                len=0.3,
-                                x=1.15,
-                                xanchor='left',
-                                y=0.8,
-                                yanchor='top'
-                            ),
                             colorscale="Viridis",
                             symbol='circle',
-                            size=8
+                            size=8,
+                            showscale=False  # Hide individual colorbar
                         ),
                         name=f'Raw δ18O - {identifier}'
                     ))
@@ -2314,17 +2489,10 @@ def main():
                     line=dict(color='blue', dash='dot', width=2),
                     marker=dict(
                         color=sorted_data[color_param_tab3],
-                        colorbar=dict(
-                            title=selected_color_param_tab3,
-                            len=0.3,  # Shorter colorbar
-                            x=1.15,
-                            xanchor='left',
-                            y=0.8,  # Position at top
-                            yanchor='middle'
-                        ),
                         colorscale="Viridis",
                         symbol='circle',
-                        size=8
+                        size=8,
+                        showscale=False  # Hide individual colorbar
                     ),
                     name=f'Raw δ18O - {identifier}'
                 ))
@@ -2349,35 +2517,28 @@ def main():
                     xaxis_title='X Axis',
                     yaxis_title='δ18O (‰)',
                     legend_title='Data Type',
-                    margin=dict(r=150),  # Increased right margin
+                    margin=dict(r=100, t=100),  # Reduced right margin
                     xaxis=dict(
                         # Show ~10 ticks across the axis
                         nticks=10,
                         tickmode='auto'
                     ),
                     legend=dict(
-                        x=1.2,  # Move legend further right
-                        xanchor='left'
+                        x=1.05,  # Move legend closer to chart
+                        xanchor='left',
+                        y=0.8,  # Keep consistent position
+                        yanchor='middle'
                     )
                 )
 
                 st.plotly_chart(fig_d18O, use_container_width=True, height=chart_height)
 
-            # Display outliers for each comment if detected
+            # Display outliers header for each comment if detected
             if not comment_data['Identifier 2'].isna().all():
                 st.subheader(f'Outliers Detected for Species: {comment}')
             
-            # Display statistical outliers (sigma-based)
-            st.markdown("##### Statistical Outliers (Based on Sigma Level):")
-            # Get only statistical outliers
+            # Get outliers data
             stat_outliers_only = statistical_outliers[statistical_outliers['Comment'] == comment]
-            if not stat_outliers_only.empty:
-                st.dataframe(stat_outliers_only)
-            else:
-                st.write("No statistical outliers detected.")
-                
-            # Display range filter outliers by category
-            st.markdown("##### Range Filter Outliers by Category:")
             
             # Get original data for this species before any filtering
             species_data = subset_data_unfiltered[subset_data_unfiltered['Comment'] == comment]
@@ -2402,87 +2563,131 @@ def main():
                 (species_data['leak_rate'] < st.session_state.leak_range[0]) |
                 (species_data['leak_rate'] > st.session_state.leak_range[1])
             ]
+        
+            # Create two columns for outlier information
+            col1, col2 = st.columns(2)
 
-            # Display each category in a collapsible section with its own table
-            with st.expander("δ13C Range Outliers", expanded=True):
-                if not d13c_outliers.empty:
-                    st.markdown(f"Range: {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} ‰")
-                    st.dataframe(d13c_outliers[['Identifier 2', 'Comment', 'd 13C/12C  Mean']])
-                else:
-                    st.write("No δ13C outliers detected")
+            # Column 1: Isotope Outliers
+            with col1:
+                st.markdown("### 📊 Isotope Outliers")
+                st.markdown("---")
+                
+                # Statistical Outliers
+                with st.expander("Statistical Outliers (Sigma-Based)", expanded=True):
+                    if not stat_outliers_only.empty:
+                        st.markdown("**Based on statistical deviation from the mean**")
+                        styled_stats = stat_outliers_only[['Identifier 2', 'Comment', 'd 13C/12C  Mean', 'd 18O/16O  Mean']].copy()
+                        styled_stats = styled_stats.rename(columns={
+                            'd 13C/12C  Mean': 'δ13C Value (‰)',
+                            'd 18O/16O  Mean': 'δ18O Value (‰)'
+                        })
+                        st.dataframe(styled_stats, use_container_width=True)
+                    else:
+                        st.info("No statistical outliers detected")
 
-            with st.expander("δ18O Range Outliers", expanded=True):
-                if not d18o_outliers.empty:
-                    st.markdown(f"Range: {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} ‰")
-                    st.dataframe(d18o_outliers[['Identifier 2', 'Comment', 'd 18O/16O  Mean']])
-                else:
-                    st.write("No δ18O outliers detected")
+                # δ13C Outliers
+                with st.expander("δ13C Range Outliers", expanded=True):
+                    if not d13c_outliers.empty:
+                        st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} ‰")
+                        styled_d13c = d13c_outliers[['Identifier 2', 'Comment', 'd 13C/12C  Mean']].copy()
+                        styled_d13c = styled_d13c.rename(columns={'d 13C/12C  Mean': 'δ13C Value (‰)'})
+                        st.dataframe(styled_d13c, use_container_width=True)
+                    else:
+                        st.info("No δ13C outliers detected")
 
-            with st.expander("Signal Intensity Outliers", expanded=True):
-                if not signal_outliers.empty:
-                    st.markdown(f"Range: {st.session_state.signal_range[0]:.2f} to {st.session_state.signal_range[1]:.2f}")
-                    st.dataframe(signal_outliers[['Identifier 2', 'Comment', '1  Cycle Int  Samp  44']])
-                else:
-                    st.write("No signal intensity outliers detected")
+                # δ18O Outliers
+                with st.expander("δ18O Range Outliers", expanded=True):
+                    if not d18o_outliers.empty:
+                        st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} ‰")
+                        styled_d18o = d18o_outliers[['Identifier 2', 'Comment', 'd 18O/16O  Mean']].copy()
+                        styled_d18o = styled_d18o.rename(columns={'d 18O/16O  Mean': 'δ18O Value (‰)'})
+                        st.dataframe(styled_d18o, use_container_width=True)
+                    else:
+                        st.info("No δ18O outliers detected")
 
-            with st.expander("Leak Rate Outliers", expanded=True):
-                if not leak_outliers.empty:
-                    st.markdown(f"Range: {st.session_state.leak_range[0]:.2f} to {st.session_state.leak_range[1]:.2f}")
-                    st.dataframe(leak_outliers[['Identifier 2', 'Comment', 'leak_rate']])
-                else:
-                    st.write("No leak rate outliers detected")
+            # Column 2: Technical Outliers
+            with col2:
+                st.markdown("### 🔧 Technical Outliers")
+                st.markdown("---")
+                
+                # Signal Intensity Outliers
+                with st.expander("Signal Intensity Outliers", expanded=True):
+                    if not signal_outliers.empty:
+                        st.markdown(f"**Acceptable Range:** {st.session_state.signal_range[0]:.2f} to {st.session_state.signal_range[1]:.2f}")
+                        styled_signal = signal_outliers[['Identifier 2', 'Comment', '1  Cycle Int  Samp  44']].copy()
+                        styled_signal = styled_signal.rename(columns={'1  Cycle Int  Samp  44': 'Signal Intensity'})
+                        st.dataframe(styled_signal, use_container_width=True)
+                    else:
+                        st.info("No signal intensity outliers detected")
+                
+                # Leak Rate Outliers
+                with st.expander("Leak Rate Outliers", expanded=True):
+                    if not leak_outliers.empty:
+                        st.markdown(f"**Acceptable Range:** {st.session_state.leak_range[0]:.2f} to {st.session_state.leak_range[1]:.2f}")
+                        styled_leak = leak_outliers[['Identifier 2', 'Comment', 'leak_rate']].copy()
+                        styled_leak = styled_leak.rename(columns={'leak_rate': 'Leak Rate'})
+                        st.dataframe(styled_leak, use_container_width=True)
+                    else:
+                        st.info("No leak rate outliers detected")
 
-            # Check if the required columns are present
-            calibrated_columns = ['d18O_calibrated', 'd13C_calibrated']
-            calibration_status = all(col in data_to_plot.columns for col in calibrated_columns)
+            # with st.expander("Leak Rate Outliers", expanded=True):
+            #     if not leak_outliers.empty:
+            #         st.markdown(f"Range: {st.session_state.leak_range[0]:.2f} to {st.session_state.leak_range[1]:.2f}")
+            #         st.dataframe(leak_outliers[['Identifier 2', 'Comment', 'leak_rate']])
+            #     else:
+            #         st.write("No leak rate outliers detected")
 
-            # Determine the calibration status and set the filename
-            if calibration_status:
-                calibration_label = "Calibration performed"
-                filename_suffix = "calibrated"
-                label_color = "green"
-                columns_to_export = [
-                    'Row', 'Method', 'Date', 'Time', 'Identifier 1', 'Identifier 2', 'Comment',
-                    'd 13C/12C  Mean', 'd 13C/12C  Std Dev', 'd 18O/16O  Mean', 'd 18O/16O  Std Dev',
-                    'd13C_calibrated', 'd18O_calibrated'
-                ]
-            else:
-                calibration_label = "Calibration not performed"
-                filename_suffix = "uncalibrated"
-                label_color = "red"
-                columns_to_export = [
-                    'Row', 'Method', 'Date', 'Time', 'Identifier 1', 'Identifier 2', 'Comment',
-                    'd 13C/12C  Mean', 'd 13C/12C  Std Dev', 'd 18O/16O  Mean', 'd 18O/16O  Std Dev'
-                ]
+        #     # Check if the required columns are present
+        #     calibrated_columns = ['d18O_calibrated', 'd13C_calibrated']
+        #     calibration_status = all(col in data_to_plot.columns for col in calibrated_columns)
 
-            # Add a colored label next to the button indicating calibration status
-            st.markdown(f'<span style="color:{label_color}; font-weight:bold;">{calibration_label}</span>',
-                        unsafe_allow_html=True)
+        #     # Determine the calibration status and set the filename
+        #     if calibration_status:
+        #         calibration_label = "Calibration performed"
+        #         filename_suffix = "calibrated"
+        #         label_color = "green"
+        #         columns_to_export = [
+        #             'Row', 'Method', 'Date', 'Time', 'Identifier 1', 'Identifier 2', 'Comment',
+        #             'd 13C/12C  Mean', 'd 13C/12C  Std Dev', 'd 18O/16O  Mean', 'd 18O/16O  Std Dev',
+        #             'd13C_calibrated', 'd18O_calibrated'
+        #         ]
+        #     else:
+        #         calibration_label = "Calibration not performed"
+        #         filename_suffix = "uncalibrated"
+        #         label_color = "red"
+        #         columns_to_export = [
+        #             'Row', 'Method', 'Date', 'Time', 'Identifier 1', 'Identifier 2', 'Comment',
+        #             'd 13C/12C  Mean', 'd 13C/12C  Std Dev', 'd 18O/16O  Mean', 'd 18O/16O  Std Dev'
+        #         ]
+
+        #     # Add a colored label next to the button indicating calibration status
+        #     st.markdown(f'<span style="color:{label_color}; font-weight:bold;">{calibration_label}</span>',
+        #                 unsafe_allow_html=True)
 
 
-            # Function to convert the dataframe to an Excel file
-            @st.cache_data
-            def to_excel(df):
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Data')
-                return output.getvalue()
+        #     # Function to convert the dataframe to an Excel file
+        #     @st.cache_data
+        #     def to_excel(df):
+        #         output = io.BytesIO()
+        #         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        #             df.to_excel(writer, index=False, sheet_name='Data')
+        #         return output.getvalue()
 
-            # Filter the dataframe to include only the columns to export
-            filtered_data = data_to_plot[columns_to_export]  # Assuming 'df' is your dataframe
+        #     # Filter the dataframe to include only the columns to export
+        #     filtered_data = data_to_plot[columns_to_export]  # Assuming 'df' is your dataframe
 
-            # Export the filtered data as Excel
-            excel_data = to_excel(filtered_data)
+        #     # Export the filtered data as Excel
+        #     excel_data = to_excel(filtered_data)
 
-            # Create the download button
-            st.download_button(
-                label="Download Data as Excel",
-                data=excel_data,
-                file_name=f'{identifier}_{comment}_{filename_suffix}_results.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-        else:
-            st.write("No chart displayed since 'All' was selected.")
+        #     # Create the download button
+        #     st.download_button(
+        #         label="Download Data as Excel",
+        #         data=excel_data,
+        #         file_name=f'{identifier}_{comment}_{filename_suffix}_results.xlsx',
+        #         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        #     )
+        # else:
+        #     st.write("No chart displayed since 'All' was selected.")
 
 
 
