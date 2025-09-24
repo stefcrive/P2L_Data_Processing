@@ -1,7 +1,7 @@
 import os
 import uuid
 from fastapi import APIRouter, UploadFile, File, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketDisconnect
 from celery.result import AsyncResult
 
@@ -46,3 +46,18 @@ async def job_ws(ws: WebSocket, task_id: str):
     finally:
         await ws.close()
 
+
+@router.get("/sse/jobs/{task_id}")
+async def job_sse(task_id: str):
+    async def event_stream():
+        import asyncio
+
+        while True:
+            res = AsyncResult(task_id, app=celery_app)
+            data = {"task_id": task_id, "state": res.state}
+            yield f"data: {data}\n\n"
+            if res.state in ("SUCCESS", "FAILURE", "REVOKED"):
+                break
+            await asyncio.sleep(1)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")

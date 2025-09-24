@@ -23,5 +23,14 @@ Structure:
 
 Existing standalone scripts (e.g., `IRMS_output_analyzer.py`) will be integrated into the FastAPI service.
 
-Getting started steps will be added as scaffolding progresses.
+Quick start (dev):
 
+1. Copy `.env.example` to `.env` and set values (Supabase URL/anon key, etc.).
+2. Start stack: `make up` (web:3000, api:8000, redis, pgvector).
+3. Open `http://localhost:3000`, sign-in via magic link (Supabase Email OTP).
+4. Upload an IRMS file from Dashboard to trigger a background job (stubbed).
+
+Testing and CI:
+- Run API tests: `make test`
+- Lint/format: `make lint` / `make fmt`
+- Pre-commit: `pip install pre-commit && make precommit-install`
