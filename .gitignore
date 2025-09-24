@@ -41,6 +41,8 @@ ENV/
 
 # Misc
 .env
+.env.local
+apps/*/.env*
 .DS_Store
 node_modules/
 apps/*/node_modules/

@@ -2,13 +2,14 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { createSupabaseClient } from "@/lib/supabase/client";
+import { createSupabaseClient, hasSupabaseEnv } from "@/lib/supabase/client";
 
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
+    if (!hasSupabaseEnv()) return;
     const supabase = createSupabaseClient();
     supabase.auth.getSession().then(({ data }) => {
       if (!data.session) {
@@ -25,6 +26,15 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
       sub.subscription.unsubscribe();
     };
   }, [router]);
+
+  if (!hasSupabaseEnv()) {
+    return (
+      <div className="p-6 text-sm">
+        Missing Supabase config. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in
+        apps/web/.env.local (see apps/web/.env.example).
+      </div>
+    );
+  }
 
   if (!ready) return null;
   return <>{children}</>;
