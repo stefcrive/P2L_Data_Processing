@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { fetchJobStatus } from "@/src/lib/api";
+import { fetchJobStatus } from "@/lib/api";
 
 export function JobStatusViewer({ taskId }: { taskId: string }) {
   const [state, setState] = useState<string>("PENDING");
@@ -39,4 +39,3 @@ export function JobStatusViewer({ taskId }: { taskId: string }) {
     </div>
   );
 }
-

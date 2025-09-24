@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { createSupabaseClient } from "@/src/lib/supabase/client";
+import { createSupabaseClient } from "@/lib/supabase/client";
 
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -29,4 +29,3 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
   if (!ready) return null;
   return <>{children}</>;
 }
-

@@ -1,9 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { createSupabaseClient } from "@/src/lib/supabase/client";
-import { Input } from "@/src/components/ui/input";
-import { Button } from "@/src/components/ui/button";
+import { createSupabaseClient } from "@/lib/supabase/client";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 
 export default function LoginPage() {
   const supabase = createSupabaseClient();
@@ -44,4 +44,3 @@ export default function LoginPage() {
     </div>
   );
 }
-

@@ -1,10 +1,10 @@
 "use client";
 
 import { useState } from "react";
-import { Input } from "@/src/components/ui/input";
-import { Button } from "@/src/components/ui/button";
-import { uploadIRMSFile } from "@/src/lib/api";
-import { JobStatusViewer } from "@/src/components/job-status";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { uploadIRMSFile } from "@/lib/api";
+import { JobStatusViewer } from "@/components/job-status";
 
 export function IRMSUpload() {
   const [file, setFile] = useState<File | null>(null);
@@ -35,4 +35,3 @@ export function IRMSUpload() {
     </div>
   );
 }
-

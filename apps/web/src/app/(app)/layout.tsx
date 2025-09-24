@@ -1,6 +1,6 @@
-import { Sidebar } from "@/src/components/sidebar";
-import { AuthGuard } from "@/src/components/auth-guard";
-import { UserMenu } from "@/src/components/user-menu";
+import { Sidebar } from "@/components/sidebar";
+import { AuthGuard } from "@/components/auth-guard";
+import { UserMenu } from "@/components/user-menu";
 
 export default function AppLayout({
   children,

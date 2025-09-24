@@ -1,7 +1,7 @@
 "use client";
 
-import { createSupabaseClient } from "@/src/lib/supabase/client";
-import { Button } from "@/src/components/ui/button";
+import { createSupabaseClient } from "@/lib/supabase/client";
+import { Button } from "@/components/ui/button";
 
 export function UserMenu() {
   const supabase = createSupabaseClient();
@@ -18,4 +18,3 @@ export function UserMenu() {
     </div>
   );
 }
-

@@ -1,5 +1,5 @@
-import { Card, CardContent, CardHeader, CardTitle } from "@/src/components/ui/card";
-import { IRMSUpload } from "@/src/components/irms-upload";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { IRMSUpload } from "@/components/irms-upload";
 
 export default function Home() {
   return (

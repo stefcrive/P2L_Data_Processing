@@ -1,5 +1,5 @@
 import * as React from "react";
-import { cn } from "@/src/lib/utils";
+import { cn } from "@/lib/utils";
 
 const Card = React.forwardRef<
   HTMLDivElement,
@@ -52,4 +52,3 @@ const CardContent = React.forwardRef<
 CardContent.displayName = "CardContent";
 
 export { Card, CardHeader, CardTitle, CardContent };
-
