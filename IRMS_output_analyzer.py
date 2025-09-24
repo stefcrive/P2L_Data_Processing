@@ -1867,6 +1867,9 @@ def main():
                 
             # Filter data to plot - exclude both statistical and range outliers
             data_to_plot = species_data[~(outlier_mask | range_mask)].copy()
+            
+            # Sort data by x_axis to ensure sequential line connections
+            data_to_plot = data_to_plot.sort_values('x_axis')
 
             # Plot main data
             # Generate unique color based on species/comment
@@ -2009,6 +2012,9 @@ def main():
             )
             statistical_outliers = species_data[outlier_mask].copy()
             data_to_plot = species_data[~outlier_mask].copy()
+            
+            # Sort data by x_axis to ensure sequential line connections
+            data_to_plot = data_to_plot.sort_values('x_axis')
             
             # Calculate range outliers
             if show_range_outliers:

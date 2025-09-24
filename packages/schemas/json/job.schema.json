@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/job.schema.json",
+  "title": "Job",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string" },
+    "type": { "type": "string" },
+    "status": { "type": "string", "enum": ["queued", "running", "succeeded", "failed"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  },
+  "required": ["id", "type", "status", "created_at", "updated_at"]
+}
+

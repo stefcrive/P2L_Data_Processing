@@ -1,0 +1,2 @@
+-- Placeholder: Storage buckets definitions
+

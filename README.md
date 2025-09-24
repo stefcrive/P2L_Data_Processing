@@ -1,18 +1,27 @@
-# IRMS Output Analyzer
+# IRMS Lab Monorepo
 
-A Python tool for analyzing IRMS (Isotope Ratio Mass Spectrometry) output data.
+Monorepo for a lab dashboard and control surface consisting of:
 
-## Requirements
-See `requirements.txt` for Python dependencies.
+- Next.js (TypeScript) frontend with Tailwind + shadcn/ui
+- FastAPI backend (Python 3.11+)
+- Supabase Postgres (RLS, pgvector, Storage)
 
-## Data Files
-The following data files are required but not included in the repository due to size limitations:
-- `all_physical.tab` (933.79 MB)
-- `all_isotopes.tab` (188.96 MB)
+Structure:
 
-Please contact the repository maintainer to obtain these data files.
+```
+/apps
+  /web           # Next.js app (App Router)
+  /api           # FastAPI app
+/packages
+  /ui            # shared UI primitives (optional)
+  /types         # shared TypeScript contract types
+  /schemas       # JSONSchema & Pydantic model definitions
+/infra
+  /supabase      # db schema, policies, seed, migrations
+  /docker        # docker & compose templates
+```
 
-## Usage
-Run the analyzer using:
-```bash
-run_analyzer.bat
+Existing standalone scripts (e.g., `IRMS_output_analyzer.py`) will be integrated into the FastAPI service.
+
+Getting started steps will be added as scaffolding progresses.
+
