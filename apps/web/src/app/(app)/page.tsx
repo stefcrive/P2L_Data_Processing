@@ -1,5 +1,5 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/src/components/ui/card";
-import { Button } from "@/src/components/ui/button";
+import { IRMSUpload } from "@/src/components/irms-upload";
 
 export default function Home() {
   return (
@@ -11,10 +11,7 @@ export default function Home() {
             <CardTitle>IRMS Jobs</CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-sm text-muted-foreground">No jobs yet. Upload to start.</p>
-            <div className="mt-4">
-              <Button>Upload IRMS File</Button>
-            </div>
+            <IRMSUpload />
           </CardContent>
         </Card>
         <Card>
@@ -37,4 +34,3 @@ export default function Home() {
     </div>
   );
 }
-
