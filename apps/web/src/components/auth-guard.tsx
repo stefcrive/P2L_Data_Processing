@@ -7,6 +7,14 @@ import { createSupabaseClient, hasSupabaseEnv } from "@/lib/supabase/client";
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [ready, setReady] = useState(false);
+  const BYPASS =
+    process.env.NEXT_PUBLIC_BYPASS_AUTH === "true" ||
+    process.env.NEXT_PUBLIC_BYPASS_AUTH === "1";
+
+  if (BYPASS) {
+    // Development bypass: no auth required
+    return <>{children}</>;
+  }
 
   useEffect(() => {
     if (!hasSupabaseEnv()) return;

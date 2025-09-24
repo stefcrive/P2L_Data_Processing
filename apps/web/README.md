@@ -7,6 +7,7 @@ Local dev setup
 1) Copy `.env.example` to `.env.local` and set:
    - `NEXT_PUBLIC_SUPABASE_URL`
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+   - Optional: `NEXT_PUBLIC_BYPASS_AUTH=true` to bypass auth in dev
 2) Run: `npm run dev`
 3) Visit http://localhost:3000
 
