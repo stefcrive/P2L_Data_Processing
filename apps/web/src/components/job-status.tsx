@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { IRMSResultsSummary } from "@/components/irms-results";
 import { fetchJobStatus } from "@/lib/api";
 
 export function JobStatusViewer({ taskId }: { taskId: string }) {
@@ -31,6 +32,11 @@ export function JobStatusViewer({ taskId }: { taskId: string }) {
     <div className="text-sm">
       <div>Task: {taskId}</div>
       <div>Status: {state}</div>
+      {result?.summary && (
+        <div className="mt-3">
+          <IRMSResultsSummary summary={result.summary} />
+        </div>
+      )}
       {result && (
         <pre className="mt-2 rounded bg-muted p-2 text-xs overflow-auto max-h-64">
           {JSON.stringify(result, null, 2)}

@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -6,11 +6,14 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str | None = None
     CELERY_BACKEND_URL: str | None = None
     INTERNAL_API_KEY: str | None = None
+    USE_CELERY: bool = True
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    # Pydantic v2 settings config: load .env and ignore unknown keys
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = Settings()
-

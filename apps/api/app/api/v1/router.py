@@ -1,11 +1,16 @@
 import os
 import uuid
+import tempfile
+from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketDisconnect
 from celery.result import AsyncResult
+import redis
 
 from ...queue.celery_app import celery_app
+from ...core.config import settings
+from ...services.irms_processor import process_file
 
 
 router = APIRouter()
@@ -14,10 +19,30 @@ router = APIRouter()
 @router.post("/irms/process")
 async def process_irms(file: UploadFile = File(...)) -> JSONResponse:
     job_id = str(uuid.uuid4())
-    os.makedirs("/tmp/irms", exist_ok=True)
-    tmp_path = f"/tmp/irms/{job_id}_{file.filename}"
+    # Cross-platform temp directory for uploaded files
+    base_tmp = Path(tempfile.gettempdir()) / "irms"
+    base_tmp.mkdir(parents=True, exist_ok=True)
+    tmp_path = str(base_tmp / f"{job_id}_{file.filename}")
     with open(tmp_path, "wb") as f:
         f.write(await file.read())
+    # If Celery is disabled, process synchronously and return result directly
+    if not settings.USE_CELERY:
+        try:
+            summary = process_file(tmp_path)
+            return JSONResponse({"job_id": job_id, "status": "succeeded", "result": {"summary": summary}})
+        except ImportError as e:
+            return JSONResponse({"error": "dependency_error", "detail": str(e)}, status_code=500)
+        except Exception as e:
+            return JSONResponse({"error": "processing_failed", "detail": str(e)}, status_code=500)
+
+    # Fast broker health check to avoid long hangs when Redis is down
+    broker_url = settings.CELERY_BROKER_URL or settings.REDIS_URL
+    try:
+        r = redis.from_url(broker_url, socket_connect_timeout=1, socket_timeout=1)
+        r.ping()
+    except Exception as e:
+        return JSONResponse({"error": "broker_unavailable", "detail": str(e)}, status_code=503)
+
     task = celery_app.send_task("app.tasks.irms.process", args=[job_id, tmp_path])
     return JSONResponse({"job_id": job_id, "task_id": task.id, "status": "queued"})
 

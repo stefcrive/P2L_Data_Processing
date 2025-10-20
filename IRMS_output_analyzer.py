@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
 import numpy as np
 import io
@@ -24,8 +24,42 @@ from reportlab.platypus import Table, TableStyle, Image
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
+# Optional helper to interpolate outliers during export
+try:
+    from interpolate_outliers import interpolate_columns
+except Exception:
+    interpolate_columns = None
+
 
 st.set_page_config(layout="wide")
+
+# Constants for isotopic type keys as encoded in standards.csv
+ISOTYPE_D13C = '��VPDB(13C)'
+ISOTYPE_D18O = '��VSMOW(18O)'
+
+# Helper: build readable date ticks for colorbars when coloring by date ordinals
+def _build_date_colorbar_ticks(values, n=6, date_format='%Y-%m-%d'):
+    try:
+        s = pd.to_numeric(pd.Series(values), errors='coerce').dropna()
+    except Exception:
+        return None, None
+    if s.empty:
+        return None, None
+    vmin, vmax = float(s.min()), float(s.max())
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return None, None
+    # Evenly spaced tick locations across the ordinal range
+    tickvals = np.linspace(vmin, vmax, int(max(2, n)))
+    # Convert ordinal numbers back to date strings
+    ticktext = []
+    for v in tickvals:
+        try:
+            # Round to the nearest day to avoid fractional ordinals
+            ts = pd.Timestamp.fromordinal(int(round(v)))
+            ticktext.append(ts.strftime(date_format))
+        except Exception:
+            ticktext.append(str(v))
+    return tickvals.tolist(), ticktext
 
 # Initialize session state variables if they don't exist
 if 'df' not in st.session_state:
@@ -36,6 +70,8 @@ if 'include_outliers' not in st.session_state:
     st.session_state.include_outliers = "No"
 if 'selected_ids' not in st.session_state:
     st.session_state.selected_ids = ["All"]
+if 'interpolate_outliers_export' not in st.session_state:
+    st.session_state.interpolate_outliers_export = False
 
 # Initialize range variables in session state with safe defaults
 if 'signal_range' not in st.session_state:
@@ -169,6 +205,23 @@ def identify_outliers_iqr(data, column, iqr_multiplier=1.5):
 
 
 standards_df = pd.read_csv("Standards.csv")
+# Normalize isotopic type labels to match internal constants
+try:
+    standards_df['Isotopic_Value_Type'] = (
+        standards_df['Isotopic_Value_Type']
+        .astype(str)
+        .str.strip()
+        .replace({
+            'δVPDB(13C)': ISOTYPE_D13C,
+            'δVSMOW(18O)': ISOTYPE_D18O,
+            'Î´VPDB(13C)': ISOTYPE_D13C,
+            'Î´VSMOW(18O)': ISOTYPE_D18O,
+            '��VPDB(13C)': ISOTYPE_D13C,
+            '��VSMOW(18O)': ISOTYPE_D18O,
+        })
+    )
+except Exception:
+    pass
 
 def get_true_value(standard_name, isotopic_type):
     """Fetch the true isotopic value for a given standard and isotopic type."""
@@ -210,8 +263,8 @@ def calibrate_results(standards_df, full_df, selected_standards):
 
     # Define isotopic types and corresponding column names
     isotopic_types = {
-        'δVPDB(13C)': ('d 13C/12C  Mean', 'd13C_calibrated'),
-        'δVSMOW(18O)': ('d 18O/16O  Mean', 'd18O_calibrated')
+        ISOTYPE_D13C: ('d 13C/12C  Mean', 'd13C_calibrated'),
+        ISOTYPE_D18O: ('d 18O/16O  Mean', 'd18O_calibrated')
     }
 
     for isotopic_type, (raw_column, calibrated_column) in isotopic_types.items():
@@ -262,11 +315,11 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
 
     # Define isotope mappings for processing
     isotopes = {
-        'δVPDB(13C)': {
+        ISOTYPE_D13C: {
             'y_label': 'δ13C',
             'measurement_col': 'd 13C/12C  Mean'
         },
-        'δVSMOW(18O)': {
+        ISOTYPE_D18O: {
             'y_label': 'δ18O',
             'measurement_col': 'd 18O/16O  Mean'
         }
@@ -277,6 +330,33 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
         true_values = []
         measured_values = []
         color_values = []
+
+        # Build a shared coloraxis so all traces use the same colorbar
+        coloraxis_cfg = dict(
+            colorscale='Viridis',
+            colorbar=dict(
+                title='Date' if color_param == 'Date_ordinal' else color_param,
+                thickness=20,
+                len=0.75,
+                y=0.5,
+                yanchor='middle',
+                x=1.15,
+                xanchor='right'
+            )
+        )
+        if color_param in measurement_df.columns:
+            try:
+                cdata = pd.to_numeric(measurement_df[color_param], errors='coerce')
+                cmin = float(np.nanmin(cdata))
+                cmax = float(np.nanmax(cdata))
+                if np.isfinite(cmin) and np.isfinite(cmax):
+                    coloraxis_cfg.update(cmin=cmin, cmax=cmax)
+            except Exception:
+                pass
+        if color_param == 'Date_ordinal' and color_param in measurement_df.columns:
+            tickvals, ticktext = _build_date_colorbar_ticks(measurement_df[color_param])
+            if tickvals and ticktext:
+                coloraxis_cfg['colorbar'].update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
 
         for standard in selected_standards:
 
@@ -325,17 +405,7 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
                 marker=dict(
                     size=10,
                     color=color_values_for_standard,
-                    colorscale='Viridis',
-                    colorbar=dict(
-                        title=color_param,
-                        thickness=20,
-                        len=0.75,    # Longer colorbar
-                        y=0.5,       # Center vertically
-                        yanchor='middle',
-                        x=1.15,      # Move further right
-                        xanchor='right'
-                    ),
-                    showscale=standard == selected_standards[0]  # Show colorbar only for first standard
+                    coloraxis='coloraxis'
                 )
             ))
 
@@ -375,7 +445,7 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
             except ValueError:
                 st.warning("Insufficient data for linear regression.")
 
-        # Update layout with annotation and axis labels
+        # Update layout with annotation and axis labels (attach shared coloraxis)
         fig.update_layout(
             title=f"{'Single' if len(selected_standards) == 1 else 'Double'} Anchor Calibration for {isotope_type}",
             xaxis_title=f"True {isotope_data['y_label']} value",
@@ -384,6 +454,7 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
             width=900,   # Increased width to accommodate colorbar
             height=600,
             margin=dict(r=150),  # Add right margin for colorbar
+            coloraxis=coloraxis_cfg,
             annotations=[
                 dict(
                     x=0.05, y=0.85, xref="paper", yref="paper",  # Adjusted y position for annotation
@@ -454,6 +525,21 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     marker_symbols = ['circle-open' if id in standards_list else 'circle' for id in df['Identifier 1']]
     hover_text = df['Identifier 2']
 
+    # Build colorbar configuration for the first trace (readable dates if needed)
+    colorbar_cfg = dict(
+        title='Date' if color_param == 'Date_ordinal' else color_param,
+        thickness=20,
+        len=0.75,  # Longer colorbar
+        y=0.5,     # Center vertically
+        yanchor='middle',
+        x=1.15,    # Move further right
+        xanchor='right'
+    )
+    if color_param == 'Date_ordinal' and color_param in df.columns:
+        tickvals, ticktext = _build_date_colorbar_ticks(df[color_param])
+        if tickvals and ticktext:
+            colorbar_cfg.update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
+
     # Scatter plots with coloring by selected parameter
     # First trace with the colorbar
     fig.add_trace(go.Scatter(
@@ -464,15 +550,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
             color=df[color_param],
             colorscale='Viridis',
             symbol=marker_symbols,
-            colorbar=dict(
-                title=color_param,
-                thickness=20,
-                len=0.75,  # Longer colorbar
-                y=0.5,     # Center vertically
-                yanchor='middle',
-                x=1.15,    # Move further right
-                xanchor='right'
-            ),
+            colorbar=colorbar_cfg,
             showscale=True
         ),
         text=hover_text,
@@ -621,7 +699,8 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     return fig
 
 
-def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=None):
+def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=None,
+                   calibration_type=None, sigma_level=None, irq_multiplier=None):
     """
     Creates a download button for exporting DataFrames as an Excel file with multiple sheets.
 
@@ -656,7 +735,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
         final_analyses = total_samples
         if outliers is not None:
             final_analyses -= len(outliers)
-        if selected_standards:
+        if False and selected_standards:  # legacy block disabled; see new block below
             final_analyses -= len(df[standards_mask])
 
         # Create Statistics sheet
@@ -739,6 +818,63 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 worksheet.write(row_offset, 0, "Calibration plots are available in the Calibration tab of the application.")
                 worksheet.write(row_offset + 1, 0, f"Calibration type: {'Single' if len(selected_standards) == 1 else 'Double'} Anchor")
                 worksheet.write(row_offset + 2, 0, f"Standards used: {', '.join(selected_standards)}")
+
+        # New standards export block aligned with Calibration outlier filtering
+        if selected_standards:
+            # Determine outlier method/thresholds from args or session_state
+            _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
+            _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
+            _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
+
+            standards_rows = []
+
+            # Write (unfiltered) standards measurements if not already present
+            try:
+                if "Standards Measurements" not in writer.sheets:
+                    std_mask = df['Identifier 1'].isin(selected_standards)
+                    df[std_mask].to_excel(writer, index=False, sheet_name="Standards Measurements")
+            except Exception:
+                pass
+
+            for _std in selected_standards:
+                _std_df = df[df['Identifier 1'] == _std].copy()
+                if _std_df.empty:
+                    continue
+
+                _total = len(_std_df)
+                try:
+                    if _method == "Z-Score":
+                        _d13 = identify_outliers(_std_df, 'd 13C/12C  Mean', _sigma)
+                        _d18 = identify_outliers(_std_df, 'd 18O/16O  Mean', _sigma)
+                    else:
+                        _d13 = identify_outliers_iqr(_std_df, 'd 13C/12C  Mean', _iqr)
+                        _d18 = identify_outliers_iqr(_std_df, 'd 18O/16O  Mean', _iqr)
+                    _clean = _std_df.loc[~(_d13 | _d18)].copy()
+                except Exception:
+                    _clean = _std_df.copy()
+
+                _included = len(_clean)
+                _d13p = _clean['d 13C/12C  Mean'].std()
+                _d13m = _clean['d 13C/12C  Mean'].mean()
+                _d18p = _clean['d 18O/16O  Mean'].std()
+                _d18m = _clean['d 18O/16O  Mean'].mean()
+
+                _method_label = f"Z-Score (Ïƒ={_sigma})" if _method == "Z-Score" else f"IQR (Ã—{_iqr})"
+
+                standards_rows.append({
+                    'Standard': _std,
+                    'δ13C Precision': _d13p,
+                    'δ13C Average': _d13m,
+                    'δ18O Precision': _d18p,
+                    'δ18O Average': _d18m,
+                    'Sample Count': _included,
+                    'Total Samples': _total,
+                    'Outlier Method': _method_label,
+                    'Calibration Type': 'Single Anchor' if len(selected_standards) == 1 else 'Double Anchor',
+                })
+
+            if standards_rows:
+                pd.DataFrame(standards_rows).to_excel(writer, index=False, sheet_name="Standards Results")
     
     towrite.seek(0)
 
@@ -987,6 +1123,23 @@ def main():
 
             # Load standards reference data
             standards_reference = pd.read_csv('standards.csv')
+            # Normalize isotopic type labels to avoid encoding mismatches
+            try:
+                standards_reference['Isotopic_Value_Type'] = (
+                    standards_reference['Isotopic_Value_Type']
+                    .astype(str)
+                    .str.strip()
+                    .replace({
+                        'δVPDB(13C)': ISOTYPE_D13C,
+                        'δVSMOW(18O)': ISOTYPE_D18O,
+                        'Î´VPDB(13C)': ISOTYPE_D13C,
+                        'Î´VSMOW(18O)': ISOTYPE_D18O,
+                        '��VPDB(13C)': ISOTYPE_D13C,
+                        '��VSMOW(18O)': ISOTYPE_D18O,
+                    })
+                )
+            except Exception:
+                pass
 
             # Create a list of unique standards
             standards_list = standards_reference['Standard'].unique().tolist()
@@ -1005,13 +1158,13 @@ def main():
 
             with col2:
                 st.markdown("#### Outlier Detection")
-                sigma_level = st.number_input("Set Sigma Level for standard´s Outlier Exclusion",
+                sigma_level = st.number_input("Set Sigma Level for standardÂ´s Outlier Exclusion",
                                             min_value=0.1,
                                             max_value=5.0,
                                             value=1.0,
                                             step=0.1)
 
-                irq_multiplier = st.number_input("Set IQR Multiplier for standard´s Outlier Exclusion",
+                irq_multiplier = st.number_input("Set IQR Multiplier for standardÂ´s Outlier Exclusion",
                                                 min_value=1.0,
                                                 max_value=10.0,
                                                 value=1.5,
@@ -1019,6 +1172,11 @@ def main():
 
                 # User selects the calibration method
                 calibration_type = st.selectbox("Choose Outlier Detection Method", options=["Z-Score", "IQR"])
+
+                # Persist current calibration/outlier settings for reuse (e.g., Excel export)
+                st.session_state.calibration_type = calibration_type
+                st.session_state.sigma_level = sigma_level
+                st.session_state.irq_multiplier = irq_multiplier
 
             with col3:
                 st.markdown("#### Visualization")
@@ -1085,9 +1243,9 @@ def main():
                         # Display plots in columns
                         col1, col2 = st.columns(2)
                         with col1:
-                            st.plotly_chart(figs['δVPDB(13C)'], use_container_width=True)
+                            st.plotly_chart(figs[ISOTYPE_D13C], use_container_width=True)
                         with col2:
-                            st.plotly_chart(figs['δVSMOW(18O)'], use_container_width=True)
+                            st.plotly_chart(figs[ISOTYPE_D18O], use_container_width=True)
 
                         # Perform calibration for both isotopic types in a single function call
                         calibrated_df = calibrate_results(
@@ -1114,10 +1272,15 @@ def main():
                         st.warning(f"No established values found for the standard: {standard}")
                         continue
 
-                    d13c_established = established_values.loc[
-                        established_values['Isotopic_Value_Type'] == 'δVPDB(13C)', 'Value'].values[0]
-                    d18o_established = established_values.loc[
-                        established_values['Isotopic_Value_Type'] == 'δVSMOW(18O)', 'Value'].values[0]
+                    cond13 = established_values['Isotopic_Value_Type'] == ISOTYPE_D13C
+                    cond18 = established_values['Isotopic_Value_Type'] == ISOTYPE_D18O
+                    vals13 = established_values.loc[cond13, 'Value']
+                    vals18 = established_values.loc[cond18, 'Value']
+                    if vals13.empty or vals18.empty:
+                        st.warning(f"Isotopic values not found for the standard: {standard}. Check standards.csv encoding.")
+                        continue
+                    d13c_established = vals13.iloc[0]
+                    d18o_established = vals18.iloc[0]
 
                     shp2l_filtered_data = st.session_state.df[
                         st.session_state.df['Identifier 1'] == standard]
@@ -1202,10 +1365,22 @@ def main():
                     """, unsafe_allow_html=True)
 
                     # Calculate statistics for both methods
-                    d13c_mean = shp2l_filtered_data['d 13C/12C  Mean'].mean()
-                    d13c_std = shp2l_filtered_data['d 13C/12C  Mean'].std()
-                    d18o_mean = shp2l_filtered_data['d 18O/16O  Mean'].mean()
-                    d18o_std = shp2l_filtered_data['d 18O/16O  Mean'].std()
+                    # IMPORTANT: compute stats from the same data shown on the plot.
+                    # Use nonâ€‘outlier points when outlier detection is enabled to avoid biased/offset lines.
+                    try:
+                        stats_source = shp2l_filtered_data.loc[~(d13c_outliers | d18o_outliers)].copy()
+                    except Exception:
+                        # Fallback to all data if for any reason the masks are unavailable
+                        stats_source = shp2l_filtered_data.copy()
+
+                    # Ensure numeric dtype and ignore NaNs
+                    d13c_series = pd.to_numeric(stats_source['d 13C/12C  Mean'], errors='coerce')
+                    d18o_series = pd.to_numeric(stats_source['d 18O/16O  Mean'], errors='coerce')
+
+                    d13c_mean = float(d13c_series.mean())
+                    d13c_std = float(d13c_series.std())
+                    d18o_mean = float(d18o_series.mean())
+                    d18o_std = float(d18o_series.std())
 
                     # Sigma level lines (for Z-Score method)
                     sigma_level_d13c_plus = d13c_mean + sigma_level * d13c_std
@@ -1214,14 +1389,14 @@ def main():
                     sigma_level_d18o_minus = d18o_mean - sigma_level * d18o_std
 
                     # IQR statistics with the irq_multiplier instead of hardcoded 1.5
-                    q1_d13c = shp2l_filtered_data['d 13C/12C  Mean'].quantile(0.25)
-                    q3_d13c = shp2l_filtered_data['d 13C/12C  Mean'].quantile(0.75)
+                    q1_d13c = d13c_series.quantile(0.25)
+                    q3_d13c = d13c_series.quantile(0.75)
                     iqr_d13c = q3_d13c - q1_d13c
                     iqr_level_d13c_plus = q3_d13c + irq_multiplier * iqr_d13c
                     iqr_level_d13c_minus = q1_d13c - irq_multiplier * iqr_d13c
 
-                    q1_d18o = shp2l_filtered_data['d 18O/16O  Mean'].quantile(0.25)
-                    q3_d18o = shp2l_filtered_data['d 18O/16O  Mean'].quantile(0.75)
+                    q1_d18o = d18o_series.quantile(0.25)
+                    q3_d18o = d18o_series.quantile(0.75)
                     iqr_d18o = q3_d18o - q1_d18o
                     iqr_level_d18o_plus = q3_d18o + irq_multiplier * iqr_d18o
                     iqr_level_d18o_minus = q1_d18o - irq_multiplier * iqr_d18o
@@ -1232,48 +1407,48 @@ def main():
 
                     # Generate plots based on user choice
                     if calibration_type == "Z-Score":
-                        # Plot for δ13C with Z-Score thresholds
+                        # Plot for Î´13C with Z-Score thresholds
                         fig_d13c = px.scatter(
                             x=x_values_d13c,
                             y=shp2l_filtered_data['d 13C/12C  Mean'],
                             color=shp2l_filtered_data[color_param],  # Add color parameter
-                            title=f'SHP2L δ13C Calibration Values (Z-Score Method)',
-                            labels={'y': 'δ13C (‰)', 'x': 'Sequence', 'color': color_param},
+            title=f'SHP2L δ13C Calibration Values (Z-Score Method)',
+            labels={'y': 'δ13C (‰)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
                         fig_d13c.add_hline(y=sigma_level_d13c_plus, line_color='green', line_dash='dot',
-                                           annotation_text=f'+{sigma_level}σ')
+                                           annotation_text=f'+{sigma_level}Ïƒ')
                         fig_d13c.add_hline(y=sigma_level_d13c_minus, line_color='green', line_dash='dot',
-                                           annotation_text=f'-{sigma_level}σ')
+                                           annotation_text=f'-{sigma_level}Ïƒ')
                         fig_d13c.add_hline(y=d13c_mean, line_color='purple', line_dash='solid',
                                            annotation_text='Mean Value')
 
-                        # Plot for δ18O with Z-Score thresholds
+                        # Plot for Î´18O with Z-Score thresholds
                         fig_d18o = px.scatter(
                             x=x_values_d18o,
                             y=shp2l_filtered_data['d 18O/16O  Mean'],
                             color=shp2l_filtered_data[color_param],  # Add color parameter
-                            title=f'SHP2L δ18O Calibration Values (Z-Score Method)',
-                            labels={'y': 'δ18O (‰)', 'x': 'Sequence', 'color': color_param},
+            title=f'SHP2L δ18O Calibration Values (Z-Score Method)',
+            labels={'y': 'δ18O (‰)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
                         fig_d18o.add_hline(y=sigma_level_d18o_plus, line_color='green', line_dash='dot',
-                                           annotation_text=f'+{sigma_level}σ')
+                                           annotation_text=f'+{sigma_level}Ïƒ')
                         fig_d18o.add_hline(y=sigma_level_d18o_minus, line_color='green', line_dash='dot',
-                                           annotation_text=f'-{sigma_level}σ')
+                                           annotation_text=f'-{sigma_level}Ïƒ')
                         fig_d18o.add_hline(y=d18o_mean, line_color='purple', line_dash='solid',
                                            annotation_text='Mean Value')
 
                     elif calibration_type == "IQR":
-                        # Plot for δ13C with IQR thresholds
+                        # Plot for Î´13C with IQR thresholds
                         fig_d13c = px.scatter(
                             x=x_values_d13c,
                             y=shp2l_filtered_data['d 13C/12C  Mean'],
                             color=shp2l_filtered_data[color_param],  # Add color parameter
-                            title=f'SHP2L δ13C Calibration Values (IQR Method)',
-                            labels={'y': 'δ13C (‰)', 'x': 'Sequence', 'color': color_param},
+            title=f'SHP2L δ13C Calibration Values (IQR Method)',
+            labels={'y': 'δ13C (‰)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
@@ -1286,13 +1461,13 @@ def main():
                         fig_d13c.add_hline(y=q1_d13c, line_color='purple', line_dash='solid',
                                            annotation_text='Q1 (25th Percentile)')
 
-                        # Plot for δ18O with IQR thresholds
+                        # Plot for Î´18O with IQR thresholds
                         fig_d18o = px.scatter(
                             x=x_values_d18o,
                             y=shp2l_filtered_data['d 18O/16O  Mean'],
                             color=shp2l_filtered_data[color_param],  # Add color parameter
-                            title=f'SHP2L δ18O Calibration Values (IQR Method)',
-                            labels={'y': 'δ18O (‰)', 'x': 'Sequence', 'color': color_param},
+            title=f'SHP2L δ18O Calibration Values (IQR Method)',
+            labels={'y': 'δ18O (‰)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
@@ -1414,8 +1589,8 @@ def main():
         #     st.write(f"Signal Intensity: {excluded_by_signal:,d} samples")
         #     st.write(f"Leak Rate: {excluded_by_leak:,d} samples")
         # with col2:
-        #     st.write(f"δ13C Range: {excluded_by_d13c:,d} samples")
-        #     st.write(f"δ18O Range: {excluded_by_d18o:,d} samples")
+        #     st.write(f"Î´13C Range: {excluded_by_d13c:,d} samples")
+        #     st.write(f"Î´18O Range: {excluded_by_d18o:,d} samples")
         # st.markdown(f"**Total Samples Excluded: {total_excluded:,d} of {total_samples:,d}**")
 
         st.subheader("Statistical Outlier Settings")
@@ -1432,8 +1607,8 @@ def main():
         # with st.expander("Active Filters"):
         #     st.write("Signal Intensity Range:", f"{signal_range[0]:.2f} to {signal_range[1]:.2f}")
         #     st.write("Leak Rate Range:", f"{leak_range[0]:.2f} to {leak_range[1]:.2f}")
-        #     st.write("δ13C Range:", f"{d13c_range[0]:.2f} to {d13c_range[1]:.2f}")
-        #     st.write("δ18O Range:", f"{d18o_range[0]:.2f} to {d18o_range[1]:.2f}")
+        #     st.write("Î´13C Range:", f"{d13c_range[0]:.2f} to {d13c_range[1]:.2f}")
+        #     st.write("Î´18O Range:", f"{d18o_range[0]:.2f} to {d18o_range[1]:.2f}")
 
         # Prepare main dataset based on user selections
         data_to_process = df_copy.copy()
@@ -1592,6 +1767,18 @@ def main():
             # Update session state
             st.session_state.include_outliers = include_outliers
 
+            # When including outliers, allow optional interpolation before export
+            if st.session_state.include_outliers == "Yes":
+                # Let the widget manage session_state via its key; don't assign to session_state directly
+                _interpolate_outliers_export = st.checkbox(
+                    "Interpolate outliers before export",
+                    value=st.session_state.get("interpolate_outliers_export", False),
+                    help="Linearly interpolate values for rows flagged as outliers before downloading.",
+                    key="interpolate_outliers_export"
+                )
+            else:
+                st.session_state.interpolate_outliers_export = False
+
         with col2:
             selected_ids = st.multiselect(
                 "Select Identifier 1 values to include:",
@@ -1700,13 +1887,94 @@ def main():
                 filename_parts.append(f"ID{len(selected_ids)}selected")
         filename_parts.append(f"{'with' if include_outliers == 'Yes' else 'without'}_outliers")
         filename = f"dataset_{'_'.join(filename_parts)}.xlsx"
+        # Clarify in filename if interpolation will be applied
+        if st.session_state.include_outliers == "Yes" and st.session_state.get("interpolate_outliers_export"):
+            if filename.lower().endswith(".xlsx"):
+                filename = filename[:-5] + "_interpolated.xlsx"
 
-        # For "Include outliers = Yes", add outliers to main data and clear outliers_df
+        # For "Include outliers = Yes", add an outlier-type column and merge outliers
         if st.session_state.include_outliers == "Yes":
-            main_data = pd.concat([main_data, outliers_df], ignore_index=True)
+            # Build per-row outlier category labels based on current settings
+            try:
+                stat_mask_all = statistical_mask.reindex(data_to_process.index, fill_value=False)
+            except Exception:
+                # Fallback in case statistical_mask is not aligned
+                stat_mask_all = pd.Series(False, index=data_to_process.index)
+
+            d13c_out_mask = (
+                (data_to_process['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
+                (data_to_process['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
+            )
+            d18o_out_mask = (
+                (data_to_process['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
+                (data_to_process['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
+            )
+            signal_out_mask = (
+                (data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
+                (data_to_process['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
+            )
+            leak_out_mask = (
+                (data_to_process['leak_rate'] < st.session_state.leak_range[0]) |
+                (data_to_process['leak_rate'] > st.session_state.leak_range[1])
+            )
+
+            cat_bools = pd.DataFrame({
+                'Statistical': stat_mask_all,
+                'δ13C Range': d13c_out_mask,
+                'δ18O Range': d18o_out_mask,
+                'Signal Intensity': signal_out_mask,
+                'Leak Rate': leak_out_mask,
+            }, index=data_to_process.index)
+
+            # Join multiple categories with '; ' for rows that meet several outlier conditions
+            outlier_types = cat_bools.apply(
+                lambda row: '; '.join([cat for cat, is_out in row.items() if bool(is_out)]), axis=1
+            )
+
+            # Attach the outlier types to the main dataset being exported
+            main_data = data_to_process.copy()
+            main_data['Outlier Types'] = outlier_types
+
+            # Clear outliers_df so only one consolidated sheet is exported
             outliers_df = pd.DataFrame()
             
-        download_excel(main_data, outliers=outliers_df, filename=filename, selected_standards=selected_standards)
+            # Optionally interpolate outlier rows before export
+            if st.session_state.get("interpolate_outliers_export"):
+                try:
+                    outlier_mask = main_data['Outlier Types'].astype(str).str.strip().replace({"": np.nan}).notna()
+                    cols_to_interp = [
+                        "d 13C/12C  Mean",
+                        "d 13C/12C  Std Dev",
+                        "d 18O/16O  Mean",
+                        "d 18O/16O  Std Dev",
+                        "d13C_calibrated",
+                        "d18O_calibrated",
+                    ]
+                    present_cols = [c for c in cols_to_interp if c in main_data.columns]
+                    if present_cols and interpolate_columns is not None:
+                        main_data = interpolate_columns(main_data, outlier_mask, present_cols)
+                    elif present_cols:
+                        # Fallback inline interpolation if helper not available
+                        df_tmp = main_data.copy()
+                        for col in present_cols:
+                            s = pd.to_numeric(df_tmp[col], errors="coerce")
+                            s_masked = s.copy()
+                            s_masked[outlier_mask] = np.nan
+                            s_interp = s_masked.interpolate(method="linear", limit_direction="both")
+                            df_tmp.loc[outlier_mask, col] = s_interp.loc[outlier_mask]
+                        main_data = df_tmp
+                except Exception as e:
+                    st.warning(f"Interpolation step skipped due to error: {e}")
+            
+        download_excel(
+            main_data,
+            outliers=outliers_df,
+            filename=filename,
+            selected_standards=selected_standards,
+            calibration_type=st.session_state.get('calibration_type'),
+            sigma_level=st.session_state.get('sigma_level'),
+            irq_multiplier=st.session_state.get('irq_multiplier'),
+        )
 
         # Read the standards.csv file
         standards_df = pd.read_csv("standards.csv")
@@ -1750,6 +2018,25 @@ def main():
             param_max = df_filtered[color_param_tab3].max()
             
             # Create a shared colorbar figure
+            # Build colorbar configuration and use readable dates if needed
+            colorbar_cfg = dict(
+                title=dict(
+                    text=selected_color_param_tab3,
+                    side='top'  # Move title above the colorbar
+                ),
+                len=0.6,  # Make colorbar wider
+                thickness=20,  # Make colorbar taller
+                x=0.5,  # Center horizontally
+                xanchor='center',
+                y=0.5,  # Center vertically
+                yanchor='middle',
+                orientation='h'  # Horizontal orientation
+            )
+            if color_param_tab3 == 'Date_ordinal' and color_param_tab3 in df_filtered.columns:
+                tickvals, ticktext = _build_date_colorbar_ticks(df_filtered[color_param_tab3])
+                if tickvals and ticktext:
+                    colorbar_cfg.update(tickvals=tickvals, ticktext=ticktext)
+
             colorbar_fig = go.Figure(go.Scatter(
                 x=[0],  # Dummy data
                 y=[0],
@@ -1761,19 +2048,7 @@ def main():
                     cmax=param_max,
                     colorscale="Viridis",
                     showscale=True,
-                    colorbar=dict(
-                        title=dict(
-                            text=selected_color_param_tab3,
-                            side='top'  # Move title above the colorbar
-                        ),
-                        len=0.6,  # Make colorbar wider
-                        thickness=20,  # Make colorbar taller
-                        x=0.5,  # Center horizontally
-                        xanchor='center',
-                        y=0.5,  # Center vertically
-                        yanchor='middle',
-                        orientation='h'  # Horizontal orientation
-                    )
+                    colorbar=colorbar_cfg
                 ),
                 showlegend=False
             ))
@@ -1945,7 +2220,7 @@ def main():
                         legendgroup='outliers'
                     ))
 
-                # δ13C range outliers
+                # Î´13C range outliers
                 d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
                 if d13c_mask.any():
                     d13c_summary.add_trace(go.Scatter(
@@ -1963,7 +2238,7 @@ def main():
                         legendgroup='outliers'
                     ))
 
-                # δ18O range outliers
+                # Î´18O range outliers
                 d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
                 if d18o_mask.any():
                     d13c_summary.add_trace(go.Scatter(
@@ -2115,7 +2390,7 @@ def main():
                         legendgroup='outliers'
                     ))
 
-                # δ13C range outliers
+                # Î´13C range outliers
                 d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
                 if d13c_mask.any():
                     d18o_summary.add_trace(go.Scatter(
@@ -2133,7 +2408,7 @@ def main():
                         legendgroup='outliers'
                     ))
 
-                # δ18O range outliers
+                # Î´18O range outliers
                 d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
                 if d18o_mask.any():
                     d18o_summary.add_trace(go.Scatter(
@@ -2384,8 +2659,8 @@ def main():
 
                 st.plotly_chart(fig_d13C, use_container_width=True, height=chart_height)
 
-                # Plot δ18O data for this identifier and comment
-                # Create figure for δ18O
+                # Plot Î´18O data for this identifier and comment
+                # Create figure for Î´18O
                 fig_d18O = go.Figure()
 
                 # Add statistical outliers if enabled
@@ -2591,7 +2866,7 @@ def main():
                     else:
                         st.info("No statistical outliers detected")
 
-                # δ13C Outliers
+                # Î´13C Outliers
                 with st.expander("δ13C Range Outliers", expanded=True):
                     if not d13c_outliers.empty:
                         st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} ‰")
@@ -2601,7 +2876,7 @@ def main():
                     else:
                         st.info("No δ13C outliers detected")
 
-                # δ18O Outliers
+                # Î´18O Outliers
                 with st.expander("δ18O Range Outliers", expanded=True):
                     if not d18o_outliers.empty:
                         st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} ‰")
@@ -2701,3 +2976,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
