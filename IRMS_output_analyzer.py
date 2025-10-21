@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
 import numpy as np
 import io
@@ -382,6 +382,31 @@ def _interpolate_outliers_by_identifier2(df, outlier_mask, cols, id2_col='Identi
     work_sorted = work_sorted.sort_values('_orig_pos_irms')
     work_sorted = work_sorted.drop(columns=['_order_irms', '_orig_pos_irms'])
     return work_sorted
+
+def _sanitize_filename(name: str) -> str:
+    try:
+        s = str(name)
+    except Exception:
+        return "output"
+    s = re.sub(r'[\\/:*?"<>|]', '_', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s or "output"
+
+def _build_client_filename(client_name: str, client_df: pd.DataFrame) -> str:
+    client_part = _sanitize_filename(client_name) if client_name else "Client"
+    try:
+        raw_ids = [str(x) for x in client_df['Identifier'].dropna().unique().tolist()]
+    except Exception:
+        raw_ids = []
+    # Always include the explicit list of Identifier 1 values (sanitized), no count summary
+    ids_sanitized = [_sanitize_filename(x) for x in raw_ids]
+    id_part = " ".join(ids_sanitized).strip()
+
+    date_str = pd.Timestamp.today().strftime('%d%m%Y')
+    # Use exact label requested, preserving '&'
+    title = "Stable C&O isosopes results P2L"
+    parts = [p for p in [client_part, id_part, title, date_str] if p]
+    return (" ".join(parts) + ".xlsx").strip()
 
 def calibrate_results(standards_df, full_df, selected_standards):
     """
@@ -843,7 +868,8 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
 
 
 def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=None,
-                   calibration_type=None, sigma_level=None, irq_multiplier=None):
+                   calibration_type=None, sigma_level=None, irq_multiplier=None,
+                   client_name=None):
     """
     Creates a download button for exporting DataFrames as an Excel file with multiple sheets.
 
@@ -901,6 +927,203 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
 
         # Write main data to Data sheet
         main_data.to_excel(writer, index=False, sheet_name="Data")
+
+        # Build Client Output sheet with corrected values and information box
+        try:
+            # Determine linearity fits (reuse from session or recompute on-the-fly from standards)
+            fits = st.session_state.get('linearity_fits') if isinstance(st.session_state, dict) else None
+            intensity_col = '1  Cycle Int  Samp  44'
+
+            # If no fits in session, compute using currently selected standards (cleaned by chosen outlier method)
+            if (not fits) and selected_standards:
+                try:
+                    _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
+                    _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
+                    _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
+                    clean_stds_all = _filter_standards_remove_outliers(df, selected_standards, _method, _sigma, _iqr)
+                    fit13 = _compute_linearity_fit(clean_stds_all, 'd 13C/12C  Mean', intensity_col)
+                    fit18 = _compute_linearity_fit(clean_stds_all, 'd 18O/16O  Mean', intensity_col)
+                    fits = {
+                        'd13C': {'slope': fit13.get('slope', np.nan), 'x_ref': fit13.get('x_ref', np.nan)},
+                        'd18O': {'slope': fit18.get('slope', np.nan), 'x_ref': fit18.get('x_ref', np.nan)},
+                        'raw': {'fit13': fit13, 'fit18': fit18},
+                    }
+                except Exception:
+                    fits = None
+
+            # Build corrected columns with best available data
+            def _build_corrected(series_cal, series_raw, isotope_key):
+                try:
+                    s_cal = pd.to_numeric(series_cal, errors='coerce') if series_cal is not None else None
+                except Exception:
+                    s_cal = None
+                try:
+                    s_raw = pd.to_numeric(series_raw, errors='coerce') if series_raw is not None else None
+                except Exception:
+                    s_raw = None
+                if s_cal is not None and f"{isotope_key}_calibrated_linearity_corrected" in df.columns:
+                    # Prefer precomputed calibrated+linearity-corrected column if present in export df
+                    return pd.to_numeric(df[f"{isotope_key}_calibrated_linearity_corrected"], errors='coerce')
+                if s_cal is not None and fits and np.isfinite(fits.get(isotope_key, {}).get('slope', np.nan)) and intensity_col in df.columns:
+                    # Apply linearity correction to calibrated values
+                    i = pd.to_numeric(df[intensity_col], errors='coerce')
+                    slope = fits[isotope_key]['slope']; xr = fits[isotope_key]['x_ref']
+                    return (s_cal - slope * (i - xr)).where(np.isfinite(s_cal) & np.isfinite(i))
+                # Fallbacks
+                if s_cal is not None:
+                    return s_cal
+                if s_raw is not None and fits and np.isfinite(fits.get(isotope_key, {}).get('slope', np.nan)) and intensity_col in df.columns:
+                    i = pd.to_numeric(df[intensity_col], errors='coerce')
+                    slope = fits[isotope_key]['slope']; xr = fits[isotope_key]['x_ref']
+                    return (s_raw - slope * (i - xr)).where(np.isfinite(s_raw) & np.isfinite(i))
+                return s_raw if s_raw is not None else pd.Series(index=df.index, dtype=float)
+
+            corrected_d13 = _build_corrected(
+                df.get('d13C_calibrated'),
+                df.get('d 13C/12C  Mean'),
+                'd13C'
+            )
+            corrected_d18 = _build_corrected(
+                df.get('d18O_calibrated'),
+                df.get('d 18O/16O  Mean'),
+                'd18O'
+            )
+
+            # Prepare client output dataframe (non-standards only)
+            client_df = pd.DataFrame({
+                'Identifier': df['Identifier 1'],
+                'Sample #': df.get('Identifier 2', pd.Series(index=df.index, dtype=object)),
+                'Species': df.get('Comment', pd.Series(index=df.index, dtype=object)),
+                'd13C (‰, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
+                'd13C (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
+                'd18O (‰, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
+                'd18O (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
+                'Corrected d13C (‰, VPDB)': corrected_d13,
+                'Corrected d18O (‰, VPDB)': corrected_d18,
+            })
+
+            # Keep only non-standards entries if selected_standards is provided
+            if selected_standards:
+                client_df = client_df[~df['Identifier 1'].isin(selected_standards)]
+
+            # Round numeric columns to 2 decimals specifically for Client Output
+            round_cols = [
+                'd13C (‰, VPDB)  Mean', 'd13C (‰, VPDB)  Std Dev',
+                'd18O (‰, VPDB)  Mean', 'd18O (‰, VPDB)  Std Dev',
+                'Corrected d13C (‰, VPDB)', 'Corrected d18O (‰, VPDB)'
+            ]
+            for rc in round_cols:
+                if rc in client_df.columns:
+                    client_df[rc] = pd.to_numeric(client_df[rc], errors='coerce').round(2)
+
+            # Do not write Client Output into dataset workbook; handled as a separate file below
+            client_sheet = "Client Output"
+            workbook = writer.book
+            # Intentionally do not create worksheet here to avoid including it in dataset file
+
+            # Basic formatting: header bold, corrected columns purple
+            header_fmt = workbook.add_format({'bold': True})
+            corrected_hdr_fmt = workbook.add_format({'bold': True, 'font_color': '#6A1B9A'})
+            num_fmt = workbook.add_format({'num_format': '0.00'})
+            num_fmt_sd = workbook.add_format({'num_format': '0.00'})
+
+            # Set column widths and header formats
+            headers = list(client_df.columns)
+            for col_idx, col_name in enumerate(headers):
+                fmt = header_fmt
+                if 'Corrected' in col_name:
+                    fmt = corrected_hdr_fmt
+                worksheet.write(0, col_idx, col_name, fmt)
+                # Reasonable widths
+                width = 15
+                if col_name in ('Identifier', 'Species'):
+                    width = 18
+                elif 'Corrected' in col_name:
+                    width = 22
+                worksheet.set_column(col_idx, col_idx, width)
+
+            # Apply numeric format to measure columns
+            meas_cols = [
+                'd13C (‰, VPDB)  Mean', 'd13C (‰, VPDB)  Std Dev',
+                'd18O (‰, VPDB)  Mean', 'd18O (‰, VPDB)  Std Dev',
+                'Corrected d13C (‰, VPDB)', 'Corrected d18O (‰, VPDB)'
+            ]
+            for col_name in meas_cols:
+                if col_name in headers:
+                    col_idx = headers.index(col_name)
+                    worksheet.set_column(col_idx, col_idx, None, num_fmt if 'Std Dev' not in col_name else num_fmt_sd)
+
+            # Compute SHP2L precision over period using standards-style logic
+            d13c_sd_val = np.nan
+            d18o_sd_val = np.nan
+            n_used = 0
+            try:
+                _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
+                _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
+                _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
+
+                shp = df[df['Identifier 1'] == 'SHP2L'].copy() if 'Identifier 1' in df.columns else pd.DataFrame()
+                if not shp.empty:
+                    # Remove outliers on SHP2L like in standards table
+                    if _method == "Z-Score":
+                        m13 = identify_outliers(shp, 'd 13C/12C  Mean', _sigma)
+                        m18 = identify_outliers(shp, 'd 18O/16O  Mean', _sigma)
+                    else:
+                        m13 = identify_outliers_iqr(shp, 'd 13C/12C  Mean', _iqr)
+                        m18 = identify_outliers_iqr(shp, 'd 18O/16O  Mean', _iqr)
+                    clean_shp = shp.loc[~(m13 | m18)].copy()
+                    n_used = len(clean_shp)
+
+                    # Ensure we have fits; compute from selected standards or SHP2L itself
+                    if not fits:
+                        try:
+                            if selected_standards:
+                                clean_all = _filter_standards_remove_outliers(df, selected_standards, _method, _sigma, _iqr)
+                            else:
+                                clean_all = clean_shp
+                            f13 = _compute_linearity_fit(clean_all, 'd 13C/12C  Mean', intensity_col)
+                            f18 = _compute_linearity_fit(clean_all, 'd 18O/16O  Mean', intensity_col)
+                            fits = {
+                                'd13C': {'slope': f13.get('slope', np.nan), 'x_ref': f13.get('x_ref', np.nan)},
+                                'd18O': {'slope': f18.get('slope', np.nan), 'x_ref': f18.get('x_ref', np.nan)},
+                            }
+                        except Exception:
+                            fits = None
+
+                    # Compute linearity-corrected precision
+                    y13s = pd.to_numeric(clean_shp.get('d 13C/12C  Mean'), errors='coerce')
+                    y18s = pd.to_numeric(clean_shp.get('d 18O/16O  Mean'), errors='coerce')
+                    if fits and np.isfinite(fits.get('d13C', {}).get('slope', np.nan)) and intensity_col in clean_shp.columns:
+                        i = pd.to_numeric(clean_shp[intensity_col], errors='coerce')
+                        y13s = (y13s - fits['d13C']['slope'] * (i - fits['d13C']['x_ref'])).where(np.isfinite(y13s) & np.isfinite(i))
+                    if fits and np.isfinite(fits.get('d18O', {}).get('slope', np.nan)) and intensity_col in clean_shp.columns:
+                        i = pd.to_numeric(clean_shp[intensity_col], errors='coerce')
+                        y18s = (y18s - fits['d18O']['slope'] * (i - fits['d18O']['x_ref'])).where(np.isfinite(y18s) & np.isfinite(i))
+                    d13c_sd_val = float(y13s.std()) if y13s is not None else np.nan
+                    d18o_sd_val = float(y18s.std()) if y18s is not None else np.nan
+            except Exception:
+                pass
+
+            # Write Equipment and standard deviation block on the right
+            equip_title_fmt = workbook.add_format({'bold': True})
+            worksheet.write(1, 10, "Equiment:", equip_title_fmt)
+            worksheet.write(1, 11, "ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer")
+            worksheet.write(2, 11, "Kiel IV automated carbonate preparation device")
+            worksheet.write(4, 10, "Standard deviation of SHP2L over measurement period:", equip_title_fmt)
+            worksheet.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} ‰ for d13C")
+            worksheet.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} ‰ for d18O")
+            worksheet.write(7, 11, f"{n_used} n")
+
+            # Insert textbox with provided content
+            materials_text = (
+                "When results produced at P2L are being published, we suggest to use the following text in the “Material and Methods” section of the publication:\n\n"
+                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of Sāo Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientific™ MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientific™ Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70°C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) ‰ for d13C and (please use the value informed by P2L) ‰ for d18O (±1 s, n = please use the value informed by P2L).\"\n\n"
+                "Reference\nCrivellari, S., Viana, P.J., Campos, M.D., Kuhnert, H., Lopes, A.B.M., da Cruz, F.W., Chiessi, C.M., 2021. Development and characterization of a new in-house reference material for stable carbon and oxygen isotopes analyses. Journal of Analytical Atomic Spectrometry 36, 1125-1134. DOI: 10.1039/D1JA00030F."
+            )
+            # Skip adding textbox since the sheet is not created in this workbook
+        except Exception:
+            # Silently skip any errors in this bypassed block
+            pass
         
         # Write outliers to second sheet only if they exist and we want to exclude them
         if outliers is not None and not outliers.empty and df is not None:
@@ -1169,14 +1392,141 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
     
     towrite.seek(0)
 
-    # Create the download button
+    # Create dataset download button
     st.download_button(
-        label="Download Excel File",
+        label="Download Dataset Excel",
         data=towrite,
         file_name=filename,
-        mime="application/vnd.ms-excel",
-        key=f"download_btn_{filename}"
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        key=f"download_dataset_{filename}"
     )
+
+    # Build a separate Client Output file and download button
+    try:
+        intensity_col = '1  Cycle Int  Samp  44'
+        fits = st.session_state.get('linearity_fits') if isinstance(st.session_state, dict) else None
+        if (not fits) and selected_standards:
+            _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
+            _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
+            _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
+            clean_stds_all = _filter_standards_remove_outliers(df, selected_standards, _method, _sigma, _iqr)
+            f13 = _compute_linearity_fit(clean_stds_all, 'd 13C/12C  Mean', intensity_col)
+            f18 = _compute_linearity_fit(clean_stds_all, 'd 18O/16O  Mean', intensity_col)
+            fits = {
+                'd13C': {'slope': f13.get('slope', np.nan), 'x_ref': f13.get('x_ref', np.nan)},
+                'd18O': {'slope': f18.get('slope', np.nan), 'x_ref': f18.get('x_ref', np.nan)},
+            }
+
+        def _build_corrected(series_cal, series_raw, isotope_key):
+            try:
+                s_cal = pd.to_numeric(series_cal, errors='coerce') if series_cal is not None else None
+            except Exception:
+                s_cal = None
+            try:
+                s_raw = pd.to_numeric(series_raw, errors='coerce') if series_raw is not None else None
+            except Exception:
+                s_raw = None
+            if s_cal is not None and f"{isotope_key}_calibrated_linearity_corrected" in df.columns:
+                return pd.to_numeric(df[f"{isotope_key}_calibrated_linearity_corrected"], errors='coerce')
+            if s_cal is not None and fits and np.isfinite(fits.get(isotope_key, {}).get('slope', np.nan)) and intensity_col in df.columns:
+                i = pd.to_numeric(df[intensity_col], errors='coerce')
+                slope = fits[isotope_key]['slope']; xr = fits[isotope_key]['x_ref']
+                return (s_cal - slope * (i - xr)).where(np.isfinite(s_cal) & np.isfinite(i))
+            if s_cal is not None:
+                return s_cal
+            if s_raw is not None and fits and np.isfinite(fits.get(isotope_key, {}).get('slope', np.nan)) and intensity_col in df.columns:
+                i = pd.to_numeric(df[intensity_col], errors='coerce')
+                slope = fits[isotope_key]['slope']; xr = fits[isotope_key]['x_ref']
+                return (s_raw - slope * (i - xr)).where(np.isfinite(s_raw) & np.isfinite(i))
+            return s_raw if s_raw is not None else pd.Series(index=df.index, dtype=float)
+
+        corrected_d13 = _build_corrected(df.get('d13C_calibrated'), df.get('d 13C/12C  Mean'), 'd13C')
+        corrected_d18 = _build_corrected(df.get('d18O_calibrated'), df.get('d 18O/16O  Mean'), 'd18O')
+
+        client_df = pd.DataFrame({
+            'Identifier': df['Identifier 1'],
+            'Sample #': df.get('Identifier 2', pd.Series(index=df.index, dtype=object)),
+            'Species': df.get('Comment', pd.Series(index=df.index, dtype=object)),
+            'd13C (‰, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
+            'd13C (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
+            'd18O (‰, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
+            'd18O (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
+            'Corrected d13C (‰, VPDB)': corrected_d13,
+            'Corrected d18O (‰, VPDB)': corrected_d18,
+        })
+        if selected_standards:
+            client_df = client_df[~df['Identifier 1'].isin(selected_standards)]
+
+        for rc in ['d13C (‰, VPDB)  Mean','d13C (‰, VPDB)  Std Dev','d18O (‰, VPDB)  Mean','d18O (‰, VPDB)  Std Dev','Corrected d13C (‰, VPDB)','Corrected d18O (‰, VPDB)']:
+            if rc in client_df.columns:
+                client_df[rc] = pd.to_numeric(client_df[rc], errors='coerce').round(2)
+
+        # SHP2L precision
+        d13c_sd_val = np.nan; d18o_sd_val = np.nan; n_used = 0
+        try:
+            _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
+            _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
+            _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
+            shp = df[df['Identifier 1'] == 'SHP2L'].copy() if 'Identifier 1' in df.columns else pd.DataFrame()
+            if not shp.empty:
+                if _method == "Z-Score":
+                    m13 = identify_outliers(shp, 'd 13C/12C  Mean', _sigma)
+                    m18 = identify_outliers(shp, 'd 18O/16O  Mean', _sigma)
+                else:
+                    m13 = identify_outliers_iqr(shp, 'd 13C/12C  Mean', _iqr)
+                    m18 = identify_outliers_iqr(shp, 'd 18O/16O  Mean', _iqr)
+                clean_shp = shp.loc[~(m13 | m18)].copy()
+                n_used = len(clean_shp)
+                y13s = pd.to_numeric(clean_shp.get('d 13C/12C  Mean'), errors='coerce')
+                y18s = pd.to_numeric(clean_shp.get('d 18O/16O  Mean'), errors='coerce')
+                if fits and np.isfinite(fits.get('d13C', {}).get('slope', np.nan)) and intensity_col in clean_shp.columns:
+                    i = pd.to_numeric(clean_shp[intensity_col], errors='coerce')
+                    y13s = (y13s - fits['d13C']['slope'] * (i - fits['d13C']['x_ref'])).where(np.isfinite(y13s) & np.isfinite(i))
+                if fits and np.isfinite(fits.get('d18O', {}).get('slope', np.nan)) and intensity_col in clean_shp.columns:
+                    i = pd.to_numeric(clean_shp[intensity_col], errors='coerce')
+                    y18s = (y18s - fits['d18O']['slope'] * (i - fits['d18O']['x_ref'])).where(np.isfinite(y18s) & np.isfinite(i))
+                d13c_sd_val = float(y13s.std()) if y13s is not None else np.nan
+                d18o_sd_val = float(y18s.std()) if y18s is not None else np.nan
+        except Exception:
+            pass
+
+        client_towrite = BytesIO()
+        with pd.ExcelWriter(client_towrite, engine='xlsxwriter') as w2:
+            client_df.to_excel(w2, index=False, sheet_name='Client Output')
+            wb = w2.book; ws = w2.sheets['Client Output']
+            header_fmt = wb.add_format({'bold': True}); corrected_hdr_fmt = wb.add_format({'bold': True, 'font_color': '#6A1B9A'})
+            num_fmt = wb.add_format({'num_format': '0.00'})
+            headers = list(client_df.columns)
+            for col_idx, col_name in enumerate(headers):
+                ws.write(0, col_idx, col_name, corrected_hdr_fmt if 'Corrected' in col_name else header_fmt)
+                width = 18 if col_name in ('Identifier','Species') else (22 if 'Corrected' in col_name else 15)
+                ws.set_column(col_idx, col_idx, width, num_fmt if col_name in ['d13C (‰, VPDB)  Mean','d13C (‰, VPDB)  Std Dev','d18O (‰, VPDB)  Mean','d18O (‰, VPDB)  Std Dev','Corrected d13C (‰, VPDB)','Corrected d18O (‰, VPDB)'] else None)
+            equip_title_fmt = wb.add_format({'bold': True})
+            ws.write(1, 10, 'Equiment:', equip_title_fmt)
+            ws.write(1, 11, 'ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer')
+            ws.write(2, 11, 'Kiel IV automated carbonate preparation device')
+            ws.write(4, 10, 'Standard deviation of SHP2L over measurement period:', equip_title_fmt)
+            ws.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} ‰ for d13C")
+            ws.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} ‰ for d18O")
+            ws.write(7, 11, f"{n_used} n")
+            materials_text = (
+                "When results produced at P2L are being published, we suggest to use the following text in the “Material and Methods” section of the publication:\n\n"
+                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of Sāo Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientific™ MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientific™ Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70°C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) ‰ for d13C and (please use the value informed by P2L) ‰ for d18O (±1 s, n = please use the value informed by P2L).\"\n\n"
+                "Reference\nCrivellari, S., Viana, P.J., Campos, M.D., Kuhnert, H., Lopes, A.B.M., da Cruz, F.W., Chiessi, C.M., 2021. Development and characterization of a new in-house reference material for stable carbon and oxygen isotopes analyses. Journal of Analytical Atomic Spectrometry 36, 1125-1134. DOI: 10.1039/D1JA00030F."
+            )
+            ws.insert_textbox('L10', materials_text, {'width': 820, 'height': 580, 'line': {'color': '#4F81BD'}})
+
+        client_towrite.seek(0)
+        client_filename = _build_client_filename(client_name, client_df)
+        st.download_button(
+            label='Download Client Output',
+            data=client_towrite,
+            file_name=client_filename,
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            key=f"download_client_{client_filename}"
+        )
+    except Exception as e:
+        st.warning(f"Client Output creation failed: {e}")
 
 
 if "df" not in st.session_state:
@@ -2261,7 +2611,7 @@ def main():
         # Place the Download Dataset section
         st.subheader("Download Dataset")
         st.write("Configure your dataset download options below:")
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             include_outliers = st.radio(
                 "Include outliers in dataset?",
@@ -2305,6 +2655,12 @@ def main():
                     "Value": st.column_config.NumberColumn("Value", width=100),
                     "Details": st.column_config.TextColumn("Details", width=150)
                 }
+            )
+        with col4:
+            st.text_input(
+                "Client name",
+                value=st.session_state.get('client_name', ''),
+                key='client_name'
             )
         st.markdown("---")
 
@@ -2494,6 +2850,7 @@ def main():
             calibration_type=st.session_state.get('calibration_type'),
             sigma_level=st.session_state.get('sigma_level'),
             irq_multiplier=st.session_state.get('irq_multiplier'),
+            client_name=st.session_state.get('client_name'),
         )
 
         # Read the standards.csv file
