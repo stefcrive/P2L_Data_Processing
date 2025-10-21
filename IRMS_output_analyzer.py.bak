@@ -33,10 +33,9 @@ except Exception:
 
 st.set_page_config(layout="wide")
 
-# Constants for isotopic type keys (canonical)
-# Use proper Greek delta to match standards.csv contents
-ISOTYPE_D13C = 'δVPDB(13C)'
-ISOTYPE_D18O = 'δVSMOW(18O)'
+# Constants for isotopic type keys as encoded in standards.csv
+ISOTYPE_D13C = '??VPDB(13C)'
+ISOTYPE_D18O = '??VSMOW(18O)'
 
 # Helper: build readable date ticks for colorbars when coloring by date ordinals
 def _build_date_colorbar_ticks(values, n=6, date_format='%Y-%m-%d'):
@@ -205,11 +204,7 @@ def identify_outliers_iqr(data, column, iqr_multiplier=1.5):
 #     return df
 
 
-# Load standards reference (tolerant to encoding/case differences)
-try:
-    standards_df = pd.read_csv("standards.csv", encoding="utf-8")
-except Exception:
-    standards_df = pd.read_csv("Standards.csv", encoding="utf-8")
+standards_df = pd.read_csv("Standards.csv")
 # Normalize isotopic type labels to match internal constants
 try:
     standards_df['Isotopic_Value_Type'] = (
@@ -221,8 +216,6 @@ try:
             'dVSMOW(18O)': ISOTYPE_D18O,
             'δVPDB(13C)': ISOTYPE_D13C,
             'δVSMOW(18O)': ISOTYPE_D18O,
-            'Î´VPDB(13C)': ISOTYPE_D13C,
-            'Î´VSMOW(18O)': ISOTYPE_D18O,
             '??VPDB(13C)': ISOTYPE_D13C,
             '??VSMOW(18O)': ISOTYPE_D18O,
         })
@@ -484,25 +477,19 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
         # Determine calibration method (single or double anchor)
         if len(selected_standards) == 1:
             # Single anchor calibration
-            if len(true_values) > 0 and len(measured_values) > 0:
-                offset = np.mean(np.array(measured_values) - np.array(true_values))
-                annotation_text = f"Offset = {offset:.3f}"
-                try:
-                    x_min, x_max = min(true_values) - 1, max(true_values) + 1
-                except ValueError:
-                    x_min, x_max = -1, 1
-                y_range = [x_min + offset, x_max + offset]
+            offset = np.mean(np.array(measured_values) - np.array(true_values))
+            annotation_text = f"Offset = {offset:.3f}"
+            x_min, x_max = min(true_values) - 1, max(true_values) + 1
+            y_range = [x_min + offset, x_max + offset]
 
-                # Add offset line
-                fig.add_trace(go.Scatter(
-                    x=[x_min, x_max],
-                    y=y_range,
-                    mode='lines',
-                    name='Offset Line',
-                    line=dict(color='orange', dash='dash')
-                ))
-            else:
-                annotation_text = "No valid points for calibration"
+            # Add offset line
+            fig.add_trace(go.Scatter(
+                x=[x_min, x_max],
+                y=y_range,
+                mode='lines',
+                name='Offset Line',
+                line=dict(color='orange', dash='dash')
+            ))
         else:
             # Double anchor calibration
             try:
@@ -914,30 +901,6 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             except Exception:
                 pass
 
-            # Build a consolidated clean standards frame for fits/params
-            try:
-                clean_stds_all = _filter_standards_remove_outliers(
-                    df,
-                    selected_standards,
-                    _method,
-                    _sigma,
-                    _iqr,
-                )
-            except Exception:
-                clean_stds_all = df[df['Identifier 1'].isin(selected_standards)].copy()
-
-            # Compute linearity fits on cleaned standards (used for precision-after-correction)
-            intensity_col = '1  Cycle Int  Samp  44'
-            try:
-                fit13 = _compute_linearity_fit(clean_stds_all, 'd 13C/12C  Mean', intensity_col)
-            except Exception:
-                fit13 = {'slope': np.nan, 'intercept': np.nan, 'r2': np.nan, 'x_ref': np.nan, 'n': 0}
-            try:
-                fit18 = _compute_linearity_fit(clean_stds_all, 'd 18O/16O  Mean', intensity_col)
-            except Exception:
-                fit18 = {'slope': np.nan, 'intercept': np.nan, 'r2': np.nan, 'x_ref': np.nan, 'n': 0}
-
-            # Build per-standard summary rows, including precision after linearity correction
             for _std in selected_standards:
                 _std_df = df[df['Identifier 1'] == _std].copy()
                 if _std_df.empty:
@@ -961,32 +924,13 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 _d18p = _clean['d 18O/16O  Mean'].std()
                 _d18m = _clean['d 18O/16O  Mean'].mean()
 
-                # Precision after linearity correction (if fits available)
-                _d13p_lin = np.nan
-                _d18p_lin = np.nan
-                try:
-                    if np.isfinite(fit13.get('slope', np.nan)) and intensity_col in _clean.columns:
-                        i = pd.to_numeric(_clean[intensity_col], errors='coerce')
-                        y = pd.to_numeric(_clean['d 13C/12C  Mean'], errors='coerce')
-                        corr = (y - fit13['slope'] * (i - fit13['x_ref'])).where(np.isfinite(y) & np.isfinite(i))
-                        _d13p_lin = float(corr.std())
-                    if np.isfinite(fit18.get('slope', np.nan)) and intensity_col in _clean.columns:
-                        i = pd.to_numeric(_clean[intensity_col], errors='coerce')
-                        y = pd.to_numeric(_clean['d 18O/16O  Mean'], errors='coerce')
-                        corr = (y - fit18['slope'] * (i - fit18['x_ref'])).where(np.isfinite(y) & np.isfinite(i))
-                        _d18p_lin = float(corr.std())
-                except Exception:
-                    pass
-
-                _method_label = f"Z-Score (Ïƒ={_sigma})" if _method == "Z-Score" else f"IQR (Ã—{_iqr})"
+                _method_label = f"Z-Score (σ={_sigma})" if _method == "Z-Score" else f"IQR (×{_iqr})"
 
                 standards_rows.append({
                     'Standard': _std,
                     'd13C Precision': _d13p,
-                    'd13C Precision (Lin-Corr)': _d13p_lin,
                     'd13C Average': _d13m,
                     'd18O Precision': _d18p,
-                    'd18O Precision (Lin-Corr)': _d18p_lin,
                     'd18O Average': _d18m,
                     'Sample Count': _included,
                     'Total Samples': _total,
@@ -995,112 +939,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 })
 
             if standards_rows:
-                # Write the per-standard summary table
                 pd.DataFrame(standards_rows).to_excel(writer, index=False, sheet_name="Standards Results")
-
-                # Append calibration and linearity parameters below the table
-                try:
-                    worksheet = writer.sheets["Standards Results"]
-                    start_row = len(standards_rows) + 2
-
-                    # Calibration parameters section
-                    worksheet.write(start_row, 0, "Calibration Parameters")
-                    start_row += 1
-                    cal_type_text = 'Single Anchor' if len(selected_standards) == 1 else 'Double Anchor'
-                    worksheet.write(start_row, 0, f"Type: {cal_type_text}")
-                    start_row += 1
-                    worksheet.write(start_row, 0, f"Standards used: {', '.join(selected_standards)}")
-                    start_row += 2
-
-                    # Compute calibration parameters from cleaned standards
-                    try:
-                        if len(selected_standards) == 1:
-                            std = selected_standards[0]
-                            # d13C single-point
-                            raw13 = pd.to_numeric(clean_stds_all.loc[clean_stds_all['Identifier 1'] == std, 'd 13C/12C  Mean'], errors='coerce').mean()
-                            tru13 = get_true_value(std, ISOTYPE_D13C)
-                            worksheet.write(start_row, 0, "d13C Single-Point: raw_std(mean)")
-                            worksheet.write(start_row, 1, float(raw13) if pd.notna(raw13) else np.nan)
-                            worksheet.write(start_row, 2, "true_std")
-                            worksheet.write(start_row, 3, float(tru13))
-                            start_row += 1
-                            # d18O single-point
-                            raw18 = pd.to_numeric(clean_stds_all.loc[clean_stds_all['Identifier 1'] == std, 'd 18O/16O  Mean'], errors='coerce').mean()
-                            tru18 = get_true_value(std, ISOTYPE_D18O)
-                            worksheet.write(start_row, 0, "d18O Single-Point: raw_std(mean)")
-                            worksheet.write(start_row, 1, float(raw18) if pd.notna(raw18) else np.nan)
-                            worksheet.write(start_row, 2, "true_std")
-                            worksheet.write(start_row, 3, float(tru18))
-                            start_row += 2
-                            worksheet.write(start_row, 0, "Formula")
-                            worksheet.write(start_row, 1, "((raw+1000)*(true+1000))/(raw_std+1000)-1000")
-                            start_row += 2
-                        elif len(selected_standards) == 2:
-                            s1, s2 = selected_standards
-                            # d13C double-point
-                            raw13_1 = pd.to_numeric(clean_stds_all.loc[clean_stds_all['Identifier 1'] == s1, 'd 13C/12C  Mean'], errors='coerce').mean()
-                            raw13_2 = pd.to_numeric(clean_stds_all.loc[clean_stds_all['Identifier 1'] == s2, 'd 13C/12C  Mean'], errors='coerce').mean()
-                            tru13_1 = get_true_value(s1, ISOTYPE_D13C)
-                            tru13_2 = get_true_value(s2, ISOTYPE_D13C)
-                            m13 = (tru13_2 - tru13_1) / (raw13_2 - raw13_1) if pd.notna(raw13_1) and pd.notna(raw13_2) else np.nan
-                            b13 = tru13_1 - m13 * raw13_1 if pd.notna(m13) and pd.notna(raw13_1) else np.nan
-                            worksheet.write(start_row, 0, "d13C Double-Point: slope (m)")
-                            worksheet.write(start_row, 1, float(m13) if pd.notna(m13) else np.nan)
-                            worksheet.write(start_row, 2, "intercept (b)")
-                            worksheet.write(start_row, 3, float(b13) if pd.notna(b13) else np.nan)
-                            start_row += 1
-                            # d18O double-point
-                            raw18_1 = pd.to_numeric(clean_stds_all.loc[clean_stds_all['Identifier 1'] == s1, 'd 18O/16O  Mean'], errors='coerce').mean()
-                            raw18_2 = pd.to_numeric(clean_stds_all.loc[clean_stds_all['Identifier 1'] == s2, 'd 18O/16O  Mean'], errors='coerce').mean()
-                            tru18_1 = get_true_value(s1, ISOTYPE_D18O)
-                            tru18_2 = get_true_value(s2, ISOTYPE_D18O)
-                            m18 = (tru18_2 - tru18_1) / (raw18_2 - raw18_1) if pd.notna(raw18_1) and pd.notna(raw18_2) else np.nan
-                            b18 = tru18_1 - m18 * raw18_1 if pd.notna(m18) and pd.notna(raw18_1) else np.nan
-                            worksheet.write(start_row, 0, "d18O Double-Point: slope (m)")
-                            worksheet.write(start_row, 1, float(m18) if pd.notna(m18) else np.nan)
-                            worksheet.write(start_row, 2, "intercept (b)")
-                            worksheet.write(start_row, 3, float(b18) if pd.notna(b18) else np.nan)
-                            start_row += 2
-                            worksheet.write(start_row, 0, "Formula")
-                            worksheet.write(start_row, 1, "cal = m*raw + b")
-                            start_row += 2
-                    except Exception:
-                        # Ignore if parameter derivation fails
-                        pass
-
-                    # Linearity correction parameters section
-                    worksheet.write(start_row, 0, "Linearity Correction Parameters")
-                    start_row += 1
-                    # d13C
-                    worksheet.write(start_row, 0, "d13C slope")
-                    worksheet.write(start_row, 1, float(fit13.get('slope', np.nan)) if np.isfinite(fit13.get('slope', np.nan)) else np.nan)
-                    worksheet.write(start_row, 2, "intercept")
-                    worksheet.write(start_row, 3, float(fit13.get('intercept', np.nan)) if np.isfinite(fit13.get('intercept', np.nan)) else np.nan)
-                    start_row += 1
-                    worksheet.write(start_row, 0, "d13C R^2")
-                    worksheet.write(start_row, 1, float(fit13.get('r2', np.nan)) if np.isfinite(fit13.get('r2', np.nan)) else np.nan)
-                    worksheet.write(start_row, 2, "x_ref (mV)")
-                    worksheet.write(start_row, 3, float(fit13.get('x_ref', np.nan)) if np.isfinite(fit13.get('x_ref', np.nan)) else np.nan)
-                    start_row += 1
-                    worksheet.write(start_row, 0, "d13C points (n)")
-                    worksheet.write(start_row, 1, int(fit13.get('n', 0)))
-                    start_row += 1
-                    # d18O
-                    worksheet.write(start_row, 0, "d18O slope")
-                    worksheet.write(start_row, 1, float(fit18.get('slope', np.nan)) if np.isfinite(fit18.get('slope', np.nan)) else np.nan)
-                    worksheet.write(start_row, 2, "intercept")
-                    worksheet.write(start_row, 3, float(fit18.get('intercept', np.nan)) if np.isfinite(fit18.get('intercept', np.nan)) else np.nan)
-                    start_row += 1
-                    worksheet.write(start_row, 0, "d18O R^2")
-                    worksheet.write(start_row, 1, float(fit18.get('r2', np.nan)) if np.isfinite(fit18.get('r2', np.nan)) else np.nan)
-                    worksheet.write(start_row, 2, "x_ref (mV)")
-                    worksheet.write(start_row, 3, float(fit18.get('x_ref', np.nan)) if np.isfinite(fit18.get('x_ref', np.nan)) else np.nan)
-                    start_row += 1
-                    worksheet.write(start_row, 0, "d18O points (n)")
-                    worksheet.write(start_row, 1, int(fit18.get('n', 0)))
-                except Exception:
-                    # If appending extra info fails, continue without blocking export
-                    pass
     
     towrite.seek(0)
 
@@ -1360,8 +1199,6 @@ def main():
                         'dVSMOW(18O)': ISOTYPE_D18O,
                         'δVPDB(13C)': ISOTYPE_D13C,
                         'δVSMOW(18O)': ISOTYPE_D18O,
-                        'Î´VPDB(13C)': ISOTYPE_D13C,
-                        'Î´VSMOW(18O)': ISOTYPE_D18O,
                         '??VPDB(13C)': ISOTYPE_D13C,
                         '??VSMOW(18O)': ISOTYPE_D18O,
                     })
@@ -1386,13 +1223,13 @@ def main():
 
             with col2:
                 st.markdown("#### Outlier Detection")
-                sigma_level = st.number_input("Set Sigma Level for standardÂ´s Outlier Exclusion",
+                sigma_level = st.number_input("Set Sigma Level for standard´s Outlier Exclusion",
                                             min_value=0.1,
                                             max_value=5.0,
                                             value=1.0,
                                             step=0.1)
 
-                irq_multiplier = st.number_input("Set IQR Multiplier for standardÂ´s Outlier Exclusion",
+                irq_multiplier = st.number_input("Set IQR Multiplier for standard´s Outlier Exclusion",
                                                 min_value=1.0,
                                                 max_value=10.0,
                                                 value=1.5,
@@ -1428,79 +1265,7 @@ def main():
                 # Add some vertical spacing
                 st.write("")
                 st.write("")
-            
-            # Compute a clean standards dataframe (outliers removed) for charts/fits as soon as standards are selected
-            clean_stds = None
-            if selected_standards:
-                clean_stds = _filter_standards_remove_outliers(
-                    st.session_state.df,
-                    selected_standards,
-                    calibration_type,
-                    sigma_level,
-                    irq_multiplier
-                )
-
-            # Action row: Calibrate results + optional linearity correction toggle
-            if selected_standards:
-                act_c1, act_c2 = st.columns([2, 1])
-                with act_c1:
-                    calibrate_clicked = st.button("Calibrate results", use_container_width=True)
-                with act_c2:
-                    apply_linearity_toggle = st.checkbox("Apply linearity correction", key="apply_linearity_toggle")
-
-                if calibrate_clicked:
-                    if len(selected_standards) not in [1, 2]:
-                        st.warning("Please select either 1 or 2 standards for calibration.")
-                    else:
-                        # Perform calibration (using standards with outliers removed)
-                        try:
-                            calibrated_df = calibrate_results(
-                                standards_df=clean_stds if clean_stds is not None else st.session_state.df,
-                                full_df=st.session_state.df,
-                                selected_standards=selected_standards
-                            )
-                            st.session_state.df = calibrated_df
-                            st.success("Calibration completed for both isotopic types.")
-                        except Exception as e:
-                            st.error(f"Calibration failed: {e}")
-
-                        # Optionally compute and apply linearity correction across the whole dataset
-                        if apply_linearity_toggle:
-                            try:
-                                intensity_col = '1  Cycle Int  Samp  44'
-                                y13_col = 'd 13C/12C  Mean'
-                                y18_col = 'd 18O/16O  Mean'
-                                fit13 = _compute_linearity_fit(clean_stds, y13_col, intensity_col) if clean_stds is not None else {'slope': np.nan, 'x_ref': np.nan}
-                                fit18 = _compute_linearity_fit(clean_stds, y18_col, intensity_col) if clean_stds is not None else {'slope': np.nan, 'x_ref': np.nan}
-                                fits = {
-                                    'd13C': {'slope': fit13.get('slope', np.nan), 'x_ref': fit13.get('x_ref', np.nan)},
-                                    'd18O': {'slope': fit18.get('slope', np.nan), 'x_ref': fit18.get('x_ref', np.nan)},
-                                }
-                                st.session_state.df = _apply_linearity_correction(st.session_state.df, intensity_col, fits)
-                                # Store fits for downstream display use
-                                st.session_state.linearity_fits = fits
-                                if np.isfinite(fit13.get('slope', np.nan)) or np.isfinite(fit18.get('slope', np.nan)):
-                                    st.success(
-                                        f"Applied linearity correction. Slopes: d13C={fit13.get('slope', float('nan')):.6f} per mV, "
-                                        f"d18O={fit18.get('slope', float('nan')):.6f} per mV."
-                                    )
-                                else:
-                                    st.info("Linearity correction requested, but insufficient data to compute fits.")
-                            except Exception as e:
-                                st.error(f"Linearity correction failed: {e}")
-
-            # Always show calibration charts when standards are selected (using cleaned standards)
-            if selected_standards:
-                try:
-                    figs = create_calibration_plots(standards_reference, clean_stds if clean_stds is not None else st.session_state.df, selected_standards, color_param)
-                    col_cal1, col_cal2 = st.columns(2)
-                    with col_cal1:
-                        st.plotly_chart(figs[ISOTYPE_D13C], use_container_width=True)
-                    with col_cal2:
-                        st.plotly_chart(figs[ISOTYPE_D18O], use_container_width=True)
-                except Exception as e:
-                    st.warning(f"Unable to render calibration charts: {e}")
-
+                
             if False:
                 if selected_standards:
                     # Check if the selected standards are 1 or 2
@@ -1561,7 +1326,7 @@ def main():
                 else:
                     st.warning("Please select at least one standard to proceed with calibration.")
 
-            # Linearity correction section (charts only; application handled by the toggle above)
+            # Linearity correction section (charts + apply button)
             st.subheader("Linearity Correction")
             if not selected_standards:
                 st.info("Select one or more standards above to compute linearity.")
@@ -1570,7 +1335,7 @@ def main():
                 y13_col = 'd 13C/12C  Mean'
                 y18_col = 'd 18O/16O  Mean'
 
-                clean_stds = clean_stds if 'clean_stds' in locals() and clean_stds is not None else _filter_standards_remove_outliers(
+                clean_stds = _filter_standards_remove_outliers(
                     st.session_state.df,
                     selected_standards,
                     calibration_type,
@@ -1665,14 +1430,16 @@ def main():
                 with c4:
                     st.plotly_chart(_build_corrected_fig(clean_stds, y18_col, fit18, 'Linearity (Standards)'), use_container_width=True)
 
-                # Persist the latest fit parameters for downstream precision display
-                try:
-                    st.session_state.linearity_fits = {
+                if st.button('Apply linearity correction', use_container_width=True):
+                    fits = {
                         'd13C': {'slope': fit13.get('slope', np.nan), 'x_ref': fit13.get('x_ref', np.nan)},
                         'd18O': {'slope': fit18.get('slope', np.nan), 'x_ref': fit18.get('x_ref', np.nan)},
                     }
-                except Exception:
-                    pass
+                    st.session_state.df = _apply_linearity_correction(st.session_state.df, intensity_col, fits)
+                    st.success(
+                        f"Applied linearity correction. Slopes: d13C={fit13['slope']:.6f} per mV, d18O={fit18['slope']:.6f} per mV. "
+                        f"Reference intensity (median): {fit13['x_ref']:.1f} mV (d13C), {fit18['x_ref']:.1f} mV (d18O)."
+                    )
 
             # print(calibration_type)
             if selected_standards:
@@ -1747,56 +1514,26 @@ def main():
                     included_standards = len(shp2l_clean)
                     standards_percentage = (included_standards / total_standards) * 100 if total_standards > 0 else 0
 
-                    # Calculate precision values (raw)
+                    # Calculate precision values
                     d13c_precision = shp2l_clean['d 13C/12C  Mean'].std()
                     d18o_precision = shp2l_clean['d 18O/16O  Mean'].std()
-
-                    # Calculate precision after linearity correction (if available)
-                    d13c_lin_prec = None
-                    d18o_lin_prec = None
-                    try:
-                        fits = st.session_state.get('linearity_fits')
-                        if fits:
-                            i_series = pd.to_numeric(shp2l_clean['1  Cycle Int  Samp  44'], errors='coerce')
-                            y13_series = pd.to_numeric(shp2l_clean['d 13C/12C  Mean'], errors='coerce')
-                            y18_series = pd.to_numeric(shp2l_clean['d 18O/16O  Mean'], errors='coerce')
-                            if np.isfinite(fits.get('d13C', {}).get('slope', np.nan)):
-                                s = fits['d13C']['slope']; xr = fits['d13C']['x_ref']
-                                d13_corr = (y13_series - s * (i_series - xr)).where(np.isfinite(y13_series) & np.isfinite(i_series))
-                                d13c_lin_prec = float(d13_corr.std())
-                            if np.isfinite(fits.get('d18O', {}).get('slope', np.nan)):
-                                s = fits['d18O']['slope']; xr = fits['d18O']['x_ref']
-                                d18_corr = (y18_series - s * (i_series - xr)).where(np.isfinite(y18_series) & np.isfinite(i_series))
-                                d18o_lin_prec = float(d18_corr.std())
-                    except Exception:
-                        pass
 
                     # Determine colors based on precision values and standards percentage
                     d13c_precision_color = '#ff4444' if d13c_precision > 0.1 else '#2ecc71'
                     d18o_precision_color = '#ff4444' if d18o_precision > 0.1 else '#2ecc71'
-                    d13c_lin_color = None if d13c_lin_prec is None else ('#ff4444' if d13c_lin_prec > 0.1 else '#2ecc71')
-                    d18o_lin_color = None if d18o_lin_prec is None else ('#ff4444' if d18o_lin_prec > 0.1 else '#2ecc71')
                     standards_percentage_color = '#2ecc71' if standards_percentage >= 75 else '#666666'
-
-                    # Optional markup for linearity-corrected precision display
-                    d13c_lin_markup = (f"<p style='font-size: 16px; margin: 2px 0;'><i>d13C Precision (linearity corrected):</i> "
-                                       f"<span style='color: {d13c_lin_color}'>{d13c_lin_prec:.3f}‰</span></p>") if d13c_lin_prec is not None else ""
-                    d18o_lin_markup = (f"<p style='font-size: 16px; margin: 2px 0;'><i>d18O Precision (linearity corrected):</i> "
-                                       f"<span style='color: {d18o_lin_color}'>{d18o_lin_prec:.3f}‰</span></p>") if d18o_lin_prec is not None else ""
                     
                     st.markdown(f"""
                     <div style='background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin: 10px 0;'>
                         <h3 style='color: #1f77b4; margin-bottom: 15px;'>Precision and Averages for {standard} (Excluding Outliers)</h3>
                         <div style='display: flex; justify-content: space-between;'>
                             <div style='flex: 1; margin-right: 20px;'>
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Precision:</b> <span style='color: {d13c_precision_color}'>{d13c_precision:.3f}‰</span></p>
-                                {d13c_lin_markup}
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Average:</b> <span style='color: #000000'>{shp2l_clean['d 13C/12C  Mean'].mean():.3f}‰</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Precision:</b> <span style='color: {d13c_precision_color}'>{d13c_precision:.3f}�</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Average:</b> <span style='color: #000000'>{shp2l_clean['d 13C/12C  Mean'].mean():.3f}�</span></p>
                             </div>
                             <div style='flex: 1;'>
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Precision:</b> <span style='color: {d18o_precision_color}'>{d18o_precision:.3f}‰</span></p>
-                                {d18o_lin_markup}
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{shp2l_clean['d 18O/16O  Mean'].mean():.3f}‰</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Precision:</b> <span style='color: {d18o_precision_color}'>{d18o_precision:.3f}�</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{shp2l_clean['d 18O/16O  Mean'].mean():.3f}�</span></p>
                             </div>
                         </div>
                         <div style='margin-top: 15px; padding-top: 10px; border-top: 1px solid #ddd;'>
@@ -1807,7 +1544,7 @@ def main():
 
                     # Calculate statistics for both methods
                     # IMPORTANT: compute stats from the same data shown on the plot.
-                    # Use nonâ€‘outlier points when outlier detection is enabled to avoid biased/offset lines.
+                    # Use non‑outlier points when outlier detection is enabled to avoid biased/offset lines.
                     try:
                         stats_source = shp2l_filtered_data.loc[~(d13c_outliers | d18o_outliers)].copy()
                     except Exception:
@@ -1848,48 +1585,48 @@ def main():
 
                     # Generate plots based on user choice
                     if calibration_type == "Z-Score":
-                        # Plot for Î´13C with Z-Score thresholds
+                        # Plot for δ13C with Z-Score thresholds
                         fig_d13c = px.scatter(
                             x=x_values_d13c,
                             y=shp2l_filtered_data['d 13C/12C  Mean'],
                             color=shp2l_filtered_data[color_param],  # Add color parameter
             title=f'SHP2L d13C Calibration Values (Z-Score Method)',
-            labels={'y': 'd13C (‰)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd13C (�)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
                         fig_d13c.add_hline(y=sigma_level_d13c_plus, line_color='green', line_dash='dot',
-                                           annotation_text=f'+{sigma_level}Ïƒ')
+                                           annotation_text=f'+{sigma_level}σ')
                         fig_d13c.add_hline(y=sigma_level_d13c_minus, line_color='green', line_dash='dot',
-                                           annotation_text=f'-{sigma_level}Ïƒ')
+                                           annotation_text=f'-{sigma_level}σ')
                         fig_d13c.add_hline(y=d13c_mean, line_color='purple', line_dash='solid',
                                            annotation_text='Mean Value')
 
-                        # Plot for Î´18O with Z-Score thresholds
+                        # Plot for δ18O with Z-Score thresholds
                         fig_d18o = px.scatter(
                             x=x_values_d18o,
                             y=shp2l_filtered_data['d 18O/16O  Mean'],
                             color=shp2l_filtered_data[color_param],  # Add color parameter
             title=f'SHP2L d18O Calibration Values (Z-Score Method)',
-            labels={'y': 'd18O (‰)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd18O (�)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
                         fig_d18o.add_hline(y=sigma_level_d18o_plus, line_color='green', line_dash='dot',
-                                           annotation_text=f'+{sigma_level}Ïƒ')
+                                           annotation_text=f'+{sigma_level}σ')
                         fig_d18o.add_hline(y=sigma_level_d18o_minus, line_color='green', line_dash='dot',
-                                           annotation_text=f'-{sigma_level}Ïƒ')
+                                           annotation_text=f'-{sigma_level}σ')
                         fig_d18o.add_hline(y=d18o_mean, line_color='purple', line_dash='solid',
                                            annotation_text='Mean Value')
 
                     elif calibration_type == "IQR":
-                        # Plot for Î´13C with IQR thresholds
+                        # Plot for δ13C with IQR thresholds
                         fig_d13c = px.scatter(
                             x=x_values_d13c,
                             y=shp2l_filtered_data['d 13C/12C  Mean'],
                             color=shp2l_filtered_data[color_param],  # Add color parameter
             title=f'SHP2L d13C Calibration Values (IQR Method)',
-            labels={'y': 'd13C (‰)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd13C (�)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
@@ -1902,13 +1639,13 @@ def main():
                         fig_d13c.add_hline(y=q1_d13c, line_color='purple', line_dash='solid',
                                            annotation_text='Q1 (25th Percentile)')
 
-                        # Plot for Î´18O with IQR thresholds
+                        # Plot for δ18O with IQR thresholds
                         fig_d18o = px.scatter(
                             x=x_values_d18o,
                             y=shp2l_filtered_data['d 18O/16O  Mean'],
                             color=shp2l_filtered_data[color_param],  # Add color parameter
             title=f'SHP2L d18O Calibration Values (IQR Method)',
-            labels={'y': 'd18O (‰)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd18O (�)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
@@ -2030,8 +1767,8 @@ def main():
         #     st.write(f"Signal Intensity: {excluded_by_signal:,d} samples")
         #     st.write(f"Leak Rate: {excluded_by_leak:,d} samples")
         # with col2:
-        #     st.write(f"Î´13C Range: {excluded_by_d13c:,d} samples")
-        #     st.write(f"Î´18O Range: {excluded_by_d18o:,d} samples")
+        #     st.write(f"δ13C Range: {excluded_by_d13c:,d} samples")
+        #     st.write(f"δ18O Range: {excluded_by_d18o:,d} samples")
         # st.markdown(f"**Total Samples Excluded: {total_excluded:,d} of {total_samples:,d}**")
 
         st.subheader("Statistical Outlier Settings")
@@ -2048,8 +1785,8 @@ def main():
         # with st.expander("Active Filters"):
         #     st.write("Signal Intensity Range:", f"{signal_range[0]:.2f} to {signal_range[1]:.2f}")
         #     st.write("Leak Rate Range:", f"{leak_range[0]:.2f} to {leak_range[1]:.2f}")
-        #     st.write("Î´13C Range:", f"{d13c_range[0]:.2f} to {d13c_range[1]:.2f}")
-        #     st.write("Î´18O Range:", f"{d18o_range[0]:.2f} to {d18o_range[1]:.2f}")
+        #     st.write("δ13C Range:", f"{d13c_range[0]:.2f} to {d13c_range[1]:.2f}")
+        #     st.write("δ18O Range:", f"{d18o_range[0]:.2f} to {d18o_range[1]:.2f}")
 
         # Prepare main dataset based on user selections
         data_to_process = df_copy.copy()
@@ -2518,16 +2255,6 @@ def main():
         # Iterate through unique comments (including the placeholder)
         unique_comments = subset_data['Comment'].unique()
 
-        # Assign a distinct marker symbol to each species for summary charts
-        # Avoid symbols used for outliers ('x', 'cross', 'diamond', 'star')
-        species_symbol_cycle = [
-            'circle', 'square', 'triangle-up', 'triangle-down', 'triangle-left', 'triangle-right'
-        ]
-        species_symbol_map = {
-            sp: species_symbol_cycle[i % len(species_symbol_cycle)]
-            for i, sp in enumerate([s for s in unique_comments if s != "No Comment"])
-        }
-
         # Create x_axis values
         subset_data['x_axis'] = np.nan
         if x_axis_option == "By Identifier 2":
@@ -2610,8 +2337,7 @@ def main():
                     size=8,
                     color=data_to_plot[color_param_tab3],
                     colorscale="Viridis",
-                    showscale=False,
-                    symbol=species_symbol_map.get(species, 'circle')
+                    showscale=False
                 ),
                 line=dict(width=1, color=species_color),
                 legendgroup=species
@@ -2672,7 +2398,7 @@ def main():
                         legendgroup='outliers'
                     ))
 
-                # Î´13C range outliers
+                # δ13C range outliers
                 d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
                 if d13c_mask.any():
                     d13c_summary.add_trace(go.Scatter(
@@ -2690,7 +2416,7 @@ def main():
                         legendgroup='outliers'
                     ))
 
-                # Î´18O range outliers
+                # δ18O range outliers
                 d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
                 if d18o_mask.any():
                     d13c_summary.add_trace(go.Scatter(
@@ -2781,8 +2507,7 @@ def main():
                     size=8,
                     color=data_to_plot[color_param_tab3],
                     colorscale="Viridis",
-                    showscale=False,
-                    symbol=species_symbol_map.get(species, 'circle')
+                    showscale=False
                 ),
                 line=dict(width=1, color=species_color),
                 legendgroup=species
@@ -2843,7 +2568,7 @@ def main():
                         legendgroup='outliers'
                     ))
 
-                # Î´13C range outliers
+                # δ13C range outliers
                 d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
                 if d13c_mask.any():
                     d18o_summary.add_trace(go.Scatter(
@@ -2861,7 +2586,7 @@ def main():
                         legendgroup='outliers'
                     ))
 
-                # Î´18O range outliers
+                # δ18O range outliers
                 d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
                 if d18o_mask.any():
                     d18o_summary.add_trace(go.Scatter(
@@ -3094,7 +2819,7 @@ def main():
                 fig_d13C.update_layout(
                     title=f'{identifier} - d13C for Species: {comment}',
                     xaxis_title='X Axis',
-                    yaxis_title='d13C (‰)',
+                    yaxis_title='d13C (�)',
                     legend_title='Data Type',
                     margin=dict(r=100, t=100),  # Reduced right margin
                     xaxis=dict(
@@ -3112,8 +2837,8 @@ def main():
 
                 st.plotly_chart(fig_d13C, use_container_width=True, height=chart_height)
 
-                # Plot Î´18O data for this identifier and comment
-                # Create figure for Î´18O
+                # Plot δ18O data for this identifier and comment
+                # Create figure for δ18O
                 fig_d18O = go.Figure()
 
                 # Add statistical outliers if enabled
@@ -3249,7 +2974,7 @@ def main():
                 fig_d18O.update_layout(
                     title=f'{identifier} - d18O for Species: {comment}',
                     xaxis_title='X Axis',
-                    yaxis_title='d18O (‰)',
+                    yaxis_title='d18O (�)',
                     legend_title='Data Type',
                     margin=dict(r=100, t=100),  # Reduced right margin
                     xaxis=dict(
@@ -3312,29 +3037,29 @@ def main():
                         st.markdown("**Based on statistical deviation from the mean**")
                         styled_stats = stat_outliers_only[['Identifier 2', 'Comment', 'd 13C/12C  Mean', 'd 18O/16O  Mean']].copy()
                         styled_stats = styled_stats.rename(columns={
-                            'd 13C/12C  Mean': 'd13C Value (‰)',
-                            'd 18O/16O  Mean': 'd18O Value (‰)'
+                            'd 13C/12C  Mean': 'd13C Value (�)',
+                            'd 18O/16O  Mean': 'd18O Value (�)'
                         })
                         st.dataframe(styled_stats, use_container_width=True)
                     else:
                         st.info("No statistical outliers detected")
 
-                # Î´13C Outliers
+                # δ13C Outliers
                 with st.expander("d13C Range Outliers", expanded=True):
                     if not d13c_outliers.empty:
-                        st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} ‰")
+                        st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} �")
                         styled_d13c = d13c_outliers[['Identifier 2', 'Comment', 'd 13C/12C  Mean']].copy()
-                        styled_d13c = styled_d13c.rename(columns={'d 13C/12C  Mean': 'd13C Value (‰)'})
+                        styled_d13c = styled_d13c.rename(columns={'d 13C/12C  Mean': 'd13C Value (�)'})
                         st.dataframe(styled_d13c, use_container_width=True)
                     else:
                         st.info("No d13C outliers detected")
 
-                # Î´18O Outliers
+                # δ18O Outliers
                 with st.expander("d18O Range Outliers", expanded=True):
                     if not d18o_outliers.empty:
-                        st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} ‰")
+                        st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} �")
                         styled_d18o = d18o_outliers[['Identifier 2', 'Comment', 'd 18O/16O  Mean']].copy()
-                        styled_d18o = styled_d18o.rename(columns={'d 18O/16O  Mean': 'd18O Value (‰)'})
+                        styled_d18o = styled_d18o.rename(columns={'d 18O/16O  Mean': 'd18O Value (�)'})
                         st.dataframe(styled_d18o, use_container_width=True)
                     else:
                         st.info("No d18O outliers detected")
