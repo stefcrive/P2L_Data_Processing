@@ -318,6 +318,71 @@ def _apply_linearity_correction(df, intensity_col, fits):
         df['d18O_calibrated_linearity_corrected'] = (y - slope * (i - x_ref)).where(np.isfinite(y) & np.isfinite(i))
     return df
 
+def _interpolate_outliers_by_identifier2(df, outlier_mask, cols, id2_col='Identifier 2'):
+    """Interpolate specified columns for rows flagged as outliers, using
+    the sequence defined by ``Identifier 2`` as the order reference.
+
+    Only values on outlier rows are replaced by the interpolation; non-outlier
+    rows retain their original values. Interpolation is linear and uses the
+    previous and next measurements in Identifier 2 order.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Source dataframe.
+    outlier_mask : pandas.Series of bool
+        Boolean mask (aligned to df.index) indicating outlier rows.
+    cols : list of str
+        Columns to interpolate.
+    id2_col : str
+        Column used to define the sequence (default: 'Identifier 2').
+
+    Returns
+    -------
+    pandas.DataFrame
+        A copy of df with interpolated values for outlier rows.
+    """
+    if df is None or len(df) == 0 or not any(c in df.columns for c in cols):
+        return df
+
+    work = df.copy()
+
+    # Build an order column from Identifier 2; prefer numeric, fallback to extracted number, then to original order
+    if id2_col in work.columns:
+        order = pd.to_numeric(work[id2_col], errors='coerce')
+        if order.isna().all():
+            # Try extracting numbers from strings
+            try:
+                order = work[id2_col].apply(lambda v: extract_number(v))
+                order = pd.to_numeric(order, errors='coerce')
+            except Exception:
+                order = pd.Series(np.arange(len(work)), index=work.index)
+    else:
+        order = pd.Series(np.arange(len(work)), index=work.index)
+
+    work['_order_irms'] = order
+    work['_orig_pos_irms'] = np.arange(len(work))
+
+    # Sort by order then by original position to keep stability; NaNs go to the end
+    work_sorted = work.sort_values(['_order_irms', '_orig_pos_irms'], na_position='last')
+    mask_sorted = outlier_mask.reindex(work_sorted.index).fillna(False)
+
+    for col in cols:
+        if col not in work_sorted.columns:
+            continue
+        s = pd.to_numeric(work_sorted[col], errors='coerce')
+        s_masked = s.copy()
+        s_masked[mask_sorted] = np.nan
+        s_interp = s_masked.interpolate(method='linear', limit_direction='both')
+        # Assign back only for the outlier rows
+        idx_to_update = mask_sorted[mask_sorted].index
+        work_sorted.loc[idx_to_update, col] = s_interp.loc[idx_to_update]
+
+    # Restore original order
+    work_sorted = work_sorted.sort_values('_orig_pos_irms')
+    work_sorted = work_sorted.drop(columns=['_order_irms', '_orig_pos_irms'])
+    return work_sorted
+
 def calibrate_results(standards_df, full_df, selected_standards):
     """
     Calibrate results based on single or double standards for both d13C and d18O.
@@ -2392,18 +2457,32 @@ def main():
                         "d18O_calibrated",
                     ]
                     present_cols = [c for c in cols_to_interp if c in main_data.columns]
-                    if present_cols and interpolate_columns is not None:
-                        main_data = interpolate_columns(main_data, outlier_mask, present_cols)
-                    elif present_cols:
-                        # Fallback inline interpolation if helper not available
-                        df_tmp = main_data.copy()
-                        for col in present_cols:
-                            s = pd.to_numeric(df_tmp[col], errors="coerce")
-                            s_masked = s.copy()
-                            s_masked[outlier_mask] = np.nan
-                            s_interp = s_masked.interpolate(method="linear", limit_direction="both")
-                            df_tmp.loc[outlier_mask, col] = s_interp.loc[outlier_mask]
-                        main_data = df_tmp
+
+                    if present_cols:
+                        # Preserve originals in dedicated columns before interpolation
+                        original_cols = []
+                        for c in present_cols:
+                            new_name = f"Original {c}"
+                            main_data[new_name] = main_data[c]
+                            original_cols.append(new_name)
+
+                        # Interpolate using Identifier 2 ordering
+                        main_data = _interpolate_outliers_by_identifier2(main_data, outlier_mask, present_cols, id2_col='Identifier 2')
+
+                        # Reorder columns so that original columns sit next to Outlier Types
+                        try:
+                            cols = list(main_data.columns)
+                            if 'Outlier Types' in cols:
+                                pos = cols.index('Outlier Types')
+                                # Remove originals from current position
+                                for oc in original_cols:
+                                    if oc in cols:
+                                        cols.remove(oc)
+                                # Insert originals after Outlier Types
+                                cols = cols[:pos+1] + original_cols + cols[pos+1:]
+                                main_data = main_data[cols]
+                        except Exception:
+                            pass
                 except Exception as e:
                     st.warning(f"Interpolation step skipped due to error: {e}")
             
