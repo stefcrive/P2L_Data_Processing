@@ -40,10 +40,6 @@ ENV/
 *.swo
 
 # Misc
+.DS_Store
 .env
 .env.local
-apps/*/.env*
-.DS_Store
-node_modules/
-apps/*/node_modules/
-packages/*/node_modules/
