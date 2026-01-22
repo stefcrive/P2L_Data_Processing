@@ -1,0 +1,400 @@
+import streamlit as st
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
+from pangaeapy.pandataset import PanDataSet
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+st.set_page_config(layout="wide")
+
+# Initialize session state for comparison data
+if "comparison_data" not in st.session_state:
+    st.session_state.comparison_data = {}
+
+
+def clean_column_name(col):
+    return col.strip().lower().replace('  ', ' ')
+
+
+def load_data(file, required_cols, selected_cols):
+    file.seek(0)
+    all_cols = pd.read_csv(file, sep='\t', nrows=0).columns.tolist()
+
+    clean_to_original = {clean_column_name(col): col for col in all_cols}
+    cols_to_load = []
+
+    for col in required_cols + selected_cols:
+        clean_col = clean_column_name(col)
+        if clean_col in clean_to_original:
+            cols_to_load.append(clean_to_original[clean_col])
+
+    file.seek(0)
+    data = pd.read_csv(file, sep='\t', usecols=cols_to_load)
+    data.columns = [clean_column_name(col) for col in data.columns]
+
+    return data
+
+
+def create_map(data, selected_columns):
+    required = ['latitude', 'longitude', 'origin of values', 'age [ka bp]']
+
+    data['age [ka bp]'] = pd.to_numeric(data['age [ka bp]'], errors='coerce')
+    data = data.dropna(subset=['age [ka bp]'])
+    data = data[(data['age [ka bp]'] >= 0) & (data['age [ka bp]'] <= 1500)]
+
+    if data.empty:
+        raise ValueError("No data available for selected filters")
+
+    agg_dict = {
+        'origin of values': lambda x: list(set(x)),
+        'age [ka bp]': lambda x: (min(x), max(x))
+    }
+    for col in selected_columns:
+        agg_dict[col] = lambda x: list(set(x.dropna().astype(str)))
+
+    grouped_data = data.groupby(['latitude', 'longitude']).agg(agg_dict).reset_index()
+
+    m = folium.Map(
+        location=[0, 0],
+        zoom_start=2,
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Esri World Imagery',
+        control_scale=True
+    )
+
+    folium.TileLayer(
+        tiles='https://stamen-tiles-{s}.a.ssl.fastly.net/terrain/{z}/{x}/{y}{r}.png',
+        name='Terrain View',
+        attr='Map tiles by Stamen Design',
+        overlay=False,
+        control=True
+    ).add_to(m)
+
+    folium.LayerControl(position='topright').add_to(m)
+
+    for _, row in grouped_data.iterrows():
+        doi_links = [
+            f'<a href="{doi}" target="_blank">{doi}</a>'
+            for doi in row['origin of values']
+        ]
+
+        popup_content = f"""
+        <b>DOIs:</b><br>{'<br>'.join(doi_links)}<br>
+        <b>Age:</b> {row['age [ka bp]'][0]:.1f}-{row['age [ka bp]'][1]:.1f} ka BP
+        """
+
+        if selected_columns:
+            popup_content += "<br><b>Available Measurements:</b><br>" + "<br>".join(
+                [f"- {col}" for col in selected_columns]
+            )
+
+        folium.Marker(
+            [row['latitude'], row['longitude']],
+            popup=folium.Popup(popup_content, max_width=300),
+            tooltip=f"Lat: {row['latitude']:.4f}, Lon: {row['longitude']:.4f}",
+            icon=folium.Icon(icon='map-marker', prefix='glyphicon')
+        ).add_to(m)
+
+    return m, grouped_data
+
+
+def display_comparison_chart():
+    with st.expander("📊 Comparison Chart", expanded=True):
+        if st.session_state.comparison_data:
+            # Initialize selected datasets in session state
+            if "selected_datasets" not in st.session_state:
+                st.session_state.selected_datasets = {}
+
+            fig = go.Figure()
+            visible_data = {}  # Track visibility states
+
+            for key, data in st.session_state.comparison_data.items():
+                # Extract event name from label (everything after last '- ')
+                legend_name = data['label'].split(' - ')[-1] if ' - ' in data['label'] else data['parameter']
+
+                fig.add_trace(go.Scatter(
+                    x=data['x'],
+                    y=data['y'],
+                    mode='lines+markers',
+                    name=legend_name,  # Show only event name in legend
+                    line=dict(color=data['color'], width=1.5 if data.get('visible', True) else 0.5),
+                    marker=dict(color=data['color'], size=6 if data.get('visible', True) else 3),
+                    opacity=1.0 if data.get('visible', True) else 0.3,
+                    visible=True  # This refers to legend interactivity, keep True
+                ))
+
+                # Initialize visibility state
+                if 'visible' not in data:
+                    data['visible'] = True
+                visible_data[key] = data['visible']
+
+            fig.update_layout(
+                title="Dataset Comparison",
+                xaxis_title="Age",
+                yaxis_title="Value",
+                showlegend=True,
+                legend=dict(title="Events/Parameters"),
+                height=600
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Compared Datasets")
+
+            # Action buttons container
+            col_actions1, col_actions2, _ = st.columns([0.2, 0.3, 0.5])
+            with col_actions1:
+                if st.button("🗑️ Remove All", key="remove_all", type="primary"):
+                    st.session_state.comparison_data = {}
+                    st.session_state.selected_datasets = {}
+                    st.rerun()
+            with col_actions2:
+                if st.button("❌ Remove Selected", key="remove_selected"):
+                    for key in list(st.session_state.comparison_data.keys()):
+                        if st.session_state.selected_datasets.get(key, False):
+                            del st.session_state.comparison_data[key]
+                            del st.session_state.selected_datasets[key]
+                    st.rerun()
+
+            # Dataset list
+            for key in list(st.session_state.comparison_data.keys()):
+                data = st.session_state.comparison_data[key]
+                col1, col2, col3, col4 = st.columns([1, 4, 1, 1])
+
+                with col1:
+                    # Checkbox for selection
+                    st.session_state.selected_datasets[key] = st.checkbox(
+                        "Select",
+                        value=st.session_state.selected_datasets.get(key, False),
+                        key=f"check_{key}"
+                    )
+
+                with col2:
+                    # Display label with visibility indicator
+                    visibility_icon = "👁️" if data['visible'] else "👁️🗨️"
+                    st.markdown(f"{visibility_icon} **{data['label']}**  \n"
+                                f"DOI: {data['doi']}  \n"
+                                f"Parameter: {data['parameter']}")
+
+                with col3:
+                    # Toggle visibility button
+                    btn_label = "Hide" if data['visible'] else "Show"
+                    if st.button(btn_label, key=f"vis_{key}"):
+                        data['visible'] = not data['visible']
+                        st.rerun()
+
+                with col4:    # Remove button
+                    if st.button("❌ Remove", key=f"rem_{key}"):
+                        del st.session_state.comparison_data[key]
+                        if key in st.session_state.selected_datasets:
+                            del st.session_state.selected_datasets[key]
+                        st.rerun()
+
+                st.markdown("---")
+
+        else:
+            st.info("No datasets added for comparison. Click 'Add to comparison' below plots to add datasets.")
+
+
+def main():
+    st.title("🌍 Paleoclimate Records Map")
+
+    if "map_obj" not in st.session_state:
+        st.session_state.map_obj = None
+    if "base_data" not in st.session_state:
+        st.session_state.base_data = None
+    if "age_range" not in st.session_state:
+        st.session_state.age_range = (0, 0)
+    if "grouped_data" not in st.session_state:
+        st.session_state.grouped_data = None
+    import pandas as pd
+    uploaded_file = st.file_uploader("Upload TSV data", type=["tsv", "tab"])
+
+
+    if uploaded_file:
+        try:
+            all_cols = pd.read_csv(uploaded_file, sep='\t', nrows=0).columns.tolist()
+            required_cols = ['Latitude', 'Longitude', 'Origin of Values', 'Age [ka BP]']
+
+            optional_cols = [col for col in all_cols
+                             if clean_column_name(col) not in {clean_column_name(c) for c in required_cols}]
+
+            d13c_cols = sorted([col for col in optional_cols if 'δ13c' in clean_column_name(col)],
+                               key=lambda x: x.lower())
+            d18o_cols = sorted([col for col in optional_cols if 'δ18o' in clean_column_name(col)],
+                               key=lambda x: x.lower())
+            other_cols = sorted([col for col in optional_cols
+                                 if not any(s in clean_column_name(col) for s in ['δ13c', 'δ18o'])],
+                                key=lambda x: x.lower())
+
+            with st.expander("📚 Select Measurement Columns", expanded=False):
+                if 'selected_columns' not in st.session_state:
+                    st.session_state.selected_columns = []
+                if 'filter_operator' not in st.session_state:
+                    st.session_state.filter_operator = 'AND'
+
+                def create_column_group(col_list, group_name):
+                    if col_list:
+                        st.subheader(group_name)
+                        cols = st.columns(3)
+                        chunk_size = len(col_list) // 3 + 1
+                        for i in range(3):
+                            with cols[i]:
+                                for col in col_list[i * chunk_size:(i + 1) * chunk_size]:
+                                    checked = st.checkbox(
+                                        col,
+                                        value=col in st.session_state.selected_columns,
+                                        key=f"{group_name}_{col}"
+                                    )
+                                    if checked:
+                                        if col not in st.session_state.selected_columns:
+                                            st.session_state.selected_columns.append(col)
+                                    else:
+                                        if col in st.session_state.selected_columns:
+                                            st.session_state.selected_columns.remove(col)
+
+                create_column_group(d13c_cols, "δ¹³C Measurements")
+                create_column_group(d18o_cols, "δ¹⁸O Measurements")
+
+                if other_cols:
+                    st.subheader("Other Measurements")
+                    cols = st.columns(3)
+                    chunk_size = len(other_cols) // 3 + 1
+                    for i in range(3):
+                        with cols[i]:
+                            for col in other_cols[i * chunk_size:(i + 1) * chunk_size]:
+                                checked = st.checkbox(
+                                    col,
+                                    value=col in st.session_state.selected_columns,
+                                    key=f"other_{col}"
+                                )
+                                if checked:
+                                    if col not in st.session_state.selected_columns:
+                                        st.session_state.selected_columns.append(col)
+                                    else:
+                                        if col in st.session_state.selected_columns:
+                                            st.session_state.selected_columns.remove(col)
+
+                st.session_state.filter_operator = st.radio(
+                    "Filtering Logic:",
+                    ["AND (All selected columns must have data)",
+                     "OR (Any selected column can have data)"],
+                    index=0 if st.session_state.filter_operator == 'AND' else 1
+                ).split()[0]
+
+            if st.button("Load/Reload Data"):
+                with st.spinner("Processing data..."):
+                    st.session_state.base_data = None
+                    st.session_state.map_obj = None
+                    st.session_state.grouped_data = None
+
+                    data = load_data(uploaded_file, required_cols, st.session_state.selected_columns)
+                    data['age [ka bp]'] = pd.to_numeric(data['age [ka bp]'], errors='coerce')
+
+                    if st.session_state.selected_columns:
+                        clean_cols = [clean_column_name(col) for col in st.session_state.selected_columns]
+                        if st.session_state.filter_operator == 'AND':
+                            data = data.dropna(subset=clean_cols)
+                        else:
+                            data = data[data[clean_cols].notnull().any(axis=1)]
+
+                    valid_age = data['age [ka bp]'].dropna()
+                    valid_age = valid_age[(valid_age >= 0) & (valid_age <= 1500)]
+
+                    if not valid_age.empty:
+                        st.session_state.base_data = data
+                        st.session_state.age_range = (float(valid_age.min()), float(valid_age.max()))
+
+            if st.session_state.base_data is not None:
+                age_range = st.slider(
+                    "Select Age Range (ka BP)",
+                    min_value=st.session_state.age_range[0],
+                    max_value=st.session_state.age_range[1],
+                    value=st.session_state.age_range,
+                    step=0.1,
+                    format="%.1f"
+                )
+
+                filtered_data = st.session_state.base_data[
+                    (st.session_state.base_data['age [ka bp]'] >= age_range[0]) &
+                    (st.session_state.base_data['age [ka bp]'] <= age_range[1])
+                    ]
+
+                if not filtered_data.empty:
+                    st.subheader("Filter Summary")
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        st.metric("Matching Rows", len(filtered_data))
+                        lat_range = (filtered_data['latitude'].min(), filtered_data['latitude'].max())
+                        st.write(f"**Latitude Range:** {lat_range[0]:.4f} to {lat_range[1]:.4f}")
+
+                    with col2:
+                        lon_range = (filtered_data['longitude'].min(), filtered_data['longitude'].max())
+                        st.write(f"**Longitude Range:** {lon_range[0]:.4f} to {lon_range[1]:.4f}")
+                        st.write(f"**Age Range:** {age_range[0]:.1f} to {age_range[1]:.1f} ka BP")
+
+                    with col3:
+                        with st.expander("Show/Hide DOIs"):
+                            unique_dois = filtered_data['origin of values'].explode().unique()
+                            for doi in unique_dois:
+                                st.write(f"- {doi}")
+
+                    valid_map_cols = [clean_column_name(col) for col in st.session_state.selected_columns]
+                    map_obj, grouped_data = create_map(filtered_data, valid_map_cols)
+                    st.session_state.map_obj = map_obj
+                    st.session_state.grouped_data = grouped_data
+
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+
+    if st.session_state.map_obj:
+        st.subheader("Interactive Map")
+        map_interaction = st_folium(
+            st.session_state.map_obj,
+            width=1200,
+            height=600,
+            returned_objects=["last_clicked"],
+            key=f"map_{hash(str(st.session_state.grouped_data))}"
+        )
+
+        if map_interaction.get("last_clicked"):
+            click_data = map_interaction["last_clicked"]
+            clicked_lat = click_data["lat"]
+            clicked_lon = click_data["lng"]
+
+            if st.session_state.grouped_data is not None:
+                grouped = st.session_state.grouped_data
+                distances = (
+                        (grouped['latitude'] - clicked_lat) ** 2 +
+                        (grouped['longitude'] - clicked_lon) ** 2
+                )
+
+                min_idx = distances.idxmin()
+                min_distance = distances[min_idx]
+
+                if min_distance <= 10:
+                    match = grouped.iloc[[min_idx]]
+                    dois = match['origin of values'].iloc[0]
+
+                    if dois:
+                        st.subheader("Dataset Information")
+                        for doi in dois:
+                            try:
+                                with st.spinner(f"Loading {doi}..."):
+                                    ds = PanDataSet(doi)
+
+                                    st.write(f"**Title:** {ds.title}")
+                                    st.write(f"**Citation:** {ds.citation}")
+                                    st.write(f"**DOI:** {doi}")
+                                    st.write(f"**Topotype:** {ds.topotype}")
+
+                                    if hasattr(ds, 'events') and ds.events:
+                                        st.subheader("Record")
+                                        for ev in ds.events:
+                                            st.write(f"- {ev.label}")
+
+                                            with st.expander("Show/Hide record statistics"):
+                                                st.subheader("Parameter Statistics")
+                                                numeric_cols = ds.data.select_dtypes(
