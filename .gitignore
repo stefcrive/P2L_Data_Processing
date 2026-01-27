@@ -6,6 +6,12 @@ all_isotopes.tab
 Pangea_paleorecord_visualizer.py
 Browser_use.py
 
+# Backups / temp
+Backup/
+*.bak
+tmp_*.txt
+*.tmp
+
 # Python
 __pycache__/
 *.py[cod]
@@ -38,6 +44,11 @@ ENV/
 .vscode/
 *.swp
 *.swo
+
+# JS / Next (legacy)
+node_modules/
+.next/
+out/
 
 # Misc
 .DS_Store
