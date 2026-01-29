@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import io
@@ -34,9 +34,9 @@ except Exception:
 st.set_page_config(layout="wide")
 
 # Constants for isotopic type keys (canonical)
-# Use proper Greek delta to match standards.csv contents
-ISOTYPE_D13C = 'δVPDB(13C)'
-ISOTYPE_D18O = 'δVSMOW(18O)'
+# standards.csv uses the plain VPDB/VSMOW values (no leading delta)
+ISOTYPE_D13C = 'VPDB(13C)'
+ISOTYPE_D18O = 'VSMOW(18O)'
 
 # Helper: build readable date ticks for colorbars when coloring by date ordinals
 def _build_date_colorbar_ticks(values, n=6, date_format='%Y-%m-%d'):
@@ -62,6 +62,29 @@ def _build_date_colorbar_ticks(values, n=6, date_format='%Y-%m-%d'):
             ticktext.append(str(v))
     return tickvals.tolist(), ticktext
 
+def _prepare_color_values(values):
+    """Coerce color values to numeric, with categorical fallback + ticks."""
+    if values is None:
+        return None, None
+    series = pd.Series(values)
+    numeric = pd.to_numeric(series, errors='coerce')
+    if numeric.notna().any():
+        return numeric, None
+    categories = series.where(series.notna(), 'Unknown').astype(str)
+    codes, uniques = pd.factorize(categories, sort=True)
+    ticks = (list(range(len(uniques))), [str(u) for u in uniques])
+    return pd.Series(codes, index=series.index), ticks
+
+def _compose_label_series(identifier_series, species_series):
+    """Compose labels as 'Identifier 1 - Species' when species exists."""
+    ids = pd.Series(identifier_series).fillna('').astype(str).str.strip()
+    species = pd.Series(species_series).fillna('').astype(str).str.strip()
+    labels = ids
+    has_species = species != ''
+    labels = labels.where(~has_species, ids + ' - ' + species)
+    labels = labels.replace({'': 'Unknown'})
+    return labels
+
 # Initialize session state variables if they don't exist
 if 'df' not in st.session_state:
     st.session_state.df = None
@@ -76,7 +99,7 @@ if 'interpolate_outliers_export' not in st.session_state:
 
 # Initialize range variables in session state with safe defaults
 if 'signal_range' not in st.session_state:
-    st.session_state.signal_range = (1000.0, 10000.0)  # Conservative default range
+    st.session_state.signal_range = (1.0, 50.0)  # Signal intensity in volts (default low cutoff 1V)
 if 'leak_range' not in st.session_state:
     st.session_state.leak_range = (0.0, 1000.0)  # Conservative default range
 if 'd13c_range' not in st.session_state:
@@ -91,6 +114,153 @@ def extract_number(text):
         return None
     matches = re.findall(r'\d+', str(text))
     return int(matches[0]) if matches else None
+
+def _extract_numeric(series):
+    """Extract numeric values from a mixed/unit string series."""
+    if series is None:
+        return pd.Series(dtype='float64')
+    if isinstance(series, pd.Series):
+        as_text = series.astype(str)
+    else:
+        as_text = pd.Series(series).astype(str)
+    extracted = as_text.str.extract(r'(-?\d+(?:\.\d+)?)')[0]
+    return pd.to_numeric(extracted, errors='coerce')
+
+def _normalize_signal_intensity(series):
+    """Normalize signal intensity to volts when values appear to be in mV."""
+    numeric = _extract_numeric(series)
+    max_val = numeric.max(skipna=True)
+    # If values exceed typical volt range, assume mV and convert to V.
+    if pd.notna(max_val) and max_val > 50:
+        numeric = numeric / 1000.0
+    return numeric
+
+def _get_species_series(df):
+    """Prefer Species column; else use Label species or Label identifier when species missing."""
+    if df is None:
+        return pd.Series(dtype=object)
+    if 'Species' in df.columns and not df['Species'].isna().all():
+        return df['Species']
+    if 'Label' in df.columns and not df['Label'].isna().all():
+        label_parts = df['Label'].apply(_split_label_species)
+        label_ident = label_parts.map(lambda v: v[0] if v else None)
+        label_species = label_parts.map(lambda v: v[1] if v else None)
+        # Use species when present; otherwise fall back to identifier (first part of Label)
+        return label_species.where(
+            label_species.notna() & (label_species.astype(str).str.strip() != ''),
+            label_ident
+        )
+    return pd.Series(index=df.index, dtype=object)
+
+def _normalize_column_key(name):
+    """Normalize column labels for robust matching across unicode variants."""
+    if not isinstance(name, str):
+        return ''
+    text = name.strip()
+    # Normalize common unicode variants (CO₂, µ/μ)
+    text = text.replace('\u2082', '2')
+    text = text.replace('\u00b5', 'u').replace('\u03bc', 'u')
+    text = re.sub(r'\s+', ' ', text)
+    return text.lower()
+
+def _find_column(df, *candidates):
+    """Find a column in df by exact or normalized label match."""
+    if df is None:
+        return None
+    norm_map = {_normalize_column_key(col): col for col in df.columns}
+    for cand in candidates:
+        if cand in df.columns:
+            return cand
+        key = _normalize_column_key(cand)
+        if key in norm_map:
+            return norm_map[key]
+    return None
+
+def _split_label_species(label):
+    """Split Label into identifier and species using 'Label - Species' convention."""
+    if not isinstance(label, str):
+        return label, None
+    parts = label.split('-', 1)
+    if len(parts) == 2:
+        ident = parts[0].strip() or label
+        species = parts[1].strip() or None
+        return ident, species
+    return label, None
+
+def _parse_new_table_layout(raw_df):
+    """Parse the 'New Table' layout with multi-row headers."""
+    header_idx = None
+    for i in range(min(len(raw_df), 20)):
+        row_vals = raw_df.iloc[i].astype(str).tolist()
+        if 'Index' in row_vals and 'User name' in row_vals:
+            header_idx = i
+            break
+    if header_idx is None:
+        return None
+
+    df = raw_df.iloc[header_idx + 1:].copy()
+    header_vals = raw_df.iloc[header_idx].tolist()
+    normalized_cols = []
+    for idx, col in enumerate(header_vals):
+        if isinstance(col, str) and col.strip() != '':
+            normalized_cols.append(col)
+        elif pd.isna(col):
+            normalized_cols.append(f"Unnamed: {idx}")
+        else:
+            normalized_cols.append(str(col))
+    df.columns = normalized_cols
+
+    if header_idx > 0:
+        prev = raw_df.iloc[header_idx - 1].tolist()
+        new_cols = []
+        for col, prev_val in zip(df.columns, prev):
+            is_missing = (
+                not isinstance(col, str)
+                or col.strip() == ''
+                or col.startswith('Unnamed')
+                or pd.isna(col)
+            )
+            if is_missing and isinstance(prev_val, str) and prev_val.strip():
+                new_cols.append(prev_val)
+            else:
+                new_cols.append(col)
+        df.columns = new_cols
+
+    if len(df) > 0:
+        first_row = df.iloc[0]
+        rename_map = {}
+        for col, val in first_row.items():
+            if isinstance(val, str) and ('d13C' in val or 'd18O' in val):
+                rename_map[col] = val
+        if rename_map:
+            df = df.iloc[1:].copy()
+            df.rename(columns=rename_map, inplace=True)
+
+    if 'Index' in df.columns:
+        df = df[df['Index'].notna()].copy()
+
+    return df
+
+def _standardize_isotope_columns(df):
+    """Map isotope columns to canonical names used throughout the app."""
+    rename_map = {}
+    for col in df.columns:
+        if not isinstance(col, str):
+            continue
+        low = col.strip().lower()
+        if 'd13' in low or 'δ13' in low:
+            if 'mean' in low:
+                rename_map[col] = 'd 13C/12C  Mean'
+            elif 'sd' in low or 'std' in low:
+                rename_map[col] = 'd 13C/12C  Std Dev'
+        if 'd18' in low or 'δ18' in low:
+            if 'mean' in low:
+                rename_map[col] = 'd 18O/16O  Mean'
+            elif 'sd' in low or 'std' in low:
+                rename_map[col] = 'd 18O/16O  Std Dev'
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
 
 def extract_info_values(df):
     """Extract values from Information column with the specific format provided."""
@@ -111,10 +281,10 @@ def extract_info_values(df):
     patterns = {
         'acid_temp': r'Acid:\s*([\d.]+)',
         'leak_rate': r'LeakRate.*?:\s*([\d.]+)',
-        'p_no_acid': r'P no Acid\s*:\s*([\d.]+)',
-        'p_gases': r'P gases:\s*([\d.]+)',
-        'total_co2': r'Total CO2\s*:\s*([\d.]+)',
-        'co2_after_exp': r'CO2 after Exp\.:\s*([\d.]+)',
+        'p_no_acid': r'P\s*no\s*Acid\s*:\s*([\d.]+)',
+        'p_gases': r'P\s*gases\s*:\s*([\d.]+)',
+        'total_co2': r'Total\s*CO(?:2|\u2082)\s*:\s*([\d.]+)',
+        'co2_after_exp': r'CO(?:2|\u2082)\s*after\s*Exp\.:\s*([\d.]+)',
         'left_mbar': r'RefRe skipped: L mBar\s*([\d.]+)',
         'right_mbar': r'RefRe skipped: R mBar\s*([\d.]+)',
         'left_pos': r'L.*?Pos\s*([\d.]+)',
@@ -127,7 +297,7 @@ def extract_info_values(df):
         info = str(row['Information'])
 
         for col, pattern in patterns.items():
-            match = re.search(pattern, info)
+            match = re.search(pattern, info, flags=re.IGNORECASE)
             if match:
                 df.at[idx, col] = float(match.group(1))
 
@@ -217,8 +387,12 @@ try:
         .astype(str)
         .str.strip()
         .replace({
+            'VPDB(13C)': ISOTYPE_D13C,
+            'VSMOW(18O)': ISOTYPE_D18O,
             'dVPDB(13C)': ISOTYPE_D13C,
             'dVSMOW(18O)': ISOTYPE_D18O,
+            '?VPDB(13C)': ISOTYPE_D13C,
+            '?VSMOW(18O)': ISOTYPE_D18O,
             'δVPDB(13C)': ISOTYPE_D13C,
             'δVSMOW(18O)': ISOTYPE_D18O,
             'Î´VPDB(13C)': ISOTYPE_D13C,
@@ -506,9 +680,12 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
                 xanchor='right'
             )
         )
-        if color_param in measurement_df.columns:
+        color_values_all, colorbar_category_ticks = _prepare_color_values(
+            measurement_df[color_param] if color_param in measurement_df.columns else None
+        )
+        if color_values_all is not None:
             try:
-                cdata = pd.to_numeric(measurement_df[color_param], errors='coerce')
+                cdata = pd.to_numeric(color_values_all, errors='coerce')
                 cmin = float(np.nanmin(cdata))
                 cmax = float(np.nanmax(cdata))
                 if np.isfinite(cmin) and np.isfinite(cmax):
@@ -517,6 +694,10 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
                 pass
         if color_param == 'Date_ordinal' and color_param in measurement_df.columns:
             tickvals, ticktext = _build_date_colorbar_ticks(measurement_df[color_param])
+            if tickvals and ticktext:
+                coloraxis_cfg['colorbar'].update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
+        elif colorbar_category_ticks is not None:
+            tickvals, ticktext = colorbar_category_ticks
             if tickvals and ticktext:
                 coloraxis_cfg['colorbar'].update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
 
@@ -535,50 +716,67 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
                 continue
 
             # Get measured values and color parameter
-            measured_values_for_standard = measurement_df[
-                measurement_df['Identifier 1'] == standard
-                ][isotope_data['measurement_col']].values
+            measured_series = pd.to_numeric(
+                measurement_df.loc[measurement_df['Identifier 1'] == standard, isotope_data['measurement_col']],
+                errors='coerce'
+            )
+            valid_mask = measured_series.notna() & np.isfinite(measured_series)
+            measured_values_for_standard = measured_series.loc[valid_mask].values
 
-            color_values_for_standard = measurement_df[
-                measurement_df['Identifier 1'] == standard
-                ][color_param].values
+            color_values_for_standard = None
+            if color_values_all is not None:
+                color_values_for_standard = color_values_all.loc[
+                    measurement_df['Identifier 1'] == standard
+                ]
+                color_values_for_standard = color_values_for_standard.loc[valid_mask].values
 
             print(f"Standard: {standard}")
             print(f"Measured values for {isotope_data['y_label']}: {measured_values_for_standard}")
             print(f"Color values: {color_values_for_standard}")
 
-            # Handle missing or NaN color values
-            if len(measured_values_for_standard) != len(color_values_for_standard) or any(
-                    pd.isnull(color_values_for_standard)):
-                st.warning(f"Color parameter values missing for standard {standard}. Skipping.")
+            # Skip standards with no measurements
+            if len(measured_values_for_standard) == 0:
+                st.warning(f"No measured values found for standard {standard}. Skipping.")
                 continue
 
             # Append values for calibration processing
-            true_values.extend([true_value] * len(measured_values_for_standard))
+            true_val = pd.to_numeric(pd.Series([true_value]), errors='coerce').iloc[0]
+            if not np.isfinite(true_val):
+                st.warning(f"Invalid true value for standard {standard}. Skipping.")
+                continue
+            true_values.extend([true_val] * len(measured_values_for_standard))
             measured_values.extend(measured_values_for_standard)
-            color_values.extend(color_values_for_standard)
+            if color_values_for_standard is not None:
+                color_values.extend(color_values_for_standard)
 
             # Add scatter points for this standard
+            marker_kwargs = dict(size=10)
+            if color_values_for_standard is not None and pd.notna(color_values_for_standard).any():
+                marker_kwargs.update(color=color_values_for_standard, coloraxis='coloraxis')
+            else:
+                marker_kwargs.update(color='rgba(150,150,150,0.8)')
             fig.add_trace(go.Scatter(
                 x=[true_value] * len(measured_values_for_standard),
                 y=measured_values_for_standard,
                 mode='markers',
                 name=f'{standard}',
-                marker=dict(
-                    size=10,
-                    color=color_values_for_standard,
-                    coloraxis='coloraxis'
-                )
+                marker=marker_kwargs
             ))
 
         # Determine calibration method (single or double anchor)
+        true_arr = np.array(true_values, dtype=float)
+        measured_arr = np.array(measured_values, dtype=float)
+        valid = np.isfinite(true_arr) & np.isfinite(measured_arr)
+        true_arr = true_arr[valid]
+        measured_arr = measured_arr[valid]
+
         if len(selected_standards) == 1:
             # Single anchor calibration
-            if len(true_values) > 0 and len(measured_values) > 0:
-                offset = np.mean(np.array(measured_values) - np.array(true_values))
+            if len(true_arr) > 0 and len(measured_arr) > 0:
+                offset = np.mean(measured_arr - true_arr)
                 annotation_text = f"Offset = {offset:.3f}"
                 try:
-                    x_min, x_max = min(true_values) - 1, max(true_values) + 1
+                    x_min, x_max = float(np.min(true_arr)) - 1, float(np.max(true_arr)) + 1
                 except ValueError:
                     x_min, x_max = -1, 1
                 y_range = [x_min + offset, x_max + offset]
@@ -596,9 +794,11 @@ def create_calibration_plots(standards_reference_df, measurement_df, selected_st
         else:
             # Double anchor calibration
             try:
-                slope, intercept, _, _, _ = linregress(true_values, measured_values)
+                if len(true_arr) < 2:
+                    raise ValueError("Insufficient data for linear regression.")
+                slope, intercept, _, _, _ = linregress(true_arr, measured_arr)
                 annotation_text = f"y = {slope:.3f}x + {intercept:.3f}"
-                x_min, x_max = min(true_values) - 1, max(true_values) + 1
+                x_min, x_max = float(np.min(true_arr)) - 1, float(np.max(true_arr)) + 1
                 x_range = [x_min, x_max]
                 y_range = [slope * x + intercept for x in x_range]
 
@@ -703,8 +903,13 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         x=1.15,    # Move further right
         xanchor='right'
     )
+    color_values, colorbar_category_ticks = _prepare_color_values(df[color_param])
     if color_param == 'Date_ordinal' and color_param in df.columns:
         tickvals, ticktext = _build_date_colorbar_ticks(df[color_param])
+        if tickvals and ticktext:
+            colorbar_cfg.update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
+    elif colorbar_category_ticks is not None:
+        tickvals, ticktext = colorbar_category_ticks
         if tickvals and ticktext:
             colorbar_cfg.update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
 
@@ -715,7 +920,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         y=df['d 13C/12C  Mean'],
         mode='markers',
         marker=dict(
-            color=df[color_param],
+            color=color_values,
             colorscale='Viridis',
             symbol=marker_symbols,
             colorbar=colorbar_cfg,
@@ -724,21 +929,21 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         text=hover_text,
         hoverinfo='text+x+y'
     ), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['p_no_acid'], y=df['d 13C/12C  Mean'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['p_no_acid'], y=df['d 13C/12C  Mean'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=1, col=2)
-    fig.add_trace(go.Scatter(x=df['total_co2'], y=df['d 13C/12C  Mean'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['total_co2'], y=df['d 13C/12C  Mean'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=1, col=3)
 
-    fig.add_trace(go.Scatter(x=df['leak_rate'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['leak_rate'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df['p_no_acid'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['p_no_acid'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=2, col=2)
-    fig.add_trace(go.Scatter(x=df['total_co2'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['total_co2'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=2, col=3)
 
     fig.add_trace(go.Box(x=df['Line'], y=df['leak_rate']), row=3, col=1)
 
-    fig.add_trace(go.Scatter(x=df['1  Cycle Int  Samp  44'], y=df['total_co2'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['1  Cycle Int  Samp  44'], y=df['total_co2'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=3, col=2)
 
     # Prepare x_data and y_data with valid (non-NaN, non-inf) values for fitting
@@ -761,23 +966,24 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         x_data_sorted = x_data_clean.iloc[sorted_indices]
         quadratic_curve_sorted = quadratic_curve[sorted_indices]
 
-    # Plot the sorted quadratic fit as a line
-    fig.add_trace(go.Scatter(
-        x=x_data_sorted, y=quadratic_curve_sorted, mode='lines', name='Quadratic Fit',
-        line=dict(color='red', dash='dash')
-    ), row=3, col=2)
+    # Plot the sorted quadratic fit as a line (only if fit succeeded)
+    if len(x_data_clean) >= 3:
+        fig.add_trace(go.Scatter(
+            x=x_data_sorted, y=quadratic_curve_sorted, mode='lines', name='Quadratic Fit',
+            line=dict(color='red', dash='dash')
+        ), row=3, col=2)
 
-    fig.add_trace(go.Scatter(x=df['1  Cycle Int  Samp  44'], y=df['d 13C/12C  Mean'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['1  Cycle Int  Samp  44'], y=df['d 13C/12C  Mean'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=3, col=3)
 
-    fig.add_trace(go.Scatter(x=df['1  Cycle Int  Samp  44'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['1  Cycle Int  Samp  44'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=4, col=1)
     fig.add_trace(go.Box(x=df['Line'], y=df['d 13C/12C  Mean']), row=4, col=2)
     fig.add_trace(go.Box(x=df['Line'], y=df['d 18O/16O  Mean']), row=4, col=3)
 
-    fig.add_trace(go.Scatter(x=df['leak_rate'], y=df['total_co2'], mode='markers', marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['leak_rate'], y=df['total_co2'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=5, col=1)
-    fig.add_trace(go.Scatter(x=df['d 13C/12C  Mean'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=df[color_param], symbol=marker_symbols, colorscale='Viridis', showscale=False), text=hover_text,
+    fig.add_trace(go.Scatter(x=df['d 13C/12C  Mean'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=color_values, symbol=marker_symbols, colorscale='Viridis', showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=5, col=2)
     fig.add_trace(go.Box(x=df['Line'], y=df['total_co2']), row=5, col=3)
 
@@ -786,19 +992,19 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     # Add scatter plots with coloring by selected parameter, adjusting marker style for standards
     fig.add_trace(go.Scatter(
         x=df['leak_rate'], y=df['1  Cycle Int  Samp  44'], mode='markers',
-        marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+        marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'
     ), row=6, col=1)
 
     fig.add_trace(go.Scatter(
         x=df['p_no_acid'], y=df['leak_rate'], mode='markers',
-        marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+        marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'
     ), row=6, col=2)
 
     fig.add_trace(go.Scatter(
         x=df['p_gases'], y=df['leak_rate'], mode='markers',
-        marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
+        marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'
     ), row=6, col=3)
 
@@ -806,6 +1012,14 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     features = ['leak_rate', 'd 13C/12C  Mean', 'p_no_acid', 'total_co2', 'd 18O/16O  Mean', 'Line',
                 '1  Cycle Int  Samp  44']
     X = df[features].dropna()
+    if X.empty:
+        fig.update_layout(
+            title_text='Diagnostic Plots',
+            height=2600,
+            showlegend=False,
+            margin=dict(r=150)
+        )
+        return fig
 
     # Standardize the data
     X_scaled = StandardScaler().fit_transform(X)
@@ -823,10 +1037,12 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
 
     # Scatter plot for PCA components
     if n_components == 2:
+        pca_color = color_values.loc[X.index] if color_values is not None else df.loc[X.index, color_param]
+        pca_hover = df.loc[X.index, 'Identifier 2']
         fig.add_trace(go.Scatter(
             x=components[:, 0], y=components[:, 1], mode='markers',
-            marker=dict(color=df[color_param], colorscale='Viridis', symbol=marker_symbols, showscale=False),
-            text=hover_text, hoverinfo='text+x+y'
+            marker=dict(color=pca_color, colorscale='Viridis', symbol=marker_symbols, showscale=False),
+            text=pca_hover, hoverinfo='text+x+y'
         ), row=7, col=1)
 
         # Add loadings as annotations
@@ -859,7 +1075,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     # Update layout with right margin for colorbar
     fig.update_layout(
         title_text='Diagnostic Plots',
-        height=2000,
+        height=2600,
         showlegend=False,
         margin=dict(r=150)  # Add right margin for colorbar
     )
@@ -990,10 +1206,11 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             )
 
             # Prepare client output dataframe (non-standards only)
+            species_series = _get_species_series(df)
             client_df = pd.DataFrame({
                 'Identifier': df['Identifier 1'],
                 'Sample #': df.get('Identifier 2', pd.Series(index=df.index, dtype=object)),
-                'Species': df.get('Comment', pd.Series(index=df.index, dtype=object)),
+                'Species': species_series,
                 'd13C (‰, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
                 'd13C (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
                 'd18O (‰, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
@@ -1367,7 +1584,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                     start_row += 1
                     worksheet.write(start_row, 0, "d13C R^2")
                     worksheet.write(start_row, 1, float(fit13.get('r2', np.nan)) if np.isfinite(fit13.get('r2', np.nan)) else np.nan)
-                    worksheet.write(start_row, 2, "x_ref (mV)")
+                    worksheet.write(start_row, 2, "x_ref (V)")
                     worksheet.write(start_row, 3, float(fit13.get('x_ref', np.nan)) if np.isfinite(fit13.get('x_ref', np.nan)) else np.nan)
                     start_row += 1
                     worksheet.write(start_row, 0, "d13C points (n)")
@@ -1381,7 +1598,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                     start_row += 1
                     worksheet.write(start_row, 0, "d18O R^2")
                     worksheet.write(start_row, 1, float(fit18.get('r2', np.nan)) if np.isfinite(fit18.get('r2', np.nan)) else np.nan)
-                    worksheet.write(start_row, 2, "x_ref (mV)")
+                    worksheet.write(start_row, 2, "x_ref (V)")
                     worksheet.write(start_row, 3, float(fit18.get('x_ref', np.nan)) if np.isfinite(fit18.get('x_ref', np.nan)) else np.nan)
                     start_row += 1
                     worksheet.write(start_row, 0, "d18O points (n)")
@@ -1460,10 +1677,11 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
         corrected_d13 = _build_corrected(s_cal13 if s_cal13 is not None else df.get('d13C_calibrated'), df.get('d 13C/12C  Mean'), 'd13C')
         corrected_d18 = _build_corrected(s_cal18 if s_cal18 is not None else df.get('d18O_calibrated'), df.get('d 18O/16O  Mean'), 'd18O')
 
+        species_series = _get_species_series(df)
         client_df = pd.DataFrame({
             'Identifier': df['Identifier 1'],
             'Sample #': df.get('Identifier 2', pd.Series(index=df.index, dtype=object)),
-            'Species': df.get('Comment', pd.Series(index=df.index, dtype=object)),
+            'Species': species_series,
             'd13C (‰, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
             'd13C (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
             'd18O (‰, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
@@ -1567,118 +1785,189 @@ def main():
     if 'confirm_reset' not in st.session_state:
         st.session_state.confirm_reset = False
 
-    # File uploader
-    uploaded_file = st.file_uploader("Choose an XLS file", type=['xls', 'xlsx'])
-
-    # Reset file processing with confirmation
-    if st.button("Load a New File", key="load_new_file_btn"):
-        st.session_state.confirm_reset = True  # Trigger confirmation prompt
-
-    # Confirmation prompt
-    if st.session_state.confirm_reset:
-        st.warning("Are you sure you want to load a new file? This will overwrite the current data.")
-        col1, col2 = st.columns(2)
-        if col1.button("Yes, load new file", key="confirm_load_btn"):
-            # Reset session state to allow a new file upload
-            st.session_state.file_processed = False
-            st.session_state.df = None
-            st.session_state.confirm_reset = False  # Reset confirmation state
-        elif col2.button("Cancel", key="cancel_load_btn"):
-            st.session_state.confirm_reset = False  # Cancel reset and close prompt
-
-    # Only load the file if it hasn't been processed yet
-    if uploaded_file is not None and not st.session_state.file_processed:
-        try:
-            try:
-                # First try with openpyxl engine
-                df = pd.read_excel(uploaded_file, engine='openpyxl')
-            except Exception as e:
-                try:
-                    # If openpyxl fails, try with xlrd engine
-                    df = pd.read_excel(uploaded_file, engine='xlrd')
-                except Exception as e:
-                    st.error(f"Failed to read Excel file: {str(e)}")
-                    return
-            
-            # Standardize types and create a clean copy
-            df = df.convert_dtypes()
-            df.reset_index(drop=True, inplace=True)
-            df = df.map(lambda x: None if pd.isna(x) else x)
-
-            # Convert the DataFrame 'Date' column to datetime with explicit format
-            df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%y', errors='coerce')
-            df['Date_ordinal'] = pd.to_numeric(df['Date'].map(lambda x: x.toordinal() if pd.notnull(x) else None))
-
-            # Save original columns for reference
-            original_columns = df.columns.tolist()
-
-            # Extract values from Information column
-            df = extract_info_values(df)
-
-            # Ensure all original columns are included
-            for col in original_columns:
-                if col not in df.columns:
-                    df[col] = None
-
-            # Save df to session_state
-            st.session_state.df = df
-            st.session_state.file_processed = True
-
-        except Exception as e:
-            st.error(f"Error loading file: {e}")
-
-    # Display a warning if no file is uploaded
-    if st.session_state.df is None:
-        st.warning("Please upload a file to begin analysis.")
-        return
-
-    # Display data preview if available
-    if st.session_state.df is not None:
-        with st.expander("Data Table", expanded=True):
-            # Display the DataFrame using Streamlit's native table component
-            st.dataframe(
-                st.session_state.df,
-                height=400,  # Set table height for vertical scroll
-                use_container_width=True  # Use full width of the container
-            )
-
-    # Sidebar for user-selected sigma level
-    # with st.sidebar:
-    #     sigma_level = st.number_input("Set Sigma Level for Outlier Exclusion",
-    #                                   min_value=0.1,
-    #                                   max_value=5.0,
-    #                                   value=1.0,
-    #                                   step=0.1)
-
-    # Create tabs for different views
-    tab1, tab2, tab3 = st.tabs([
+    tab_import, tab1, tab2, tab3 = st.tabs([
+        'Data import',
         'Diagnostics',
         'Calibration',
         'Data Processing'
     ])
 
-    color_options = {
-        'Line': 'Line',
-        'Signal Intensity': '1  Cycle Int  Samp  44',
-        'd18O values': 'd 18O/16O  Mean',
-        'd13C values': 'd 13C/12C  Mean',
-        'Leak Rate': 'leak_rate',
-        'Total CO2': 'total_co2',
-        'P gasses': 'p_gases',
-        'P no acid': 'p_no_acid',
-        'Date': 'Date_ordinal'
-    }
+    has_data = False
 
-    # Get list of friendly names for dropdown
-    color_param_names = list(color_options.keys())
+    with tab_import:
+        # File uploader
+        uploaded_files = st.file_uploader(
+            "Choose XLS files",
+            type=['xls', 'xlsx'],
+            accept_multiple_files=True
+        )
 
-    with tab1:
-        st.header('Diagnostic Plots')
-        
-        # Create three columns for controls
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
+        # Reset file processing with confirmation
+        if st.button("Load a New File", key="load_new_file_btn"):
+            st.session_state.confirm_reset = True  # Trigger confirmation prompt
+
+        # Confirmation prompt
+        if st.session_state.confirm_reset:
+            st.warning("Are you sure you want to load a new file? This will overwrite the current data.")
+            col1, col2 = st.columns(2)
+            if col1.button("Yes, load new file", key="confirm_load_btn"):
+                # Reset session state to allow a new file upload
+                st.session_state.file_processed = False
+                st.session_state.df = None
+                st.session_state.confirm_reset = False  # Reset confirmation state
+            elif col2.button("Cancel", key="cancel_load_btn"):
+                st.session_state.confirm_reset = False  # Cancel reset and close prompt
+
+        # Only load files if they haven't been processed yet
+        if uploaded_files and not st.session_state.file_processed:
+            try:
+                dfs = []
+                for uploaded_file in uploaded_files:
+                    try:
+                        # First try with openpyxl engine (check for multi-row headers)
+                        raw = pd.read_excel(uploaded_file, header=None, engine='openpyxl')
+                        df = _parse_new_table_layout(raw)
+                        if df is None:
+                            uploaded_file.seek(0)
+                            df = pd.read_excel(uploaded_file, engine='openpyxl')
+                    except Exception as e:
+                        try:
+                            # If openpyxl fails, try with xlrd engine
+                            uploaded_file.seek(0)
+                            raw = pd.read_excel(uploaded_file, header=None, engine='xlrd')
+                            df = _parse_new_table_layout(raw)
+                            if df is None:
+                                uploaded_file.seek(0)
+                                df = pd.read_excel(uploaded_file, engine='xlrd')
+                        except Exception as e:
+                            st.error(f"Failed to read Excel file '{uploaded_file.name}': {str(e)}")
+                            continue
+                    
+                    # Standardize types and create a clean copy
+                    df = df.convert_dtypes()
+                    df.reset_index(drop=True, inplace=True)
+                    df = df.map(lambda x: None if pd.isna(x) else x)
+
+                    # Normalize isotope column names
+                    df = _standardize_isotope_columns(df)
+
+                    # Convert the DataFrame 'Date' column to datetime with explicit format
+                    if 'Date' in df.columns:
+                        df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%y', errors='coerce')
+                    elif 'Start Time' in df.columns:
+                        df['Date'] = pd.to_datetime(df['Start Time'], errors='coerce')
+
+                    if 'Date' in df.columns:
+                        df['Date_ordinal'] = pd.to_numeric(
+                            df['Date'].map(lambda x: x.toordinal() if pd.notnull(x) else None)
+                        )
+
+                    # Save original columns for reference
+                    original_columns = df.columns.tolist()
+
+                    # Extract values from Information column when present
+                    if 'Information' in df.columns:
+                        df = extract_info_values(df)
+
+                    # Map structured columns to analysis fields when present (tolerate unicode variants)
+                    leak_col = _find_column(df, 'Kiel IV Leak Rate')
+                    if leak_col and 'leak_rate' not in df.columns:
+                        df['leak_rate'] = _extract_numeric(df[leak_col])
+                    gases_col = _find_column(df, 'Kiel IV Non Condensable Pressure', 'Kiel IV Non-Condensable Pressure')
+                    if gases_col and 'p_gases' not in df.columns:
+                        df['p_gases'] = _extract_numeric(df[gases_col])
+                    residual_col = _find_column(df, 'Kiel IV Residual CO2 Pressure')
+                    if residual_col and 'p_no_acid' not in df.columns:
+                        df['p_no_acid'] = _extract_numeric(df[residual_col])
+                    sample_col = _find_column(df, 'Kiel IV CO2 Sample Pressure')
+                    if sample_col and 'total_co2' not in df.columns:
+                        df['total_co2'] = _extract_numeric(df[sample_col])
+
+                    if '1  Cycle Int  Samp  44' in df.columns:
+                        df['1  Cycle Int  Samp  44'] = _normalize_signal_intensity(df['1  Cycle Int  Samp  44'])
+                    else:
+                        intensity_candidates = [
+                            'Pressure Adjust Result Intensity',
+                            'Pressure Adjust Initial Intensity',
+                            'Initial Intensity from µ-Volume',
+                            'Initial Intensity from μ-Volume',
+                            'Initial Intensity from Âµ-Volume'
+                        ]
+                        for cand in intensity_candidates:
+                            col = _find_column(df, cand)
+                            if col:
+                                df['1  Cycle Int  Samp  44'] = _normalize_signal_intensity(df[col])
+                                break
+
+                    if 'Label' in df.columns:
+                        label_parts = df['Label'].apply(_split_label_species)
+                        if 'Identifier 1' not in df.columns:
+                            df['Identifier 1'] = label_parts.map(lambda v: v[0] if v else None)
+                        if 'Species' not in df.columns:
+                            df['Species'] = label_parts.map(lambda v: v[1] if v else None)
+                    elif 'Identifier 1' not in df.columns:
+                        if 'Sample' in df.columns:
+                            df['Identifier 1'] = df['Sample']
+                        else:
+                            df['Identifier 1'] = None
+                    if 'Identifier 2' not in df.columns:
+                        if 'Comment' in df.columns:
+                            df['Identifier 2'] = df['Comment']
+                        elif 'Run ID' in df.columns:
+                            df['Identifier 2'] = df['Run ID']
+                        elif 'Index' in df.columns:
+                            df['Identifier 2'] = df['Index']
+                        else:
+                            df['Identifier 2'] = None
+
+                    if 'Comment' not in df.columns and 'Sample Type' in df.columns:
+                        df['Comment'] = df['Sample Type']
+                    # Leave Species empty unless provided or parsed from Label
+
+                    # Normalize Label to "Identifier 1 - Species" when possible
+                    if 'Identifier 1' in df.columns:
+                        df['Label'] = _compose_label_series(
+                            df['Identifier 1'],
+                            df.get('Species', pd.Series(index=df.index, dtype=object))
+                        )
+
+                    # Ensure required analysis columns exist
+                    for col in ['leak_rate', 'p_no_acid', 'total_co2', 'p_gases', '1  Cycle Int  Samp  44', 'Line']:
+                        if col not in df.columns:
+                            df[col] = np.nan
+
+                    # Ensure all original columns are included
+                    for col in original_columns:
+                        if col not in df.columns:
+                            df[col] = None
+
+                    dfs.append(df)
+
+                if not dfs:
+                    return
+
+                df = pd.concat(dfs, ignore_index=True, sort=False) if len(dfs) > 1 else dfs[0]
+
+                # Save df to session_state
+                st.session_state.df = df
+                st.session_state.file_processed = True
+
+            except Exception as e:
+                st.error(f"Error loading file: {e}")
+
+        # Display a warning if no file is uploaded
+        if st.session_state.df is None:
+            st.warning("Please upload a file to begin analysis.")
+        else:
+            # Display data preview if available
+            with st.expander("Data Table", expanded=True):
+                # Display the DataFrame using Streamlit's native table component
+                st.dataframe(
+                    st.session_state.df,
+                    height=400,  # Set table height for vertical scroll
+                    width='stretch'  # Use full width of the container
+                )
+
             st.subheader('Sample Statistics')
             # Display sample counts as a table with percentage
             # Count samples considering duplicates (Identifier 1 and 2 combinations)
@@ -1701,13 +1990,46 @@ def main():
             })
             # Format the percentage column
             count_df['Measurements %'] = count_df['Measurements %'].map('{:,.1f}%'.format)
-            st.dataframe(count_df, hide_index=True)
+            st.dataframe(count_df, hide_index=True, width='stretch')
             # Display metrics
             metrics_col1, metrics_col2 = st.columns(2)
             metrics_col1.metric("Total Unique Samples", total_unique)
             metrics_col2.metric("Total Measurements", total_measurements)
 
-        with col2:
+        has_data = st.session_state.df is not None
+
+    if not has_data:
+        return
+    # Sidebar for user-selected sigma level
+    # with st.sidebar:
+    #     sigma_level = st.number_input("Set Sigma Level for Outlier Exclusion",
+    #                                   min_value=0.1,
+    #                                   max_value=5.0,
+    #                                   value=1.0,
+    #                                   step=0.1)
+
+    color_options = {
+        'Line': 'Line',
+        'Signal Intensity': '1  Cycle Int  Samp  44',
+        'd18O values': 'd 18O/16O  Mean',
+        'd13C values': 'd 13C/12C  Mean',
+        'Leak Rate': 'leak_rate',
+        'Total CO2': 'total_co2',
+        'P gasses': 'p_gases',
+        'P no acid': 'p_no_acid',
+        'Date': 'Date_ordinal'
+    }
+
+    # Get list of friendly names for dropdown
+    color_param_names = list(color_options.keys())
+
+    with tab1:
+        st.header('Diagnostic Plots')
+        
+        # Create two columns for controls
+        col1, col2 = st.columns(2)
+
+        with col1:
             st.subheader('Parameter Selection')
             # Dropdown for selecting color parameter
             default_color_param = 'd18O values'
@@ -1726,7 +2048,7 @@ def main():
                 default=None
             )
             
-        with col3:
+        with col2:
             st.subheader('Value Ranges')
             # d13C/12C Mean range selector
             d13c_min = float(st.session_state.df['d 13C/12C  Mean'].min())
@@ -1781,7 +2103,7 @@ def main():
         fig = create_diagnostic_plots(filtered_df, color_param)
 
         # Display the plot
-        st.plotly_chart(fig)
+        st.plotly_chart(fig, width='stretch')
 
     with tab2:
             st.header("Calibration")
@@ -1795,8 +2117,12 @@ def main():
                     .astype(str)
                     .str.strip()
                     .replace({
+                        'VPDB(13C)': ISOTYPE_D13C,
+                        'VSMOW(18O)': ISOTYPE_D18O,
                         'dVPDB(13C)': ISOTYPE_D13C,
                         'dVSMOW(18O)': ISOTYPE_D18O,
+                        '?VPDB(13C)': ISOTYPE_D13C,
+                        '?VSMOW(18O)': ISOTYPE_D18O,
                         'δVPDB(13C)': ISOTYPE_D13C,
                         'δVSMOW(18O)': ISOTYPE_D18O,
                         'Î´VPDB(13C)': ISOTYPE_D13C,
@@ -1822,6 +2148,7 @@ def main():
                     standards_list,
                     help="Select 1 standard for single-point calibration or 2 standards for double-point calibration"
                 )
+                st.session_state.selected_standards = selected_standards
 
             with col2:
                 st.markdown("#### Outlier Detection")
@@ -1883,7 +2210,7 @@ def main():
             if selected_standards:
                 act_c1, act_c2 = st.columns([2, 1])
                 with act_c1:
-                    calibrate_clicked = st.button("Calibrate results", use_container_width=True)
+                    calibrate_clicked = st.button("Calibrate results", width='stretch')
                 with act_c2:
                     apply_linearity_toggle = st.checkbox("Apply linearity correction", key="apply_linearity_toggle")
 
@@ -1920,8 +2247,8 @@ def main():
                                 st.session_state.linearity_fits = fits
                                 if np.isfinite(fit13.get('slope', np.nan)) or np.isfinite(fit18.get('slope', np.nan)):
                                     st.success(
-                                        f"Applied linearity correction. Slopes: d13C={fit13.get('slope', float('nan')):.6f} per mV, "
-                                        f"d18O={fit18.get('slope', float('nan')):.6f} per mV."
+                                        f"Applied linearity correction. Slopes: d13C={fit13.get('slope', float('nan')):.6f} per V, "
+                                        f"d18O={fit18.get('slope', float('nan')):.6f} per V."
                                     )
                                 else:
                                     st.info("Linearity correction requested, but insufficient data to compute fits.")
@@ -1934,9 +2261,9 @@ def main():
                     figs = create_calibration_plots(standards_reference, clean_stds if clean_stds is not None else st.session_state.df, selected_standards, color_param)
                     col_cal1, col_cal2 = st.columns(2)
                     with col_cal1:
-                        st.plotly_chart(figs[ISOTYPE_D13C], use_container_width=True)
+                        st.plotly_chart(figs[ISOTYPE_D13C], width='stretch')
                     with col_cal2:
-                        st.plotly_chart(figs[ISOTYPE_D18O], use_container_width=True)
+                        st.plotly_chart(figs[ISOTYPE_D18O], width='stretch')
                 except Exception as e:
                     st.warning(f"Unable to render calibration charts: {e}")
 
@@ -1982,9 +2309,9 @@ def main():
                         # Display plots in columns
                         col1, col2 = st.columns(2)
                         with col1:
-                            st.plotly_chart(figs[ISOTYPE_D13C], use_container_width=True)
+                            st.plotly_chart(figs[ISOTYPE_D13C], width='stretch')
                         with col2:
-                            st.plotly_chart(figs[ISOTYPE_D18O], use_container_width=True)
+                            st.plotly_chart(figs[ISOTYPE_D18O], width='stretch')
 
                         # Perform calibration for both isotopic types in a single function call
                         calibrated_df = calibrate_results(
@@ -2022,11 +2349,12 @@ def main():
 
                 def _build_linearity_fig(df_src, y_col, fit, title_prefix):
                     fig = go.Figure()
+                    color_vals, _ = _prepare_color_values(df_src.get(color_param, None))
                     fig.add_trace(go.Scatter(
                         x=df_src[intensity_col],
                         y=df_src[y_col],
                         mode='markers',
-                        marker=dict(color=df_src.get(color_param, None), colorscale='Viridis', showscale=False),
+                        marker=dict(color=color_vals, colorscale='Viridis', showscale=False),
                         name='Standards'
                     ))
                     x = pd.to_numeric(df_src[intensity_col], errors='coerce')
@@ -2043,7 +2371,7 @@ def main():
                         eq = "Insufficient data for regression"
                     fig.update_layout(
                         title=f"{title_prefix}: {y_col} vs Intensity",
-                        xaxis_title='Signal Intensity (mV) - 1  Cycle Int  Samp  44',
+                        xaxis_title='Signal Intensity (V) - 1  Cycle Int  Samp  44',
                         yaxis_title=y_col,
                         annotations=[dict(x=0.02, y=0.98, xref='paper', yref='paper',
                                           text=eq, showarrow=False,
@@ -2063,6 +2391,9 @@ def main():
                         'y_corr': corr,
                         'color': df_src.get(color_param, None)
                     })
+                    color_vals, _ = _prepare_color_values(plot_df['color'])
+                    if color_vals is not None:
+                        plot_df['color'] = color_vals
                     m = np.isfinite(plot_df['x']) & np.isfinite(plot_df['y_corr'])
                     plot_df = plot_df[m]
                     fig = go.Figure()
@@ -2083,7 +2414,7 @@ def main():
                         eq = "Insufficient data for regression"
                     fig.update_layout(
                         title=f"{title_prefix}: {y_col} vs Intensity (Corrected)",
-                        xaxis_title='Signal Intensity (mV) - 1  Cycle Int  Samp  44',
+                        xaxis_title='Signal Intensity (V) - 1  Cycle Int  Samp  44',
                         yaxis_title=f"{y_col} (linearity corrected)",
                         annotations=[dict(x=0.02, y=0.98, xref='paper', yref='paper',
                                           text=eq, showarrow=False,
@@ -2094,15 +2425,15 @@ def main():
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.plotly_chart(_build_linearity_fig(clean_stds, y13_col, fit13, 'Linearity (Standards)'), use_container_width=True)
+                    st.plotly_chart(_build_linearity_fig(clean_stds, y13_col, fit13, 'Linearity (Standards)'), width='stretch')
                 with c2:
-                    st.plotly_chart(_build_corrected_fig(clean_stds, y13_col, fit13, 'Linearity (Standards)'), use_container_width=True)
+                    st.plotly_chart(_build_corrected_fig(clean_stds, y13_col, fit13, 'Linearity (Standards)'), width='stretch')
 
                 c3, c4 = st.columns(2)
                 with c3:
-                    st.plotly_chart(_build_linearity_fig(clean_stds, y18_col, fit18, 'Linearity (Standards)'), use_container_width=True)
+                    st.plotly_chart(_build_linearity_fig(clean_stds, y18_col, fit18, 'Linearity (Standards)'), width='stretch')
                 with c4:
-                    st.plotly_chart(_build_corrected_fig(clean_stds, y18_col, fit18, 'Linearity (Standards)'), use_container_width=True)
+                    st.plotly_chart(_build_corrected_fig(clean_stds, y18_col, fit18, 'Linearity (Standards)'), width='stretch')
 
                 # Persist the latest fit parameters for downstream precision display
                 try:
@@ -2361,8 +2692,8 @@ def main():
                                            annotation_text='Q1 (25th Percentile)')
 
                     # Display the plots
-                    st.plotly_chart(fig_d13c, use_container_width=True)
-                    st.plotly_chart(fig_d18o, use_container_width=True)
+                    st.plotly_chart(fig_d13c, width='stretch')
+                    st.plotly_chart(fig_d18o, width='stretch')
 
 
             else:
@@ -2393,14 +2724,14 @@ def main():
         
         with col1:
             # Signal Intensity filter
-            signal_min = float(df_copy['1  Cycle Int  Samp  44'].min())
-            signal_max = float(df_copy['1  Cycle Int  Samp  44'].max())
+            signal_min = 0.0
+            signal_max = 50.0
             # Store ranges in session state to make them available throughout the app
             st.session_state.signal_range = st.slider(
                 'Filter by Signal Intensity',
                 min_value=signal_min,
                 max_value=signal_max,
-                value=(float(1000), signal_max)
+                value=(1.0, signal_max)
             )
 
             # Leak Rate filter
@@ -2458,6 +2789,12 @@ def main():
         
         # Apply all filters to a filtered copy for plotting
         df_filtered = df_copy.loc[signal_mask & leak_mask & d13c_mask & d18o_mask]
+
+        # Exclude selected standards from plotting data
+        standards_to_exclude = st.session_state.get('selected_standards', selected_standards if 'selected_standards' in locals() else [])
+        if standards_to_exclude:
+            df_filtered = df_filtered[~df_filtered['Identifier 1'].isin(standards_to_exclude)]
+            df_unfiltered = df_unfiltered[~df_unfiltered['Identifier 1'].isin(standards_to_exclude)]
         
         # Calculate total excluded after applying all filters
         total_excluded = total_samples - len(df_copy)
@@ -2498,12 +2835,13 @@ def main():
             data_to_process = data_to_process[data_to_process['Identifier 1'].isin(st.session_state.selected_ids)]
 
         # Initialize mask for statistical outliers
-        statistical_mask = pd.Series(False, index=data_to_process.index)
+        statistical_mask = pd.Series(False, index=data_to_process.index, dtype=bool)
+        group_series = _get_species_series(data_to_process)
         
         # Calculate statistical outliers separately for each identifier and comment group
         for identifier in data_to_process['Identifier 1'].unique():
-            for comment in data_to_process[data_to_process['Identifier 1'] == identifier]['Comment'].unique():
-                group_mask = (data_to_process['Identifier 1'] == identifier) & (data_to_process['Comment'] == comment)
+            for group_val in group_series[data_to_process['Identifier 1'] == identifier].unique():
+                group_mask = (data_to_process['Identifier 1'] == identifier) & (group_series == group_val)
                 group_data = data_to_process[group_mask]
                 
                 if len(group_data) > 1:  # Only process groups with more than one sample
@@ -2520,7 +2858,7 @@ def main():
                         (group_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
                         (group_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
                     )
-                    statistical_mask[group_mask] = group_stat_outliers
+                    statistical_mask.loc[group_mask] = group_stat_outliers.astype(bool).to_numpy()
                     
         # Get standards from calibration table
         try:
@@ -2686,19 +3024,19 @@ def main():
                 value=st.session_state.get('client_name', ''),
                 key='client_name'
             )
-            # Comment-to-Species replacement mapping for Client Output
+            # Species replacement mapping for Client Output
             try:
-                unique_comments = sorted([str(x) for x in df_copy.get('Comment', pd.Series(dtype=object)).dropna().unique().tolist()])
+                unique_species_vals = sorted([str(x) for x in _get_species_series(df_copy).dropna().unique().tolist()])
             except Exception:
-                unique_comments = []
+                unique_species_vals = []
             existing_map = st.session_state.get('comment_replacements', {}) or {}
-            with st.expander("Species labels (from Comment) — customize for Client Output"):
+            with st.expander("Species labels (from Label/Species) — customize for Client Output"):
                 new_map = {}
-                for i, cval in enumerate(unique_comments):
-                    key = f"comment_map_{i}"
-                    default_val = existing_map.get(cval, cval)
-                    user_val = st.text_input(f"{cval}", value=str(default_val), key=key)
-                    new_map[cval] = user_val
+                for i, sval in enumerate(unique_species_vals):
+                    key = f"species_map_{i}"
+                    default_val = existing_map.get(sval, sval)
+                    user_val = st.text_input(f"{sval}", value=str(default_val), key=key)
+                    new_map[sval] = user_val
                 st.session_state.comment_replacements = new_map
         st.markdown("---")
 
@@ -2712,11 +3050,11 @@ def main():
             outliers_df = pd.DataFrame()
             
             # Statistical outliers - making sure to use the correct index
-            statistical_mask = pd.Series(False, index=data_to_process.index)
+            statistical_mask = pd.Series(False, index=data_to_process.index, dtype=bool)
             # Calculate statistical outliers by group
             for identifier in data_to_process['Identifier 1'].unique():
-                for comment in data_to_process[data_to_process['Identifier 1'] == identifier]['Comment'].unique():
-                    group_mask = (data_to_process['Identifier 1'] == identifier) & (data_to_process['Comment'] == comment)
+                for group_val in group_series[data_to_process['Identifier 1'] == identifier].unique():
+                    group_mask = (data_to_process['Identifier 1'] == identifier) & (group_series == group_val)
                     group_data = data_to_process[group_mask]
                     
                     if len(group_data) > 1:  # Only process groups with more than one sample
@@ -2733,7 +3071,7 @@ def main():
                             (group_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
                             (group_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
                         )
-                        statistical_mask[group_mask] = group_stat_outliers
+                        statistical_mask.loc[group_mask] = group_stat_outliers.astype(bool).to_numpy()
             
             statistical_outliers = data_to_process[statistical_mask].copy()
             if not statistical_outliers.empty:
@@ -2903,6 +3241,10 @@ def main():
             if pd.notna(identifier) and identifier not in standard_identifiers
         ]
 
+        # Remove any standards explicitly selected in the Calibration tab
+        if standards_to_exclude:
+            unique_identifiers = [identifier for identifier in unique_identifiers if identifier not in standards_to_exclude]
+
         # Add 'All' option to the unique_identifiers list (this will allow the user to select all identifiers)
         unique_identifiers.insert(0, 'All')
 
@@ -2911,7 +3253,7 @@ def main():
         
         col1, col2 = st.columns(2)
         with col1:
-            selected_identifier = st.selectbox("Select Identifier 1:", options=unique_identifiers)
+            selected_identifier = st.selectbox("Select Identifier 1 (from Label):", options=unique_identifiers)
             x_axis_option = st.selectbox(
                 "Choose X-Axis Display Option:",
                 options=["By Identifier 2", "By Sequence"]
@@ -2925,14 +3267,25 @@ def main():
             show_statistical_outliers = st.checkbox("Show statistical outliers on chart", value=False, key="show_statistical_outliers")
             show_range_outliers = st.checkbox("Show range outliers on chart", value=False, key="show_range_outliers")
 
+        color_param_tab3_value_col = "_tab3_color_value"
+        color_source_tab3 = df_filtered[color_param_tab3]
+        color_values_tab3 = pd.to_numeric(color_source_tab3, errors='coerce')
+        colorbar_category_ticks = None
+        if color_values_tab3.isna().all():
+            categories = color_source_tab3.astype(str)
+            codes, uniques = pd.factorize(categories, sort=True)
+            color_values_tab3 = pd.Series(codes, index=df_filtered.index)
+            colorbar_category_ticks = (list(range(len(uniques))), [str(u) for u in uniques])
+        df_filtered[color_param_tab3_value_col] = color_values_tab3
+
         # If 'All' is selected, include data for all identifiers
         if selected_identifier == 'All':
             subset_data = df_filtered
             subset_data_unfiltered = df_unfiltered
             
             # Get the actual data range for the selected parameter
-            param_min = df_filtered[color_param_tab3].min()
-            param_max = df_filtered[color_param_tab3].max()
+            param_min = color_values_tab3.min()
+            param_max = color_values_tab3.max()
             
             # Create a shared colorbar figure
             # Build colorbar configuration and use readable dates if needed
@@ -2950,7 +3303,12 @@ def main():
                 orientation='h'  # Horizontal orientation
             )
             if color_param_tab3 == 'Date_ordinal' and color_param_tab3 in df_filtered.columns:
-                tickvals, ticktext = _build_date_colorbar_ticks(df_filtered[color_param_tab3])
+                tickvals, ticktext = _build_date_colorbar_ticks(color_values_tab3)
+                if tickvals and ticktext:
+                    colorbar_cfg.update(tickvals=tickvals, ticktext=ticktext)
+
+            if colorbar_category_ticks is not None:
+                tickvals, ticktext = colorbar_category_ticks
                 if tickvals and ticktext:
                     colorbar_cfg.update(tickvals=tickvals, ticktext=ticktext)
 
@@ -2979,7 +3337,7 @@ def main():
                 width=None  # Let width be determined by container
             )
             with col2:
-                st.plotly_chart(colorbar_fig, use_container_width=True)
+                st.plotly_chart(colorbar_fig, width='stretch')
         else:
             subset_data = df_filtered[df_filtered['Identifier 1'] == selected_identifier]
             subset_data_unfiltered = df_unfiltered[df_unfiltered['Identifier 1'] == selected_identifier]
@@ -2987,12 +3345,26 @@ def main():
 
 
 
-        # Replace NaN values in the 'Comment' column with a placeholder
-        # Ensure 'Comment' column is of type object (string) to allow text values
-        subset_data['Comment'] = subset_data['Comment'].astype(str).fillna("No Comment")
+        # Use "Identifier 1 - Species" when Species exists; otherwise fall back to Identifier 1 only
+        plot_label_col = "_plot_label"
+        if 'Species' in subset_data.columns and not subset_data['Species'].isna().all():
+            subset_data.loc[:, plot_label_col] = _compose_label_series(
+                subset_data['Identifier 1'],
+                subset_data['Species']
+            )
+            subset_data_unfiltered.loc[:, plot_label_col] = _compose_label_series(
+                subset_data_unfiltered.get('Identifier 1', pd.Series(index=subset_data_unfiltered.index, dtype=object)),
+                subset_data_unfiltered.get('Species', pd.Series(index=subset_data_unfiltered.index, dtype=object))
+            )
+        else:
+            subset_data.loc[:, plot_label_col] = subset_data['Identifier 1'].fillna("Unknown").astype(str)
+            subset_data_unfiltered.loc[:, plot_label_col] = subset_data_unfiltered.get(
+                'Identifier 1', pd.Series(index=subset_data_unfiltered.index, dtype=object)
+            ).fillna("Unknown").astype(str)
+        species_col = plot_label_col
 
-        # Iterate through unique comments (including the placeholder)
-        unique_comments = subset_data['Comment'].unique()
+        # Iterate through unique species (including the placeholder)
+        unique_species = subset_data[species_col].unique()
 
         # Assign a distinct marker symbol to each species for summary charts
         # Avoid symbols used for outliers ('x', 'cross', 'diamond', 'star')
@@ -3001,7 +3373,7 @@ def main():
         ]
         species_symbol_map = {
             sp: species_symbol_cycle[i % len(species_symbol_cycle)]
-            for i, sp in enumerate([s for s in unique_comments if s != "No Comment"])
+            for i, sp in enumerate([s for s in unique_species if s != "Unknown"])
         }
 
         # Create x_axis values
@@ -3019,12 +3391,12 @@ def main():
         
         # Create summary chart for d13C
         d13c_summary = go.Figure()
-        for species in unique_comments:
-            if species == "No Comment":
+        for species in unique_species:
+            if species == "Unknown":
                 continue
             
-            species_data = subset_data[subset_data['Comment'] == species]
-            species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered['Comment'] == species]
+            species_data = subset_data[subset_data[species_col] == species]
+            species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
             
             # Calculate statistical outliers
             mean_d13C = species_data['d 13C/12C  Mean'].mean()
@@ -3084,7 +3456,7 @@ def main():
                 name=species,
                 marker=dict(
                     size=8,
-                    color=data_to_plot[color_param_tab3],
+                    color=data_to_plot[color_param_tab3_value_col],
                     colorscale="Viridis",
                     showscale=False,
                     symbol=species_symbol_map.get(species, 'circle')
@@ -3190,16 +3562,16 @@ def main():
             showlegend=True,
             height=500
         )
-        st.plotly_chart(d13c_summary, use_container_width=True)
+        st.plotly_chart(d13c_summary, width='stretch')
         
         # Create summary chart for d18O
         d18o_summary = go.Figure()
-        for species in unique_comments:
-            if species == "No Comment":
+        for species in unique_species:
+            if species == "Unknown":
                 continue
             
-            species_data = subset_data[subset_data['Comment'] == species]
-            species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered['Comment'] == species]
+            species_data = subset_data[subset_data[species_col] == species]
+            species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
             
             # Calculate statistical outliers
             mean_d13C = species_data['d 13C/12C  Mean'].mean()
@@ -3255,7 +3627,7 @@ def main():
                 name=species,
                 marker=dict(
                     size=8,
-                    color=data_to_plot[color_param_tab3],
+                    color=data_to_plot[color_param_tab3_value_col],
                     colorscale="Viridis",
                     showscale=False,
                     symbol=species_symbol_map.get(species, 'circle')
@@ -3363,15 +3735,15 @@ def main():
         )
         # Invert y-axis so increasing d18O plots downward
         d18o_summary.update_yaxes(autorange='reversed')
-        st.plotly_chart(d18o_summary, use_container_width=True)
+        st.plotly_chart(d18o_summary, width='stretch')
 
-        # Create cross-plot: d13C vs d18O grouped by Species (Comment)
+        # Create cross-plot: d13C vs d18O grouped by Species
         species_scatter = go.Figure()
-        for species in unique_comments:
-            if species == "No Comment":
+        for species in unique_species:
+            if species == "Unknown":
                 continue
 
-            species_data = subset_data[subset_data['Comment'] == species]
+            species_data = subset_data[subset_data[species_col] == species]
             if species_data.empty:
                 continue
 
@@ -3433,32 +3805,32 @@ def main():
             ))
 
         species_scatter.update_layout(
-            title="d13C vs d18O by Species (Comment)",
+            title="d13C vs d18O by Species",
             xaxis_title="d18O",
             yaxis_title="d13C",
             showlegend=True,
             height=500
         )
-        st.plotly_chart(species_scatter, use_container_width=True)
+        st.plotly_chart(species_scatter, width='stretch')
 
         # Process individual species
-        for comment in unique_comments:
-            # Filter data for this specific comment
-            comment_data = subset_data[subset_data['Comment'] == comment]
-            
+        for species in unique_species:
+            # Filter data for this specific species
+            species_data = subset_data[subset_data[species_col] == species]
+
             # Skip if Identifier 2 is empty
-            if comment_data['Identifier 2'].isna().all():
+            if species_data['Identifier 2'].isna().all():
                 continue
 
             col1, col2 = st.columns([3, 1])
             with col1:
-                st.subheader(f'Species: {comment}')
+                st.subheader(f'Species: {species}')
 
             # Calculate thresholds for outliers for each comment subset
-            mean_d13C = comment_data['d 13C/12C  Mean'].mean()
-            std_d13C = comment_data['d 13C/12C  Mean'].std()
-            mean_d18O = comment_data['d 18O/16O  Mean'].mean()
-            std_d18O = comment_data['d 18O/16O  Mean'].std()
+            mean_d13C = species_data['d 13C/12C  Mean'].mean()
+            std_d13C = species_data['d 13C/12C  Mean'].std()
+            mean_d18O = species_data['d 18O/16O  Mean'].mean()
+            std_d18O = species_data['d 18O/16O  Mean'].std()
 
             lower_threshold_d13C = mean_d13C - (sigma_level_data * std_d13C)
             upper_threshold_d13C = mean_d13C + (sigma_level_data * std_d13C)
@@ -3466,32 +3838,32 @@ def main():
             upper_threshold_d18O = mean_d18O + (sigma_level_data * std_d18O)
 
             # Create x_axis values first for all data
-            comment_data['x_axis'] = np.nan
+            species_data['x_axis'] = np.nan
             if x_axis_option == "By Identifier 2":
-                comment_data['x_axis'] = comment_data['Identifier 2'].apply(
+                species_data['x_axis'] = species_data['Identifier 2'].apply(
                     lambda x: float(re.search(r'\d+\.?\d*', str(x)).group()) if pd.notnull(x) and re.search(
                         r'\d+\.?\d*', str(x)) else None
                 )
             else:
-                comment_data['x_axis'] = range(len(comment_data))
+                species_data['x_axis'] = range(len(species_data))
 
             # Now identify statistical outliers (after x_axis is created)
             outlier_mask = (
-                (comment_data['d 13C/12C  Mean'] < lower_threshold_d13C) |
-                (comment_data['d 13C/12C  Mean'] > upper_threshold_d13C) |
-                (comment_data['d 18O/16O  Mean'] < lower_threshold_d18O) |
-                (comment_data['d 18O/16O  Mean'] > upper_threshold_d18O)
+                (species_data['d 13C/12C  Mean'] < lower_threshold_d13C) |
+                (species_data['d 13C/12C  Mean'] > upper_threshold_d13C) |
+                (species_data['d 18O/16O  Mean'] < lower_threshold_d18O) |
+                (species_data['d 18O/16O  Mean'] > upper_threshold_d18O)
             )
             # Apply mask and include necessary columns (including x_axis)
-            statistical_outliers = comment_data[outlier_mask].copy()
+            statistical_outliers = species_data[outlier_mask].copy()
 
             # Remove statistical outliers from data_to_plot
-            data_to_plot = comment_data[~outlier_mask].copy()
+            data_to_plot = species_data[~outlier_mask].copy()
 
             # Identify range bar outliers from unfiltered data
             # Identify and process range outliers if enabled
             if show_range_outliers:
-                species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered['Comment'] == comment]
+                species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
                 # Create mask for range outliers
                 range_mask = (
                     (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
@@ -3517,7 +3889,7 @@ def main():
                         range_bar_outliers['x_axis'] = range(len(range_bar_outliers))
             else:
                 # Create empty DataFrame with required columns
-                range_bar_outliers = pd.DataFrame(columns=['Identifier 1', 'Identifier 2', 'd 13C/12C  Mean', 'd 18O/16O  Mean', 'Comment', 'x_axis'])
+                range_bar_outliers = pd.DataFrame(columns=['Identifier 1', 'Identifier 2', 'd 13C/12C  Mean', 'd 18O/16O  Mean', species_col, 'x_axis'])
 
             # Combine both types of outliers
             outliers = pd.concat([statistical_outliers, range_bar_outliers]).drop_duplicates()
@@ -3620,7 +3992,7 @@ def main():
                     mode='lines+markers',
                     line=dict(color='blue', dash='dot', width=2),
                     marker=dict(
-                        color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3],
+                        color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3_value_col],
                         colorscale="Viridis",
                         symbol='circle',
                         size=8,
@@ -3636,7 +4008,7 @@ def main():
                         mode='lines+markers',
                         line=dict(color='orange', dash='dot', width=2),
                         marker=dict(
-                            color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3],
+                            color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3_value_col],
                             colorscale="Viridis",
                             symbol='square',
                             size=8,
@@ -3646,7 +4018,7 @@ def main():
                     ))
 
                 fig_d13C.update_layout(
-                    title=f'{identifier} - d13C for Species: {comment}',
+                    title=f'{identifier} - d13C for Species: {species}',
                     xaxis_title='X Axis',
                     yaxis_title='d13C (‰)',
                     legend_title='Data Type',
@@ -3664,7 +4036,7 @@ def main():
                     )
                 )
 
-                st.plotly_chart(fig_d13C, use_container_width=True, height=chart_height)
+                st.plotly_chart(fig_d13C, width='stretch', height=chart_height)
 
                 # Plot Î´18O data for this identifier and comment
                 # Create figure for Î´18O
@@ -3728,7 +4100,7 @@ def main():
                         mode='lines+markers',
                         line=dict(color='blue', dash='dot', width=2),
                         marker=dict(
-                            color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3],
+                            color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3_value_col],
                             colorscale="Viridis",
                             symbol='circle',
                             size=8,
@@ -3744,7 +4116,7 @@ def main():
                             mode='lines+markers',
                             line=dict(color='orange', dash='dot', width=2),
                             marker=dict(
-                                color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3],
+                                color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3_value_col],
                                 colorscale="Viridis",
                                 symbol='square',
                                 size=8
@@ -3776,7 +4148,7 @@ def main():
                     mode='lines+markers',
                     line=dict(color='blue', dash='dot', width=2),
                     marker=dict(
-                        color=sorted_data[color_param_tab3],
+                        color=sorted_data[color_param_tab3_value_col],
                         colorscale="Viridis",
                         symbol='circle',
                         size=8,
@@ -3792,7 +4164,7 @@ def main():
                         mode='lines+markers',
                         line=dict(color='orange', dash='dot', width=2),
                         marker=dict(
-                            color=sorted_data[color_param_tab3],
+                            color=sorted_data[color_param_tab3_value_col],
                             colorscale="Viridis",
                             symbol='square',
                             size=8
@@ -3801,7 +4173,7 @@ def main():
                     ))
 
                 fig_d18O.update_layout(
-                    title=f'{identifier} - d18O for Species: {comment}',
+                    title=f'{identifier} - d18O for Species: {species}',
                     xaxis_title='X Axis',
                     yaxis_title='d18O (‰)',
                     legend_title='Data Type',
@@ -3821,17 +4193,17 @@ def main():
                 # Invert y-axis so increasing d18O plots downward
                 fig_d18O.update_yaxes(autorange='reversed')
 
-                st.plotly_chart(fig_d18O, use_container_width=True, height=chart_height)
+                st.plotly_chart(fig_d18O, width='stretch', height=chart_height)
 
             # Display outliers header for each comment if detected
-            if not comment_data['Identifier 2'].isna().all():
-                st.subheader(f'Outliers Detected for Species: {comment}')
+            if not species_data['Identifier 2'].isna().all():
+                st.subheader(f'Outliers Detected for Species: {species}')
             
             # Get outliers data
-            stat_outliers_only = statistical_outliers[statistical_outliers['Comment'] == comment]
+            stat_outliers_only = statistical_outliers[statistical_outliers[species_col] == species]
             
             # Get original data for this species before any filtering
-            species_data = subset_data_unfiltered[subset_data_unfiltered['Comment'] == comment]
+            species_data = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
             
             # Create masks for each range category
             d13c_outliers = species_data[
@@ -3866,12 +4238,13 @@ def main():
                 with st.expander("Statistical Outliers (Sigma-Based)", expanded=True):
                     if not stat_outliers_only.empty:
                         st.markdown("**Based on statistical deviation from the mean**")
-                        styled_stats = stat_outliers_only[['Identifier 2', 'Comment', 'd 13C/12C  Mean', 'd 18O/16O  Mean']].copy()
+                        styled_stats = stat_outliers_only[['Identifier 2', species_col, 'd 13C/12C  Mean', 'd 18O/16O  Mean']].copy()
                         styled_stats = styled_stats.rename(columns={
+                            species_col: 'Species',
                             'd 13C/12C  Mean': 'd13C Value (‰)',
                             'd 18O/16O  Mean': 'd18O Value (‰)'
                         })
-                        st.dataframe(styled_stats, use_container_width=True)
+                        st.dataframe(styled_stats, width='stretch')
                     else:
                         st.info("No statistical outliers detected")
 
@@ -3879,9 +4252,10 @@ def main():
                 with st.expander("d13C Range Outliers", expanded=True):
                     if not d13c_outliers.empty:
                         st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} ‰")
-                        styled_d13c = d13c_outliers[['Identifier 2', 'Comment', 'd 13C/12C  Mean']].copy()
-                        styled_d13c = styled_d13c.rename(columns={'d 13C/12C  Mean': 'd13C Value (‰)'})
-                        st.dataframe(styled_d13c, use_container_width=True)
+                        styled_d13c = d13c_outliers[['Identifier 2', species_col, 'd 13C/12C  Mean']].copy()
+                        styled_d13c = styled_d13c.rename(columns={
+                            species_col: 'Species','d 13C/12C  Mean': 'd13C Value (‰)'})
+                        st.dataframe(styled_d13c, width='stretch')
                     else:
                         st.info("No d13C outliers detected")
 
@@ -3889,9 +4263,10 @@ def main():
                 with st.expander("d18O Range Outliers", expanded=True):
                     if not d18o_outliers.empty:
                         st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} ‰")
-                        styled_d18o = d18o_outliers[['Identifier 2', 'Comment', 'd 18O/16O  Mean']].copy()
-                        styled_d18o = styled_d18o.rename(columns={'d 18O/16O  Mean': 'd18O Value (‰)'})
-                        st.dataframe(styled_d18o, use_container_width=True)
+                        styled_d18o = d18o_outliers[['Identifier 2', species_col, 'd 18O/16O  Mean']].copy()
+                        styled_d18o = styled_d18o.rename(columns={
+                            species_col: 'Species','d 18O/16O  Mean': 'd18O Value (‰)'})
+                        st.dataframe(styled_d18o, width='stretch')
                     else:
                         st.info("No d18O outliers detected")
 
@@ -3904,9 +4279,10 @@ def main():
                 with st.expander("Signal Intensity Outliers", expanded=True):
                     if not signal_outliers.empty:
                         st.markdown(f"**Acceptable Range:** {st.session_state.signal_range[0]:.2f} to {st.session_state.signal_range[1]:.2f}")
-                        styled_signal = signal_outliers[['Identifier 2', 'Comment', '1  Cycle Int  Samp  44']].copy()
-                        styled_signal = styled_signal.rename(columns={'1  Cycle Int  Samp  44': 'Signal Intensity'})
-                        st.dataframe(styled_signal, use_container_width=True)
+                        styled_signal = signal_outliers[['Identifier 2', species_col, '1  Cycle Int  Samp  44']].copy()
+                        styled_signal = styled_signal.rename(columns={
+                            species_col: 'Species','1  Cycle Int  Samp  44': 'Signal Intensity'})
+                        st.dataframe(styled_signal, width='stretch')
                     else:
                         st.info("No signal intensity outliers detected")
                 
@@ -3914,16 +4290,17 @@ def main():
                 with st.expander("Leak Rate Outliers", expanded=True):
                     if not leak_outliers.empty:
                         st.markdown(f"**Acceptable Range:** {st.session_state.leak_range[0]:.2f} to {st.session_state.leak_range[1]:.2f}")
-                        styled_leak = leak_outliers[['Identifier 2', 'Comment', 'leak_rate']].copy()
-                        styled_leak = styled_leak.rename(columns={'leak_rate': 'Leak Rate'})
-                        st.dataframe(styled_leak, use_container_width=True)
+                        styled_leak = leak_outliers[['Identifier 2', species_col, 'leak_rate']].copy()
+                        styled_leak = styled_leak.rename(columns={
+                            species_col: 'Species','leak_rate': 'Leak Rate'})
+                        st.dataframe(styled_leak, width='stretch')
                     else:
                         st.info("No leak rate outliers detected")
 
             # with st.expander("Leak Rate Outliers", expanded=True):
             #     if not leak_outliers.empty:
             #         st.markdown(f"Range: {st.session_state.leak_range[0]:.2f} to {st.session_state.leak_range[1]:.2f}")
-            #         st.dataframe(leak_outliers[['Identifier 2', 'Comment', 'leak_rate']])
+            #         st.dataframe(leak_outliers[['Identifier 2', species_col, 'leak_rate']])
             #     else:
             #         st.write("No leak rate outliers detected")
 
@@ -3985,4 +4362,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

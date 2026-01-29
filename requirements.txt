@@ -4,3 +4,8 @@ numpy
 matplotlib
 seaborn
 openpyxl
+plotly
+scikit-learn
+reportlab
+scipy
+xlsxwriter
