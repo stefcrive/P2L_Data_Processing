@@ -115,16 +115,59 @@ def extract_number(text):
     matches = re.findall(r'\d+', str(text))
     return int(matches[0]) if matches else None
 
+def _parse_numeric_token(token):
+    """Parse a numeric token with optional thousands/decimal separators."""
+    if token is None or pd.isna(token):
+        return None
+    text = str(token).strip()
+    if text == "":
+        return None
+    # Find the first number-like chunk (digits with optional separators/sign).
+    match = re.search(r'[-+]?[\d.,]+', text)
+    if not match:
+        return None
+    num = match.group(0)
+    # Remove spaces (including non-breaking/thin spaces) used as thousands separators.
+    num = re.sub(r"[\s\u00A0\u2009]", "", num)
+
+    if "," in num and "." in num:
+        # Decide decimal separator by last occurrence; other is thousands separator.
+        if num.rfind(",") > num.rfind("."):
+            num = num.replace(".", "")
+            num = num.replace(",", ".")
+        else:
+            num = num.replace(",", "")
+    elif "," in num:
+        if num.count(",") > 1:
+            num = num.replace(",", "")
+        else:
+            left, right = num.split(",", 1)
+            if right.isdigit() and len(right) in (1, 2):
+                num = left + "." + right
+            else:
+                num = left + right
+    elif "." in num:
+        if num.count(".") > 1:
+            num = num.replace(".", "")
+        else:
+            left, right = num.split(".", 1)
+            # If it looks like a thousands separator (e.g., 1.234), collapse it.
+            if right.isdigit() and len(right) == 3 and left.isdigit() and len(left) <= 3:
+                num = left + right
+
+    try:
+        return float(num)
+    except Exception:
+        return None
+
+
 def _extract_numeric(series):
     """Extract numeric values from a mixed/unit string series."""
     if series is None:
         return pd.Series(dtype='float64')
-    if isinstance(series, pd.Series):
-        as_text = series.astype(str)
-    else:
-        as_text = pd.Series(series).astype(str)
-    extracted = as_text.str.extract(r'(-?\d+(?:\.\d+)?)')[0]
-    return pd.to_numeric(extracted, errors='coerce')
+    ser = series if isinstance(series, pd.Series) else pd.Series(series)
+    parsed = ser.map(_parse_numeric_token)
+    return pd.to_numeric(parsed, errors='coerce')
 
 def _normalize_signal_intensity(series):
     """Normalize signal intensity to volts when values appear to be in mV."""
@@ -315,19 +358,44 @@ def identify_outliers(data, column, sigma_level):
     Returns:
     - A boolean Series indicating True for outliers and False otherwise.
     """
-    # Calculate mean and standard deviation
-    column_mean = data[column].mean()
-    column_std = data[column].std()
+    # Coerce to numeric to avoid silent failures on string/object columns
+    series = pd.to_numeric(data[column], errors='coerce')
+    mean_val, std_val, outliers = _compute_sigma_stats(series, sigma_level)
+    if outliers is None:
+        return pd.Series(False, index=data.index)
+    return outliers.reindex(data.index, fill_value=False)
 
-    # print(f"Number of rows: {len(data)}")
-    # Define the threshold for outliers
-    upper_threshold = column_mean + sigma_level * column_std
-    lower_threshold = column_mean - sigma_level * column_std
 
-    # Identify outliers by comparing values to the thresholds
-    outliers = (data[column] > upper_threshold) | (data[column] < lower_threshold)
+def _compute_sigma_stats(series, sigma_level):
+    """Compute mean/std and outlier mask using a two-pass sigma calculation."""
+    valid_mask = series.notna()
+    if valid_mask.sum() < 2:
+        return (np.nan, np.nan, None)
 
-    return outliers
+    vals = series[valid_mask]
+    mean1 = vals.mean()
+    std1 = vals.std()
+    if not np.isfinite(mean1) or not np.isfinite(std1) or std1 == 0:
+        return (mean1, std1, None)
+
+    lower1 = mean1 - sigma_level * std1
+    upper1 = mean1 + sigma_level * std1
+    inliers1 = valid_mask & (series >= lower1) & (series <= upper1)
+    base = series[inliers1]
+    if base.dropna().shape[0] >= 2:
+        mean2 = base.mean()
+        std2 = base.std()
+    else:
+        mean2 = mean1
+        std2 = std1
+
+    if not np.isfinite(mean2) or not np.isfinite(std2) or std2 == 0:
+        return (mean2, std2, None)
+
+    lower2 = mean2 - sigma_level * std2
+    upper2 = mean2 + sigma_level * std2
+    outliers = valid_mask & ((series < lower2) | (series > upper2))
+    return (mean2, std2, outliers)
 
 def identify_outliers_iqr(data, column, iqr_multiplier=1.5):
     """
@@ -341,23 +409,27 @@ def identify_outliers_iqr(data, column, iqr_multiplier=1.5):
     Returns:
     - A boolean Series indicating True for outliers and False otherwise.
     """
+    # Coerce to numeric to avoid silent failures on string/object columns
+    series = pd.to_numeric(data[column], errors='coerce')
+    valid = series.dropna()
+    if valid.empty:
+        return pd.Series(False, index=data.index)
+
     # Calculate Q1, Q3, and IQR for the column
-    q1 = data[column].quantile(0.25)
-    q3 = data[column].quantile(0.75)
+    q1 = valid.quantile(0.25)
+    q3 = valid.quantile(0.75)
     iqr = q3 - q1
+    if not np.isfinite(iqr):
+        return pd.Series(False, index=data.index)
 
     # Define the upper and lower bounds for outliers using the provided multiplier
     upper_bound = q3 + iqr_multiplier * iqr
     lower_bound = q1 - iqr_multiplier * iqr
 
     # Identify outliers (values outside the upper and lower bounds)
-    outliers = (data[column] > upper_bound) | (data[column] < lower_bound)
+    outliers = (series > upper_bound) | (series < lower_bound)
 
-    # Align with the original data's index
-    outliers_full_index = pd.Series(False, index=data.index)
-    outliers_full_index.loc[data[column].dropna().index] = outliers
-
-    return outliers_full_index
+    return outliers.fillna(False)
 
 # def calibrate_results(df):
 #     """Calibrate results based on SHP2L standards."""
@@ -2194,6 +2266,67 @@ def main():
                 # Add some vertical spacing
                 st.write("")
                 st.write("")
+
+            # Precision date range selection (standards only)
+            precision_date_bounds = None
+            date_col = _find_column(st.session_state.df, 'Date')
+            if date_col:
+                date_series_all = pd.to_datetime(st.session_state.df[date_col], errors='coerce')
+                valid_dates = date_series_all.dropna()
+                if not valid_dates.empty:
+                    min_date = valid_dates.min().date()
+                    max_date = valid_dates.max().date()
+
+                    def _normalize_date_range(value):
+                        if isinstance(value, (list, tuple)) and len(value) == 2:
+                            start_val, end_val = value
+                        elif value is not None:
+                            start_val = value
+                            end_val = value
+                        else:
+                            start_val = min_date
+                            end_val = max_date
+                        try:
+                            start_val = pd.Timestamp(start_val).date()
+                            end_val = pd.Timestamp(end_val).date()
+                        except Exception:
+                            start_val = min_date
+                            end_val = max_date
+                        if start_val < min_date:
+                            start_val = min_date
+                        if end_val > max_date:
+                            end_val = max_date
+                        if start_val > end_val:
+                            start_val, end_val = end_val, start_val
+                        return start_val, end_val
+
+                    stored_range = st.session_state.get('precision_date_range')
+                    default_start, default_end = _normalize_date_range(stored_range)
+                    if 'precision_date_range_input' not in st.session_state:
+                        st.session_state.precision_date_range_input = (default_start, default_end)
+
+                    st.markdown("#### Precision Date Range")
+                    precision_date_range = st.date_input(
+                        "Select date range for precision calculations (standards only):",
+                        min_value=min_date,
+                        max_value=max_date,
+                        value=st.session_state.precision_date_range_input,
+                        key="precision_date_range_input",
+                    )
+                    start_date, end_date = _normalize_date_range(precision_date_range)
+                    st.session_state.precision_date_range = (start_date, end_date)
+                    if start_date is not None and end_date is not None:
+                        st.caption(
+                            f"Precision calculations use standards dated {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}."
+                        )
+                        precision_date_bounds = (
+                            pd.Timestamp(start_date),
+                            pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1),
+                        )
+                else:
+                    st.info("No valid dates available; precision calculations will use all standards.")
+            else:
+                st.info("No Date column available; precision calculations will use all standards.")
             
             # Compute a clean standards dataframe (outliers removed) for charts/fits as soon as standards are selected
             clean_stds = None
@@ -2205,6 +2338,11 @@ def main():
                     sigma_level,
                     irq_multiplier
                 )
+            clean_stds_for_charts = clean_stds
+            if clean_stds_for_charts is not None and precision_date_bounds and date_col and date_col in clean_stds_for_charts.columns:
+                date_series_chart = pd.to_datetime(clean_stds_for_charts[date_col], errors='coerce')
+                date_mask_chart = (date_series_chart >= precision_date_bounds[0]) & (date_series_chart <= precision_date_bounds[1])
+                clean_stds_for_charts = clean_stds_for_charts.loc[date_mask_chart].copy()
 
             # Action row: Calibrate results + optional linearity correction toggle
             if selected_standards:
@@ -2258,7 +2396,8 @@ def main():
             # Always show calibration charts when standards are selected (using cleaned standards)
             if selected_standards:
                 try:
-                    figs = create_calibration_plots(standards_reference, clean_stds if clean_stds is not None else st.session_state.df, selected_standards, color_param)
+                    chart_src = clean_stds_for_charts if clean_stds_for_charts is not None else clean_stds if clean_stds is not None else st.session_state.df
+                    figs = create_calibration_plots(standards_reference, chart_src, selected_standards, color_param)
                     col_cal1, col_cal2 = st.columns(2)
                     with col_cal1:
                         st.plotly_chart(figs[ISOTYPE_D13C], width='stretch')
@@ -2343,9 +2482,14 @@ def main():
                     sigma_level,
                     irq_multiplier,
                 )
+                linearity_src = clean_stds_for_charts if 'clean_stds_for_charts' in locals() and clean_stds_for_charts is not None else clean_stds
+                if linearity_src is not None and precision_date_bounds and date_col and date_col in linearity_src.columns:
+                    date_series_chart = pd.to_datetime(linearity_src[date_col], errors='coerce')
+                    date_mask_chart = (date_series_chart >= precision_date_bounds[0]) & (date_series_chart <= precision_date_bounds[1])
+                    linearity_src = linearity_src.loc[date_mask_chart].copy()
 
-                fit13 = _compute_linearity_fit(clean_stds, y13_col, intensity_col)
-                fit18 = _compute_linearity_fit(clean_stds, y18_col, intensity_col)
+                fit13 = _compute_linearity_fit(linearity_src, y13_col, intensity_col)
+                fit18 = _compute_linearity_fit(linearity_src, y18_col, intensity_col)
 
                 def _build_linearity_fig(df_src, y_col, fit, title_prefix):
                     fig = go.Figure()
@@ -2425,15 +2569,15 @@ def main():
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.plotly_chart(_build_linearity_fig(clean_stds, y13_col, fit13, 'Linearity (Standards)'), width='stretch')
+                    st.plotly_chart(_build_linearity_fig(linearity_src, y13_col, fit13, 'Linearity (Standards)'), width='stretch')
                 with c2:
-                    st.plotly_chart(_build_corrected_fig(clean_stds, y13_col, fit13, 'Linearity (Standards)'), width='stretch')
+                    st.plotly_chart(_build_corrected_fig(linearity_src, y13_col, fit13, 'Linearity (Standards)'), width='stretch')
 
                 c3, c4 = st.columns(2)
                 with c3:
-                    st.plotly_chart(_build_linearity_fig(clean_stds, y18_col, fit18, 'Linearity (Standards)'), width='stretch')
+                    st.plotly_chart(_build_linearity_fig(linearity_src, y18_col, fit18, 'Linearity (Standards)'), width='stretch')
                 with c4:
-                    st.plotly_chart(_build_corrected_fig(clean_stds, y18_col, fit18, 'Linearity (Standards)'), width='stretch')
+                    st.plotly_chart(_build_corrected_fig(linearity_src, y18_col, fit18, 'Linearity (Standards)'), width='stretch')
 
                 # Persist the latest fit parameters for downstream precision display
                 try:
@@ -2466,10 +2610,20 @@ def main():
                     shp2l_filtered_data = st.session_state.df[
                         st.session_state.df['Identifier 1'] == standard]
 
+                    if precision_date_bounds and date_col:
+                        date_series_std = pd.to_datetime(shp2l_filtered_data[date_col], errors='coerce')
+                        date_mask = (date_series_std >= precision_date_bounds[0]) & (date_series_std <= precision_date_bounds[1])
+                        shp2l_filtered_data = shp2l_filtered_data.loc[date_mask]
+
                     # print(f"Number of rows: {len(shp2l_filtered_data)}")
 
                     if shp2l_filtered_data.empty:
-                        st.warning(f"No data available for the standard: {standard}")
+                        if precision_date_bounds:
+                            start_ts = precision_date_bounds[0].strftime('%Y-%m-%d')
+                            end_ts = precision_date_bounds[1].strftime('%Y-%m-%d')
+                            st.warning(f"No data available for the standard: {standard} in the selected precision date range ({start_ts} to {end_ts}).")
+                        else:
+                            st.warning(f"No data available for the standard: {standard}")
                         continue
 
                     # Initialize outliers variables to ensure they exist
@@ -2521,6 +2675,35 @@ def main():
                     d13c_precision = shp2l_clean['d 13C/12C  Mean'].std()
                     d18o_precision = shp2l_clean['d 18O/16O  Mean'].std()
 
+                    # Precision per line (1/2), excluding outliers
+                    line_precision_markup = ""
+                    line_col = _find_column(shp2l_clean, 'Line')
+                    if line_col is not None:
+                        line_df = shp2l_clean.copy()
+                        line_df['_line_val'] = pd.to_numeric(line_df[line_col], errors='coerce')
+                        line_df = line_df.dropna(subset=['_line_val'])
+                        if not line_df.empty:
+                            line_blocks = []
+                            for line_value in sorted(line_df['_line_val'].unique()):
+                                if not np.isfinite(line_value):
+                                    continue
+                                if line_value not in (1, 2):
+                                    continue
+                                line_subset = line_df[line_df['_line_val'] == line_value]
+                                d13_line = pd.to_numeric(line_subset['d 13C/12C  Mean'], errors='coerce').std()
+                                d18_line = pd.to_numeric(line_subset['d 18O/16O  Mean'], errors='coerce').std()
+                                d13_text = "--" if pd.isna(d13_line) else f"{d13_line:.3f}‰"
+                                d18_text = "--" if pd.isna(d18_line) else f"{d18_line:.3f}‰"
+                                line_blocks.append(
+                                    f"<p style='font-size: 16px; margin: 4px 0;'>"
+                                    f"<b>Line {int(line_value)} precision:</b> d13C {d13_text} | d18O {d18_text}"
+                                    f"</p>"
+                                )
+                            if line_blocks:
+                                line_precision_markup = (
+                                    "<div style='margin-top: 8px;'>" + "".join(line_blocks) + "</div>"
+                                )
+
                     # Calculate precision after linearity correction (if available)
                     d13c_lin_prec = None
                     d18o_lin_prec = None
@@ -2569,6 +2752,7 @@ def main():
                                 <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{shp2l_clean['d 18O/16O  Mean'].mean():.3f}‰</span></p>
                             </div>
                         </div>
+                        {line_precision_markup}
                         <div style='margin-top: 15px; padding-top: 10px; border-top: 1px solid #ddd;'>
                             <p style='font-size: 16px; color: {standards_percentage_color};'>Standards included: {included_standards} out of {total_standards} ({standards_percentage:.1f}%)</p>
                         </div>
@@ -2584,14 +2768,16 @@ def main():
                         # Fallback to all data if for any reason the masks are unavailable
                         stats_source = shp2l_filtered_data.copy()
 
-                    # Ensure numeric dtype and ignore NaNs
-                    d13c_series = pd.to_numeric(stats_source['d 13C/12C  Mean'], errors='coerce')
-                    d18o_series = pd.to_numeric(stats_source['d 18O/16O  Mean'], errors='coerce')
+                    # Use the same base data for thresholds as the outlier detection
+                    threshold_source = shp2l_filtered_data
 
-                    d13c_mean = float(d13c_series.mean())
-                    d13c_std = float(d13c_series.std())
-                    d18o_mean = float(d18o_series.mean())
-                    d18o_std = float(d18o_series.std())
+                    # Ensure numeric dtype and ignore NaNs
+                    d13c_series = pd.to_numeric(threshold_source['d 13C/12C  Mean'], errors='coerce')
+                    d18o_series = pd.to_numeric(threshold_source['d 18O/16O  Mean'], errors='coerce')
+
+                    # Compute mean/std using the same sigma logic as outlier detection
+                    d13c_mean, d13c_std, _ = _compute_sigma_stats(d13c_series, sigma_level)
+                    d18o_mean, d18o_std, _ = _compute_sigma_stats(d18o_series, sigma_level)
 
                     # Sigma level lines (for Z-Score method)
                     sigma_level_d13c_plus = d13c_mean + sigma_level * d13c_std
@@ -2612,22 +2798,33 @@ def main():
                     iqr_level_d18o_plus = q3_d18o + irq_multiplier * iqr_d18o
                     iqr_level_d18o_minus = q1_d18o - irq_multiplier * iqr_d18o
 
-                    # Define equally spaced x-values for plots
-                    x_values_d13c = range(1, len(shp2l_filtered_data) + 1)
-                    x_values_d18o = range(1, len(shp2l_filtered_data) + 1)
+                    # Define sequence index for plotting (full dataset for alignment)
+                    seq_index = pd.Series(range(1, len(shp2l_filtered_data) + 1), index=shp2l_filtered_data.index)
+                    outlier_mask = (d13c_outliers | d18o_outliers).reindex(shp2l_filtered_data.index).fillna(False)
+                    inlier_mask = ~outlier_mask
+                    inlier_df = shp2l_filtered_data.loc[inlier_mask]
+                    outlier_df = shp2l_filtered_data.loc[outlier_mask]
 
                     # Generate plots based on user choice
                     if calibration_type == "Z-Score":
                         # Plot for Î´13C with Z-Score thresholds
                         fig_d13c = px.scatter(
-                            x=x_values_d13c,
-                            y=shp2l_filtered_data['d 13C/12C  Mean'],
-                            color=shp2l_filtered_data[color_param],  # Add color parameter
+                            x=seq_index.loc[inlier_df.index],
+                            y=inlier_df['d 13C/12C  Mean'],
+                            color=inlier_df[color_param],  # Add color parameter
             title=f'SHP2L d13C Calibration Values (Z-Score Method)',
             labels={'y': 'd13C (‰)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
+                        if not outlier_df.empty:
+                            fig_d13c.add_trace(go.Scatter(
+                                x=seq_index.loc[outlier_df.index],
+                                y=outlier_df['d 13C/12C  Mean'],
+                                mode='markers',
+                                name='Outliers',
+                                marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
+                            ))
                         fig_d13c.add_hline(y=sigma_level_d13c_plus, line_color='green', line_dash='dot',
                                            annotation_text=f'+{sigma_level}Ïƒ')
                         fig_d13c.add_hline(y=sigma_level_d13c_minus, line_color='green', line_dash='dot',
@@ -2637,14 +2834,22 @@ def main():
 
                         # Plot for Î´18O with Z-Score thresholds
                         fig_d18o = px.scatter(
-                            x=x_values_d18o,
-                            y=shp2l_filtered_data['d 18O/16O  Mean'],
-                            color=shp2l_filtered_data[color_param],  # Add color parameter
+                            x=seq_index.loc[inlier_df.index],
+                            y=inlier_df['d 18O/16O  Mean'],
+                            color=inlier_df[color_param],  # Add color parameter
             title=f'SHP2L d18O Calibration Values (Z-Score Method)',
             labels={'y': 'd18O (‰)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
+                        if not outlier_df.empty:
+                            fig_d18o.add_trace(go.Scatter(
+                                x=seq_index.loc[outlier_df.index],
+                                y=outlier_df['d 18O/16O  Mean'],
+                                mode='markers',
+                                name='Outliers',
+                                marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
+                            ))
                         fig_d18o.add_hline(y=sigma_level_d18o_plus, line_color='green', line_dash='dot',
                                            annotation_text=f'+{sigma_level}Ïƒ')
                         fig_d18o.add_hline(y=sigma_level_d18o_minus, line_color='green', line_dash='dot',
@@ -2655,18 +2860,26 @@ def main():
                     elif calibration_type == "IQR":
                         # Plot for Î´13C with IQR thresholds
                         fig_d13c = px.scatter(
-                            x=x_values_d13c,
-                            y=shp2l_filtered_data['d 13C/12C  Mean'],
-                            color=shp2l_filtered_data[color_param],  # Add color parameter
+                            x=seq_index.loc[inlier_df.index],
+                            y=inlier_df['d 13C/12C  Mean'],
+                            color=inlier_df[color_param],  # Add color parameter
             title=f'SHP2L d13C Calibration Values (IQR Method)',
             labels={'y': 'd13C (‰)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
+                        if not outlier_df.empty:
+                            fig_d13c.add_trace(go.Scatter(
+                                x=seq_index.loc[outlier_df.index],
+                                y=outlier_df['d 13C/12C  Mean'],
+                                mode='markers',
+                                name='Outliers',
+                                marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
+                            ))
                         fig_d13c.add_hline(y=iqr_level_d13c_plus, line_color='green', line_dash='dot',
-                                           annotation_text='+1.5 IQR')
+                                           annotation_text=f'+{irq_multiplier:g} IQR')
                         fig_d13c.add_hline(y=iqr_level_d13c_minus, line_color='green', line_dash='dot',
-                                           annotation_text='-1.5 IQR')
+                                           annotation_text=f'-{irq_multiplier:g} IQR')
                         fig_d13c.add_hline(y=q3_d13c, line_color='purple', line_dash='solid',
                                            annotation_text='Q3 (75th Percentile)')
                         fig_d13c.add_hline(y=q1_d13c, line_color='purple', line_dash='solid',
@@ -2674,18 +2887,26 @@ def main():
 
                         # Plot for Î´18O with IQR thresholds
                         fig_d18o = px.scatter(
-                            x=x_values_d18o,
-                            y=shp2l_filtered_data['d 18O/16O  Mean'],
-                            color=shp2l_filtered_data[color_param],  # Add color parameter
+                            x=seq_index.loc[inlier_df.index],
+                            y=inlier_df['d 18O/16O  Mean'],
+                            color=inlier_df[color_param],  # Add color parameter
             title=f'SHP2L d18O Calibration Values (IQR Method)',
             labels={'y': 'd18O (‰)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
+                        if not outlier_df.empty:
+                            fig_d18o.add_trace(go.Scatter(
+                                x=seq_index.loc[outlier_df.index],
+                                y=outlier_df['d 18O/16O  Mean'],
+                                mode='markers',
+                                name='Outliers',
+                                marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
+                            ))
                         fig_d18o.add_hline(y=iqr_level_d18o_plus, line_color='green', line_dash='dot',
-                                           annotation_text='+1.5 IQR')
+                                           annotation_text=f'+{irq_multiplier:g} IQR')
                         fig_d18o.add_hline(y=iqr_level_d18o_minus, line_color='green', line_dash='dot',
-                                           annotation_text='-1.5 IQR')
+                                           annotation_text=f'-{irq_multiplier:g} IQR')
                         fig_d18o.add_hline(y=q3_d18o, line_color='purple', line_dash='solid',
                                            annotation_text='Q3 (75th Percentile)')
                         fig_d18o.add_hline(y=q1_d18o, line_color='purple', line_dash='solid',
