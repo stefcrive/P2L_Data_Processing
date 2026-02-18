@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 import io
 import hashlib
+import json
+from datetime import datetime
+from pathlib import Path
 
 # Enable pandas copy-on-write mode to prevent SettingWithCopyWarning
 pd.options.mode.copy_on_write = True
@@ -38,6 +41,423 @@ st.set_page_config(layout="wide")
 # standards.csv uses the plain VPDB/VSMOW values (no leading delta)
 ISOTYPE_D13C = 'VPDB(13C)'
 ISOTYPE_D18O = 'VSMOW(18O)'
+
+AUTOSAVE_LOG_PATH_KEY = "autosave_log_path"
+AUTOSAVE_SNAPSHOT_PATH_KEY = "autosave_snapshot_path"
+AUTOSAVE_SAVE_DIR_KEY = "autosave_save_dir"
+AUTOSAVE_ERROR_KEY = "autosave_error"
+AUTOSAVE_EVENT_COUNT_KEY = "autosave_event_count"
+AUTOSAVE_INIT_TS_KEY = "autosave_initialized_at"
+AUTOSAVE_DIR_OVERRIDE_KEY = "autosave_dir_override"
+AUTOSAVE_SOURCE_FILES_KEY = "autosave_source_files"
+AUTOSAVE_META_PATH_KEY = "autosave_meta_path"
+AUTOSAVE_RESUMED_KEY = "autosave_resumed"
+AUTOSAVE_SESSION_TOKEN_KEY = "autosave_session_token"
+
+
+def _safe_filename_fragment(value):
+    """Return a filesystem-safe filename fragment."""
+    text = str(value).strip()
+    if text == "":
+        return "session"
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = text.strip("._")
+    return text if text else "session"
+
+
+def _numeric_or_none(value):
+    """Convert numeric-like values to float; return None for NaN/invalid."""
+    num = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]
+    return float(num) if pd.notna(num) else None
+
+
+def _normalize_upload_spec(upload_item):
+    """Normalize uploaded file metadata to {'name','size','md5','raw_name'}."""
+    raw_name = upload_item
+    raw_size = None
+    raw_md5 = None
+    if isinstance(upload_item, dict):
+        raw_name = upload_item.get("name")
+        raw_size = upload_item.get("size")
+        raw_md5 = upload_item.get("md5")
+
+    raw_name_text = "" if raw_name is None else str(raw_name).strip()
+    if raw_name_text == "":
+        return None
+
+    size_val = None
+    try:
+        if raw_size is not None and not pd.isna(raw_size):
+            size_val = int(raw_size)
+            if size_val < 0:
+                size_val = None
+    except Exception:
+        size_val = None
+
+    md5_val = None
+    if raw_md5 is not None:
+        text = str(raw_md5).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{32}", text):
+            md5_val = text
+
+    return {
+        "raw_name": raw_name_text,
+        "name": Path(raw_name_text).name,
+        "size": size_val,
+        "md5": md5_val,
+    }
+
+
+def _iter_autosave_search_roots():
+    """Yield preferred roots to search for uploaded workbooks."""
+    roots = []
+    seen = set()
+
+    def _add(path_obj):
+        if path_obj is None:
+            return
+        try:
+            p = Path(path_obj).resolve()
+        except Exception:
+            return
+        key = str(p).lower()
+        if key in seen or not p.exists() or not p.is_dir():
+            return
+        seen.add(key)
+        roots.append(p)
+
+    home = Path.home()
+    _add(home / "Desktop")
+    _add(home / "Documents")
+    _add(home / "Downloads")
+    _add(home)
+    cwd = Path.cwd()
+    _add(cwd)
+    _add(cwd.parent)
+    return roots
+
+
+def _file_md5(path_obj, chunk_size=1024 * 1024):
+    """Compute MD5 for a local file."""
+    digest = hashlib.md5()
+    with Path(path_obj).open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _find_upload_matches(name, size=None, md5=None, max_matches=40):
+    """Find local files matching uploaded name, preferring size matches."""
+    matches = []
+    for root in _iter_autosave_search_roots():
+        try:
+            for path in root.rglob(name):
+                if not path.is_file():
+                    continue
+                if size is not None:
+                    try:
+                        if int(path.stat().st_size) != int(size):
+                            continue
+                    except Exception:
+                        continue
+                if md5:
+                    try:
+                        if _file_md5(path).lower() != str(md5).lower():
+                            continue
+                    except Exception:
+                        continue
+                matches.append(path.resolve())
+                if len(matches) >= max_matches:
+                    return matches
+        except Exception:
+            continue
+    return matches
+
+
+def _candidate_upload_directories(upload_item):
+    """Best-effort local folder detection for an uploaded workbook."""
+    spec = _normalize_upload_spec(upload_item)
+    if spec is None:
+        return []
+
+    raw_name = spec["raw_name"]
+    name = spec["name"]
+    size = spec["size"]
+    md5 = spec.get("md5")
+
+    dirs = []
+    seen = set()
+
+    def _add_dir(path_obj):
+        if path_obj is None:
+            return
+        try:
+            p = Path(path_obj).resolve()
+        except Exception:
+            return
+        key = str(p).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        dirs.append(p)
+
+    raw_path = Path(raw_name)
+    if raw_path.is_absolute() and raw_path.exists() and raw_path.is_file():
+        _add_dir(raw_path.parent)
+
+    matches = _find_upload_matches(name, size=size, md5=md5)
+    if not matches and size is not None:
+        matches = _find_upload_matches(name, size=None, md5=md5)
+    if not matches and md5:
+        matches = _find_upload_matches(name, size=size, md5=None)
+    for m in matches:
+        _add_dir(m.parent)
+    return dirs
+
+
+def _resolve_autosave_directory(upload_files):
+    """Resolve autosave folder, preferring detected Excel directory."""
+    override_raw = st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY)
+    if override_raw is not None and str(override_raw).strip() != "":
+        override_path = Path(str(override_raw).strip()).expanduser()
+        if not override_path.is_absolute():
+            override_path = (Path.cwd() / override_path).resolve()
+        return override_path
+
+    dirs = []
+    for upload_item in upload_files:
+        dirs.extend(_candidate_upload_directories(upload_item))
+    if not dirs:
+        return Path.cwd().resolve()
+
+    counts = {}
+    for folder in dirs:
+        key = str(folder)
+        counts[key] = counts.get(key, 0) + 1
+    cwd_key = str(Path.cwd().resolve()).lower()
+    best = max(
+        counts.items(),
+        key=lambda item: (item[1], 0 if str(item[0]).lower() == cwd_key else 1),
+    )[0]
+    return Path(best)
+
+
+def _build_autosave_session_token(upload_specs):
+    """Build a stable token from uploaded file names and sizes."""
+    if not upload_specs:
+        return "nofiles"
+    parts = []
+    for spec in sorted(upload_specs, key=lambda s: str(s.get("name", "")).lower()):
+        name = str(spec.get("name", "")).strip().lower()
+        size = spec.get("size")
+        size_text = "na" if size is None else str(int(size))
+        md5_text = spec.get("md5") or "nomd5"
+        parts.append(f"{name}:{size_text}:{md5_text}")
+    payload = "|".join(parts)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]
+
+
+def _summarize_autosave_log(log_path):
+    """Return (event_count, edited_rows_from_last_event) for a JSONL log."""
+    event_count = 0
+    last_payload = None
+    try:
+        with Path(log_path).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line == "":
+                    continue
+                event_count += 1
+                try:
+                    last_payload = json.loads(line)
+                except Exception:
+                    continue
+    except Exception:
+        return 0, set()
+
+    edited_rows = set()
+    if isinstance(last_payload, dict):
+        rows = last_payload.get("edited_rows", [])
+        if isinstance(rows, (list, tuple, set)):
+            edited_rows = {str(r) for r in rows if str(r).strip() != ""}
+    return event_count, edited_rows
+
+
+def _write_autosave_metadata():
+    """Persist autosave session metadata."""
+    meta_path_raw = st.session_state.get(AUTOSAVE_META_PATH_KEY)
+    if not meta_path_raw:
+        return False
+    meta_path = Path(meta_path_raw)
+    payload = {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "save_dir": st.session_state.get(AUTOSAVE_SAVE_DIR_KEY),
+        "log_path": st.session_state.get(AUTOSAVE_LOG_PATH_KEY),
+        "snapshot_path": st.session_state.get(AUTOSAVE_SNAPSHOT_PATH_KEY),
+        "session_token": st.session_state.get(AUTOSAVE_SESSION_TOKEN_KEY),
+        "source_files": st.session_state.get(AUTOSAVE_SOURCE_FILES_KEY, []),
+        "event_count": int(st.session_state.get(AUTOSAVE_EVENT_COUNT_KEY, 0)),
+        "resumed": bool(st.session_state.get(AUTOSAVE_RESUMED_KEY, False)),
+    }
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return True
+
+
+def _reset_autosave_state():
+    """Clear autosave-related session-state keys."""
+    for key in [
+        AUTOSAVE_LOG_PATH_KEY,
+        AUTOSAVE_SNAPSHOT_PATH_KEY,
+        AUTOSAVE_SAVE_DIR_KEY,
+        AUTOSAVE_ERROR_KEY,
+        AUTOSAVE_EVENT_COUNT_KEY,
+        AUTOSAVE_INIT_TS_KEY,
+        AUTOSAVE_SOURCE_FILES_KEY,
+        AUTOSAVE_META_PATH_KEY,
+        AUTOSAVE_RESUMED_KEY,
+        AUTOSAVE_SESSION_TOKEN_KEY,
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _initialize_autosave_session(upload_files, base_df=None):
+    """Create or resume autosave files for the current workbook session."""
+    try:
+        normalized = []
+        for item in (upload_files or []):
+            spec = _normalize_upload_spec(item)
+            if spec is not None:
+                normalized.append(spec)
+
+        names = [spec["name"] for spec in normalized]
+        st.session_state[AUTOSAVE_SOURCE_FILES_KEY] = names
+        save_dir = _resolve_autosave_directory(normalized)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        session_token = _build_autosave_session_token(normalized)
+
+        if len(names) == 1:
+            base_name = _safe_filename_fragment(Path(names[0]).stem)
+        elif len(names) > 1:
+            ordered_names = sorted(names, key=lambda v: str(v).lower())
+            base_name = f"{_safe_filename_fragment(Path(ordered_names[0]).stem)}_plus_{len(names)-1}"
+        else:
+            base_name = "irms_data"
+        base_name = (base_name[:64] if len(base_name) > 64 else base_name) + f"_{session_token}"
+
+        log_path = save_dir / f"{base_name}_session_edits.jsonl"
+        snapshot_path = save_dir / f"{base_name}_session_snapshot.csv"
+        meta_path = save_dir / f"{base_name}_session_meta.json"
+
+        resumed_df = None
+        resumed = False
+        if snapshot_path.exists():
+            try:
+                if snapshot_path.stat().st_size > 0:
+                    resumed_df = pd.read_csv(snapshot_path, low_memory=False)
+                    resumed = True
+            except Exception:
+                resumed_df = None
+                resumed = False
+
+        # Ensure files exist so users can verify autosave location.
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not log_path.exists():
+            log_path.write_text("", encoding="utf-8")
+
+        if resumed_df is None:
+            if base_df is not None:
+                base_df.to_csv(snapshot_path, index=False)
+            elif not snapshot_path.exists():
+                snapshot_path.write_text("", encoding="utf-8")
+        elif not snapshot_path.exists():
+            snapshot_path.write_text("", encoding="utf-8")
+
+        event_count, edited_rows = _summarize_autosave_log(log_path)
+
+        st.session_state[AUTOSAVE_LOG_PATH_KEY] = str(log_path)
+        st.session_state[AUTOSAVE_SNAPSHOT_PATH_KEY] = str(snapshot_path)
+        st.session_state[AUTOSAVE_META_PATH_KEY] = str(meta_path)
+        st.session_state[AUTOSAVE_SAVE_DIR_KEY] = str(save_dir)
+        st.session_state[AUTOSAVE_ERROR_KEY] = None
+        st.session_state[AUTOSAVE_EVENT_COUNT_KEY] = int(event_count)
+        st.session_state[AUTOSAVE_INIT_TS_KEY] = datetime.now().isoformat(timespec='seconds')
+        st.session_state[AUTOSAVE_RESUMED_KEY] = bool(resumed)
+        st.session_state[AUTOSAVE_SESSION_TOKEN_KEY] = session_token
+        _write_autosave_metadata()
+        return {
+            "ok": True,
+            "resumed": bool(resumed),
+            "resumed_df": resumed_df,
+            "edited_rows": edited_rows,
+        }
+    except Exception as exc:
+        st.session_state[AUTOSAVE_LOG_PATH_KEY] = None
+        st.session_state[AUTOSAVE_SNAPSHOT_PATH_KEY] = None
+        st.session_state[AUTOSAVE_META_PATH_KEY] = None
+        st.session_state[AUTOSAVE_SAVE_DIR_KEY] = None
+        st.session_state[AUTOSAVE_RESUMED_KEY] = False
+        st.session_state[AUTOSAVE_SESSION_TOKEN_KEY] = None
+        st.session_state[AUTOSAVE_ERROR_KEY] = f"Autosave initialization failed: {exc}"
+        return {
+            "ok": False,
+            "resumed": False,
+            "resumed_df": None,
+            "edited_rows": set(),
+        }
+
+
+def _append_autosave_event(action, changes=None, context=None):
+    """Append a single JSONL event to the autosave log."""
+    log_path_raw = st.session_state.get(AUTOSAVE_LOG_PATH_KEY)
+    if not log_path_raw:
+        return False
+
+    payload = {
+        "timestamp": datetime.now().isoformat(timespec='seconds'),
+        "action": str(action),
+        "changes": changes or [],
+        "context": context or {},
+        "edited_rows": sorted(_get_edited_row_tokens()),
+        "row_count": int(len(st.session_state.df)) if st.session_state.get('df') is not None else 0,
+    }
+    log_path = Path(log_path_raw)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, default=str) + "\n")
+    st.session_state[AUTOSAVE_EVENT_COUNT_KEY] = int(st.session_state.get(AUTOSAVE_EVENT_COUNT_KEY, 0)) + 1
+    return True
+
+
+def _write_autosave_snapshot():
+    """Write the full current dataframe snapshot to CSV."""
+    snapshot_path_raw = st.session_state.get(AUTOSAVE_SNAPSHOT_PATH_KEY)
+    df = st.session_state.get('df')
+    if not snapshot_path_raw or df is None:
+        return False
+
+    snapshot_path = Path(snapshot_path_raw)
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(snapshot_path, index=False)
+    return True
+
+
+def _autosave_session_update(action, changes=None, context=None):
+    """Persist an autosave event and refreshed dataframe snapshot."""
+    try:
+        logged = _append_autosave_event(action, changes=changes, context=context)
+        snapshotted = _write_autosave_snapshot()
+        if not logged and not snapshotted:
+            return False
+        _write_autosave_metadata()
+        st.session_state[AUTOSAVE_ERROR_KEY] = None
+        return True
+    except Exception as exc:
+        st.session_state[AUTOSAVE_ERROR_KEY] = str(exc)
+        return False
 
 # Helper: build readable date ticks for colorbars when coloring by date ordinals
 def _build_date_colorbar_ticks(values, n=6, date_format='%Y-%m-%d'):
@@ -131,7 +551,67 @@ def _get_selected_plotly_points(chart_state):
         points = selection.get('points', []) or []
     else:
         points = getattr(selection, 'points', None) or []
-    return [p for p in points if isinstance(p, dict)]
+    return [p for p in points if p is not None]
+
+
+def _event_point_get(point, key, default=None):
+    """Read a key from Plotly event point objects or plain dictionaries."""
+    if isinstance(point, dict):
+        return point.get(key, default)
+    value = getattr(point, key, None)
+    if value is not None:
+        return value
+    try:
+        return point.get(key, default)
+    except Exception:
+        return default
+
+
+def _token_from_customdata_payload(customdata):
+    """Convert trace customdata payload to a canonical editor token."""
+    if hasattr(customdata, 'tolist'):
+        customdata = customdata.tolist()
+    if not isinstance(customdata, (list, tuple, np.ndarray)) or len(customdata) < 2:
+        return None
+    isotope_key = str(customdata[1]).strip()
+    raw_row_label = customdata[0]
+    row_label = None
+    try:
+        if st.session_state.df is not None:
+            row_label = _resolve_index_label(st.session_state.df.index, raw_row_label)
+    except Exception:
+        row_label = None
+    row_key = str(row_label) if row_label is not None else str(raw_row_label)
+    if isotope_key == '' or row_key == '':
+        return None
+    return f"{isotope_key}|{row_key}"
+
+
+def _apply_editor_selection_to_figure(fig, editor_key_prefix):
+    """Re-apply persisted point selection so multi-select can continue across reruns."""
+    tokens_raw = st.session_state.get(f"{editor_key_prefix}_selected_tokens", [])
+    if isinstance(tokens_raw, str):
+        token_set = {tokens_raw}
+    elif isinstance(tokens_raw, (list, tuple, set)):
+        token_set = {str(t) for t in tokens_raw if str(t).strip() != ''}
+    else:
+        token_set = set()
+    if not token_set:
+        return
+
+    for trace in getattr(fig, 'data', []):
+        customdata = getattr(trace, 'customdata', None)
+        if customdata is None:
+            continue
+        selected_idx = []
+        try:
+            for i, payload in enumerate(customdata):
+                token = _token_from_customdata_payload(payload)
+                if token in token_set:
+                    selected_idx.append(i)
+        except Exception:
+            continue
+        trace.selectedpoints = selected_idx if selected_idx else None
 
 
 def _resolve_index_label(index_obj, raw_value):
@@ -728,6 +1208,7 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
 
     chart_nonce_key = f"{editor_key_prefix}_chart_nonce"
     nav_token_key = f"{editor_key_prefix}_nav_token"
+    selected_tokens_key = f"{editor_key_prefix}_selected_tokens"
 
     def _build_target(isotope_key, row_label, identifier_1=None, identifier_2=None):
         target_col = col_map.get(str(isotope_key).strip())
@@ -783,6 +1264,24 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
         if row_label is None:
             return None
         return _build_target(isotope_key, row_label)
+
+    def _restore_targets_from_tokens(tokens):
+        restored = []
+        seen = set()
+        if isinstance(tokens, str):
+            tokens = [tokens]
+        if not isinstance(tokens, (list, tuple, set)):
+            return restored
+        for token in tokens:
+            built = _target_from_token(token)
+            if built is None:
+                continue
+            token_val = _token_for_target(built)
+            if token_val in seen:
+                continue
+            seen.add(token_val)
+            restored.append(built)
+        return restored
 
     def _build_navigation_targets(active_target):
         target_col = active_target['target_col']
@@ -954,8 +1453,12 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
     points = _get_selected_plotly_points(chart_state)
     selected_targets = []
     seen_targets = set()
+    persisted_targets = _restore_targets_from_tokens(st.session_state.get(selected_tokens_key, []))
+    persisted_tokens = {_token_for_target(t) for t in persisted_targets}
     for point in points:
-        customdata = point.get('customdata')
+        customdata = _event_point_get(point, 'customdata')
+        if hasattr(customdata, 'tolist'):
+            customdata = customdata.tolist()
         if not isinstance(customdata, (list, tuple, np.ndarray)) or len(customdata) < 4:
             continue
         raw_row_label = customdata[0]
@@ -974,12 +1477,32 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
         seen_targets.add(target_token)
         selected_targets.append(built)
 
+    if selected_targets:
+        # In Streamlit rerun flow, shift+click can arrive as only the newest point.
+        # Merge with previous persisted selection so additive multi-select remains usable.
+        if len(selected_targets) == 1 and persisted_targets:
+            merged = persisted_targets[:]
+            merged_tokens = set(persisted_tokens)
+            for t in selected_targets:
+                tok = _token_for_target(t)
+                if tok not in merged_tokens:
+                    merged.append(t)
+                    merged_tokens.add(tok)
+            selected_targets = merged
+        st.session_state[selected_tokens_key] = [_token_for_target(t) for t in selected_targets]
+
     if len(selected_targets) == 1:
         st.session_state[nav_token_key] = _token_for_target(selected_targets[0])
     elif len(selected_targets) == 0:
-        nav_target = _target_from_token(st.session_state.get(nav_token_key))
-        if nav_target is not None:
-            selected_targets = [nav_target]
+        restored_targets = persisted_targets
+        if restored_targets:
+            selected_targets = restored_targets
+        else:
+            nav_target = _target_from_token(st.session_state.get(nav_token_key))
+            if nav_target is not None:
+                selected_targets = [nav_target]
+            else:
+                st.session_state.pop(selected_tokens_key, None)
 
     if not selected_targets:
         st.markdown("Select a primary data marker to edit its delta value or apply an offset.")
@@ -999,6 +1522,7 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             nav_index = 0
             selected_targets = [nav_targets[0]]
             st.session_state[nav_token_key] = _token_for_target(nav_targets[0])
+            st.session_state[selected_tokens_key] = [st.session_state[nav_token_key]]
 
     selection_signature = '|'.join(sorted([f"{t['isotope_key']}:{t['row_key']}" for t in selected_targets]))
     selection_hash = hashlib.md5(selection_signature.encode('utf-8')).hexdigest()[:10]
@@ -1015,23 +1539,26 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
         if st.button("Prev <", key=f"{editor_key_prefix}_prev", help="Previous datapoint", disabled=prev_disabled, use_container_width=True):
             prev_target = nav_targets[nav_index - 1]
             st.session_state[nav_token_key] = _token_for_target(prev_target)
+            st.session_state[selected_tokens_key] = [st.session_state[nav_token_key]]
             st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
             st.rerun()
     with next_col:
         if st.button("Next >", key=f"{editor_key_prefix}_next", help="Next datapoint", disabled=next_disabled, use_container_width=True):
             next_target = nav_targets[nav_index + 1]
             st.session_state[nav_token_key] = _token_for_target(next_target)
+            st.session_state[selected_tokens_key] = [st.session_state[nav_token_key]]
             st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
             st.rerun()
     with close_col:
         if st.button("X", key=f"{editor_key_prefix}_close", help="Exit edit mode", type="secondary"):
             st.session_state.pop(nav_token_key, None)
+            st.session_state.pop(selected_tokens_key, None)
             st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
             st.rerun()
 
     submitted_offset = False
     submitted_interpolate = False
-    interpolated_value = None
+    interpolation_plan = []
     if single_mode:
         target = selected_targets[0]
         is_failed_sample = bool(target.get('is_failed_sample', False))
@@ -1083,7 +1610,12 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 use_container_width=True,
             )
         if submitted_interpolate and prev_neighbor is not None and next_neighbor is not None:
-            interpolated_value = (prev_neighbor['value'] + next_neighbor['value']) / 2.0
+            interpolation_plan = [
+                {
+                    "target": target,
+                    "value": (prev_neighbor['value'] + next_neighbor['value']) / 2.0,
+                }
+            ]
         if not is_failed_sample:
             _render_selected_point_cycle_diagnostics(target, editor_key_prefix)
 
@@ -1096,6 +1628,9 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
                 errors='coerce'
             ).iloc[0]
+            prev_status = None
+            if 'Collector Status' in st.session_state.df.columns:
+                prev_status = st.session_state.df.at[target['row_label'], 'Collector Status']
             _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
             prev_cal = np.nan
             if cal_col in st.session_state.df.columns:
@@ -1111,6 +1646,32 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 previous_raw=prev_raw,
                 previous_calibrated=prev_cal
             )
+            new_cal = np.nan
+            if cal_col in st.session_state.df.columns:
+                new_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+            new_status = None
+            if 'Collector Status' in st.session_state.df.columns:
+                new_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+            _autosave_session_update(
+                "set_delta_value",
+                changes=[
+                    {
+                        "isotope": target['isotope_key'],
+                        "row_label": str(target['row_label']),
+                        "column": target['target_col'],
+                        "identifier_1": target['identifier_1'],
+                        "identifier_2": target['identifier_2'],
+                        "excel_file": target['source_excel'],
+                        "previous_value": _numeric_or_none(prev_raw),
+                        "new_value": _numeric_or_none(new_value),
+                        "previous_calibrated": _numeric_or_none(prev_cal),
+                        "new_calibrated": _numeric_or_none(new_cal),
+                        "previous_status": None if pd.isna(prev_status) else str(prev_status),
+                        "new_status": None if pd.isna(new_status) else str(new_status),
+                    }
+                ],
+                context={"editor": editor_key_prefix},
+            )
             st.success(
                 f"Updated {target['isotope_key']} to {float(new_value):.4f} for "
                 f"{target['identifier_1']} / {target['identifier_2']}."
@@ -1122,28 +1683,56 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             f"{len(selected_targets)} datapoints selected ({', '.join(isotopes)}). "
             "Single-point absolute value edit is hidden for multi-select."
         )
-        with st.form(key=f"{editor_key_prefix}_offset_form_{selection_hash}"):
-            offset_value = st.number_input(
-                "Offset to add",
-                value=0.0,
-                step=1.0,
-                format="%.4f",
-                key=f"{editor_key_prefix}_offset_input_{selection_hash}",
+        multi_cols = st.columns(2, gap="medium")
+        with multi_cols[0]:
+            with st.form(key=f"{editor_key_prefix}_offset_form_{selection_hash}"):
+                offset_value = st.number_input(
+                    "Offset to add",
+                    value=0.0,
+                    step=1.0,
+                    format="%.4f",
+                    key=f"{editor_key_prefix}_offset_input_{selection_hash}",
+                )
+                submitted_offset = st.form_submit_button(
+                    f"Apply Offset to {len(selected_targets)} point{'s' if len(selected_targets) != 1 else ''}"
+                )
+        eligible_count = 0
+        for target in selected_targets:
+            prev_neighbor, next_neighbor = _find_interpolation_neighbors(target)
+            if prev_neighbor is None or next_neighbor is None:
+                continue
+            interpolation_plan.append(
+                {
+                    "target": target,
+                    "value": (prev_neighbor['value'] + next_neighbor['value']) / 2.0,
+                }
             )
-            submitted_offset = st.form_submit_button(
-                f"Apply Offset to {len(selected_targets)} point{'s' if len(selected_targets) != 1 else ''}"
+            eligible_count += 1
+        with multi_cols[1]:
+            st.caption(
+                f"Interpolate available for {eligible_count}/{len(selected_targets)} selected points."
+            )
+            submitted_interpolate = st.button(
+                f"Interpolate {eligible_count} point{'s' if eligible_count != 1 else ''}",
+                key=f"{editor_key_prefix}_interpolate_multi_{selection_hash}",
+                disabled=(eligible_count == 0),
+                use_container_width=True,
             )
 
     if submitted_offset:
         offset_value = float(offset_value)
         original_map = st.session_state.setdefault('original_delta_values', {})
         edited_rows = _get_edited_row_tokens()
+        autosave_changes = []
         for target in selected_targets:
             current_value = pd.to_numeric(
                 pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
                 errors='coerce'
             ).iloc[0]
             current_value = float(current_value) if pd.notna(current_value) else 0.0
+            prev_status = None
+            if 'Collector Status' in st.session_state.df.columns:
+                prev_status = st.session_state.df.at[target['row_label'], 'Collector Status']
             original_key = f"{target['isotope_key']}|{target['row_key']}"
             if original_key not in original_map:
                 original_map[original_key] = float(current_value)
@@ -1151,7 +1740,8 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             prev_cal = np.nan
             if cal_col in st.session_state.df.columns:
                 prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
-            st.session_state.df.at[target['row_label'], target['target_col']] = current_value + offset_value
+            new_value = current_value + offset_value
+            st.session_state.df.at[target['row_label'], target['target_col']] = new_value
             _refresh_collector_status_after_delta_edit(target['row_label'])
             _refresh_calibrated_after_delta_edit(
                 target['row_label'],
@@ -1159,48 +1749,115 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 previous_raw=current_value,
                 previous_calibrated=prev_cal
             )
+            new_cal = np.nan
+            if cal_col in st.session_state.df.columns:
+                new_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+            new_status = None
+            if 'Collector Status' in st.session_state.df.columns:
+                new_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+            autosave_changes.append(
+                {
+                    "isotope": target['isotope_key'],
+                    "row_label": str(target['row_label']),
+                    "column": target['target_col'],
+                    "identifier_1": target.get('identifier_1'),
+                    "identifier_2": target.get('identifier_2'),
+                    "excel_file": target.get('source_excel'),
+                    "previous_value": _numeric_or_none(current_value),
+                    "new_value": _numeric_or_none(new_value),
+                    "offset_applied": _numeric_or_none(offset_value),
+                    "previous_calibrated": _numeric_or_none(prev_cal),
+                    "new_calibrated": _numeric_or_none(new_cal),
+                    "previous_status": None if pd.isna(prev_status) else str(prev_status),
+                    "new_status": None if pd.isna(new_status) else str(new_status),
+                }
+            )
             edited_rows.add(target['row_key'])
         st.session_state['edited_delta_rows'] = edited_rows
+        _autosave_session_update(
+            "offset_delta_values",
+            changes=autosave_changes,
+            context={
+                "offset": _numeric_or_none(offset_value),
+                "count": len(selected_targets),
+                "editor": editor_key_prefix,
+            },
+        )
         st.success(
             f"Applied offset {offset_value:+.4f} to {len(selected_targets)} "
             f"datapoint{'s' if len(selected_targets) != 1 else ''}."
         )
         st.rerun()
 
-    if submitted_interpolate and single_mode and interpolated_value is not None:
-        target = selected_targets[0]
-        prev_raw = pd.to_numeric(
-            pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
-            errors='coerce'
-        ).iloc[0]
-        _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
-        prev_cal = np.nan
-        if cal_col in st.session_state.df.columns:
-            prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+    if submitted_interpolate and interpolation_plan:
         original_map = st.session_state.setdefault('original_delta_values', {})
-        original_key = f"{target['isotope_key']}|{target['row_key']}"
-        if original_key not in original_map:
-            previous_value = pd.to_numeric(
+        edited_rows = _get_edited_row_tokens()
+        autosave_changes = []
+        for plan_item in interpolation_plan:
+            target = plan_item["target"]
+            interpolated_value = float(plan_item["value"])
+            prev_raw = pd.to_numeric(
                 pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
                 errors='coerce'
             ).iloc[0]
-            if pd.notna(previous_value):
-                original_map[original_key] = float(previous_value)
-        edited_rows = _get_edited_row_tokens()
-        edited_rows.add(target['row_key'])
+            prev_status = None
+            if 'Collector Status' in st.session_state.df.columns:
+                prev_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+            _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
+            prev_cal = np.nan
+            if cal_col in st.session_state.df.columns:
+                prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+            original_key = f"{target['isotope_key']}|{target['row_key']}"
+            if original_key not in original_map and pd.notna(prev_raw):
+                original_map[original_key] = float(prev_raw)
+            edited_rows.add(target['row_key'])
+            st.session_state.df.at[target['row_label'], target['target_col']] = interpolated_value
+            _refresh_collector_status_after_delta_edit(target['row_label'])
+            _refresh_calibrated_after_delta_edit(
+                target['row_label'],
+                target['isotope_key'],
+                previous_raw=prev_raw,
+                previous_calibrated=prev_cal
+            )
+            new_cal = np.nan
+            if cal_col in st.session_state.df.columns:
+                new_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+            new_status = None
+            if 'Collector Status' in st.session_state.df.columns:
+                new_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+            autosave_changes.append(
+                {
+                    "isotope": target['isotope_key'],
+                    "row_label": str(target['row_label']),
+                    "column": target['target_col'],
+                    "identifier_1": target['identifier_1'],
+                    "identifier_2": target['identifier_2'],
+                    "excel_file": target['source_excel'],
+                    "previous_value": _numeric_or_none(prev_raw),
+                    "new_value": _numeric_or_none(interpolated_value),
+                    "previous_calibrated": _numeric_or_none(prev_cal),
+                    "new_calibrated": _numeric_or_none(new_cal),
+                    "previous_status": None if pd.isna(prev_status) else str(prev_status),
+                    "new_status": None if pd.isna(new_status) else str(new_status),
+                }
+            )
         st.session_state['edited_delta_rows'] = edited_rows
-        st.session_state.df.at[target['row_label'], target['target_col']] = float(interpolated_value)
-        _refresh_collector_status_after_delta_edit(target['row_label'])
-        _refresh_calibrated_after_delta_edit(
-            target['row_label'],
-            target['isotope_key'],
-            previous_raw=prev_raw,
-            previous_calibrated=prev_cal
+        _autosave_session_update(
+            "interpolate_delta_value" if len(autosave_changes) == 1 else "interpolate_delta_values",
+            changes=autosave_changes,
+            context={"editor": editor_key_prefix, "count": len(autosave_changes)},
         )
-        st.success(
-            f"Interpolated {target['isotope_key']} to {float(interpolated_value):.4f} for "
-            f"{target['identifier_1']} / {target['identifier_2']}."
-        )
+        if len(autosave_changes) == 1:
+            target = interpolation_plan[0]["target"]
+            value = float(interpolation_plan[0]["value"])
+            st.success(
+                f"Interpolated {target['isotope_key']} to {value:.4f} for "
+                f"{target['identifier_1']} / {target['identifier_2']}."
+            )
+        else:
+            st.success(
+                f"Interpolated {len(autosave_changes)} datapoints."
+            )
         st.rerun()
 
 # Initialize session state variables if they don't exist
@@ -1222,6 +1879,28 @@ if 'selected_ids' not in st.session_state:
     st.session_state.selected_ids = ["All"]
 if 'interpolate_outliers_export' not in st.session_state:
     st.session_state.interpolate_outliers_export = False
+if AUTOSAVE_LOG_PATH_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_LOG_PATH_KEY] = None
+if AUTOSAVE_SNAPSHOT_PATH_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_SNAPSHOT_PATH_KEY] = None
+if AUTOSAVE_SAVE_DIR_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_SAVE_DIR_KEY] = None
+if AUTOSAVE_ERROR_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_ERROR_KEY] = None
+if AUTOSAVE_EVENT_COUNT_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_EVENT_COUNT_KEY] = 0
+if AUTOSAVE_INIT_TS_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_INIT_TS_KEY] = None
+if AUTOSAVE_DIR_OVERRIDE_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_DIR_OVERRIDE_KEY] = ""
+if AUTOSAVE_SOURCE_FILES_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_SOURCE_FILES_KEY] = []
+if AUTOSAVE_META_PATH_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_META_PATH_KEY] = None
+if AUTOSAVE_RESUMED_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_RESUMED_KEY] = False
+if AUTOSAVE_SESSION_TOKEN_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_SESSION_TOKEN_KEY] = None
 
 # Initialize range variables in session state with safe defaults
 if 'signal_range' not in st.session_state:
@@ -3615,6 +4294,28 @@ def main():
         st.session_state.file_processed = False
     if 'confirm_reset' not in st.session_state:
         st.session_state.confirm_reset = False
+    if AUTOSAVE_LOG_PATH_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_LOG_PATH_KEY] = None
+    if AUTOSAVE_SNAPSHOT_PATH_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_SNAPSHOT_PATH_KEY] = None
+    if AUTOSAVE_SAVE_DIR_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_SAVE_DIR_KEY] = None
+    if AUTOSAVE_ERROR_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_ERROR_KEY] = None
+    if AUTOSAVE_EVENT_COUNT_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_EVENT_COUNT_KEY] = 0
+    if AUTOSAVE_INIT_TS_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_INIT_TS_KEY] = None
+    if AUTOSAVE_DIR_OVERRIDE_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_DIR_OVERRIDE_KEY] = ""
+    if AUTOSAVE_SOURCE_FILES_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_SOURCE_FILES_KEY] = []
+    if AUTOSAVE_META_PATH_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_META_PATH_KEY] = None
+    if AUTOSAVE_RESUMED_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_RESUMED_KEY] = False
+    if AUTOSAVE_SESSION_TOKEN_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_SESSION_TOKEN_KEY] = None
 
     tab_import, tab1, tab2, tab3 = st.tabs([
         'Data import',
@@ -3626,6 +4327,16 @@ def main():
     has_data = False
 
     with tab_import:
+        autosave_dir_override = st.text_input(
+            "Session autosave folder (optional)",
+            value=st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY, ""),
+            help=(
+                "Leave blank to auto-detect from uploaded filenames (fallback: current app folder). "
+                "Set this path to force autosave into a specific Excel folder."
+            ),
+        )
+        st.session_state[AUTOSAVE_DIR_OVERRIDE_KEY] = str(autosave_dir_override).strip()
+
         # File uploader
         uploaded_files = st.file_uploader(
             "Choose XLS files",
@@ -3649,6 +4360,7 @@ def main():
                 st.session_state.edited_delta_rows = set()
                 st.session_state.original_delta_values = {}
                 st.session_state.calibration_coefficients = {}
+                _reset_autosave_state()
                 st.session_state.confirm_reset = False  # Reset confirmation state
             elif col2.button("Cancel", key="cancel_load_btn"):
                 st.session_state.confirm_reset = False  # Cancel reset and close prompt
@@ -3658,6 +4370,7 @@ def main():
             try:
                 dfs = []
                 dfs_cycles_source = []
+                loaded_file_specs = []
                 for uploaded_file in uploaded_files:
                     try:
                         # First try with openpyxl engine (check for multi-row headers)
@@ -3791,6 +4504,18 @@ def main():
                             df[col] = None
 
                     dfs.append(df)
+                    file_size = getattr(uploaded_file, "size", None)
+                    try:
+                        file_size = int(file_size) if file_size is not None else None
+                    except Exception:
+                        file_size = None
+                    file_md5 = None
+                    try:
+                        if hasattr(uploaded_file, "getvalue"):
+                            file_md5 = hashlib.md5(uploaded_file.getvalue()).hexdigest().lower()
+                    except Exception:
+                        file_md5 = None
+                    loaded_file_specs.append({"name": uploaded_file.name, "size": file_size, "md5": file_md5})
 
                 if not dfs:
                     return
@@ -3802,13 +4527,30 @@ def main():
                     (dfs_cycles_source[0] if dfs_cycles_source else None)
                 )
 
+                autosave_state = _initialize_autosave_session(loaded_file_specs, base_df=df)
+                resumed_df = autosave_state.get("resumed_df")
+                active_df = resumed_df if resumed_df is not None else df
+
                 # Save df to session_state
-                st.session_state.df = df
+                st.session_state.df = active_df
                 st.session_state.df_cycles_source = df_cycles_source
-                st.session_state.edited_delta_rows = set()
+                restored_rows = autosave_state.get("edited_rows", set()) if autosave_state.get("resumed") else set()
+                st.session_state.edited_delta_rows = set(restored_rows)
                 st.session_state.original_delta_values = {}
                 st.session_state.calibration_coefficients = {}
                 st.session_state.file_processed = True
+
+                autosave_initialized = bool(autosave_state.get("ok"))
+                if autosave_initialized:
+                    _autosave_session_update(
+                        "session_resumed" if autosave_state.get("resumed") else "session_loaded",
+                        changes=[],
+                        context={
+                            "uploaded_files": [str(s.get("name", "")) for s in loaded_file_specs],
+                            "source_folder": st.session_state.get(AUTOSAVE_SAVE_DIR_KEY),
+                            "resumed": bool(autosave_state.get("resumed")),
+                        },
+                    )
 
             except Exception as e:
                 st.error(f"Error loading file: {e}")
@@ -3817,6 +4559,32 @@ def main():
         if st.session_state.df is None:
             st.warning("Please upload a file to begin analysis.")
         else:
+            autosave_log = st.session_state.get(AUTOSAVE_LOG_PATH_KEY)
+            autosave_snapshot = st.session_state.get(AUTOSAVE_SNAPSHOT_PATH_KEY)
+            autosave_error = st.session_state.get(AUTOSAVE_ERROR_KEY)
+            autosave_events = int(st.session_state.get(AUTOSAVE_EVENT_COUNT_KEY, 0))
+            autosave_resumed = bool(st.session_state.get(AUTOSAVE_RESUMED_KEY, False))
+            if autosave_log:
+                st.caption(f"Session edit log: {autosave_log}")
+            if autosave_snapshot:
+                st.caption(f"Session autosave snapshot: {autosave_snapshot}")
+            st.caption(f"Autosave events written: {autosave_events}")
+            if autosave_resumed:
+                st.caption("Autosave status: resumed existing session snapshot.")
+            if autosave_error:
+                st.warning(f"Session autosave warning: {autosave_error}")
+            if not st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY):
+                st.info(
+                    "Autosave folder is auto-detected from matching workbook files on this computer. "
+                    "If detection picked the wrong folder, set 'Session autosave folder (optional)' above."
+                )
+            if st.button("Save Session Now", key="save_session_now_btn"):
+                wrote = _autosave_session_update("manual_save", changes=[], context={"trigger": "manual_button"})
+                if wrote:
+                    st.success("Session saved to autosave files.")
+                else:
+                    st.warning("Session save did not run. Check autosave warning above.")
+
             # Display data preview if available
             with st.expander("Data Table", expanded=True):
                 # Display the DataFrame using Streamlit's native table component
@@ -4154,6 +4922,14 @@ def main():
                                 clean_stds if clean_stds is not None else st.session_state.df,
                                 selected_standards
                             )
+                            _autosave_session_update(
+                                "calibrate_results",
+                                changes=[],
+                                context={
+                                    "selected_standards": [str(s) for s in selected_standards],
+                                    "calibration_type": str(calibration_type),
+                                },
+                            )
                             st.success("Calibration completed for both isotopic types.")
                         except Exception as e:
                             st.error(f"Calibration failed: {e}")
@@ -4173,6 +4949,14 @@ def main():
                                 st.session_state.df = _apply_linearity_correction(st.session_state.df, intensity_col, fits)
                                 # Store fits for downstream display use
                                 st.session_state.linearity_fits = fits
+                                _autosave_session_update(
+                                    "apply_linearity_correction",
+                                    changes=[],
+                                    context={
+                                        "selected_standards": [str(s) for s in selected_standards],
+                                        "fits": fits,
+                                    },
+                                )
                                 if np.isfinite(fit13.get('slope', np.nan)) or np.isfinite(fit18.get('slope', np.nan)):
                                     st.success(
                                         f"Applied linearity correction. Slopes: d13C={fit13.get('slope', float('nan')):.6f} per V, "
@@ -5936,6 +6720,7 @@ def main():
             clickmode='event+select',
             dragmode='zoom'
         )
+        _apply_editor_selection_to_figure(d13c_summary, d13_summary_editor_prefix)
         d13_summary_nonce = int(st.session_state.get(f"{d13_summary_editor_prefix}_chart_nonce", 0))
         d13c_summary_state = st.plotly_chart(
             d13c_summary,
@@ -6396,6 +7181,7 @@ def main():
         )
         # Invert y-axis so increasing d18O plots downward
         d18o_summary.update_yaxes(autorange='reversed')
+        _apply_editor_selection_to_figure(d18o_summary, d18_summary_editor_prefix)
         d18_summary_nonce = int(st.session_state.get(f"{d18_summary_editor_prefix}_chart_nonce", 0))
         d18o_summary_state = st.plotly_chart(
             d18o_summary,
@@ -6410,6 +7196,7 @@ def main():
         species_scatter = go.Figure()
         scatter_legend_partial_shown = False
         scatter_legend_failed_full_shown = False
+        scatter_legend_statistical_shown = False
         for species in unique_species:
             if species == "Unknown":
                 continue
@@ -6431,6 +7218,7 @@ def main():
             std_d13C = species_data['d 13C/12C  Mean'].std()
             mean_d18O = species_data['d 18O/16O  Mean'].mean()
             std_d18O = species_data['d 18O/16O  Mean'].std()
+            edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
 
             outlier_mask = (
                 (species_data['d 13C/12C  Mean'] < mean_d13C - (sigma_level_data * std_d13C)) |
@@ -6438,6 +7226,7 @@ def main():
                 (species_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
+            outlier_mask = outlier_mask & ~edited_mask_species
 
             range_mask_unfiltered = (
                 (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
@@ -6491,6 +7280,36 @@ def main():
                 ),
                 text=data_to_plot['Identifier 2'].astype(str)
             ))
+
+            # Overlay sigma-based outliers on the species cross-plot.
+            if show_statistical_outliers:
+                stat_outliers_scatter = species_data[outlier_mask].copy()
+                stat_outliers_scatter = stat_outliers_scatter[
+                    stat_outliers_scatter['d 13C/12C  Mean'].notna() & stat_outliers_scatter['d 18O/16O  Mean'].notna()
+                ]
+                if not stat_outliers_scatter.empty:
+                    species_scatter.add_trace(go.Scatter(
+                        x=stat_outliers_scatter['d 18O/16O  Mean'],
+                        y=stat_outliers_scatter['d 13C/12C  Mean'],
+                        mode='markers',
+                        name='Statistical Outliers',
+                        marker=dict(
+                            size=12,
+                            symbol='x',
+                            color='red',
+                            line=dict(width=2, color='red')
+                        ),
+                        showlegend=not scatter_legend_statistical_shown,
+                        legendgroup='outliers',
+                        text=stat_outliers_scatter['Identifier 2'].astype(str),
+                        hovertemplate=(
+                            f'Species: {species}<br>'
+                            'd18O: %{x:.4f}<br>'
+                            'd13C: %{y:.4f}<br>'
+                            'Identifier 2: %{text}<extra></extra>'
+                        )
+                    ))
+                    scatter_legend_statistical_shown = True
 
             # Overlay saturated collectors (valid means)
             if show_saturated_collectors and saturated_collectors_mask.any():
@@ -6553,8 +7372,8 @@ def main():
         # Process individual species
         for species in unique_species:
             # Filter data for this specific species
-            species_data = subset_data[subset_data[species_col] == species]
-            species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
+            species_data = subset_data[subset_data[species_col] == species].copy()
+            species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species].copy()
             if species_data_unfiltered.empty and species_data.empty:
                 continue
 
@@ -6567,6 +7386,13 @@ def main():
             saturated_samples_mask = status_series == 'Fully Saturated Collectors'
             failed_mask = status_series == 'Failed Sample'
             saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
+            failed_idx = species_data_unfiltered[failed_mask].index
+            edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
+            edited_mask_species_unfiltered = pd.Series(
+                species_data_unfiltered.index.map(_is_row_edited),
+                index=species_data_unfiltered.index,
+                dtype=bool
+            )
 
             col1, col2 = st.columns([3, 1])
             with col1:
@@ -6690,8 +7516,12 @@ def main():
                 d18_key_suffix = f"{key_suffix_base}_d18"
                 d13_raw_only_key = f"tab3_d13c_raw_line_only_{d13_key_suffix}"
                 d18_raw_only_key = f"tab3_d18o_raw_line_only_{d18_key_suffix}"
+                d13_hide_cal_key = f"tab3_d13c_hide_calibrated_{d13_key_suffix}"
+                d18_hide_cal_key = f"tab3_d18o_hide_calibrated_{d18_key_suffix}"
                 d13_raw_line_only = bool(st.session_state.get(d13_raw_only_key, False))
                 d18_raw_line_only = bool(st.session_state.get(d18_raw_only_key, False))
+                d13_hide_calibrated = bool(st.session_state.get(d13_hide_cal_key, False))
+                d18_hide_calibrated = bool(st.session_state.get(d18_hide_cal_key, False))
 
                 # Plot d13C data for this identifier and comment
                 # Create figure for d13C
@@ -6961,7 +7791,11 @@ def main():
                         )
                     ))
 
-                if 'd13C_calibrated' in identifier_curve_data.columns:
+                d13_has_calibrated_curve = (
+                    'd13C_calibrated' in identifier_curve_data.columns
+                    and pd.to_numeric(identifier_curve_data['d13C_calibrated'], errors='coerce').notna().any()
+                )
+                if d13_has_calibrated_curve and not d13_hide_calibrated and not d13_raw_line_only:
                     fig_d13C.add_trace(go.Scatter(
                         x=identifier_curve_data['x_axis'],
                         y=identifier_curve_data['d13C_calibrated'],
@@ -7047,6 +7881,7 @@ def main():
                             showlegend=False,
                             legendgroup='active_selection'
                         ))
+                _apply_editor_selection_to_figure(fig_d13C, d13_editor_prefix)
                 d13_chart_nonce = int(st.session_state.get(f"{d13_editor_prefix}_chart_nonce", 0))
                 d13_chart_col, d13_btn_col = st.columns([12, 1], gap="small")
                 with d13_btn_col:
@@ -7054,6 +7889,11 @@ def main():
                     if st.button(d13_btn_label, key=f"{d13_raw_only_key}_btn", use_container_width=True):
                         st.session_state[d13_raw_only_key] = not d13_raw_line_only
                         st.rerun()
+                    if d13_has_calibrated_curve:
+                        d13_cal_btn_label = "Show calibrated curve" if d13_hide_calibrated else "Hide calibrated curve"
+                        if st.button(d13_cal_btn_label, key=f"{d13_hide_cal_key}_btn", use_container_width=True):
+                            st.session_state[d13_hide_cal_key] = not d13_hide_calibrated
+                            st.rerun()
                 with d13_chart_col:
                     d13_chart_state = st.plotly_chart(
                         fig_d13C,
@@ -7164,14 +8004,19 @@ def main():
                         )
                     ))
     
-                    if 'd18O_calibrated' in identifier_curve_data.columns:
-                        fig_d18O.add_trace(go.Scatter(
-                            x=identifier_curve_data['x_axis'],
-                            y=identifier_curve_data['d18O_calibrated'],
-                            mode='lines',
-                            line=dict(color='orange', width=2),
-                            name=f'Calibrated d18O - {identifier}'
-                        ))
+                    d18_has_calibrated_curve_identifier = (
+                        'd18O_calibrated' in identifier_curve_data.columns
+                        and pd.to_numeric(identifier_curve_data['d18O_calibrated'], errors='coerce').notna().any()
+                    )
+                    if d18_has_calibrated_curve_identifier:
+                        if not d18_hide_calibrated and not d18_raw_line_only:
+                            fig_d18O.add_trace(go.Scatter(
+                                x=identifier_curve_data['x_axis'],
+                                y=identifier_curve_data['d18O_calibrated'],
+                                mode='lines',
+                                line=dict(color='orange', width=2),
+                                name=f'Calibrated d18O - {identifier}'
+                            ))
                         if d13c_filter_mask.any():
                             d13_df = identifier_range_outliers[d13c_filter_mask]
                             fig_d18O.add_trace(go.Scatter(
@@ -7205,6 +8050,10 @@ def main():
 
                 # Plot main data trace with correct sorting
                 sorted_data = identifier_curve_data.sort_values(by='x_axis')
+                d18_has_calibrated_curve = (
+                    'd18O_calibrated' in sorted_data.columns
+                    and pd.to_numeric(sorted_data['d18O_calibrated'], errors='coerce').notna().any()
+                )
 
                 # Highlight saturated collectors (valid means)
                 if show_saturated_collectors:
@@ -7365,7 +8214,7 @@ def main():
                         )
                     ))
 
-                if 'd18O_calibrated' in sorted_data.columns:
+                if d18_has_calibrated_curve and not d18_hide_calibrated and not d18_raw_line_only:
                     fig_d18O.add_trace(go.Scatter(
                         x=sorted_data['x_axis'],
                         y=sorted_data['d18O_calibrated'],
@@ -7453,6 +8302,7 @@ def main():
                             showlegend=False,
                             legendgroup='active_selection'
                         ))
+                _apply_editor_selection_to_figure(fig_d18O, d18_editor_prefix)
                 d18_chart_nonce = int(st.session_state.get(f"{d18_editor_prefix}_chart_nonce", 0))
                 d18_chart_col, d18_btn_col = st.columns([12, 1], gap="small")
                 with d18_btn_col:
@@ -7460,6 +8310,11 @@ def main():
                     if st.button(d18_btn_label, key=f"{d18_raw_only_key}_btn", use_container_width=True):
                         st.session_state[d18_raw_only_key] = not d18_raw_line_only
                         st.rerun()
+                    if d18_has_calibrated_curve:
+                        d18_cal_btn_label = "Show calibrated curve" if d18_hide_calibrated else "Hide calibrated curve"
+                        if st.button(d18_cal_btn_label, key=f"{d18_hide_cal_key}_btn", use_container_width=True):
+                            st.session_state[d18_hide_cal_key] = not d18_hide_calibrated
+                            st.rerun()
                 with d18_chart_col:
                     d18_chart_state = st.plotly_chart(
                         fig_d18O,
