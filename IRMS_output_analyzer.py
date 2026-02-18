@@ -98,6 +98,23 @@ def _build_delta_point_customdata(df, isotope_key):
     return np.column_stack((idx_vals, iso_vals, id1_vals, id2_vals))
 
 
+def _get_edited_row_tokens():
+    """Return edited row labels as string tokens."""
+    edited = st.session_state.get('edited_delta_rows', set())
+    if isinstance(edited, set):
+        return {str(x) for x in edited}
+    if edited is None:
+        return set()
+    if isinstance(edited, (list, tuple, pd.Index, np.ndarray)):
+        return {str(x) for x in edited}
+    return {str(edited)}
+
+
+def _is_row_edited(row_label):
+    """Check whether a sample row has been edited in this session."""
+    return str(row_label) in _get_edited_row_tokens()
+
+
 def _get_selected_plotly_points(chart_state):
     """Return all selected Plotly points from a Streamlit chart event."""
     if chart_state is None:
@@ -132,6 +149,189 @@ def _resolve_index_label(index_obj, raw_value):
         except Exception:
             continue
     return None
+
+
+def _get_active_editor_target(editor_key_prefix):
+    """Return currently navigated editor target from session state, if available."""
+    if st.session_state.df is None:
+        return None
+    token = st.session_state.get(f"{editor_key_prefix}_nav_token")
+    if not token or '|' not in str(token):
+        return None
+    isotope_key, raw_row_key = str(token).split('|', 1)
+    isotope_key = str(isotope_key).strip()
+    row_label = _resolve_index_label(st.session_state.df.index, raw_row_key)
+    if row_label is None or row_label not in st.session_state.df.index:
+        return None
+    col_map = {
+        'd13C': 'd 13C/12C  Mean',
+        'd18O': 'd 18O/16O  Mean',
+    }
+    target_col = col_map.get(isotope_key)
+    if target_col is None or target_col not in st.session_state.df.columns:
+        return None
+    value_raw = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, target_col]]), errors='coerce').iloc[0]
+    status_value = ""
+    if 'Collector Status' in st.session_state.df.columns:
+        raw_status = st.session_state.df.at[row_label, 'Collector Status']
+        if pd.notna(raw_status) and str(raw_status).strip() != '':
+            status_value = str(raw_status).strip()
+    return {
+        'isotope_key': isotope_key,
+        'row_label': row_label,
+        'target_col': target_col,
+        'value': float(value_raw) if pd.notna(value_raw) else None,
+        'collector_status': status_value,
+    }
+
+
+def _refresh_collector_status_after_delta_edit(row_label):
+    """Keep collector status aligned after manual delta edits/interpolation."""
+    if st.session_state.df is None or row_label not in st.session_state.df.index:
+        return
+    if 'Collector Status' not in st.session_state.df.columns:
+        return
+    if 'd 13C/12C  Mean' not in st.session_state.df.columns or 'd 18O/16O  Mean' not in st.session_state.df.columns:
+        return
+
+    status_raw = st.session_state.df.at[row_label, 'Collector Status']
+    status = '' if pd.isna(status_raw) else str(status_raw).strip()
+    # Respect fully saturated classification produced by cycle diagnostics.
+    if status == 'Fully Saturated Collectors':
+        return
+
+    d13 = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, 'd 13C/12C  Mean']]), errors='coerce').iloc[0]
+    d18 = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, 'd 18O/16O  Mean']]), errors='coerce').iloc[0]
+    has_d13 = bool(pd.notna(d13))
+    has_d18 = bool(pd.notna(d18))
+
+    if not has_d13 and not has_d18:
+        st.session_state.df.at[row_label, 'Collector Status'] = 'Failed Sample'
+    elif status == 'Failed Sample':
+        st.session_state.df.at[row_label, 'Collector Status'] = 'Partially Saturated Collectors'
+
+
+def _get_isotope_columns(isotope_key):
+    """Return raw/calibrated/corrected column names for an isotope key."""
+    key = str(isotope_key).strip()
+    if key == 'd13C':
+        return ('d 13C/12C  Mean', 'd13C_calibrated', 'd13C_calibrated_linearity_corrected')
+    if key == 'd18O':
+        return ('d 18O/16O  Mean', 'd18O_calibrated', 'd18O_calibrated_linearity_corrected')
+    return (None, None, None)
+
+
+def _estimate_calibration_affine(raw_col, cal_col, exclude_row_label=None):
+    """Estimate affine calibration y = m*x + b from existing dataset columns."""
+    if st.session_state.df is None or raw_col not in st.session_state.df.columns or cal_col not in st.session_state.df.columns:
+        return (None, None)
+    raw_series = pd.to_numeric(st.session_state.df[raw_col], errors='coerce')
+    cal_series = pd.to_numeric(st.session_state.df[cal_col], errors='coerce')
+    valid = raw_series.notna() & cal_series.notna()
+    if exclude_row_label is not None and exclude_row_label in valid.index:
+        valid.loc[exclude_row_label] = False
+    x = raw_series[valid]
+    y = cal_series[valid]
+    if len(x) >= 2:
+        x_vals = x.to_numpy(dtype=float)
+        y_vals = y.to_numpy(dtype=float)
+        if np.nanstd(x_vals) > 0:
+            m, b = np.polyfit(x_vals, y_vals, 1)
+            if np.isfinite(m) and np.isfinite(b):
+                return (float(m), float(b))
+    if len(x) == 1:
+        xv = float(x.iloc[0])
+        yv = float(y.iloc[0])
+        if np.isfinite(xv) and np.isfinite(yv):
+            return (1.0, yv - xv)
+    return (None, None)
+
+
+def _refresh_calibrated_after_delta_edit(row_label, isotope_key, previous_raw=None, previous_calibrated=None):
+    """Update calibrated values for an edited row when calibration columns are present."""
+    raw_col, cal_col, corrected_col = _get_isotope_columns(isotope_key)
+    if st.session_state.df is None or raw_col is None or cal_col is None:
+        return
+    if row_label not in st.session_state.df.index:
+        return
+    if raw_col not in st.session_state.df.columns or cal_col not in st.session_state.df.columns:
+        return
+
+    new_raw = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, raw_col]]), errors='coerce').iloc[0]
+    if pd.isna(new_raw):
+        st.session_state.df.at[row_label, cal_col] = np.nan
+        if corrected_col in st.session_state.df.columns:
+            st.session_state.df.at[row_label, corrected_col] = np.nan
+        return
+    new_raw = float(new_raw)
+
+    m = None
+    b = None
+    coeffs = st.session_state.get('calibration_coefficients')
+    if isinstance(coeffs, dict):
+        iso_coeff = coeffs.get(str(isotope_key).strip(), {})
+        m_c = pd.to_numeric(pd.Series([iso_coeff.get('slope')]), errors='coerce').iloc[0]
+        b_c = pd.to_numeric(pd.Series([iso_coeff.get('intercept')]), errors='coerce').iloc[0]
+        if np.isfinite(m_c) and np.isfinite(b_c):
+            m = float(m_c)
+            b = float(b_c)
+    if m is None or b is None:
+        m, b = _estimate_calibration_affine(raw_col, cal_col, exclude_row_label=row_label)
+
+    if m is not None and b is not None and np.isfinite(m) and np.isfinite(b):
+        new_cal = m * new_raw + b
+    else:
+        prev_raw_num = pd.to_numeric(pd.Series([previous_raw]), errors='coerce').iloc[0]
+        prev_cal_num = pd.to_numeric(pd.Series([previous_calibrated]), errors='coerce').iloc[0]
+        if np.isfinite(prev_raw_num) and np.isfinite(prev_cal_num):
+            new_cal = float(prev_cal_num) + (new_raw - float(prev_raw_num))
+        else:
+            return
+
+    if np.isfinite(new_cal):
+        st.session_state.df.at[row_label, cal_col] = float(new_cal)
+    else:
+        st.session_state.df.at[row_label, cal_col] = np.nan
+        if corrected_col in st.session_state.df.columns:
+            st.session_state.df.at[row_label, corrected_col] = np.nan
+        return
+
+    if corrected_col in st.session_state.df.columns:
+        fits = st.session_state.get('linearity_fits', {})
+        fit = fits.get(str(isotope_key).strip(), {}) if isinstance(fits, dict) else {}
+        slope_lin = pd.to_numeric(pd.Series([fit.get('slope')]), errors='coerce').iloc[0]
+        x_ref = pd.to_numeric(pd.Series([fit.get('x_ref')]), errors='coerce').iloc[0]
+        intensity = np.nan
+        if '1  Cycle Int  Samp  44' in st.session_state.df.columns:
+            intensity = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, '1  Cycle Int  Samp  44']]), errors='coerce').iloc[0]
+        if np.isfinite(slope_lin) and np.isfinite(x_ref) and np.isfinite(intensity):
+            st.session_state.df.at[row_label, corrected_col] = float(new_cal - float(slope_lin) * (float(intensity) - float(x_ref)))
+        else:
+            st.session_state.df.at[row_label, corrected_col] = float(new_cal)
+
+
+def _augment_curve_with_edited_rows(base_curve_df, species_data_unfiltered, identifier):
+    """Ensure edited points (including edited outliers/failed rows) appear in curve traces."""
+    base = base_curve_df.copy() if base_curve_df is not None else pd.DataFrame()
+    if species_data_unfiltered is None or species_data_unfiltered.empty or 'Identifier 1' not in species_data_unfiltered.columns:
+        return base.sort_values(by='x_axis', na_position='last') if 'x_axis' in base.columns else base
+    edited_mask = pd.Series(species_data_unfiltered.index.map(_is_row_edited), index=species_data_unfiltered.index, dtype=bool)
+    extra = species_data_unfiltered[
+        species_data_unfiltered['Identifier 1'].astype(str).str.strip().eq(str(identifier).strip()) & edited_mask
+    ].copy()
+    if extra.empty:
+        return base.sort_values(by='x_axis', na_position='last') if 'x_axis' in base.columns else base
+    if base.empty:
+        merged = extra
+    else:
+        merged = pd.concat([base, extra], axis=0, sort=False)
+    try:
+        merged = merged[~merged.index.duplicated(keep='last')]
+    except Exception:
+        pass
+    if 'x_axis' in merged.columns:
+        merged = merged.sort_values(by='x_axis', na_position='last')
+    return merged
 
 
 def _extract_mass_from_intensity_column(col_name):
@@ -290,11 +490,111 @@ def _get_cycles_for_selected_point(row_label, target_col):
     return cycles, selected_pre
 
 
+def _build_selected_point_diagnostics_inline(target, pre_row=None):
+    """Build fixed diagnostics text for the selected datapoint as a single inline line."""
+    if st.session_state.df is None:
+        return ""
+    if target['row_label'] not in st.session_state.df.index:
+        return ""
+
+    processed_row = st.session_state.df.loc[target['row_label']]
+    if isinstance(processed_row, pd.DataFrame):
+        processed_row = processed_row.iloc[0]
+
+    row_sources = []
+    if isinstance(processed_row, pd.Series):
+        row_sources.append(processed_row)
+    if isinstance(pre_row, pd.Series):
+        row_sources.append(pre_row)
+    if not row_sources:
+        return ""
+
+    field_map = [
+        ('Line', ['Line']),
+        ('Signal Intensity', ['1  Cycle Int  Samp  44']),
+        ('d18O values', ['d 18O/16O  Mean']),
+        ('d13C values', ['d 13C/12C  Mean']),
+        ('Leak Rate', ['leak_rate']),
+        ('Total CO2', ['total_co2']),
+        ('P gasses', ['p_gases']),
+        ('P no acid', ['p_no_acid']),
+        ('Date', ['Date', 'Date_ordinal']),
+    ]
+
+    def _has_value(value):
+        if value is None:
+            return False
+        if isinstance(value, (float, np.floating)) and np.isnan(value):
+            return False
+        try:
+            if pd.isna(value):
+                return False
+        except Exception:
+            pass
+        return str(value).strip() != ''
+
+    def _get_value_from_series(src, candidates):
+        if not isinstance(src, pd.Series):
+            return None, None
+        src_norm_map = {_normalize_column_key(col): col for col in src.index}
+        for cand in candidates:
+            if cand in src.index and _has_value(src[cand]):
+                return src[cand], cand
+        for cand in candidates:
+            col = src_norm_map.get(_normalize_column_key(cand))
+            if col is not None and _has_value(src[col]):
+                return src[col], col
+        return None, None
+
+    def _format_value(label, value, source_col):
+        if not _has_value(value):
+            return "N/A"
+        if label == 'Date':
+            parsed = pd.to_datetime(value, errors='coerce')
+            if pd.notna(parsed):
+                return parsed.strftime('%Y-%m-%d')
+            if _normalize_column_key(source_col) == 'date_ordinal':
+                try:
+                    parsed_ord = pd.Timestamp.fromordinal(int(float(value)))
+                    return parsed_ord.strftime('%Y-%m-%d')
+                except Exception:
+                    pass
+            return str(value)
+        if isinstance(value, (int, np.integer)):
+            return str(int(value))
+        if isinstance(value, (float, np.floating)):
+            if np.isfinite(value):
+                if label == 'Line' and float(value).is_integer():
+                    return str(int(value))
+                return f"{float(value):.4f}"
+            return str(value)
+        return str(value)
+
+    parts = []
+    for label, candidates in field_map:
+        selected_value = None
+        selected_col = None
+        for src in row_sources:
+            value, col = _get_value_from_series(src, candidates)
+            if _has_value(value):
+                selected_value = value
+                selected_col = col
+                break
+        display_value = _format_value(label, selected_value, selected_col)
+        parts.append(f"**{label}:** `{display_value}`")
+
+    return " | ".join(parts)
+
+
 def _render_selected_point_cycle_diagnostics(target, key_prefix):
     """Render cycle-level chart and table for the selected sample point."""
     cycles, pre_row = _get_cycles_for_selected_point(target['row_label'], target['target_col'])
+    diagnostics_line = _build_selected_point_diagnostics_inline(target, pre_row=pre_row)
+    if diagnostics_line:
+        st.markdown(diagnostics_line)
+
     if cycles is None or cycles.empty:
-        st.caption("Cycle-level diagnostics are unavailable for this datapoint.")
+        st.markdown("Cycle-level diagnostics are unavailable for this datapoint.")
         return
 
     st.markdown("##### Cycle Diagnostics")
@@ -404,13 +704,13 @@ def _render_selected_point_cycle_diagnostics(target, key_prefix):
                 key=f"cycle_diag_fig_{key_prefix}_{target['isotope_key']}_{target['row_key']}"
             )
         else:
-            st.caption("No cycle intensity columns were detected for this datapoint.")
+            st.markdown("No cycle intensity columns were detected for this datapoint.")
 
     with diag_col_table:
         if isinstance(pre_row, pd.Series):
             status_val = pre_row.get('Collector Status')
             if pd.notna(status_val) and str(status_val).strip() != '':
-                st.caption(f"Collector Status: `{status_val}`")
+                st.markdown(f"**Collector Status:** `{status_val}`")
         st.dataframe(
             cycle_table.reset_index(drop=True).style.apply(_highlight_excluded, axis=1),
             hide_index=True,
@@ -435,6 +735,11 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             return None
         if row_label not in st.session_state.df.index:
             return None
+        status_value = ""
+        if 'Collector Status' in st.session_state.df.columns:
+            raw_status = st.session_state.df.at[row_label, 'Collector Status']
+            if pd.notna(raw_status) and str(raw_status).strip() != '':
+                status_value = str(raw_status).strip()
         source_excel = "Unknown"
         if 'Excel File' in st.session_state.df.columns:
             source_val = st.session_state.df.at[row_label, 'Excel File']
@@ -444,8 +749,14 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             identifier_1 = st.session_state.df.at[row_label, 'Identifier 1']
         if identifier_2 is None and 'Identifier 2' in st.session_state.df.columns:
             identifier_2 = st.session_state.df.at[row_label, 'Identifier 2']
-        current_value = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, target_col]]), errors='coerce').iloc[0]
-        current_value = float(current_value) if pd.notna(current_value) else 0.0
+        current_value_raw = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, target_col]]), errors='coerce').iloc[0]
+        has_value = pd.notna(current_value_raw)
+        current_value = float(current_value_raw) if has_value else 0.0
+        original_map = st.session_state.get('original_delta_values', {})
+        original_key = f"{str(isotope_key).strip()}|{str(row_label)}"
+        original_value_raw = original_map.get(original_key, current_value_raw if has_value else np.nan)
+        original_value_num = pd.to_numeric(pd.Series([original_value_raw]), errors='coerce').iloc[0]
+        original_value = float(original_value_num) if pd.notna(original_value_num) else None
         return {
             'row_label': row_label,
             'row_key': str(row_label),
@@ -454,7 +765,11 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             'identifier_2': '' if identifier_2 is None or pd.isna(identifier_2) else str(identifier_2),
             'target_col': target_col,
             'source_excel': source_excel,
+            'collector_status': status_value,
+            'is_failed_sample': status_value == 'Failed Sample',
+            'has_value': bool(has_value),
             'current_value': current_value,
+            'original_value': original_value,
         }
 
     def _token_for_target(target):
@@ -473,12 +788,19 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
         target_col = active_target['target_col']
         id1 = active_target.get('identifier_1', '')
         base = st.session_state.df.copy()
-        y_vals = pd.to_numeric(base[target_col], errors='coerce')
-        base = base[y_vals.notna()].copy()
         if 'Identifier 1' in base.columns and str(id1).strip() != '':
             id_mask = base['Identifier 1'].astype(str).str.strip().eq(str(id1).strip())
             if id_mask.any():
                 base = base[id_mask].copy()
+        if base.empty:
+            return [active_target]
+        active_row = active_target['row_label']
+        if active_row not in base.index and active_row in st.session_state.df.index:
+            base = pd.concat([base, st.session_state.df.loc[[active_row]]], axis=0)
+        y_vals = pd.to_numeric(base[target_col], errors='coerce')
+        if y_vals.notna().any():
+            keep_mask = y_vals.notna() | (base.index == active_row)
+            base = base.loc[keep_mask].copy()
         if base.empty:
             return [active_target]
 
@@ -506,6 +828,128 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             if built is not None:
                 nav_targets.append(built)
         return nav_targets if nav_targets else [active_target]
+
+    def _find_interpolation_neighbors(active_target):
+        target_col = active_target['target_col']
+        id1 = active_target.get('identifier_1', '')
+        base = st.session_state.df.copy()
+        if 'Identifier 1' in base.columns and str(id1).strip() != '':
+            id_mask = base['Identifier 1'].astype(str).str.strip().eq(str(id1).strip())
+            if id_mask.any():
+                base = base[id_mask].copy()
+        if base.empty or active_target['row_label'] not in base.index:
+            return None, None
+
+        sort_rows = []
+        for idx, row in base.iterrows():
+            id2_val = row.get('Identifier 2', None)
+            id2_num = _parse_numeric_token(id2_val)
+            key = (
+                id2_num is None,
+                float(id2_num) if id2_num is not None else float('inf'),
+                '' if id2_val is None or pd.isna(id2_val) else str(id2_val),
+                int(idx) if isinstance(idx, (int, np.integer)) else str(idx),
+            )
+            sort_rows.append((key, idx, row))
+        sort_rows.sort(key=lambda x: x[0])
+        ordered_rows = [idx for _, idx, _ in sort_rows]
+        try:
+            anchor_idx = ordered_rows.index(active_target['row_label'])
+        except ValueError:
+            return None, None
+
+        # Interpolation neighbors should ignore rows currently considered outliers.
+        status_series = base.get('Collector Status', pd.Series('', index=base.index)).astype(str).str.strip()
+        status_excluded = status_series.isin({
+            'Failed Sample',
+            'Fully Saturated Collectors',
+            'Partially Saturated Collectors',
+        })
+
+        range_excluded = pd.Series(False, index=base.index, dtype=bool)
+        try:
+            if 'd 13C/12C  Mean' in base.columns:
+                d13_vals = pd.to_numeric(base['d 13C/12C  Mean'], errors='coerce')
+                range_excluded = range_excluded | (
+                    d13_vals.notna() &
+                    ((d13_vals < float(st.session_state.d13c_range[0])) | (d13_vals > float(st.session_state.d13c_range[1])))
+                )
+            if 'd 18O/16O  Mean' in base.columns:
+                d18_vals = pd.to_numeric(base['d 18O/16O  Mean'], errors='coerce')
+                range_excluded = range_excluded | (
+                    d18_vals.notna() &
+                    ((d18_vals < float(st.session_state.d18o_range[0])) | (d18_vals > float(st.session_state.d18o_range[1])))
+                )
+            if '1  Cycle Int  Samp  44' in base.columns:
+                sig_vals = pd.to_numeric(base['1  Cycle Int  Samp  44'], errors='coerce')
+                range_excluded = range_excluded | (
+                    sig_vals.notna() &
+                    ((sig_vals < float(st.session_state.signal_range[0])) | (sig_vals > float(st.session_state.signal_range[1])))
+                )
+            if 'leak_rate' in base.columns:
+                leak_vals = pd.to_numeric(base['leak_rate'], errors='coerce')
+                range_excluded = range_excluded | (
+                    leak_vals.notna() &
+                    ((leak_vals < float(st.session_state.leak_range[0])) | (leak_vals > float(st.session_state.leak_range[1])))
+                )
+        except Exception:
+            pass
+
+        sigma_excluded = pd.Series(False, index=base.index, dtype=bool)
+        sigma_level = float(st.session_state.get('sigma_level_data', 4.0))
+        if sigma_level > 0:
+            if 'd 13C/12C  Mean' in base.columns:
+                d13_vals = pd.to_numeric(base['d 13C/12C  Mean'], errors='coerce')
+                mean_d13 = d13_vals.mean(skipna=True)
+                std_d13 = d13_vals.std(skipna=True)
+                if np.isfinite(std_d13) and std_d13 > 0 and np.isfinite(mean_d13):
+                    sigma_excluded = sigma_excluded | (
+                        d13_vals.notna() &
+                        ((d13_vals < (mean_d13 - sigma_level * std_d13)) | (d13_vals > (mean_d13 + sigma_level * std_d13)))
+                    )
+            if 'd 18O/16O  Mean' in base.columns:
+                d18_vals = pd.to_numeric(base['d 18O/16O  Mean'], errors='coerce')
+                mean_d18 = d18_vals.mean(skipna=True)
+                std_d18 = d18_vals.std(skipna=True)
+                if np.isfinite(std_d18) and std_d18 > 0 and np.isfinite(mean_d18):
+                    sigma_excluded = sigma_excluded | (
+                        d18_vals.notna() &
+                        ((d18_vals < (mean_d18 - sigma_level * std_d18)) | (d18_vals > (mean_d18 + sigma_level * std_d18)))
+                    )
+
+        candidate_mask = ~(status_excluded | range_excluded | sigma_excluded)
+
+        prev_neighbor = None
+        for i in range(anchor_idx - 1, -1, -1):
+            idx = ordered_rows[i]
+            if idx not in candidate_mask.index or not bool(candidate_mask.loc[idx]):
+                continue
+            val = pd.to_numeric(pd.Series([base.at[idx, target_col]]), errors='coerce').iloc[0]
+            if pd.notna(val):
+                id2_val = base.at[idx, 'Identifier 2'] if 'Identifier 2' in base.columns else ''
+                prev_neighbor = {
+                    'row_label': idx,
+                    'identifier_2': '' if pd.isna(id2_val) else str(id2_val),
+                    'value': float(val),
+                }
+                break
+
+        next_neighbor = None
+        for i in range(anchor_idx + 1, len(ordered_rows)):
+            idx = ordered_rows[i]
+            if idx not in candidate_mask.index or not bool(candidate_mask.loc[idx]):
+                continue
+            val = pd.to_numeric(pd.Series([base.at[idx, target_col]]), errors='coerce').iloc[0]
+            if pd.notna(val):
+                id2_val = base.at[idx, 'Identifier 2'] if 'Identifier 2' in base.columns else ''
+                next_neighbor = {
+                    'row_label': idx,
+                    'identifier_2': '' if pd.isna(id2_val) else str(id2_val),
+                    'value': float(val),
+                }
+                break
+
+        return prev_neighbor, next_neighbor
 
     points = _get_selected_plotly_points(chart_state)
     selected_targets = []
@@ -538,7 +982,7 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             selected_targets = [nav_target]
 
     if not selected_targets:
-        st.caption("Select a primary data marker to edit its delta value or apply an offset.")
+        st.markdown("Select a primary data marker to edit its delta value or apply an offset.")
         return
 
     single_mode = len(selected_targets) == 1
@@ -559,20 +1003,22 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
     selection_signature = '|'.join(sorted([f"{t['isotope_key']}:{t['row_key']}" for t in selected_targets]))
     selection_hash = hashlib.md5(selection_signature.encode('utf-8')).hexdigest()[:10]
 
-    header_col, prev_col, next_col, close_col, _spacer_col = st.columns([6, 1, 1, 1, 22], gap="small")
+    header_col, spacer_col, prev_col, next_col, close_col = st.columns([8, 8, 2, 2, 1], gap="small")
     with header_col:
         st.markdown("#### Edit Selected Delta Value")
+    with spacer_col:
+        st.empty()
 
     prev_disabled = not single_mode or nav_index <= 0
     next_disabled = not single_mode or nav_index < 0 or nav_index >= (len(nav_targets) - 1)
     with prev_col:
-        if st.button("<", key=f"{editor_key_prefix}_prev", help="Previous datapoint", disabled=prev_disabled):
+        if st.button("Prev <", key=f"{editor_key_prefix}_prev", help="Previous datapoint", disabled=prev_disabled, use_container_width=True):
             prev_target = nav_targets[nav_index - 1]
             st.session_state[nav_token_key] = _token_for_target(prev_target)
             st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
             st.rerun()
     with next_col:
-        if st.button(">", key=f"{editor_key_prefix}_next", help="Next datapoint", disabled=next_disabled):
+        if st.button("Next >", key=f"{editor_key_prefix}_next", help="Next datapoint", disabled=next_disabled, use_container_width=True):
             next_target = nav_targets[nav_index + 1]
             st.session_state[nav_token_key] = _token_for_target(next_target)
             st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
@@ -584,47 +1030,95 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             st.rerun()
 
     submitted_offset = False
+    submitted_interpolate = False
+    interpolated_value = None
     if single_mode:
         target = selected_targets[0]
-        st.caption(
-            f"Identifier 1: `{target['identifier_1']}` | Identifier 2: `{target['identifier_2']}` | "
-            f"Origin Excel File: `{target['source_excel']}` | "
-            f"Current {target['isotope_key']}: `{target['current_value']:.4f}`"
+        is_failed_sample = bool(target.get('is_failed_sample', False))
+        original_display = "N/A" if target['original_value'] is None else f"{target['original_value']:.4f}"
+        st.markdown(
+            f"**Identifier 1:** `{target['identifier_1']}` | **Identifier 2:** `{target['identifier_2']}` | "
+            f"**Origin Excel File:** `{target['source_excel']}` | "
+            f"**Original {target['isotope_key']}:** `{original_display}`"
         )
-        _render_selected_point_cycle_diagnostics(target, editor_key_prefix)
-        form_col_set, form_col_offset = st.columns(2, gap="medium")
+        form_cols = st.columns(3, gap="medium")
+        form_col_set = form_cols[0]
+        form_col_offset = form_cols[1]
         with form_col_set:
             with st.form(key=f"{editor_key_prefix}_set_form_{selection_hash}"):
+                set_value_sig = hashlib.md5(f"{target['current_value']:.8f}".encode('utf-8')).hexdigest()[:6]
+                set_input_key = f"{editor_key_prefix}_set_input_{selection_hash}_{set_value_sig}"
                 new_value = st.number_input(
-                    f"New {target['isotope_key']} value",
+                    f"{target['isotope_key']} value (per mil)",
                     value=target['current_value'],
                     step=0.001,
                     format="%.4f",
-                    key=f"{editor_key_prefix}_set_input_{selection_hash}",
+                    key=set_input_key,
                 )
                 submitted_set = st.form_submit_button(f"Update {target['isotope_key']}")
         with form_col_offset:
             with st.form(key=f"{editor_key_prefix}_offset_form_{selection_hash}"):
                 offset_value = st.number_input(
-                    "Offset to add",
+                    "Offset to add (per mil)",
                     value=0.0,
                     step=0.001,
                     format="%.4f",
                     key=f"{editor_key_prefix}_offset_input_{selection_hash}",
                 )
                 submitted_offset = st.form_submit_button("Apply Offset")
+        prev_neighbor, next_neighbor = _find_interpolation_neighbors(target)
+        interp_help = (
+            "Interpolate requires both previous and next samples with valid delta values."
+            if prev_neighbor is None or next_neighbor is None
+            else (
+                f"Interpolated from {prev_neighbor['value']:.4f} and {next_neighbor['value']:.4f} per mil."
+            )
+        )
+        with form_cols[2]:
+            st.caption(interp_help)
+            submitted_interpolate = st.button(
+                "Interpolate",
+                key=f"{editor_key_prefix}_interpolate_{selection_hash}",
+                disabled=(prev_neighbor is None or next_neighbor is None),
+                use_container_width=True,
+            )
+        if submitted_interpolate and prev_neighbor is not None and next_neighbor is not None:
+            interpolated_value = (prev_neighbor['value'] + next_neighbor['value']) / 2.0
+        if not is_failed_sample:
+            _render_selected_point_cycle_diagnostics(target, editor_key_prefix)
 
         if submitted_set:
+            original_map = st.session_state.setdefault('original_delta_values', {})
+            original_key = f"{target['isotope_key']}|{target['row_key']}"
+            if original_key not in original_map:
+                original_map[original_key] = float(target['current_value'])
+            prev_raw = pd.to_numeric(
+                pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
+                errors='coerce'
+            ).iloc[0]
+            _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
+            prev_cal = np.nan
+            if cal_col in st.session_state.df.columns:
+                prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+            edited_rows = _get_edited_row_tokens()
+            edited_rows.add(target['row_key'])
+            st.session_state['edited_delta_rows'] = edited_rows
             st.session_state.df.at[target['row_label'], target['target_col']] = float(new_value)
+            _refresh_collector_status_after_delta_edit(target['row_label'])
+            _refresh_calibrated_after_delta_edit(
+                target['row_label'],
+                target['isotope_key'],
+                previous_raw=prev_raw,
+                previous_calibrated=prev_cal
+            )
             st.success(
                 f"Updated {target['isotope_key']} to {float(new_value):.4f} for "
                 f"{target['identifier_1']} / {target['identifier_2']}."
             )
-            st.info("If calibrated columns exist, rerun calibration to refresh calibrated values.")
             st.rerun()
     else:
         isotopes = sorted({t['isotope_key'] for t in selected_targets})
-        st.caption(
+        st.markdown(
             f"{len(selected_targets)} datapoints selected ({', '.join(isotopes)}). "
             "Single-point absolute value edit is hidden for multi-select."
         )
@@ -632,7 +1126,7 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             offset_value = st.number_input(
                 "Offset to add",
                 value=0.0,
-                step=0.001,
+                step=1.0,
                 format="%.4f",
                 key=f"{editor_key_prefix}_offset_input_{selection_hash}",
             )
@@ -642,18 +1136,71 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
 
     if submitted_offset:
         offset_value = float(offset_value)
+        original_map = st.session_state.setdefault('original_delta_values', {})
+        edited_rows = _get_edited_row_tokens()
         for target in selected_targets:
             current_value = pd.to_numeric(
                 pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
                 errors='coerce'
             ).iloc[0]
             current_value = float(current_value) if pd.notna(current_value) else 0.0
+            original_key = f"{target['isotope_key']}|{target['row_key']}"
+            if original_key not in original_map:
+                original_map[original_key] = float(current_value)
+            _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
+            prev_cal = np.nan
+            if cal_col in st.session_state.df.columns:
+                prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
             st.session_state.df.at[target['row_label'], target['target_col']] = current_value + offset_value
+            _refresh_collector_status_after_delta_edit(target['row_label'])
+            _refresh_calibrated_after_delta_edit(
+                target['row_label'],
+                target['isotope_key'],
+                previous_raw=current_value,
+                previous_calibrated=prev_cal
+            )
+            edited_rows.add(target['row_key'])
+        st.session_state['edited_delta_rows'] = edited_rows
         st.success(
             f"Applied offset {offset_value:+.4f} to {len(selected_targets)} "
             f"datapoint{'s' if len(selected_targets) != 1 else ''}."
         )
-        st.info("If calibrated columns exist, rerun calibration to refresh calibrated values.")
+        st.rerun()
+
+    if submitted_interpolate and single_mode and interpolated_value is not None:
+        target = selected_targets[0]
+        prev_raw = pd.to_numeric(
+            pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
+            errors='coerce'
+        ).iloc[0]
+        _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
+        prev_cal = np.nan
+        if cal_col in st.session_state.df.columns:
+            prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+        original_map = st.session_state.setdefault('original_delta_values', {})
+        original_key = f"{target['isotope_key']}|{target['row_key']}"
+        if original_key not in original_map:
+            previous_value = pd.to_numeric(
+                pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
+                errors='coerce'
+            ).iloc[0]
+            if pd.notna(previous_value):
+                original_map[original_key] = float(previous_value)
+        edited_rows = _get_edited_row_tokens()
+        edited_rows.add(target['row_key'])
+        st.session_state['edited_delta_rows'] = edited_rows
+        st.session_state.df.at[target['row_label'], target['target_col']] = float(interpolated_value)
+        _refresh_collector_status_after_delta_edit(target['row_label'])
+        _refresh_calibrated_after_delta_edit(
+            target['row_label'],
+            target['isotope_key'],
+            previous_raw=prev_raw,
+            previous_calibrated=prev_cal
+        )
+        st.success(
+            f"Interpolated {target['isotope_key']} to {float(interpolated_value):.4f} for "
+            f"{target['identifier_1']} / {target['identifier_2']}."
+        )
         st.rerun()
 
 # Initialize session state variables if they don't exist
@@ -663,6 +1210,12 @@ if 'file_processed' not in st.session_state:
     st.session_state.file_processed = False
 if 'df_cycles_source' not in st.session_state:
     st.session_state.df_cycles_source = None
+if 'edited_delta_rows' not in st.session_state:
+    st.session_state.edited_delta_rows = set()
+if 'original_delta_values' not in st.session_state:
+    st.session_state.original_delta_values = {}
+if 'calibration_coefficients' not in st.session_state:
+    st.session_state.calibration_coefficients = {}
 if 'include_outliers' not in st.session_state:
     st.session_state.include_outliers = "No"
 if 'selected_ids' not in st.session_state:
@@ -715,8 +1268,14 @@ def _parse_numeric_token(token):
             num = num.replace(",", "")
         else:
             left, right = num.split(",", 1)
-            if right.isdigit() and len(right) in (1, 2):
-                num = left + "." + right
+            if right.isdigit():
+                # Treat comma as decimal when precision is >= 1 digit and not a clear thousands group.
+                if len(right) in (1, 2):
+                    num = left + "." + right
+                elif len(right) == 3 and left.isdigit() and left not in ("0", "+0", "-0"):
+                    num = left + right
+                else:
+                    num = left + "." + right
             else:
                 num = left + right
     elif "." in num:
@@ -1045,6 +1604,27 @@ def _apply_cycle_averages(df):
             return intensity_df
         return None
 
+    def _pick_mass_sample_column(cycles_df, mass_value):
+        cols = [c for c in intensity_cols if c in cycles_df.columns and _extract_col_mass(c) == mass_value]
+        if not cols:
+            return None
+        labeled_sample = []
+        for c in cols:
+            low = _normalize_column_key(c)
+            if 'standard' in low:
+                continue
+            if 'sample' in low or 'samp' in low:
+                labeled_sample.append(c)
+        if labeled_sample:
+            return labeled_sample[0]
+        # Fallback: choose the column with the highest median intensity
+        medians = []
+        for c in cols:
+            vals = _normalize_signal_intensity(cycles_df[c])
+            medians.append((c, float(vals.median(skipna=True)) if vals.notna().any() else -np.inf))
+        medians.sort(key=lambda t: t[1], reverse=True)
+        return medians[0][0] if medians else None
+
     def _build_saturation_mask(intensity_df, required_masses):
         if intensity_df is None or intensity_df.empty:
             return None
@@ -1081,6 +1661,17 @@ def _apply_cycle_averages(df):
             has_cycle_intensity = True
             sat_mask_d13 = _build_saturation_mask(intensity_df, [44, 45])
             sat_mask_d18 = _build_saturation_mask(intensity_df, [44, 45, 46])
+
+            # Use Cycle 1 m/z44 sample collector as signal intensity for outlier checks.
+            samp44_col = _pick_mass_sample_column(sample_cycles, 44)
+            if samp44_col is not None:
+                cycle1 = sample_cycles[sample_cycles['_cycle_order'] == 1]
+                if not cycle1.empty:
+                    cycle1_val = _normalize_signal_intensity(cycle1[samp44_col]).iloc[0]
+                else:
+                    cycle1_val = _normalize_signal_intensity(sample_cycles[samp44_col]).dropna().iloc[0] if _normalize_signal_intensity(sample_cycles[samp44_col]).notna().any() else np.nan
+                if pd.notna(cycle1_val):
+                    pre_rows.at[sample_idx, '1  Cycle Int  Samp  44'] = float(cycle1_val)
         low_signal_failed = False
         pre_intensity_cols = [c for c in sample_intensity_cols if c in pre_rows.columns]
         if pre_intensity_cols:
@@ -1174,8 +1765,10 @@ def _apply_cycle_averages(df):
         # Determine collector status
         pre_d13 = pre_rows.at[sample_idx, 'd 13C/12C  Mean'] if 'd 13C/12C  Mean' in pre_rows.columns else np.nan
         pre_d18 = pre_rows.at[sample_idx, 'd 18O/16O  Mean'] if 'd 18O/16O  Mean' in pre_rows.columns else np.nan
-        # Any missing isotope value is treated as failed so it is grouped/marked with failed samples.
-        failed = low_signal_failed or (not np.isfinite(pre_d13)) or (not np.isfinite(pre_d18))
+        has_pre_d13 = bool(np.isfinite(pre_d13))
+        has_pre_d18 = bool(np.isfinite(pre_d18))
+        both_missing = (not has_pre_d13) and (not has_pre_d18)
+        one_missing = has_pre_d13 ^ has_pre_d18
         fully_saturated = (
             has_cycle_intensity and
             (d13_has_cycles or d18_has_cycles) and
@@ -1188,15 +1781,16 @@ def _apply_cycle_averages(df):
             pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = np.nan
             pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = np.nan
             pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = np.nan
-        elif failed:
+        elif low_signal_failed:
             pre_rows.at[sample_idx, 'Collector Status'] = 'Failed Sample'
-            if low_signal_failed:
-                pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = np.nan
-                pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = np.nan
-                pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = np.nan
-                pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = np.nan
-        elif saturated_any:
+            pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = np.nan
+            pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = np.nan
+            pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = np.nan
+            pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = np.nan
+        elif saturated_any and (has_pre_d13 or has_pre_d18):
             pre_rows.at[sample_idx, 'Collector Status'] = 'Partially Saturated Collectors'
+        elif both_missing or one_missing:
+            pre_rows.at[sample_idx, 'Collector Status'] = 'Failed Sample'
 
     # Keep non-cycle rows (rows without Cycle Number)
     other_rows = work[work['_cycle_order'].isna()].copy()
@@ -1763,6 +2357,53 @@ def _build_client_filename(client_name: str, client_df: pd.DataFrame) -> str:
     title = "Stable C&O isosopes results P2L"
     parts = [p for p in [client_part, id_part, title, date_str] if p]
     return (" ".join(parts) + ".xlsx").strip()
+
+
+def _compute_calibration_coefficients(standards_df, selected_standards):
+    """Compute per-isotope affine coefficients for calibrated = slope*raw + intercept."""
+    coeffs = {}
+    if standards_df is None or len(selected_standards) not in (1, 2):
+        return coeffs
+
+    isotopic_types = {
+        'd13C': (ISOTYPE_D13C, 'd 13C/12C  Mean'),
+        'd18O': (ISOTYPE_D18O, 'd 18O/16O  Mean'),
+    }
+    for iso_key, (iso_type_name, raw_col) in isotopic_types.items():
+        if raw_col not in standards_df.columns:
+            continue
+        slope = np.nan
+        intercept = np.nan
+        if len(selected_standards) == 1:
+            standard = selected_standards[0]
+            raw_std = pd.to_numeric(
+                standards_df.loc[standards_df['Identifier 1'] == standard, raw_col],
+                errors='coerce'
+            ).mean()
+            true_std = pd.to_numeric(pd.Series([get_true_value(standard, iso_type_name)]), errors='coerce').iloc[0]
+            if np.isfinite(raw_std) and np.isfinite(true_std) and np.isfinite(raw_std + 1000) and abs(raw_std + 1000) > 1e-12:
+                slope = (true_std + 1000.0) / (raw_std + 1000.0)
+                intercept = (1000.0 * slope) - 1000.0
+        else:
+            standard1, standard2 = selected_standards
+            raw_rm1 = pd.to_numeric(
+                standards_df.loc[standards_df['Identifier 1'] == standard1, raw_col],
+                errors='coerce'
+            ).mean()
+            raw_rm2 = pd.to_numeric(
+                standards_df.loc[standards_df['Identifier 1'] == standard2, raw_col],
+                errors='coerce'
+            ).mean()
+            true_rm1 = pd.to_numeric(pd.Series([get_true_value(standard1, iso_type_name)]), errors='coerce').iloc[0]
+            true_rm2 = pd.to_numeric(pd.Series([get_true_value(standard2, iso_type_name)]), errors='coerce').iloc[0]
+            denom = raw_rm1 - raw_rm2
+            if np.isfinite(raw_rm1) and np.isfinite(raw_rm2) and np.isfinite(true_rm1) and np.isfinite(true_rm2) and np.isfinite(denom) and abs(denom) > 1e-12:
+                slope = (true_rm1 - true_rm2) / denom
+                intercept = true_rm1 - slope * raw_rm1
+        if np.isfinite(slope) and np.isfinite(intercept):
+            coeffs[iso_key] = {'slope': float(slope), 'intercept': float(intercept)}
+    return coeffs
+
 
 def calibrate_results(standards_df, full_df, selected_standards):
     """
@@ -2964,6 +3605,12 @@ def main():
         st.session_state.df = None
     if 'df_cycles_source' not in st.session_state:
         st.session_state.df_cycles_source = None
+    if 'edited_delta_rows' not in st.session_state:
+        st.session_state.edited_delta_rows = set()
+    if 'original_delta_values' not in st.session_state:
+        st.session_state.original_delta_values = {}
+    if 'calibration_coefficients' not in st.session_state:
+        st.session_state.calibration_coefficients = {}
     if 'file_processed' not in st.session_state:
         st.session_state.file_processed = False
     if 'confirm_reset' not in st.session_state:
@@ -2999,6 +3646,9 @@ def main():
                 st.session_state.file_processed = False
                 st.session_state.df = None
                 st.session_state.df_cycles_source = None
+                st.session_state.edited_delta_rows = set()
+                st.session_state.original_delta_values = {}
+                st.session_state.calibration_coefficients = {}
                 st.session_state.confirm_reset = False  # Reset confirmation state
             elif col2.button("Cancel", key="cancel_load_btn"):
                 st.session_state.confirm_reset = False  # Cancel reset and close prompt
@@ -3155,6 +3805,9 @@ def main():
                 # Save df to session_state
                 st.session_state.df = df
                 st.session_state.df_cycles_source = df_cycles_source
+                st.session_state.edited_delta_rows = set()
+                st.session_state.original_delta_values = {}
+                st.session_state.calibration_coefficients = {}
                 st.session_state.file_processed = True
 
             except Exception as e:
@@ -3497,6 +4150,10 @@ def main():
                                 selected_standards=selected_standards
                             )
                             st.session_state.df = calibrated_df
+                            st.session_state.calibration_coefficients = _compute_calibration_coefficients(
+                                clean_stds if clean_stds is not None else st.session_state.df,
+                                selected_standards
+                            )
                             st.success("Calibration completed for both isotopic types.")
                         except Exception as e:
                             st.error(f"Calibration failed: {e}")
@@ -4170,6 +4827,7 @@ def main():
                                          max_value=6.0,
                                          value=4.0,
                                          step=0.1)
+        st.session_state['sigma_level_data'] = float(sigma_level_data)
 
         
 
@@ -4190,6 +4848,7 @@ def main():
 
         # Initialize mask for statistical outliers
         statistical_mask = pd.Series(False, index=data_to_process.index, dtype=bool)
+        edited_mask_data = pd.Series(data_to_process.index.map(_is_row_edited), index=data_to_process.index, dtype=bool)
         group_series = _get_species_series(data_to_process)
         
         # Calculate statistical outliers separately for each identifier and comment group
@@ -4213,6 +4872,7 @@ def main():
                         (group_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
                     )
                     statistical_mask.loc[group_mask] = group_stat_outliers.astype(bool).to_numpy()
+        statistical_mask = statistical_mask & ~edited_mask_data
                     
         # Get standards from calibration table
         try:
@@ -4241,7 +4901,8 @@ def main():
             (data_to_process['leak_rate'] >= st.session_state.leak_range[0]) &
             (data_to_process['leak_rate'] <= st.session_state.leak_range[1]) &
             not_saturated_samples &
-            not_failed_samples
+            not_failed_samples &
+            ~edited_mask_data
         )
 
         # Combine range and statistical masks
@@ -4250,6 +4911,7 @@ def main():
         # Filter out standards from the data before calculating statistics
         non_standards_mask = ~data_to_process['Identifier 1'].isin(all_standards)
         data_without_standards = data_to_process[non_standards_mask].copy()
+        edited_mask_no_std = pd.Series(data_without_standards.index.map(_is_row_edited), index=data_without_standards.index, dtype=bool)
 
         # Calculate total samples (excluding standards)
         # Count unique samples and total measurements
@@ -4258,14 +4920,14 @@ def main():
 
         # Calculate outliers using data_without_standards
         stat_outliers = sum(statistical_mask[non_standards_mask])
-        d13c_mask = (data_without_standards['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (data_without_standards['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
-        d18o_mask = (data_without_standards['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (data_without_standards['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
-        signal_mask = (data_without_standards['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (data_without_standards['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
-        leak_mask = (data_without_standards['leak_rate'] < st.session_state.leak_range[0]) | (data_without_standards['leak_rate'] > st.session_state.leak_range[1])
+        d13c_mask = ((data_without_standards['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (data_without_standards['d 13C/12C  Mean'] > st.session_state.d13c_range[1])) & ~edited_mask_no_std
+        d18o_mask = ((data_without_standards['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (data_without_standards['d 18O/16O  Mean'] > st.session_state.d18o_range[1])) & ~edited_mask_no_std
+        signal_mask = ((data_without_standards['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (data_without_standards['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])) & ~edited_mask_no_std
+        leak_mask = ((data_without_standards['leak_rate'] < st.session_state.leak_range[0]) | (data_without_standards['leak_rate'] > st.session_state.leak_range[1])) & ~edited_mask_no_std
         status_series_no_std = data_without_standards.get('Collector Status', pd.Series(False, index=data_without_standards.index))
-        failed_mask = status_series_no_std == 'Failed Sample'
-        saturated_mask = status_series_no_std == 'Partially Saturated Collectors'
-        saturated_sample_mask = status_series_no_std == 'Fully Saturated Collectors'
+        failed_mask = (status_series_no_std == 'Failed Sample') & ~edited_mask_no_std
+        saturated_mask = (status_series_no_std == 'Partially Saturated Collectors') & ~edited_mask_no_std
+        saturated_sample_mask = (status_series_no_std == 'Fully Saturated Collectors') & ~edited_mask_no_std
 
         # Count outliers
         d13c_outliers = sum(d13c_mask)
@@ -4426,6 +5088,7 @@ def main():
 
         # Separate data into main_data and outliers_df
         main_data = data_to_process[within_all].copy() if st.session_state.include_outliers == "No" else data_to_process.copy()
+        edited_mask_out = pd.Series(data_to_process.index.map(_is_row_edited), index=data_to_process.index, dtype=bool)
         if st.session_state.include_outliers == "No":
             # Collect outliers with their categories
             outliers_df = pd.DataFrame()
@@ -4434,6 +5097,7 @@ def main():
             failed_outliers_df = data_to_process[
                 data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Failed Sample'
             ].copy()
+            failed_outliers_df = failed_outliers_df[~failed_outliers_df.index.map(_is_row_edited)]
             if not failed_outliers_df.empty:
                 failed_outliers_df['Category'] = 'Failed Sample'
                 outliers_df = pd.concat([outliers_df, failed_outliers_df])
@@ -4441,6 +5105,7 @@ def main():
             saturated_samples_df = data_to_process[
                 data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors'
             ].copy()
+            saturated_samples_df = saturated_samples_df[~saturated_samples_df.index.map(_is_row_edited)]
             if not saturated_samples_df.empty:
                 saturated_samples_df['Category'] = 'Fully Saturated Collectors'
                 outliers_df = pd.concat([outliers_df, saturated_samples_df])
@@ -4468,6 +5133,7 @@ def main():
                             (group_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
                         )
                         statistical_mask.loc[group_mask] = group_stat_outliers.astype(bool).to_numpy()
+            statistical_mask = statistical_mask & ~edited_mask_out
             
             statistical_outliers = data_to_process[statistical_mask].copy()
             if not statistical_outliers.empty:
@@ -4479,6 +5145,7 @@ def main():
                 (data_to_process['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
                 (data_to_process['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
             ].copy()
+            d13c_outliers = d13c_outliers[~d13c_outliers.index.map(_is_row_edited)]
             if not d13c_outliers.empty:
                 d13c_outliers['Category'] = 'd13C Range'
                 outliers_df = pd.concat([outliers_df, d13c_outliers])
@@ -4487,6 +5154,7 @@ def main():
                 (data_to_process['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                 (data_to_process['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
             ].copy()
+            d18o_outliers = d18o_outliers[~d18o_outliers.index.map(_is_row_edited)]
             if not d18o_outliers.empty:
                 d18o_outliers['Category'] = 'd18O Range'
                 outliers_df = pd.concat([outliers_df, d18o_outliers])
@@ -4495,6 +5163,7 @@ def main():
                 (data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
                 (data_to_process['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
             ].copy()
+            signal_outliers = signal_outliers[~signal_outliers.index.map(_is_row_edited)]
             if not signal_outliers.empty:
                 signal_outliers['Category'] = 'Signal Intensity'
                 outliers_df = pd.concat([outliers_df, signal_outliers])
@@ -4503,6 +5172,7 @@ def main():
                 (data_to_process['leak_rate'] < st.session_state.leak_range[0]) |
                 (data_to_process['leak_rate'] > st.session_state.leak_range[1])
             ].copy()
+            leak_outliers = leak_outliers[~leak_outliers.index.map(_is_row_edited)]
             if not leak_outliers.empty:
                 leak_outliers['Category'] = 'Leak Rate'
                 outliers_df = pd.concat([outliers_df, leak_outliers])
@@ -4538,21 +5208,21 @@ def main():
             d13c_out_mask = (
                 (data_to_process['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
                 (data_to_process['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
-            )
+            ) & ~edited_mask_out
             d18o_out_mask = (
                 (data_to_process['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                 (data_to_process['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
-            )
+            ) & ~edited_mask_out
             signal_out_mask = (
                 (data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
                 (data_to_process['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
-            )
+            ) & ~edited_mask_out
             leak_out_mask = (
                 (data_to_process['leak_rate'] < st.session_state.leak_range[0]) |
                 (data_to_process['leak_rate'] > st.session_state.leak_range[1])
-            )
-            failed_out_mask = data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Failed Sample'
-            saturated_sample_out_mask = data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors'
+            ) & ~edited_mask_out
+            failed_out_mask = (data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Failed Sample') & ~edited_mask_out
+            saturated_sample_out_mask = (data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors') & ~edited_mask_out
 
             cat_bools = pd.DataFrame({
                 'Statistical': stat_mask_all,
@@ -4800,12 +5470,17 @@ def main():
 
         # Summary Charts
         st.subheader("Summary Charts")
+        d13_summary_editor_prefix = "tab3_d13c_summary_editor"
+        d18_summary_editor_prefix = "tab3_d18o_summary_editor"
         
         # Create summary chart for d13C
         d13c_summary = go.Figure()
+        d13_active_target = _get_active_editor_target(d13_summary_editor_prefix)
         d13_legend_partial_shown = False
         d13_legend_failed_full_shown = False
         d13_legend_failed_no_values_shown = False
+        d13_legend_failed_interp_shown = False
+        d13_legend_edited_shown = False
         for species in unique_species:
             if species == "Unknown":
                 continue
@@ -4814,12 +5489,27 @@ def main():
             species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
             if species_data_unfiltered.empty and species_data.empty:
                 continue
+            edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
 
             status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
             saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
             saturated_samples_mask = status_series == 'Fully Saturated Collectors'
             failed_mask = status_series == 'Failed Sample'
             saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
+            failed_idx = species_data_unfiltered[failed_mask].index
+            edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
+            edited_mask_species_unfiltered = pd.Series(
+                species_data_unfiltered.index.map(_is_row_edited),
+                index=species_data_unfiltered.index,
+                dtype=bool
+            )
+            failed_idx = species_data_unfiltered[failed_mask].index
+            edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
+            edited_mask_species_unfiltered = pd.Series(
+                species_data_unfiltered.index.map(_is_row_edited),
+                index=species_data_unfiltered.index,
+                dtype=bool
+            )
             failed_idx = species_data_unfiltered[failed_mask].index
             
             # Calculate statistical outliers
@@ -4834,24 +5524,27 @@ def main():
                 (species_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
+            outlier_mask = outlier_mask & ~edited_mask_species
             # Store statistical outliers
             statistical_outliers = species_data[outlier_mask].copy()
 
-            # Calculate range outliers mask (always calculate to filter data)
-            range_mask = (
-                (species_data['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
-                (species_data['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
-                (species_data['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
-                (species_data['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
-                (species_data['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (species_data['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
-                (species_data['leak_rate'] < st.session_state.leak_range[0]) |
-                (species_data['leak_rate'] > st.session_state.leak_range[1])
+            # Calculate range outliers mask using unfiltered data so signal/leak outliers aren't dropped
+            range_mask_unfiltered = (
+                (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
+                (species_data_unfiltered['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
+                (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
+                (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
+                (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
+                (species_data_unfiltered['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
+                (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
+                (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
             )
+            range_mask_unfiltered = range_mask_unfiltered & ~edited_mask_species_unfiltered
+            range_mask_for_plot = range_mask_unfiltered.reindex(species_data.index, fill_value=False)
 
             # Store range outliers if showing them
             if show_range_outliers:
-                range_outliers = species_data[range_mask].copy()
+                range_outliers = species_data_unfiltered[range_mask_unfiltered].copy()
                 # Add x_axis values to range outliers
                 if x_axis_option == "By Identifier 2":
                     range_outliers['x_axis'] = range_outliers['Identifier 2'].apply(
@@ -4861,11 +5554,11 @@ def main():
                 else:
                     range_outliers['x_axis'] = range(len(range_outliers))
             else:
-                range_outliers = pd.DataFrame(columns=species_data.columns)
+                range_outliers = pd.DataFrame(columns=species_data_unfiltered.columns)
                 
             # Filter data to plot - exclude statistical, range outliers, and saturated samples
             data_to_plot = species_data[
-                ~(outlier_mask | range_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+                ~(outlier_mask | range_mask_for_plot | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
             ].copy()
             
             # Sort data by x_axis to ensure sequential line connections
@@ -4897,10 +5590,35 @@ def main():
                     'd13C: %{y:.4f}<extra></extra>'
                 )
             ))
+            edited_points = data_to_plot[data_to_plot.index.map(_is_row_edited)]
+            if not edited_points.empty:
+                edited_customdata = _build_delta_point_customdata(edited_points, 'd13C')
+                d13c_summary.add_trace(go.Scatter(
+                    x=edited_points['x_axis'],
+                    y=edited_points['d 13C/12C  Mean'],
+                    mode='markers',
+                    name='Edited Samples',
+                    marker=dict(
+                        size=12,
+                        symbol='circle',
+                        color='#ff00ff',
+                        line=dict(width=1, color='#ff00ff')
+                    ),
+                    showlegend=not d13_legend_edited_shown,
+                    legendgroup='edited_samples',
+                    customdata=edited_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd13C: %{y:.4f}<extra></extra>'
+                    )
+                ))
+                d13_legend_edited_shown = True
 
             # Highlight saturated collectors (compromised but valid)
             if show_saturated_collectors and saturated_collectors_mask.any():
                 sat_collectors = species_data_unfiltered[saturated_collectors_mask]
+                sat_collectors_customdata = _build_delta_point_customdata(sat_collectors, 'd13C')
                 d13c_summary.add_trace(go.Scatter(
                     x=sat_collectors['x_axis'],
                     y=sat_collectors['d 13C/12C  Mean'],
@@ -4913,13 +5631,20 @@ def main():
                         line=dict(width=2, color='#ff7f0e')
                     ),
                     showlegend=not d13_legend_partial_shown,
-                    legendgroup='collector_status'
+                    legendgroup='collector_status',
+                    customdata=sat_collectors_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd13C: %{y:.4f}<extra></extra>'
+                    )
                 ))
                 d13_legend_partial_shown = True
 
             # Plot saturated samples as outliers
             if show_saturated_samples and saturated_samples_mask.any():
                 sat_samples = species_data_unfiltered[saturated_samples_mask]
+                sat_customdata = _build_delta_point_customdata(sat_samples, 'd13C')
                 y_vals_sat = pd.to_numeric(sat_samples['d 13C/12C  Mean'], errors='coerce')
                 if y_vals_sat.notna().any():
                     y_sat = y_vals_sat.tolist()
@@ -4943,12 +5668,71 @@ def main():
                         line=dict(width=2, color='#d62728')
                     ),
                     showlegend=not d13_legend_failed_full_shown,
-                    legendgroup='outliers'
+                    legendgroup='outliers',
+                    customdata=sat_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd13C: %{y:.4f}<extra></extra>'
+                    )
                 ))
                 d13_legend_failed_full_shown = True
 
             if show_failed_samples and failed_mask.any():
                 failed_samples = species_data_unfiltered[failed_mask]
+                failed_vals = pd.to_numeric(failed_samples['d 13C/12C  Mean'], errors='coerce')
+                failed_is_edited = pd.Series(failed_samples.index.map(_is_row_edited), index=failed_samples.index)
+                failed_interp = failed_samples[failed_vals.notna() & failed_is_edited].copy()
+                failed_recovered = failed_samples[failed_vals.notna() & ~failed_is_edited].copy()
+                failed_missing = failed_samples[failed_vals.isna()].copy()
+                if not failed_recovered.empty:
+                    failed_recovered_customdata = _build_delta_point_customdata(failed_recovered, 'd13C')
+                    d13c_summary.add_trace(go.Scatter(
+                        x=failed_recovered['x_axis'],
+                        y=pd.to_numeric(failed_recovered['d 13C/12C  Mean'], errors='coerce'),
+                        mode='markers',
+                        name='Partially Failed (Recovered Mean)',
+                        marker=dict(
+                            size=12,
+                            symbol='diamond-open',
+                            color='#ff7f0e',
+                            line=dict(width=2, color='#ff7f0e')
+                        ),
+                        showlegend=not d13_legend_partial_shown,
+                        legendgroup='collector_status',
+                        customdata=failed_recovered_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: %{y:.4f}<extra></extra>'
+                        )
+                    ))
+                    d13_legend_partial_shown = True
+                if not failed_interp.empty:
+                    failed_interp_customdata = _build_delta_point_customdata(failed_interp, 'd13C')
+                    d13c_summary.add_trace(go.Scatter(
+                        x=failed_interp['x_axis'],
+                        y=pd.to_numeric(failed_interp['d 13C/12C  Mean'], errors='coerce'),
+                        mode='markers',
+                        name='Failed Samples (Interpolated)',
+                        marker=dict(
+                            size=10,
+                            symbol='triangle-down',
+                            color='#ff00ff',
+                            line=dict(width=1, color='#ff00ff')
+                        ),
+                        showlegend=not d13_legend_failed_interp_shown,
+                        legendgroup='outliers',
+                        customdata=failed_interp_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: %{y:.4f}<extra></extra>'
+                        )
+                    ))
+                    d13_legend_failed_interp_shown = True
+                if not failed_missing.empty:
+                    failed_customdata = _build_delta_point_customdata(failed_missing, 'd13C')
                 y_vals = pd.to_numeric(species_data['d 13C/12C  Mean'], errors='coerce')
                 y_min = y_vals.min()
                 y_max = y_vals.max()
@@ -4956,25 +5740,33 @@ def main():
                     y_min, y_max = -1.0, 1.0
                 y_range = y_max - y_min if np.isfinite(y_max) else 1.0
                 y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
-                d13c_summary.add_trace(go.Scatter(
-                    x=failed_samples['x_axis'],
-                    y=[y_failed] * len(failed_samples),
-                    mode='markers',
-                    name='Failed Samples (No Values)',
-                    marker=dict(
-                        size=10,
-                        symbol='triangle-down',
-                        color='#7f7f7f',
-                        line=dict(width=1, color='#7f7f7f')
-                    ),
-                    showlegend=not d13_legend_failed_no_values_shown,
-                    legendgroup='outliers',
-                    text=failed_samples['Identifier 2'].astype(str)
-                ))
-                d13_legend_failed_no_values_shown = True
+                if not failed_missing.empty:
+                    d13c_summary.add_trace(go.Scatter(
+                        x=failed_missing['x_axis'],
+                        y=[y_failed] * len(failed_missing),
+                        mode='markers',
+                        name='Failed Samples (No Values)',
+                        marker=dict(
+                            size=10,
+                            symbol='triangle-down',
+                            color='#7f7f7f',
+                            line=dict(width=1, color='#7f7f7f')
+                        ),
+                        showlegend=not d13_legend_failed_no_values_shown,
+                        legendgroup='outliers',
+                        text=failed_missing['Identifier 2'].astype(str),
+                        customdata=failed_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: missing (click to edit)<extra></extra>'
+                        )
+                    ))
+                    d13_legend_failed_no_values_shown = True
 
             # Plot statistical outliers if enabled
             if show_statistical_outliers and not statistical_outliers.empty:
+                statistical_customdata = _build_delta_point_customdata(statistical_outliers, 'd13C')
                 d13c_summary.add_trace(go.Scatter(
                     x=statistical_outliers['x_axis'],
                     y=statistical_outliers['d 13C/12C  Mean'],
@@ -4987,7 +5779,13 @@ def main():
                         line=dict(width=2, color=species_color)
                     ),
                     showlegend=True,
-                    legendgroup='outliers'
+                    legendgroup='outliers',
+                    customdata=statistical_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd13C: %{y:.4f}<extra></extra>'
+                    )
                 ))
 
             # Plot range outliers by type if enabled
@@ -4995,9 +5793,10 @@ def main():
                 # Signal intensity outliers
                 signal_mask = (range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (range_outliers['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
                 if signal_mask.any():
+                    signal_outliers_df = range_outliers[signal_mask]
                     d13c_summary.add_trace(go.Scatter(
-                        x=range_outliers[signal_mask]['x_axis'],
-                        y=range_outliers[signal_mask]['d 13C/12C  Mean'],
+                        x=signal_outliers_df['x_axis'],
+                        y=signal_outliers_df['d 13C/12C  Mean'],
                         mode='markers',
                         marker=dict(
                             color=species_color,
@@ -5007,15 +5806,22 @@ def main():
                         ),
                         name='Signal Intensity Range',
                         showlegend=True,
-                        legendgroup='outliers'
+                        legendgroup='outliers',
+                        customdata=_build_delta_point_customdata(signal_outliers_df, 'd13C'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: %{y:.4f}<extra></extra>'
+                        )
                     ))
 
                 # Leak rate outliers
                 leak_mask = (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])
                 if leak_mask.any():
+                    leak_outliers_df = range_outliers[leak_mask]
                     d13c_summary.add_trace(go.Scatter(
-                        x=range_outliers[leak_mask]['x_axis'],
-                        y=range_outliers[leak_mask]['d 13C/12C  Mean'],
+                        x=leak_outliers_df['x_axis'],
+                        y=leak_outliers_df['d 13C/12C  Mean'],
                         mode='markers',
                         marker=dict(
                             color=species_color,
@@ -5025,15 +5831,22 @@ def main():
                         ),
                         name='Leak Rate Range',
                         showlegend=True,
-                        legendgroup='outliers'
+                        legendgroup='outliers',
+                        customdata=_build_delta_point_customdata(leak_outliers_df, 'd13C'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: %{y:.4f}<extra></extra>'
+                        )
                     ))
 
                 # Î´13C range outliers
                 d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
                 if d13c_mask.any():
+                    d13_range_outliers_df = range_outliers[d13c_mask]
                     d13c_summary.add_trace(go.Scatter(
-                        x=range_outliers[d13c_mask]['x_axis'],
-                        y=range_outliers[d13c_mask]['d 13C/12C  Mean'],
+                        x=d13_range_outliers_df['x_axis'],
+                        y=d13_range_outliers_df['d 13C/12C  Mean'],
                         mode='markers',
                         marker=dict(
                             color=species_color,
@@ -5043,15 +5856,22 @@ def main():
                         ),
                         name='d13C Range',
                         showlegend=True,
-                        legendgroup='outliers'
+                        legendgroup='outliers',
+                        customdata=_build_delta_point_customdata(d13_range_outliers_df, 'd13C'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: %{y:.4f}<extra></extra>'
+                        )
                     ))
 
                 # Î´18O range outliers
                 d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
                 if d18o_mask.any():
+                    d18_range_outliers_df = range_outliers[d18o_mask]
                     d13c_summary.add_trace(go.Scatter(
-                        x=range_outliers[d18o_mask]['x_axis'],
-                        y=range_outliers[d18o_mask]['d 13C/12C  Mean'],
+                        x=d18_range_outliers_df['x_axis'],
+                        y=d18_range_outliers_df['d 13C/12C  Mean'],
                         mode='markers',
                         marker=dict(
                             color=species_color,
@@ -5061,17 +5881,61 @@ def main():
                         ),
                         name='d18O Range',
                         showlegend=True,
-                        legendgroup='outliers'
+                        legendgroup='outliers',
+                        customdata=_build_delta_point_customdata(d18_range_outliers_df, 'd13C'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: %{y:.4f}<extra></extra>'
+                        )
                     ))
+        if (
+            d13_active_target is not None
+            and d13_active_target.get('isotope_key') == 'd13C'
+            and d13_active_target.get('row_label') in subset_data_unfiltered.index
+        ):
+            active_row = subset_data_unfiltered.loc[d13_active_target['row_label']]
+            if isinstance(active_row, pd.DataFrame):
+                active_row = active_row.iloc[0]
+            x_active = active_row.get('x_axis', np.nan)
+            if pd.notna(x_active):
+                y_active = pd.to_numeric(pd.Series([active_row.get('d 13C/12C  Mean')]), errors='coerce').iloc[0]
+                if pd.notna(y_active):
+                    y_active_plot = float(y_active)
+                else:
+                    y_vals = pd.to_numeric(subset_data['d 13C/12C  Mean'], errors='coerce')
+                    y_min = y_vals.min()
+                    y_max = y_vals.max()
+                    if not np.isfinite(y_min):
+                        y_min, y_max = -1.0, 1.0
+                    y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                    y_active_plot = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                status_val = str(active_row.get('Collector Status', '')).strip()
+                marker_symbol = 'triangle-down' if status_val in ('Failed Sample', 'Fully Saturated Collectors') else 'circle'
+                d13c_summary.add_trace(go.Scatter(
+                    x=[x_active],
+                    y=[y_active_plot],
+                    mode='markers',
+                    name='Active Selection',
+                    marker=dict(
+                        size=14,
+                        symbol=marker_symbol,
+                        color='#ff00ff',
+                        line=dict(width=2, color='#ff00ff')
+                    ),
+                    showlegend=False,
+                    legendgroup='active_selection'
+                ))
+
         d13c_summary.update_layout(
             title="d13C Summary by Species",
             xaxis_title="Sample Number" if x_axis_option == "By Sequence" else "Identifier 2",
             yaxis_title="d13C",
             showlegend=True,
             height=500,
-            clickmode='event+select'
+            clickmode='event+select',
+            dragmode='zoom'
         )
-        d13_summary_editor_prefix = "tab3_d13c_summary_editor"
         d13_summary_nonce = int(st.session_state.get(f"{d13_summary_editor_prefix}_chart_nonce", 0))
         d13c_summary_state = st.plotly_chart(
             d13c_summary,
@@ -5084,9 +5948,12 @@ def main():
         
         # Create summary chart for d18O
         d18o_summary = go.Figure()
+        d18_active_target = _get_active_editor_target(d18_summary_editor_prefix)
         d18_legend_partial_shown = False
         d18_legend_failed_full_shown = False
         d18_legend_failed_no_values_shown = False
+        d18_legend_failed_interp_shown = False
+        d18_legend_edited_shown = False
         for species in unique_species:
             if species == "Unknown":
                 continue
@@ -5095,6 +5962,7 @@ def main():
             species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
             if species_data_unfiltered.empty and species_data.empty:
                 continue
+            edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
 
             status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
             saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
@@ -5115,17 +5983,12 @@ def main():
                 (species_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
+            outlier_mask = outlier_mask & ~edited_mask_species
             statistical_outliers = species_data[outlier_mask].copy()
-            data_to_plot = species_data[
-                ~(outlier_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
-            ].copy()
-            
-            # Sort data by x_axis to ensure sequential line connections
-            data_to_plot = data_to_plot.sort_values('x_axis')
             
             # Calculate range outliers
             if show_range_outliers:
-                range_mask = (
+                range_mask_unfiltered = (
                     (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
                     (species_data_unfiltered['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
                     (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
@@ -5135,7 +5998,10 @@ def main():
                     (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
                     (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
                 )
-                range_outliers = species_data_unfiltered[range_mask].copy()
+                edited_mask_species_unf = pd.Series(species_data_unfiltered.index.map(_is_row_edited), index=species_data_unfiltered.index, dtype=bool)
+                range_mask_unfiltered = range_mask_unfiltered & ~edited_mask_species_unf
+                range_outliers = species_data_unfiltered[range_mask_unfiltered].copy()
+                range_mask_for_plot = range_mask_unfiltered.reindex(species_data.index, fill_value=False)
                 # Add x_axis values to range outliers
                 if x_axis_option == "By Identifier 2":
                     range_outliers['x_axis'] = range_outliers['Identifier 2'].apply(
@@ -5146,6 +6012,14 @@ def main():
                     range_outliers['x_axis'] = range(len(range_outliers))
             else:
                 range_outliers = pd.DataFrame(columns=species_data.columns)
+                range_mask_for_plot = pd.Series(False, index=species_data.index, dtype=bool)
+
+            data_to_plot = species_data[
+                ~(outlier_mask | range_mask_for_plot | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+            ].copy()
+            
+            # Sort data by x_axis to ensure sequential line connections
+            data_to_plot = data_to_plot.sort_values('x_axis')
 
             # Plot main data
             # Generate unique color for this species
@@ -5174,10 +6048,35 @@ def main():
                     'd18O: %{y:.4f}<extra></extra>'
                 )
             ))
+            edited_points = data_to_plot[data_to_plot.index.map(_is_row_edited)]
+            if not edited_points.empty:
+                edited_customdata = _build_delta_point_customdata(edited_points, 'd18O')
+                d18o_summary.add_trace(go.Scatter(
+                    x=edited_points['x_axis'],
+                    y=edited_points['d 18O/16O  Mean'],
+                    mode='markers',
+                    name='Edited Samples',
+                    marker=dict(
+                        size=12,
+                        symbol='circle',
+                        color='#ff00ff',
+                        line=dict(width=1, color='#ff00ff')
+                    ),
+                    showlegend=not d18_legend_edited_shown,
+                    legendgroup='edited_samples',
+                    customdata=edited_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd18O: %{y:.4f}<extra></extra>'
+                    )
+                ))
+                d18_legend_edited_shown = True
 
             # Highlight saturated collectors (compromised but valid)
             if show_saturated_collectors and saturated_collectors_mask.any():
                 sat_collectors = species_data_unfiltered[saturated_collectors_mask]
+                sat_collectors_customdata = _build_delta_point_customdata(sat_collectors, 'd18O')
                 d18o_summary.add_trace(go.Scatter(
                     x=sat_collectors['x_axis'],
                     y=sat_collectors['d 18O/16O  Mean'],
@@ -5190,13 +6089,20 @@ def main():
                         line=dict(width=2, color='#ff7f0e')
                     ),
                     showlegend=not d18_legend_partial_shown,
-                    legendgroup='collector_status'
+                    legendgroup='collector_status',
+                    customdata=sat_collectors_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd18O: %{y:.4f}<extra></extra>'
+                    )
                 ))
                 d18_legend_partial_shown = True
 
             # Plot saturated samples as outliers
             if show_saturated_samples and saturated_samples_mask.any():
                 sat_samples = species_data_unfiltered[saturated_samples_mask]
+                sat_customdata = _build_delta_point_customdata(sat_samples, 'd18O')
                 y_vals_sat = pd.to_numeric(sat_samples['d 18O/16O  Mean'], errors='coerce')
                 if y_vals_sat.notna().any():
                     y_sat = y_vals_sat.tolist()
@@ -5220,12 +6126,71 @@ def main():
                         line=dict(width=2, color='#d62728')
                     ),
                     showlegend=not d18_legend_failed_full_shown,
-                    legendgroup='outliers'
+                    legendgroup='outliers',
+                    customdata=sat_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd18O: %{y:.4f}<extra></extra>'
+                    )
                 ))
                 d18_legend_failed_full_shown = True
 
             if show_failed_samples and failed_mask.any():
                 failed_samples = species_data_unfiltered[failed_mask]
+                failed_vals = pd.to_numeric(failed_samples['d 18O/16O  Mean'], errors='coerce')
+                failed_is_edited = pd.Series(failed_samples.index.map(_is_row_edited), index=failed_samples.index)
+                failed_interp = failed_samples[failed_vals.notna() & failed_is_edited].copy()
+                failed_recovered = failed_samples[failed_vals.notna() & ~failed_is_edited].copy()
+                failed_missing = failed_samples[failed_vals.isna()].copy()
+                if not failed_recovered.empty:
+                    failed_recovered_customdata = _build_delta_point_customdata(failed_recovered, 'd18O')
+                    d18o_summary.add_trace(go.Scatter(
+                        x=failed_recovered['x_axis'],
+                        y=pd.to_numeric(failed_recovered['d 18O/16O  Mean'], errors='coerce'),
+                        mode='markers',
+                        name='Partially Failed (Recovered Mean)',
+                        marker=dict(
+                            size=12,
+                            symbol='diamond-open',
+                            color='#ff7f0e',
+                            line=dict(width=2, color='#ff7f0e')
+                        ),
+                        showlegend=not d18_legend_partial_shown,
+                        legendgroup='collector_status',
+                        customdata=failed_recovered_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
+                    ))
+                    d18_legend_partial_shown = True
+                if not failed_interp.empty:
+                    failed_interp_customdata = _build_delta_point_customdata(failed_interp, 'd18O')
+                    d18o_summary.add_trace(go.Scatter(
+                        x=failed_interp['x_axis'],
+                        y=pd.to_numeric(failed_interp['d 18O/16O  Mean'], errors='coerce'),
+                        mode='markers',
+                        name='Failed Samples (Interpolated)',
+                        marker=dict(
+                            size=10,
+                            symbol='triangle-down',
+                            color='#ff00ff',
+                            line=dict(width=1, color='#ff00ff')
+                        ),
+                        showlegend=not d18_legend_failed_interp_shown,
+                        legendgroup='outliers',
+                        customdata=failed_interp_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
+                    ))
+                    d18_legend_failed_interp_shown = True
+                if not failed_missing.empty:
+                    failed_customdata = _build_delta_point_customdata(failed_missing, 'd18O')
                 y_vals = pd.to_numeric(species_data['d 18O/16O  Mean'], errors='coerce')
                 y_min = y_vals.min()
                 y_max = y_vals.max()
@@ -5233,25 +6198,33 @@ def main():
                     y_min, y_max = -1.0, 1.0
                 y_range = y_max - y_min if np.isfinite(y_max) else 1.0
                 y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
-                d18o_summary.add_trace(go.Scatter(
-                    x=failed_samples['x_axis'],
-                    y=[y_failed] * len(failed_samples),
-                    mode='markers',
-                    name='Failed Samples (No Values)',
-                    marker=dict(
-                        size=10,
-                        symbol='triangle-down',
-                        color='#7f7f7f',
-                        line=dict(width=1, color='#7f7f7f')
-                    ),
-                    showlegend=not d18_legend_failed_no_values_shown,
-                    legendgroup='outliers',
-                    text=failed_samples['Identifier 2'].astype(str)
-                ))
-                d18_legend_failed_no_values_shown = True
+                if not failed_missing.empty:
+                    d18o_summary.add_trace(go.Scatter(
+                        x=failed_missing['x_axis'],
+                        y=[y_failed] * len(failed_missing),
+                        mode='markers',
+                        name='Failed Samples (No Values)',
+                        marker=dict(
+                            size=10,
+                            symbol='triangle-down',
+                            color='#7f7f7f',
+                            line=dict(width=1, color='#7f7f7f')
+                        ),
+                        showlegend=not d18_legend_failed_no_values_shown,
+                        legendgroup='outliers',
+                        text=failed_missing['Identifier 2'].astype(str),
+                        customdata=failed_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: missing (click to edit)<extra></extra>'
+                        )
+                    ))
+                    d18_legend_failed_no_values_shown = True
 
             # Plot statistical outliers if enabled
             if show_statistical_outliers and not statistical_outliers.empty:
+                statistical_customdata = _build_delta_point_customdata(statistical_outliers, 'd18O')
                 d18o_summary.add_trace(go.Scatter(
                     x=statistical_outliers['x_axis'],
                     y=statistical_outliers['d 18O/16O  Mean'],
@@ -5264,7 +6237,13 @@ def main():
                         line=dict(width=2, color=species_color)
                     ),
                     showlegend=True,
-                    legendgroup='outliers'
+                    legendgroup='outliers',
+                    customdata=statistical_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd18O: %{y:.4f}<extra></extra>'
+                    )
                 ))
 
             # Plot range outliers by type if enabled
@@ -5272,9 +6251,10 @@ def main():
                 # Signal intensity outliers
                 signal_mask = (range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (range_outliers['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
                 if signal_mask.any():
+                    signal_outliers_df = range_outliers[signal_mask]
                     d18o_summary.add_trace(go.Scatter(
-                        x=range_outliers[signal_mask]['x_axis'],
-                        y=range_outliers[signal_mask]['d 18O/16O  Mean'],
+                        x=signal_outliers_df['x_axis'],
+                        y=signal_outliers_df['d 18O/16O  Mean'],
                         mode='markers',
                         marker=dict(
                             color=species_color,
@@ -5284,15 +6264,22 @@ def main():
                         ),
                         name='Signal Intensity Range',
                         showlegend=True,
-                        legendgroup='outliers'
+                        legendgroup='outliers',
+                        customdata=_build_delta_point_customdata(signal_outliers_df, 'd18O'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
                     ))
 
                 # Leak rate outliers
                 leak_mask = (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])
                 if leak_mask.any():
+                    leak_outliers_df = range_outliers[leak_mask]
                     d18o_summary.add_trace(go.Scatter(
-                        x=range_outliers[leak_mask]['x_axis'],
-                        y=range_outliers[leak_mask]['d 18O/16O  Mean'],
+                        x=leak_outliers_df['x_axis'],
+                        y=leak_outliers_df['d 18O/16O  Mean'],
                         mode='markers',
                         marker=dict(
                             color=species_color,
@@ -5302,15 +6289,22 @@ def main():
                         ),
                         name='Leak Rate Range',
                         showlegend=True,
-                        legendgroup='outliers'
+                        legendgroup='outliers',
+                        customdata=_build_delta_point_customdata(leak_outliers_df, 'd18O'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
                     ))
 
                 # Î´13C range outliers
                 d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
                 if d13c_mask.any():
+                    d13_range_outliers_df = range_outliers[d13c_mask]
                     d18o_summary.add_trace(go.Scatter(
-                        x=range_outliers[d13c_mask]['x_axis'],
-                        y=range_outliers[d13c_mask]['d 18O/16O  Mean'],
+                        x=d13_range_outliers_df['x_axis'],
+                        y=d13_range_outliers_df['d 18O/16O  Mean'],
                         mode='markers',
                         marker=dict(
                             color=species_color,
@@ -5320,15 +6314,22 @@ def main():
                         ),
                         name='d13C Range',
                         showlegend=True,
-                        legendgroup='outliers'
+                        legendgroup='outliers',
+                        customdata=_build_delta_point_customdata(d13_range_outliers_df, 'd18O'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
                     ))
 
                 # Î´18O range outliers
                 d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
                 if d18o_mask.any():
+                    d18_range_outliers_df = range_outliers[d18o_mask]
                     d18o_summary.add_trace(go.Scatter(
-                        x=range_outliers[d18o_mask]['x_axis'],
-                        y=range_outliers[d18o_mask]['d 18O/16O  Mean'],
+                        x=d18_range_outliers_df['x_axis'],
+                        y=d18_range_outliers_df['d 18O/16O  Mean'],
                         mode='markers',
                         marker=dict(
                             color=species_color,
@@ -5338,19 +6339,63 @@ def main():
                         ),
                         name='d18O Range',
                         showlegend=True,
-                        legendgroup='outliers'
+                        legendgroup='outliers',
+                        customdata=_build_delta_point_customdata(d18_range_outliers_df, 'd18O'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
                     ))
+        if (
+            d18_active_target is not None
+            and d18_active_target.get('isotope_key') == 'd18O'
+            and d18_active_target.get('row_label') in subset_data_unfiltered.index
+        ):
+            active_row = subset_data_unfiltered.loc[d18_active_target['row_label']]
+            if isinstance(active_row, pd.DataFrame):
+                active_row = active_row.iloc[0]
+            x_active = active_row.get('x_axis', np.nan)
+            if pd.notna(x_active):
+                y_active = pd.to_numeric(pd.Series([active_row.get('d 18O/16O  Mean')]), errors='coerce').iloc[0]
+                if pd.notna(y_active):
+                    y_active_plot = float(y_active)
+                else:
+                    y_vals = pd.to_numeric(subset_data['d 18O/16O  Mean'], errors='coerce')
+                    y_min = y_vals.min()
+                    y_max = y_vals.max()
+                    if not np.isfinite(y_min):
+                        y_min, y_max = -1.0, 1.0
+                    y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                    y_active_plot = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                status_val = str(active_row.get('Collector Status', '')).strip()
+                marker_symbol = 'triangle-down' if status_val in ('Failed Sample', 'Fully Saturated Collectors') else 'circle'
+                d18o_summary.add_trace(go.Scatter(
+                    x=[x_active],
+                    y=[y_active_plot],
+                    mode='markers',
+                    name='Active Selection',
+                    marker=dict(
+                        size=14,
+                        symbol=marker_symbol,
+                        color='#ff00ff',
+                        line=dict(width=2, color='#ff00ff')
+                    ),
+                    showlegend=False,
+                    legendgroup='active_selection'
+                ))
+
         d18o_summary.update_layout(
             title="d18O Summary by Species",
             xaxis_title="Sample Number" if x_axis_option == "By Sequence" else "Identifier 2",
             yaxis_title="d18O",
             showlegend=True,
             height=500,
-            clickmode='event+select'
+            clickmode='event+select',
+            dragmode='zoom'
         )
         # Invert y-axis so increasing d18O plots downward
         d18o_summary.update_yaxes(autorange='reversed')
-        d18_summary_editor_prefix = "tab3_d18o_summary_editor"
         d18_summary_nonce = int(st.session_state.get(f"{d18_summary_editor_prefix}_chart_nonce", 0))
         d18o_summary_state = st.plotly_chart(
             d18o_summary,
@@ -5394,20 +6439,27 @@ def main():
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
 
-            range_mask = (
-                (species_data['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
-                (species_data['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
-                (species_data['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
-                (species_data['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
-                (species_data['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (species_data['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
-                (species_data['leak_rate'] < st.session_state.leak_range[0]) |
-                (species_data['leak_rate'] > st.session_state.leak_range[1])
+            range_mask_unfiltered = (
+                (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
+                (species_data_unfiltered['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
+                (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
+                (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
+                (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
+                (species_data_unfiltered['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
+                (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
+                (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
             )
+            edited_mask_species_unfiltered = pd.Series(
+                species_data_unfiltered.index.map(_is_row_edited),
+                index=species_data_unfiltered.index,
+                dtype=bool
+            )
+            range_mask_unfiltered = range_mask_unfiltered & ~edited_mask_species_unfiltered
+            range_mask_for_plot = range_mask_unfiltered.reindex(species_data.index, fill_value=False)
 
             # Filter to non-outliers for main scatter
             data_to_plot = species_data[
-                ~(outlier_mask | range_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+                ~(outlier_mask | range_mask_for_plot | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
             ].copy()
             # Drop rows with missing isotope values
             data_to_plot = data_to_plot[
@@ -5493,7 +6545,8 @@ def main():
             xaxis_title="d18O",
             yaxis_title="d13C",
             showlegend=True,
-            height=500
+            height=500,
+            dragmode='zoom'
         )
         st.plotly_chart(species_scatter, width='stretch')
 
@@ -5547,13 +6600,15 @@ def main():
                 (species_data['d 18O/16O  Mean'] < lower_threshold_d18O) |
                 (species_data['d 18O/16O  Mean'] > upper_threshold_d18O)
             )
+            outlier_mask = outlier_mask & ~edited_mask_species
             # Apply mask and include necessary columns (including x_axis)
             statistical_outliers = species_data[outlier_mask].copy()
 
             # Remove statistical outliers and saturated samples from data_to_plot
-            data_to_plot = species_data[
-                ~(outlier_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
-            ].copy()
+            saturated_idx_mask = pd.Series(species_data.index.isin(saturated_samples_idx), index=species_data.index, dtype=bool)
+            failed_idx_mask = pd.Series(species_data.index.isin(failed_idx), index=species_data.index, dtype=bool)
+            drop_mask = outlier_mask.reindex(species_data.index, fill_value=False) | saturated_idx_mask | failed_idx_mask
+            data_to_plot = species_data[~drop_mask].copy()
 
             # Identify range bar outliers from unfiltered data
             # Identify and process range outliers if enabled
@@ -5569,6 +6624,7 @@ def main():
                     (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
                     (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
                 )
+                range_mask = range_mask & ~edited_mask_species_unfiltered
                 # Apply mask and include necessary columns
                 range_bar_outliers = species_data_unfiltered[range_mask].copy()
 
@@ -5628,6 +6684,15 @@ def main():
                 if data_for_identifier.empty and not has_status_markers:
                     continue  # Skip if there is no data to plot for this identifier
 
+                key_suffix_base = re.sub(r'[^0-9A-Za-z_]+', '_', f"{species}_{identifier}")
+                key_suffix_base = f"{key_suffix_base}_{abs(hash((species, identifier))) % 10000000}"
+                d13_key_suffix = f"{key_suffix_base}_d13"
+                d18_key_suffix = f"{key_suffix_base}_d18"
+                d13_raw_only_key = f"tab3_d13c_raw_line_only_{d13_key_suffix}"
+                d18_raw_only_key = f"tab3_d18o_raw_line_only_{d18_key_suffix}"
+                d13_raw_line_only = bool(st.session_state.get(d13_raw_only_key, False))
+                d18_raw_line_only = bool(st.session_state.get(d18_raw_only_key, False))
+
                 # Plot d13C data for this identifier and comment
                 # Create figure for d13C
                 fig_d13C = go.Figure()
@@ -5636,6 +6701,7 @@ def main():
                 if show_statistical_outliers and not statistical_outliers.empty:
                     identifier_stat_outliers = statistical_outliers[statistical_outliers['Identifier 1'] == identifier]
                     if not identifier_stat_outliers.empty:
+                        stat_customdata = _build_delta_point_customdata(identifier_stat_outliers, 'd13C')
                         fig_d13C.add_trace(go.Scatter(
                             x=identifier_stat_outliers['x_axis'],
                             y=identifier_stat_outliers['d 13C/12C  Mean'],
@@ -5646,7 +6712,13 @@ def main():
                                 size=12,
                                 line=dict(width=2)
                             ),
-                            name='Statistical Outliers'
+                            name='Statistical Outliers',
+                            customdata=stat_customdata,
+                            hovertemplate=(
+                                'Identifier 1: %{customdata[2]}<br>'
+                                'Identifier 2: %{customdata[3]}<br>'
+                                'd13C: %{y:.4f}<extra></extra>'
+                            )
                         ))
                         # Add them to display_data if checkbox is checked - no need to add here since they're already in display_data
 
@@ -5662,36 +6734,64 @@ def main():
 
                         # Plot each type with different symbol but same red color
                         if signal_range_mask.any():
+                            signal_df = identifier_range_outliers[signal_range_mask]
                             fig_d13C.add_trace(go.Scatter(
-                                x=identifier_range_outliers[signal_range_mask]['x_axis'],
-                                y=identifier_range_outliers[signal_range_mask]['d 13C/12C  Mean'],
+                                x=signal_df['x_axis'],
+                                y=signal_df['d 13C/12C  Mean'],
                                 mode='markers',
                                 marker=dict(color='red', symbol='diamond', size=12, line=dict(width=2)),
-                                name='Signal Intensity Range'
+                                name='Signal Intensity Range',
+                                customdata=_build_delta_point_customdata(signal_df, 'd13C'),
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd13C: %{y:.4f}<extra></extra>'
+                                )
                             ))
                         if leak_range_mask.any():
+                            leak_df = identifier_range_outliers[leak_range_mask]
                             fig_d13C.add_trace(go.Scatter(
-                                x=identifier_range_outliers[leak_range_mask]['x_axis'],
-                                y=identifier_range_outliers[leak_range_mask]['d 13C/12C  Mean'],
+                                x=leak_df['x_axis'],
+                                y=leak_df['d 13C/12C  Mean'],
                                 mode='markers',
                                 marker=dict(color='red', symbol='star', size=12, line=dict(width=2)),
-                                name='Leak Rate Range'
+                                name='Leak Rate Range',
+                                customdata=_build_delta_point_customdata(leak_df, 'd13C'),
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd13C: %{y:.4f}<extra></extra>'
+                                )
                             ))
                         if d13c_filter_mask.any():
+                            d13_df = identifier_range_outliers[d13c_filter_mask]
                             fig_d13C.add_trace(go.Scatter(
-                                x=identifier_range_outliers[d13c_filter_mask]['x_axis'],
-                                y=identifier_range_outliers[d13c_filter_mask]['d 13C/12C  Mean'],
+                                x=d13_df['x_axis'],
+                                y=d13_df['d 13C/12C  Mean'],
                                 mode='markers',
                                 marker=dict(color='red', symbol='cross', size=12, line=dict(width=2)),
-                                name='d13C Range'
+                                name='d13C Range',
+                                customdata=_build_delta_point_customdata(d13_df, 'd13C'),
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd13C: %{y:.4f}<extra></extra>'
+                                )
                             ))
                         if d18o_filter_mask.any():
+                            d18_df = identifier_range_outliers[d18o_filter_mask]
                             fig_d13C.add_trace(go.Scatter(
-                                x=identifier_range_outliers[d18o_filter_mask]['x_axis'],
-                                y=identifier_range_outliers[d18o_filter_mask]['d 13C/12C  Mean'],
+                                x=d18_df['x_axis'],
+                                y=d18_df['d 13C/12C  Mean'],
                                 mode='markers',
                                 marker=dict(color='red', symbol='x', size=12, line=dict(width=2)),
-                                name='d18O Range'
+                                name='d18O Range',
+                                customdata=_build_delta_point_customdata(d18_df, 'd13C'),
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd13C: %{y:.4f}<extra></extra>'
+                                )
                             ))
 
                 # Highlight saturated collectors (valid means)
@@ -5700,12 +6800,19 @@ def main():
                         (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask
                     ]
                     if not identifier_sat_collectors.empty:
+                        sat_collectors_customdata = _build_delta_point_customdata(identifier_sat_collectors, 'd13C')
                         fig_d13C.add_trace(go.Scatter(
                             x=identifier_sat_collectors['x_axis'],
                             y=identifier_sat_collectors['d 13C/12C  Mean'],
                             mode='markers',
                             marker=dict(color='#ff7f0e', symbol='diamond-open', size=12, line=dict(width=2)),
-                            name='Partially Failed (Recovered Mean)'
+                            name='Partially Failed (Recovered Mean)',
+                            customdata=sat_collectors_customdata,
+                            hovertemplate=(
+                                'Identifier 1: %{customdata[2]}<br>'
+                                'Identifier 2: %{customdata[3]}<br>'
+                                'd13C: %{y:.4f}<extra></extra>'
+                            )
                         ))
 
                 # Show saturated samples as outliers
@@ -5714,6 +6821,7 @@ def main():
                         (species_data_unfiltered['Identifier 1'] == identifier) & saturated_samples_mask
                     ]
                     if not identifier_sat_samples.empty:
+                        sat_customdata = _build_delta_point_customdata(identifier_sat_samples, 'd13C')
                         y_vals_sat = pd.to_numeric(identifier_sat_samples['d 13C/12C  Mean'], errors='coerce')
                         if y_vals_sat.notna().any():
                             y_sat = y_vals_sat.tolist()
@@ -5730,7 +6838,13 @@ def main():
                             y=y_sat,
                             mode='markers',
                             marker=dict(color='#d62728', symbol='triangle-down', size=12, line=dict(width=2)),
-                            name='Failed Samples (Fully Saturated)'
+                            name='Failed Samples (Fully Saturated)',
+                            customdata=sat_customdata,
+                            hovertemplate=(
+                                'Identifier 1: %{customdata[2]}<br>'
+                                'Identifier 2: %{customdata[3]}<br>'
+                                'd13C: %{y:.4f}<extra></extra>'
+                            )
                         ))
 
                 if show_failed_samples:
@@ -5738,6 +6852,43 @@ def main():
                         (species_data_unfiltered['Identifier 1'] == identifier) & failed_mask
                     ]
                     if not identifier_failed.empty:
+                        failed_vals = pd.to_numeric(identifier_failed['d 13C/12C  Mean'], errors='coerce')
+                        failed_is_edited = pd.Series(identifier_failed.index.map(_is_row_edited), index=identifier_failed.index)
+                        identifier_failed_interp = identifier_failed[failed_vals.notna() & failed_is_edited].copy()
+                        identifier_failed_recovered = identifier_failed[failed_vals.notna() & ~failed_is_edited].copy()
+                        identifier_failed_missing = identifier_failed[failed_vals.isna()].copy()
+                        if not identifier_failed_recovered.empty:
+                            failed_recovered_customdata = _build_delta_point_customdata(identifier_failed_recovered, 'd13C')
+                            fig_d13C.add_trace(go.Scatter(
+                                x=identifier_failed_recovered['x_axis'],
+                                y=pd.to_numeric(identifier_failed_recovered['d 13C/12C  Mean'], errors='coerce'),
+                                mode='markers',
+                                marker=dict(color='#ff7f0e', symbol='diamond-open', size=12, line=dict(width=2)),
+                                name='Partially Failed (Recovered Mean)',
+                                customdata=failed_recovered_customdata,
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd13C: %{y:.4f}<extra></extra>'
+                                )
+                            ))
+                        if not identifier_failed_interp.empty:
+                            failed_interp_customdata = _build_delta_point_customdata(identifier_failed_interp, 'd13C')
+                            fig_d13C.add_trace(go.Scatter(
+                                x=identifier_failed_interp['x_axis'],
+                                y=pd.to_numeric(identifier_failed_interp['d 13C/12C  Mean'], errors='coerce'),
+                                mode='markers',
+                                marker=dict(color='#ff00ff', symbol='triangle-down', size=10, line=dict(width=1)),
+                                name='Failed Samples (Interpolated)',
+                                customdata=failed_interp_customdata,
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd13C: %{y:.4f}<extra></extra>'
+                                )
+                            ))
+                        if not identifier_failed_missing.empty:
+                            failed_customdata = _build_delta_point_customdata(identifier_failed_missing, 'd13C')
                         y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
                         y_min = y_vals.min()
                         y_max = y_vals.max()
@@ -5745,24 +6896,36 @@ def main():
                             y_min, y_max = -1.0, 1.0
                         y_range = y_max - y_min if np.isfinite(y_max) else 1.0
                         y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
-                        fig_d13C.add_trace(go.Scatter(
-                            x=identifier_failed['x_axis'],
-                            y=[y_failed] * len(identifier_failed),
-                            mode='markers',
-                            marker=dict(color='#7f7f7f', symbol='triangle-down', size=10, line=dict(width=1)),
-                            name='Failed Samples (No Values)'
-                        ))
+                        if not identifier_failed_missing.empty:
+                            fig_d13C.add_trace(go.Scatter(
+                                x=identifier_failed_missing['x_axis'],
+                                y=[y_failed] * len(identifier_failed_missing),
+                                mode='markers',
+                                marker=dict(color='#7f7f7f', symbol='triangle-down', size=10, line=dict(width=1)),
+                                name='Failed Samples (No Values)',
+                                customdata=failed_customdata,
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd13C: missing (click to edit)<extra></extra>'
+                                )
+                            ))
 
                 identifier_display_data = display_data[display_data['Identifier 1'] == identifier]
-                d13_identifier_customdata = _build_delta_point_customdata(identifier_display_data, 'd13C')
+                identifier_curve_data = _augment_curve_with_edited_rows(
+                    identifier_display_data,
+                    species_data_unfiltered,
+                    identifier
+                )
+                d13_identifier_customdata = _build_delta_point_customdata(identifier_curve_data, 'd13C')
 
                 fig_d13C.add_trace(go.Scatter(
-                    x=identifier_display_data['x_axis'],
-                    y=identifier_display_data['d 13C/12C  Mean'],
+                    x=identifier_curve_data['x_axis'],
+                    y=identifier_curve_data['d 13C/12C  Mean'],
                     mode='lines+markers',
                     line=dict(color='blue', dash='dot', width=2),
                     marker=dict(
-                        color=identifier_display_data[color_param_tab3_value_col],
+                        color=identifier_curve_data[color_param_tab3_value_col],
                         colorscale="Viridis",
                         symbol='circle',
                         size=8,
@@ -5776,21 +6939,51 @@ def main():
                         'd13C: %{y:.4f}<extra></extra>'
                     )
                 ))
-
-                if 'd13C_calibrated' in data_for_identifier.columns:
+                edited_identifier_d13 = identifier_curve_data[identifier_curve_data.index.map(_is_row_edited)]
+                if not edited_identifier_d13.empty:
+                    edited_customdata = _build_delta_point_customdata(edited_identifier_d13, 'd13C')
                     fig_d13C.add_trace(go.Scatter(
-                        x=identifier_display_data['x_axis'],
-                        y=identifier_display_data['d13C_calibrated'],
-                        mode='lines+markers',
-                        line=dict(color='orange', dash='dot', width=2),
+                        x=edited_identifier_d13['x_axis'],
+                        y=edited_identifier_d13['d 13C/12C  Mean'],
+                        mode='markers',
                         marker=dict(
-                            color=identifier_display_data[color_param_tab3_value_col],
-                            colorscale="Viridis",
-                            symbol='square',
-                            size=8,
-                            showscale=False  # Hide individual colorbar
+                            color='#ff00ff',
+                            symbol='circle',
+                            size=12,
+                            line=dict(width=1, color='#ff00ff')
                         ),
+                        name='Edited Samples',
+                        customdata=edited_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: %{y:.4f}<extra></extra>'
+                        )
+                    ))
+
+                if 'd13C_calibrated' in identifier_curve_data.columns:
+                    fig_d13C.add_trace(go.Scatter(
+                        x=identifier_curve_data['x_axis'],
+                        y=identifier_curve_data['d13C_calibrated'],
+                        mode='lines',
+                        line=dict(color='orange', width=2),
                         name=f'Calibrated d13C - {identifier}'
+                    ))
+
+                if d13_raw_line_only:
+                    fig_d13C = go.Figure()
+                    fig_d13C.add_trace(go.Scatter(
+                        x=identifier_curve_data['x_axis'],
+                        y=identifier_curve_data['d 13C/12C  Mean'],
+                        mode='lines',
+                        line=dict(color='blue', width=2),
+                        name=f'Raw d13C - {identifier}',
+                        customdata=d13_identifier_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd13C: %{y:.4f}<extra></extra>'
+                        )
                     ))
 
                 fig_d13C.update_layout(
@@ -5812,20 +7005,66 @@ def main():
                     )
                 )
 
-                fig_d13C.update_layout(clickmode='event+select')
-                d13_key_suffix = re.sub(r'[^0-9A-Za-z_]+', '_', f"{species}_{identifier}")
-                d13_key_suffix = f"{d13_key_suffix}_{abs(hash((species, identifier))) % 10000000}"
+                fig_d13C.update_layout(clickmode='event+select', dragmode='zoom')
                 d13_editor_prefix = f"tab3_d13c_editor_{d13_key_suffix}"
+                d13_active_target = _get_active_editor_target(d13_editor_prefix)
+                if (
+                    not d13_raw_line_only
+                    and
+                    d13_active_target is not None
+                    and d13_active_target.get('isotope_key') == 'd13C'
+                    and d13_active_target.get('row_label') in species_data_unfiltered.index
+                ):
+                    active_row = species_data_unfiltered.loc[d13_active_target['row_label']]
+                    if isinstance(active_row, pd.DataFrame):
+                        active_row = active_row.iloc[0]
+                    x_active = active_row.get('x_axis', np.nan)
+                    if pd.notna(x_active):
+                        y_active = pd.to_numeric(pd.Series([active_row.get('d 13C/12C  Mean')]), errors='coerce').iloc[0]
+                        if pd.notna(y_active):
+                            y_active_plot = float(y_active)
+                        else:
+                            y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
+                            y_min = y_vals.min()
+                            y_max = y_vals.max()
+                            if not np.isfinite(y_min):
+                                y_min, y_max = -1.0, 1.0
+                            y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                            y_active_plot = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                        status_val = str(active_row.get('Collector Status', '')).strip()
+                        marker_symbol = 'triangle-down' if status_val in ('Failed Sample', 'Fully Saturated Collectors') else 'circle'
+                        fig_d13C.add_trace(go.Scatter(
+                            x=[x_active],
+                            y=[y_active_plot],
+                            mode='markers',
+                            marker=dict(
+                                color='#ff00ff',
+                                symbol=marker_symbol,
+                                size=14,
+                                line=dict(width=2, color='#ff00ff')
+                            ),
+                            name='Active Selection',
+                            showlegend=False,
+                            legendgroup='active_selection'
+                        ))
                 d13_chart_nonce = int(st.session_state.get(f"{d13_editor_prefix}_chart_nonce", 0))
-                d13_chart_state = st.plotly_chart(
-                    fig_d13C,
-                    width='stretch',
-                    height=chart_height,
-                    key=f"tab3_d13c_{d13_key_suffix}_{d13_chart_nonce}",
-                    on_select='rerun',
-                    selection_mode='points'
-                )
-                _render_delta_editor_from_chart_selection(d13_chart_state, d13_editor_prefix)
+                d13_chart_col, d13_btn_col = st.columns([12, 1], gap="small")
+                with d13_btn_col:
+                    d13_btn_label = "Show Full" if d13_raw_line_only else "Raw Line Only"
+                    if st.button(d13_btn_label, key=f"{d13_raw_only_key}_btn", use_container_width=True):
+                        st.session_state[d13_raw_only_key] = not d13_raw_line_only
+                        st.rerun()
+                with d13_chart_col:
+                    d13_chart_state = st.plotly_chart(
+                        fig_d13C,
+                        width='stretch',
+                        height=chart_height,
+                        key=f"tab3_d13c_{d13_key_suffix}_{d13_chart_nonce}",
+                        on_select='rerun',
+                        selection_mode='points'
+                    )
+                if not d13_raw_line_only:
+                    _render_delta_editor_from_chart_selection(d13_chart_state, d13_editor_prefix)
 
                 # Plot Î´18O data for this identifier and comment
                 # Create figure for Î´18O
@@ -5835,6 +7074,7 @@ def main():
                 if show_statistical_outliers:
                     identifier_stat_outliers = statistical_outliers[statistical_outliers['Identifier 1'] == identifier]
                     if not identifier_stat_outliers.empty:
+                        stat_customdata = _build_delta_point_customdata(identifier_stat_outliers, 'd18O')
                         fig_d18O.add_trace(go.Scatter(
                             x=identifier_stat_outliers['x_axis'],
                             y=identifier_stat_outliers['d 18O/16O  Mean'],
@@ -5845,7 +7085,13 @@ def main():
                                 size=12,
                                 line=dict(width=2)
                             ),
-                            name='Statistical Outliers'
+                            name='Statistical Outliers',
+                            customdata=stat_customdata,
+                            hovertemplate=(
+                                'Identifier 1: %{customdata[2]}<br>'
+                                'Identifier 2: %{customdata[3]}<br>'
+                                'd18O: %{y:.4f}<extra></extra>'
+                            )
                         ))
 
                 # Add range outliers if enabled
@@ -5866,37 +7112,51 @@ def main():
 
                         # Plot each type with different symbol but same red color
                         if signal_range_mask.any():
+                            signal_df = identifier_range_outliers[signal_range_mask]
                             fig_d18O.add_trace(go.Scatter(
-                                x=identifier_range_outliers[signal_range_mask]['x_axis'],
-                                y=identifier_range_outliers[signal_range_mask]['d 18O/16O  Mean'],
+                                x=signal_df['x_axis'],
+                                y=signal_df['d 18O/16O  Mean'],
                                 mode='markers',
                                 marker=dict(color='red', symbol='diamond', size=12, line=dict(width=2)),
-                                name='Signal Intensity Range'
+                                name='Signal Intensity Range',
+                                customdata=_build_delta_point_customdata(signal_df, 'd18O'),
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd18O: %{y:.4f}<extra></extra>'
+                                )
                             ))
                         if leak_range_mask.any():
+                            leak_df = identifier_range_outliers[leak_range_mask]
                             fig_d18O.add_trace(go.Scatter(
-                                x=identifier_range_outliers[leak_range_mask]['x_axis'],
-                                y=identifier_range_outliers[leak_range_mask]['d 18O/16O  Mean'],
+                                x=leak_df['x_axis'],
+                                y=leak_df['d 18O/16O  Mean'],
                                 mode='markers',
                                 marker=dict(color='red', symbol='star', size=12, line=dict(width=2)),
-                                name='Leak Rate Range'
+                                name='Leak Rate Range',
+                                customdata=_build_delta_point_customdata(leak_df, 'd18O'),
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd18O: %{y:.4f}<extra></extra>'
+                                )
                             ))
 
                     # Add main data trace using display_data
                     fig_d18O.add_trace(go.Scatter(
-                        x=identifier_display_data['x_axis'],
-                        y=identifier_display_data['d 18O/16O  Mean'],
+                        x=identifier_curve_data['x_axis'],
+                        y=identifier_curve_data['d 18O/16O  Mean'],
                         mode='lines+markers',
                         line=dict(color='blue', dash='dot', width=2),
                         marker=dict(
-                            color=identifier_display_data[color_param_tab3_value_col],
+                            color=identifier_curve_data[color_param_tab3_value_col],
                             colorscale="Viridis",
                             symbol='circle',
                             size=8,
                             showscale=False  # Hide individual colorbar
                         ),
                         name=f'Raw d18O - {identifier}',
-                        customdata=_build_delta_point_customdata(identifier_display_data, 'd18O'),
+                        customdata=_build_delta_point_customdata(identifier_curve_data, 'd18O'),
                         hovertemplate=(
                             'Identifier 1: %{customdata[2]}<br>'
                             'Identifier 2: %{customdata[3]}<br>'
@@ -5904,39 +7164,47 @@ def main():
                         )
                     ))
     
-                    if 'd18O_calibrated' in display_data.columns:
+                    if 'd18O_calibrated' in identifier_curve_data.columns:
                         fig_d18O.add_trace(go.Scatter(
-                            x=identifier_display_data['x_axis'],
-                            y=identifier_display_data['d18O_calibrated'],
-                            mode='lines+markers',
-                            line=dict(color='orange', dash='dot', width=2),
-                            marker=dict(
-                                color=identifier_display_data[color_param_tab3_value_col],
-                                colorscale="Viridis",
-                                symbol='square',
-                                size=8
-                            ),
+                            x=identifier_curve_data['x_axis'],
+                            y=identifier_curve_data['d18O_calibrated'],
+                            mode='lines',
+                            line=dict(color='orange', width=2),
                             name=f'Calibrated d18O - {identifier}'
                         ))
                         if d13c_filter_mask.any():
+                            d13_df = identifier_range_outliers[d13c_filter_mask]
                             fig_d18O.add_trace(go.Scatter(
-                                x=identifier_range_outliers[d13c_filter_mask]['x_axis'],
-                                y=identifier_range_outliers[d18o_filter_mask]['d 18O/16O  Mean'],
+                                x=d13_df['x_axis'],
+                                y=d13_df['d 18O/16O  Mean'],
                                 mode='markers',
                                 marker=dict(color='red', symbol='cross', size=12, line=dict(width=2)),
-                                name='d13C Range'
+                                name='d13C Range',
+                                customdata=_build_delta_point_customdata(d13_df, 'd18O'),
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd18O: %{y:.4f}<extra></extra>'
+                                )
                             ))
                         if d18o_filter_mask.any():
+                            d18_df = identifier_range_outliers[d18o_filter_mask]
                             fig_d18O.add_trace(go.Scatter(
-                                x=identifier_range_outliers[d18o_filter_mask]['x_axis'],
-                                y=identifier_range_outliers[d18o_filter_mask]['d 18O/16O  Mean'],
+                                x=d18_df['x_axis'],
+                                y=d18_df['d 18O/16O  Mean'],
                                 mode='markers',
                                 marker=dict(color='red', symbol='x', size=12, line=dict(width=2)),
-                                name='d18O Range'
+                                name='d18O Range',
+                                customdata=_build_delta_point_customdata(d18_df, 'd18O'),
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd18O: %{y:.4f}<extra></extra>'
+                                )
                             ))
 
                 # Plot main data trace with correct sorting
-                sorted_data = data_for_identifier.sort_values(by='x_axis')
+                sorted_data = identifier_curve_data.sort_values(by='x_axis')
 
                 # Highlight saturated collectors (valid means)
                 if show_saturated_collectors:
@@ -5944,12 +7212,19 @@ def main():
                         (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask
                     ]
                     if not identifier_sat_collectors.empty:
+                        sat_collectors_customdata = _build_delta_point_customdata(identifier_sat_collectors, 'd18O')
                         fig_d18O.add_trace(go.Scatter(
                             x=identifier_sat_collectors['x_axis'],
                             y=identifier_sat_collectors['d 18O/16O  Mean'],
                             mode='markers',
                             marker=dict(color='#ff7f0e', symbol='diamond-open', size=12, line=dict(width=2)),
-                            name='Partially Failed (Recovered Mean)'
+                            name='Partially Failed (Recovered Mean)',
+                            customdata=sat_collectors_customdata,
+                            hovertemplate=(
+                                'Identifier 1: %{customdata[2]}<br>'
+                                'Identifier 2: %{customdata[3]}<br>'
+                                'd18O: %{y:.4f}<extra></extra>'
+                            )
                         ))
 
                 # Show saturated samples as outliers
@@ -5958,6 +7233,7 @@ def main():
                         (species_data_unfiltered['Identifier 1'] == identifier) & saturated_samples_mask
                     ]
                     if not identifier_sat_samples.empty:
+                        sat_customdata = _build_delta_point_customdata(identifier_sat_samples, 'd18O')
                         y_vals_sat = pd.to_numeric(identifier_sat_samples['d 18O/16O  Mean'], errors='coerce')
                         if y_vals_sat.notna().any():
                             y_sat = y_vals_sat.tolist()
@@ -5974,7 +7250,13 @@ def main():
                             y=y_sat,
                             mode='markers',
                             marker=dict(color='#d62728', symbol='triangle-down', size=12, line=dict(width=2)),
-                            name='Failed Samples (Fully Saturated)'
+                            name='Failed Samples (Fully Saturated)',
+                            customdata=sat_customdata,
+                            hovertemplate=(
+                                'Identifier 1: %{customdata[2]}<br>'
+                                'Identifier 2: %{customdata[3]}<br>'
+                                'd18O: %{y:.4f}<extra></extra>'
+                            )
                         ))
 
                 if show_failed_samples:
@@ -5982,6 +7264,43 @@ def main():
                         (species_data_unfiltered['Identifier 1'] == identifier) & failed_mask
                     ]
                     if not identifier_failed.empty:
+                        failed_vals = pd.to_numeric(identifier_failed['d 18O/16O  Mean'], errors='coerce')
+                        failed_is_edited = pd.Series(identifier_failed.index.map(_is_row_edited), index=identifier_failed.index)
+                        identifier_failed_interp = identifier_failed[failed_vals.notna() & failed_is_edited].copy()
+                        identifier_failed_recovered = identifier_failed[failed_vals.notna() & ~failed_is_edited].copy()
+                        identifier_failed_missing = identifier_failed[failed_vals.isna()].copy()
+                        if not identifier_failed_recovered.empty:
+                            failed_recovered_customdata = _build_delta_point_customdata(identifier_failed_recovered, 'd18O')
+                            fig_d18O.add_trace(go.Scatter(
+                                x=identifier_failed_recovered['x_axis'],
+                                y=pd.to_numeric(identifier_failed_recovered['d 18O/16O  Mean'], errors='coerce'),
+                                mode='markers',
+                                marker=dict(color='#ff7f0e', symbol='diamond-open', size=12, line=dict(width=2)),
+                                name='Partially Failed (Recovered Mean)',
+                                customdata=failed_recovered_customdata,
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd18O: %{y:.4f}<extra></extra>'
+                                )
+                            ))
+                        if not identifier_failed_interp.empty:
+                            failed_interp_customdata = _build_delta_point_customdata(identifier_failed_interp, 'd18O')
+                            fig_d18O.add_trace(go.Scatter(
+                                x=identifier_failed_interp['x_axis'],
+                                y=pd.to_numeric(identifier_failed_interp['d 18O/16O  Mean'], errors='coerce'),
+                                mode='markers',
+                                marker=dict(color='#ff00ff', symbol='triangle-down', size=10, line=dict(width=1)),
+                                name='Failed Samples (Interpolated)',
+                                customdata=failed_interp_customdata,
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd18O: %{y:.4f}<extra></extra>'
+                                )
+                            ))
+                        if not identifier_failed_missing.empty:
+                            failed_customdata = _build_delta_point_customdata(identifier_failed_missing, 'd18O')
                         y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
                         y_min = y_vals.min()
                         y_max = y_vals.max()
@@ -5989,13 +7308,20 @@ def main():
                             y_min, y_max = -1.0, 1.0
                         y_range = y_max - y_min if np.isfinite(y_max) else 1.0
                         y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
-                        fig_d18O.add_trace(go.Scatter(
-                            x=identifier_failed['x_axis'],
-                            y=[y_failed] * len(identifier_failed),
-                            mode='markers',
-                            marker=dict(color='#7f7f7f', symbol='triangle-down', size=10, line=dict(width=1)),
-                            name='Failed Samples (No Values)'
-                        ))
+                        if not identifier_failed_missing.empty:
+                            fig_d18O.add_trace(go.Scatter(
+                                x=identifier_failed_missing['x_axis'],
+                                y=[y_failed] * len(identifier_failed_missing),
+                                mode='markers',
+                                marker=dict(color='#7f7f7f', symbol='triangle-down', size=10, line=dict(width=1)),
+                                name='Failed Samples (No Values)',
+                                customdata=failed_customdata,
+                                hovertemplate=(
+                                    'Identifier 1: %{customdata[2]}<br>'
+                                    'Identifier 2: %{customdata[3]}<br>'
+                                    'd18O: missing (click to edit)<extra></extra>'
+                                )
+                            ))
 
                 fig_d18O.add_trace(go.Scatter(
                     x=sorted_data['x_axis'],
@@ -6017,20 +7343,51 @@ def main():
                         'd18O: %{y:.4f}<extra></extra>'
                     )
                 ))
+                edited_identifier_d18 = sorted_data[sorted_data.index.map(_is_row_edited)]
+                if not edited_identifier_d18.empty:
+                    edited_customdata = _build_delta_point_customdata(edited_identifier_d18, 'd18O')
+                    fig_d18O.add_trace(go.Scatter(
+                        x=edited_identifier_d18['x_axis'],
+                        y=edited_identifier_d18['d 18O/16O  Mean'],
+                        mode='markers',
+                        marker=dict(
+                            color='#ff00ff',
+                            symbol='circle',
+                            size=12,
+                            line=dict(width=1, color='#ff00ff')
+                        ),
+                        name='Edited Samples',
+                        customdata=edited_customdata,
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
+                    ))
 
-                if 'd18O_calibrated' in data_for_identifier.columns:
+                if 'd18O_calibrated' in sorted_data.columns:
                     fig_d18O.add_trace(go.Scatter(
                         x=sorted_data['x_axis'],
                         y=sorted_data['d18O_calibrated'],
-                        mode='lines+markers',
-                        line=dict(color='orange', dash='dot', width=2),
-                        marker=dict(
-                            color=sorted_data[color_param_tab3_value_col],
-                            colorscale="Viridis",
-                            symbol='square',
-                            size=8
-                        ),
+                        mode='lines',
+                        line=dict(color='orange', width=2),
                         name=f'Calibrated d18O - {identifier}'
+                    ))
+
+                if d18_raw_line_only:
+                    fig_d18O = go.Figure()
+                    fig_d18O.add_trace(go.Scatter(
+                        x=sorted_data['x_axis'],
+                        y=sorted_data['d 18O/16O  Mean'],
+                        mode='lines',
+                        line=dict(color='blue', width=2),
+                        name=f'Raw d18O - {identifier}',
+                        customdata=_build_delta_point_customdata(sorted_data, 'd18O'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
                     ))
 
                 fig_d18O.update_layout(
@@ -6054,20 +7411,66 @@ def main():
                 # Invert y-axis so increasing d18O plots downward
                 fig_d18O.update_yaxes(autorange='reversed')
 
-                fig_d18O.update_layout(clickmode='event+select')
-                d18_key_suffix = re.sub(r'[^0-9A-Za-z_]+', '_', f"{species}_{identifier}")
-                d18_key_suffix = f"{d18_key_suffix}_{abs(hash((species, identifier))) % 10000000}"
+                fig_d18O.update_layout(clickmode='event+select', dragmode='zoom')
                 d18_editor_prefix = f"tab3_d18o_editor_{d18_key_suffix}"
+                d18_active_target = _get_active_editor_target(d18_editor_prefix)
+                if (
+                    not d18_raw_line_only
+                    and
+                    d18_active_target is not None
+                    and d18_active_target.get('isotope_key') == 'd18O'
+                    and d18_active_target.get('row_label') in species_data_unfiltered.index
+                ):
+                    active_row = species_data_unfiltered.loc[d18_active_target['row_label']]
+                    if isinstance(active_row, pd.DataFrame):
+                        active_row = active_row.iloc[0]
+                    x_active = active_row.get('x_axis', np.nan)
+                    if pd.notna(x_active):
+                        y_active = pd.to_numeric(pd.Series([active_row.get('d 18O/16O  Mean')]), errors='coerce').iloc[0]
+                        if pd.notna(y_active):
+                            y_active_plot = float(y_active)
+                        else:
+                            y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
+                            y_min = y_vals.min()
+                            y_max = y_vals.max()
+                            if not np.isfinite(y_min):
+                                y_min, y_max = -1.0, 1.0
+                            y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                            y_active_plot = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                        status_val = str(active_row.get('Collector Status', '')).strip()
+                        marker_symbol = 'triangle-down' if status_val in ('Failed Sample', 'Fully Saturated Collectors') else 'circle'
+                        fig_d18O.add_trace(go.Scatter(
+                            x=[x_active],
+                            y=[y_active_plot],
+                            mode='markers',
+                            marker=dict(
+                                color='#ff00ff',
+                                symbol=marker_symbol,
+                                size=14,
+                                line=dict(width=2, color='#ff00ff')
+                            ),
+                            name='Active Selection',
+                            showlegend=False,
+                            legendgroup='active_selection'
+                        ))
                 d18_chart_nonce = int(st.session_state.get(f"{d18_editor_prefix}_chart_nonce", 0))
-                d18_chart_state = st.plotly_chart(
-                    fig_d18O,
-                    width='stretch',
-                    height=chart_height,
-                    key=f"tab3_d18o_{d18_key_suffix}_{d18_chart_nonce}",
-                    on_select='rerun',
-                    selection_mode='points'
-                )
-                _render_delta_editor_from_chart_selection(d18_chart_state, d18_editor_prefix)
+                d18_chart_col, d18_btn_col = st.columns([12, 1], gap="small")
+                with d18_btn_col:
+                    d18_btn_label = "Show Full" if d18_raw_line_only else "Raw Line Only"
+                    if st.button(d18_btn_label, key=f"{d18_raw_only_key}_btn", use_container_width=True):
+                        st.session_state[d18_raw_only_key] = not d18_raw_line_only
+                        st.rerun()
+                with d18_chart_col:
+                    d18_chart_state = st.plotly_chart(
+                        fig_d18O,
+                        width='stretch',
+                        height=chart_height,
+                        key=f"tab3_d18o_{d18_key_suffix}_{d18_chart_nonce}",
+                        on_select='rerun',
+                        selection_mode='points'
+                    )
+                if not d18_raw_line_only:
+                    _render_delta_editor_from_chart_selection(d18_chart_state, d18_editor_prefix)
 
             # Display outliers header for each comment if detected
             if not species_data['Identifier 2'].isna().all():
@@ -6075,6 +7478,7 @@ def main():
             
             # Get outliers data
             stat_outliers_only = statistical_outliers[statistical_outliers[species_col] == species]
+            stat_outliers_only = stat_outliers_only[~stat_outliers_only.index.map(_is_row_edited)]
             
             # Get original data for this species before any filtering
             species_data = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
@@ -6084,21 +7488,25 @@ def main():
                 (species_data['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
                 (species_data['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
             ]
+            d13c_outliers = d13c_outliers[~d13c_outliers.index.map(_is_row_edited)]
             
             d18o_outliers = species_data[
                 (species_data['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                 (species_data['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
             ]
+            d18o_outliers = d18o_outliers[~d18o_outliers.index.map(_is_row_edited)]
             
             signal_outliers = species_data[
                 (species_data['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
                 (species_data['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
             ]
+            signal_outliers = signal_outliers[~signal_outliers.index.map(_is_row_edited)]
             
             leak_outliers = species_data[
                 (species_data['leak_rate'] < st.session_state.leak_range[0]) |
                 (species_data['leak_rate'] > st.session_state.leak_range[1])
             ]
+            leak_outliers = leak_outliers[~leak_outliers.index.map(_is_row_edited)]
         
             # Create two columns for outlier information
             col1, col2 = st.columns(2)
