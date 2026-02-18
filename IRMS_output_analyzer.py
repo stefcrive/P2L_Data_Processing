@@ -173,10 +173,466 @@ def _normalize_signal_intensity(series):
     """Normalize signal intensity to volts when values appear to be in mV."""
     numeric = _extract_numeric(series)
     max_val = numeric.max(skipna=True)
-    # If values exceed typical volt range, assume mV and convert to V.
-    if pd.notna(max_val) and max_val > 50:
+    # Treat clearly mV-scale values as millivolts (e.g., 48000 mV -> 48 V).
+    # Keep normal volt-scale cycle values (e.g., 52 V) unchanged.
+    if pd.notna(max_val) and max_val > 1000:
         numeric = numeric / 1000.0
     return numeric
+
+def _coalesce_duplicate_columns(df):
+    """Resolve duplicate column names while preserving independent collector columns."""
+    if df is None or df.columns.is_unique:
+        return df
+    canonical_merge_cols = {
+        'd 13C/12C  Mean',
+        'd 13C/12C  Std Dev',
+        'd 18O/16O  Mean',
+        'd 18O/16O  Std Dev',
+        'Identifier 1',
+        'Identifier 2',
+        'Cycle Number',
+    }
+    result_parts = []
+    cols = pd.Index(df.columns)
+    for col in cols.unique():
+        subset = df.loc[:, cols == col]
+        if isinstance(subset, pd.Series):
+            result_parts.append(subset.to_frame(name=col))
+            continue
+        if subset.shape[1] == 1:
+            result_parts.append(subset.iloc[:, [0]].rename(columns={subset.columns[0]: col}))
+            continue
+        if col in canonical_merge_cols:
+            merged_col = subset.bfill(axis=1).iloc[:, 0].to_frame(name=col)
+            result_parts.append(merged_col)
+        else:
+            renamed = subset.copy()
+            renamed.columns = [col if i == 0 else f"{col}__dup{i+1}" for i in range(subset.shape[1])]
+            result_parts.append(renamed)
+    return pd.concat(result_parts, axis=1)
+
+def _find_cycle_intensity_columns(df):
+    """Find per-cycle intensity columns in the dataset."""
+    if df is None:
+        return []
+    cols = []
+    for col in df.columns:
+        if not isinstance(col, str):
+            continue
+        low = _normalize_column_key(col)
+        has_mass = bool(re.search(r'\b4[4-6](?:\.\d+)?\b', low) or 'm/z' in low or 'mz' in low)
+        is_signal_named = bool('intensit' in low or re.search(r'\bint\b', low) or 'signal' in low)
+        looks_delta = bool('delta' in low or re.search(r'\bd4[5-6]co2\b', low) or low.startswith('d45') or low.startswith('d46'))
+        if (is_signal_named and has_mass) or (has_mass and not looks_delta):
+            cols.append(col)
+    if cols:
+        return cols
+    # Fallback: accept intensity columns without explicit sample label
+    for col in df.columns:
+        if not isinstance(col, str):
+            continue
+        low = _normalize_column_key(col)
+        if ('intensit' in low or re.search(r'\bint\b', low) or 'signal' in low):
+            if ('m/z' in low or 'mz' in low or re.search(r'\b4[4-6](?:\.\d+)?\b', low) or 'cycle' in low):
+                cols.append(col)
+    return cols
+
+def _pick_intensity_column(cols, masses=None):
+    """Pick the best intensity column, preferring specific masses."""
+    if not cols:
+        return None
+    if masses:
+        for mass in masses:
+            pattern = rf'(?<!\\d){mass}(?!\\d)'
+            for col in cols:
+                if re.search(pattern, str(col)):
+                    return col
+    return cols[0]
+
+def _extract_cycle_order(value):
+    """Extract cycle order as integer (Pre -> 0, Cycle N -> N)."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return np.nan
+    text = str(value).strip().lower()
+    if text == '' or text == 'nan':
+        return np.nan
+    if text == 'pre':
+        return 0
+    match = re.search(r'(\d+)', text)
+    if match:
+        return int(match.group(1))
+    return np.nan
+
+def _detect_saturated_prefix(series, min_tail=3, sigma=3.0, min_abs_shift=1.0):
+    """Detect a saturated prefix in cycle values using a robust tail-based threshold.
+
+    Returns a list of cycle orders to exclude (prefix only).
+    """
+    if series is None:
+        return []
+    s = pd.Series(series).dropna()
+    if s.empty or len(s) < max(3, min_tail):
+        return []
+    s = s.sort_index()
+    tail = s.tail(min(min_tail, len(s)))
+    med = float(tail.median())
+    mad = float((tail - med).abs().median())
+    # Convert MAD to sigma-like; fallback to std when MAD is zero
+    spread = 1.4826 * mad
+    if not np.isfinite(spread) or spread == 0:
+        spread = float(tail.std())
+    if not np.isfinite(spread) or spread == 0:
+        # Final fallback: small tolerance scaled to signal magnitude
+        spread = max(float(tail.abs().median()) * 0.02, 0.05)
+    tol = sigma * spread
+    inlier = (s - med).abs() <= tol
+    window = min(min_tail, len(s))
+    for i in range(len(s) - window + 1):
+        if bool(inlier.iloc[i:i + window].all()):
+            excluded = s.iloc[:i]
+            if excluded.empty:
+                return []
+            # Guard against over-detection on normal drift when no intensity columns exist.
+            if (excluded - med).abs().max() < max(tol, float(min_abs_shift)):
+                return []
+            return list(s.index[:i])
+    # No stable window detected -> treat all cycles as saturated
+    if (s - med).abs().max() < max(tol, float(min_abs_shift)):
+        return []
+    return list(s.index)
+
+def _apply_cycle_averages(df):
+    """Compute per-sample d13C/d18O means from cycle rows, excluding saturated cycles."""
+    if df is None or 'Cycle Number' not in df.columns:
+        return df
+
+    work = df.copy()
+
+    # Coalesce duplicate isotope columns (keep first non-null across duplicates)
+    for col in ['d 13C/12C  Mean', 'd 18O/16O  Mean', 'd 13C/12C  Std Dev', 'd 18O/16O  Std Dev']:
+        dup_positions = [i for i, c in enumerate(work.columns) if c == col]
+        if len(dup_positions) > 1:
+            subset = work.iloc[:, dup_positions]
+            combined = subset.bfill(axis=1).iloc[:, 0]
+            work = work.drop(columns=[col])
+            work[col] = combined
+    cycle_order = work['Cycle Number'].apply(_extract_cycle_order)
+    is_pre = work['Cycle Number'].astype(str).str.strip().str.lower().eq('pre')
+    cycle_order = cycle_order.where(~is_pre, 0)
+    work['_cycle_order'] = cycle_order
+
+    # Build group id for sequences starting at Pre
+    group_id = is_pre.cumsum()
+    group_id = group_id.where(is_pre | cycle_order.notna(), np.nan)
+    work['_cycle_group'] = group_id
+
+    # Forward-fill key identifiers within each group to attach cycle rows to samples
+    id_cols = [
+        'Identifier 1', 'Identifier 2', 'Label', 'Species', 'Comment', 'Run ID',
+        'Line', 'Date', 'Date_ordinal', 'Sample Type', 'Reference'
+    ]
+    for col in id_cols:
+        if col in work.columns:
+            work[col] = work.groupby('_cycle_group')[col].ffill()
+
+    pre_rows = work[is_pre].copy()
+    cycle_rows = work[(work['_cycle_order'] > 0) & work['_cycle_group'].notna()].copy()
+
+    if pre_rows.empty:
+        return df
+
+    # Ensure numeric cycle values
+    for col in ['d 13C/12C  Mean', 'd 18O/16O  Mean', 'd 13C/12C  Std Dev', 'd 18O/16O  Std Dev']:
+        if col in work.columns:
+            col_positions = [i for i, c in enumerate(work.columns) if c == col]
+            for pos in col_positions:
+                work.iloc[:, pos] = pd.to_numeric(work.iloc[:, pos], errors='coerce')
+
+    # Initialize status columns
+    pre_rows['Collector Status'] = 'OK'
+    pre_rows['Cycles Total'] = 0
+    pre_rows['d13C Cycles Used'] = 0
+    pre_rows['d18O Cycles Used'] = 0
+    pre_rows['d13C Cycles Excluded'] = 0
+    pre_rows['d18O Cycles Excluded'] = 0
+
+    intensity_cols = _find_cycle_intensity_columns(work)
+    saturation_threshold = 48.0
+    low_signal_threshold = 0.2
+
+    def _pick_sample_intensity_columns(source_df, cols):
+        labeled_sample = []
+        for c in cols:
+            low = _normalize_column_key(c)
+            if 'standard' in low:
+                continue
+            if 'sample' in low or 'samp' in low:
+                labeled_sample.append(c)
+        if labeled_sample:
+            return labeled_sample
+        if len(cols) >= 4:
+            # If sample/reference labels are missing, sample cups are typically the higher-voltage set.
+            medians = []
+            for c in cols:
+                vals = _normalize_signal_intensity(source_df[c]) if c in source_df.columns else pd.Series(dtype='float64')
+                medians.append((c, float(vals.median(skipna=True)) if vals.notna().any() else -np.inf))
+            medians.sort(key=lambda t: t[1], reverse=True)
+            top = [c for c, _ in medians[:3]]
+            if top:
+                return top
+        return cols
+
+    sample_intensity_cols = _pick_sample_intensity_columns(work, intensity_cols)
+
+    def _pick_cycle_value_source(col_main, patterns):
+        # Prefer per-cycle isotope columns (e.g., d45CO2/d46CO2) over mean columns.
+        for col in work.columns:
+            if not isinstance(col, str):
+                continue
+            low = _normalize_column_key(col)
+            if 'standard' in low:
+                continue
+            if any(term in low for term in ('std', 'sd', 'se')):
+                continue
+            if 'mean' in low:
+                continue
+            if any(re.search(pat, low) for pat in patterns):
+                vals = pd.to_numeric(cycle_rows[col], errors='coerce')
+                if vals.notna().any():
+                    return col
+        # Fallback to canonical mean column only when no cycle-specific value source exists.
+        if col_main in work.columns:
+            vals = pd.to_numeric(cycle_rows[col_main], errors='coerce')
+            if vals.notna().any():
+                return col_main
+        for col in work.columns:
+            if not isinstance(col, str):
+                continue
+            low = _normalize_column_key(col)
+            if 'standard' in low:
+                continue
+            if any(term in low for term in ('std', 'sd', 'se')):
+                continue
+            if any(re.search(pat, low) for pat in patterns):
+                vals = pd.to_numeric(cycle_rows[col], errors='coerce')
+                if vals.notna().any():
+                    return col
+        return col_main if col_main in work.columns else None
+
+    d13_value_col = _pick_cycle_value_source(
+        'd 13C/12C  Mean',
+        [r'd13', r'd ?13c', r'd45co2', r'\bd45\b']
+    )
+    d18_value_col = _pick_cycle_value_source(
+        'd 18O/16O  Mean',
+        [r'd18', r'd ?18o', r'd46co2', r'\bd46\b']
+    )
+
+    def _extract_col_mass(col_name):
+        low = _normalize_column_key(col_name)
+        m = re.search(r'(?<!\d)(44|45|46)(?:\.0+)?(?!\d)', low)
+        if m:
+            return int(m.group(1))
+        return None
+
+    def _compute_cycle_intensity_frame(cycles_df):
+        cols = [c for c in intensity_cols if c in cycles_df.columns]
+        intensity_df = None
+        if cols:
+            intensity_df = pd.DataFrame({
+                col: _normalize_signal_intensity(cycles_df[col])
+                for col in cols
+            })
+        else:
+            # Fallback: use any numeric columns in cycle rows (excluding known isotope/ID fields)
+            exclude = {
+                'Cycle Number', 'Identifier 1', 'Identifier 2', 'Label', 'Species', 'Comment',
+                'Run ID', 'Line', 'Date', 'Date_ordinal', 'Sample Type', 'Reference',
+                'd 13C/12C  Mean', 'd 13C/12C  Std Dev',
+                'd 18O/16O  Mean', 'd 18O/16O  Std Dev'
+            }
+            data = {}
+            for col in cycles_df.columns:
+                if col in exclude or not isinstance(col, str):
+                    continue
+                low = _normalize_column_key(col)
+                if not ('intensit' in low or re.search(r'\bint\b', low) or 'signal' in low):
+                    continue
+                if not ('m/z' in low or 'mz' in low or re.search(r'\b4[4-6](?:\.\d+)?\b', low) or 'cycle' in low):
+                    continue
+                vals = _normalize_signal_intensity(cycles_df[col])
+                if vals.notna().any():
+                    data[col] = vals
+            if data:
+                intensity_df = pd.DataFrame(data)
+        if intensity_df is None or intensity_df.empty:
+            return None
+        valid = intensity_df.notna().any(axis=1)
+        if valid.any():
+            return intensity_df
+        return None
+
+    def _build_saturation_mask(intensity_df, required_masses):
+        if intensity_df is None or intensity_df.empty:
+            return None
+        sat_mask = pd.Series(False, index=intensity_df.index, dtype=bool)
+        has_mass_cols = False
+        for mass in required_masses:
+            mass_cols = [c for c in intensity_df.columns if _extract_col_mass(c) == mass]
+            if not mass_cols:
+                continue
+            has_mass_cols = True
+            # For each required mass, if any collector (sample/reference) is saturated, exclude the cycle.
+            mass_sat = (intensity_df[mass_cols] > saturation_threshold).any(axis=1)
+            sat_mask = sat_mask | mass_sat
+        if not has_mass_cols:
+            return None
+        return sat_mask
+
+    for group in pre_rows['_cycle_group'].dropna().unique():
+        sample_mask = pre_rows['_cycle_group'] == group
+        sample_idx = pre_rows.index[sample_mask][0]
+        cycles = cycle_rows[cycle_rows['_cycle_group'] == group]
+        # Only true analysis cycles contribute to recovered means (exclude "Pre").
+        sample_cycles = cycles.copy()
+
+        total_cycles = int(cycles.shape[0])
+        pre_rows.at[sample_idx, 'Cycles Total'] = total_cycles
+
+        saturated_any = False
+        has_cycle_intensity = False
+        sat_mask_d13 = None
+        sat_mask_d18 = None
+        intensity_df = _compute_cycle_intensity_frame(sample_cycles)
+        if intensity_df is not None:
+            has_cycle_intensity = True
+            sat_mask_d13 = _build_saturation_mask(intensity_df, [44, 45])
+            sat_mask_d18 = _build_saturation_mask(intensity_df, [44, 45, 46])
+        low_signal_failed = False
+        pre_intensity_cols = [c for c in sample_intensity_cols if c in pre_rows.columns]
+        if pre_intensity_cols:
+            pre_vals = _normalize_signal_intensity(pre_rows.loc[sample_idx, pre_intensity_cols])
+            pre_max = pre_vals.max(skipna=True)
+            if pd.notna(pre_max) and pre_max < low_signal_threshold:
+                low_signal_failed = True
+        elif '1  Cycle Int  Samp  44' in pre_rows.columns:
+            pre_val = _parse_numeric_token(pre_rows.at[sample_idx, '1  Cycle Int  Samp  44'])
+            if pre_val is not None and pre_val < low_signal_threshold:
+                low_signal_failed = True
+        # d13C
+        d13_mean = np.nan
+        d13_std = np.nan
+        d13_used = 0
+        d13_excl = 0
+        d13_has_cycles = False
+        if d13_value_col and d13_value_col in sample_cycles.columns:
+            d13_vals = pd.to_numeric(sample_cycles[d13_value_col], errors='coerce')
+            d13_cycles = sample_cycles.assign(_d13=d13_vals)
+            d13_cycles = d13_cycles[d13_cycles['_d13'].notna()]
+            if not d13_cycles.empty:
+                d13_has_cycles = True
+                d13_filtered = pd.Series(dtype='float64')
+                if has_cycle_intensity and sat_mask_d13 is not None:
+                    sat_mask = sat_mask_d13.reindex(d13_cycles.index).fillna(False)
+                    d13_excl = int(sat_mask.sum())
+                    if d13_excl > 0:
+                        saturated_any = True
+                    d13_filtered = d13_cycles.loc[~sat_mask, '_d13']
+                else:
+                    # No cycle intensity available: keep all valid cycles.
+                    d13_filtered = d13_cycles['_d13']
+                if not d13_filtered.empty:
+                    d13_mean = float(d13_filtered.mean())
+                    d13_std = float(d13_filtered.std()) if len(d13_filtered) > 1 else np.nan
+                    d13_used = int(d13_filtered.shape[0])
+
+        # d18O
+        d18_mean = np.nan
+        d18_std = np.nan
+        d18_used = 0
+        d18_excl = 0
+        d18_has_cycles = False
+        if d18_value_col and d18_value_col in sample_cycles.columns:
+            d18_vals = pd.to_numeric(sample_cycles[d18_value_col], errors='coerce')
+            d18_cycles = sample_cycles.assign(_d18=d18_vals)
+            d18_cycles = d18_cycles[d18_cycles['_d18'].notna()]
+            if not d18_cycles.empty:
+                d18_has_cycles = True
+                d18_filtered = pd.Series(dtype='float64')
+                if has_cycle_intensity and sat_mask_d18 is not None:
+                    sat_mask = sat_mask_d18.reindex(d18_cycles.index).fillna(False)
+                    d18_excl = int(sat_mask.sum())
+                    if d18_excl > 0:
+                        saturated_any = True
+                    d18_filtered = d18_cycles.loc[~sat_mask, '_d18']
+                else:
+                    # No cycle intensity available: keep all valid cycles.
+                    d18_filtered = d18_cycles['_d18']
+                if not d18_filtered.empty:
+                    d18_mean = float(d18_filtered.mean())
+                    d18_std = float(d18_filtered.std()) if len(d18_filtered) > 1 else np.nan
+                    d18_used = int(d18_filtered.shape[0])
+
+        # Apply cycle-derived means when available; otherwise keep existing pre values
+        if np.isfinite(d13_mean):
+            pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = d13_mean
+        if np.isfinite(d13_std):
+            pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = d13_std
+        if np.isfinite(d18_mean):
+            pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = d18_mean
+        if np.isfinite(d18_std):
+            pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = d18_std
+
+        # Isotope-specific failure handling:
+        # If one isotope has cycle data but all those cycles are excluded (e.g., persistent cup saturation),
+        # keep the other isotope and force this isotope to NaN so it is not included in results.
+        if d13_has_cycles and d13_used == 0:
+            pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = np.nan
+            pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = np.nan
+        if d18_has_cycles and d18_used == 0:
+            pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = np.nan
+            pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = np.nan
+
+        pre_rows.at[sample_idx, 'd13C Cycles Used'] = d13_used
+        pre_rows.at[sample_idx, 'd18O Cycles Used'] = d18_used
+        pre_rows.at[sample_idx, 'd13C Cycles Excluded'] = d13_excl
+        pre_rows.at[sample_idx, 'd18O Cycles Excluded'] = d18_excl
+
+        # Determine collector status
+        pre_d13 = pre_rows.at[sample_idx, 'd 13C/12C  Mean'] if 'd 13C/12C  Mean' in pre_rows.columns else np.nan
+        pre_d18 = pre_rows.at[sample_idx, 'd 18O/16O  Mean'] if 'd 18O/16O  Mean' in pre_rows.columns else np.nan
+        # Any missing isotope value is treated as failed so it is grouped/marked with failed samples.
+        failed = low_signal_failed or (not np.isfinite(pre_d13)) or (not np.isfinite(pre_d18))
+        fully_saturated = (
+            has_cycle_intensity and
+            (d13_has_cycles or d18_has_cycles) and
+            d13_used == 0 and d18_used == 0 and
+            (d13_excl > 0 or d18_excl > 0)
+        )
+        if fully_saturated:
+            pre_rows.at[sample_idx, 'Collector Status'] = 'Fully Saturated Collectors'
+            pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = np.nan
+            pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = np.nan
+            pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = np.nan
+            pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = np.nan
+        elif failed:
+            pre_rows.at[sample_idx, 'Collector Status'] = 'Failed Sample'
+            if low_signal_failed:
+                pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = np.nan
+                pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = np.nan
+                pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = np.nan
+                pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = np.nan
+        elif saturated_any:
+            pre_rows.at[sample_idx, 'Collector Status'] = 'Partially Saturated Collectors'
+
+    # Keep non-cycle rows (rows without Cycle Number)
+    other_rows = work[work['_cycle_order'].isna()].copy()
+    if not other_rows.empty and 'Collector Status' not in other_rows.columns:
+        other_rows['Collector Status'] = 'OK'
+
+    result = pd.concat([pre_rows, other_rows], axis=0).sort_index()
+    result = result.drop(columns=['_cycle_order', '_cycle_group'], errors='ignore')
+    return result
 
 def _get_species_series(df):
     """Prefer Species column; else use Label species or Label identifier when species missing."""
@@ -230,6 +686,56 @@ def _split_label_species(label):
         return ident, species
     return label, None
 
+def _canonicalize_header_columns(df):
+    """Normalize key column names after multi-row header merge."""
+    if df is None:
+        return df
+    rename = {}
+    for col in df.columns:
+        if not isinstance(col, str):
+            continue
+        low = _normalize_column_key(col)
+        target = None
+        if re.search(r'\bindex\b', low):
+            target = 'Index'
+        elif 'user name' in low:
+            target = 'User name'
+        elif 'start time' in low:
+            target = 'Start Time'
+        elif 'stop time' in low:
+            target = 'Stop Time'
+        elif re.search(r'\bstatus\b', low):
+            target = 'Status'
+        elif 'mark to pause' in low:
+            target = 'Mark To Pause'
+        elif re.search(r'\blabel\b', low):
+            target = 'Label'
+        elif re.search(r'\bcomment\b', low):
+            target = 'Comment'
+        elif 'run id' in low:
+            target = 'Run ID'
+        elif re.search(r'\bline\b', low):
+            target = 'Line'
+        elif re.search(r'\bvial\b', low):
+            target = 'Vial'
+        elif 'evaluate' in low:
+            target = 'Evaluate'
+        elif 'sample type' in low:
+            target = 'Sample Type'
+        elif 'reference' in low:
+            target = 'Reference'
+        elif 'cycle number' in low:
+            target = 'Cycle Number'
+        elif low == 'information' or low.endswith(' information'):
+            target = 'Information'
+        elif low == 'date':
+            target = 'Date'
+        if target and target not in df.columns and target not in rename.values():
+            rename[col] = target
+    if rename:
+        df = df.rename(columns=rename)
+    return df
+
 def _parse_new_table_layout(raw_df):
     """Parse the 'New Table' layout with multi-row headers."""
     header_idx = None
@@ -241,49 +747,80 @@ def _parse_new_table_layout(raw_df):
     if header_idx is None:
         return None
 
-    df = raw_df.iloc[header_idx + 1:].copy()
-    header_vals = raw_df.iloc[header_idx].tolist()
-    normalized_cols = []
-    for idx, col in enumerate(header_vals):
-        if isinstance(col, str) and col.strip() != '':
-            normalized_cols.append(col)
-        elif pd.isna(col):
-            normalized_cols.append(f"Unnamed: {idx}")
-        else:
-            normalized_cols.append(str(col))
-    df.columns = normalized_cols
-
+    header_row = raw_df.iloc[header_idx].tolist()
+    header_start_idx = header_idx
     if header_idx > 0:
-        prev = raw_df.iloc[header_idx - 1].tolist()
-        new_cols = []
-        for col, prev_val in zip(df.columns, prev):
-            is_missing = (
-                not isinstance(col, str)
-                or col.strip() == ''
-                or col.startswith('Unnamed')
-                or pd.isna(col)
-            )
-            if is_missing and isinstance(prev_val, str) and prev_val.strip():
-                new_cols.append(prev_val)
-            else:
-                new_cols.append(col)
-        df.columns = new_cols
+        prev_row = raw_df.iloc[header_idx - 1]
+        if prev_row.notna().any():
+            header_start_idx = header_idx - 1
+    index_col_pos = None
+    for idx, val in enumerate(header_row):
+        if isinstance(val, str) and val.strip().lower() == 'index':
+            index_col_pos = idx
+            break
 
+    data_start_idx = header_idx + 1
+    if index_col_pos is not None:
+        for i in range(header_idx + 1, len(raw_df)):
+            val = raw_df.iat[i, index_col_pos]
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                continue
+            text = str(val).strip()
+            if text == '' or text.lower() == 'nan':
+                continue
+            if _parse_numeric_token(val) is not None:
+                data_start_idx = i
+                break
+
+    unit_tokens = {'\u2030', 'â€°', '%', 'ppm', 'ppb', 'mv', 'v', 'c'}
+    cols = []
+    for col_idx in range(raw_df.shape[1]):
+        parts = []
+        for row_idx in range(header_start_idx, data_start_idx):
+            val = raw_df.iat[row_idx, col_idx]
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                continue
+            text = str(val).strip()
+            if text == '' or text.lower() == 'nan':
+                continue
+            if text.lower() in unit_tokens:
+                continue
+            parts.append(text)
+        dedup = []
+        for part in parts:
+            if not dedup or dedup[-1].lower() != part.lower():
+                dedup.append(part)
+        col_name = ' '.join(dedup) if dedup else f'Unnamed: {col_idx}'
+        cols.append(col_name)
+
+    df = raw_df.iloc[data_start_idx:].copy()
+    df.columns = cols
+    df = _canonicalize_header_columns(df)
+
+    # Drop a units row if present immediately after headers (fallback)
     if len(df) > 0:
-        first_row = df.iloc[0]
-        rename_map = {}
-        for col, val in first_row.items():
-            if isinstance(val, str) and ('d13C' in val or 'd18O' in val):
-                rename_map[col] = val
-        if rename_map:
+        unit_row = df.iloc[0]
+        unit_hits = 0
+        non_empty = 0
+        for val in unit_row.values.tolist():
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                continue
+            text = str(val).strip().lower()
+            if text == '' or text == 'nan':
+                continue
+            non_empty += 1
+            if text in unit_tokens:
+                unit_hits += 1
+        if non_empty > 0 and unit_hits / max(non_empty, 1) >= 0.6:
             df = df.iloc[1:].copy()
-            df.rename(columns=rename_map, inplace=True)
 
     if 'Index' in df.columns:
-        df = df[df['Index'].notna()].copy()
+        if 'Cycle Number' in df.columns:
+            df = df[df['Index'].notna() | df['Cycle Number'].notna()].copy()
+        else:
+            df = df[df['Index'].notna()].copy()
 
     return df
-
 def _standardize_isotope_columns(df):
     """Map isotope columns to canonical names used throughout the app."""
     rename_map = {}
@@ -1916,12 +2453,19 @@ def main():
                             continue
                     
                     # Standardize types and create a clean copy
+                    df = _coalesce_duplicate_columns(df)
                     df = df.convert_dtypes()
                     df.reset_index(drop=True, inplace=True)
                     df = df.map(lambda x: None if pd.isna(x) else x)
+                    df['Excel File'] = uploaded_file.name
 
                     # Normalize isotope column names
                     df = _standardize_isotope_columns(df)
+                    df = _coalesce_duplicate_columns(df)
+                    # Ensure isotope mean/std columns exist
+                    for col in ['d 13C/12C  Mean', 'd 13C/12C  Std Dev', 'd 18O/16O  Mean', 'd 18O/16O  Std Dev']:
+                        if col not in df.columns:
+                            df[col] = np.nan
 
                     # Convert the DataFrame 'Date' column to datetime with explicit format
                     if 'Date' in df.columns:
@@ -2007,6 +2551,9 @@ def main():
                     for col in ['leak_rate', 'p_no_acid', 'total_co2', 'p_gases', '1  Cycle Int  Samp  44', 'Line']:
                         if col not in df.columns:
                             df[col] = np.nan
+
+                    # Compute per-sample means from cycles when Cycle Number is present
+                    df = _apply_cycle_averages(df)
 
                     # Ensure all original columns are included
                     for col in original_columns:
@@ -3095,6 +3642,9 @@ def main():
         within_statistical = ~statistical_mask
 
         # Create mask for data within all ranges
+        status_series_all = data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index))
+        not_saturated_samples = status_series_all != 'Fully Saturated Collectors'
+        not_failed_samples = status_series_all != 'Failed Sample'
         within_ranges = (
             (data_to_process['d 13C/12C  Mean'] >= st.session_state.d13c_range[0]) &
             (data_to_process['d 13C/12C  Mean'] <= st.session_state.d13c_range[1]) &
@@ -3103,7 +3653,9 @@ def main():
             (data_to_process['1  Cycle Int  Samp  44'] >= st.session_state.signal_range[0]) &
             (data_to_process['1  Cycle Int  Samp  44'] <= st.session_state.signal_range[1]) &
             (data_to_process['leak_rate'] >= st.session_state.leak_range[0]) &
-            (data_to_process['leak_rate'] <= st.session_state.leak_range[1])
+            (data_to_process['leak_rate'] <= st.session_state.leak_range[1]) &
+            not_saturated_samples &
+            not_failed_samples
         )
 
         # Combine range and statistical masks
@@ -3124,15 +3676,22 @@ def main():
         d18o_mask = (data_without_standards['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (data_without_standards['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
         signal_mask = (data_without_standards['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (data_without_standards['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
         leak_mask = (data_without_standards['leak_rate'] < st.session_state.leak_range[0]) | (data_without_standards['leak_rate'] > st.session_state.leak_range[1])
+        status_series_no_std = data_without_standards.get('Collector Status', pd.Series(False, index=data_without_standards.index))
+        failed_mask = status_series_no_std == 'Failed Sample'
+        saturated_mask = status_series_no_std == 'Partially Saturated Collectors'
+        saturated_sample_mask = status_series_no_std == 'Fully Saturated Collectors'
 
         # Count outliers
         d13c_outliers = sum(d13c_mask)
         d18o_outliers = sum(d18o_mask)
         signal_outliers = sum(signal_mask)
         leak_outliers = sum(leak_mask)
+        failed_outliers = int(failed_mask.sum())
+        saturated_collectors = int(saturated_mask.sum())
+        saturated_samples = int(saturated_sample_mask.sum())
 
         # Calculate final analyses (total samples minus all outliers)
-        total_outliers = stat_outliers + d13c_outliers + d18o_outliers + signal_outliers + leak_outliers
+        total_outliers = stat_outliers + d13c_outliers + d18o_outliers + signal_outliers + leak_outliers + failed_outliers + saturated_samples
         final_analyses = total_samples - total_outliers
 
         # Create a DataFrame for displaying statistics
@@ -3181,6 +3740,21 @@ def main():
                 'Value': leak_outliers,
                 'Details': f'({(leak_outliers/total_measurements)*100:.1f}% of measurements)'
             })
+        stats_data.append({
+            'Metric': 'Failed Samples',
+            'Value': failed_outliers,
+            'Details': f'({(failed_outliers/total_measurements)*100:.1f}% of measurements)'
+        })
+        stats_data.append({
+            'Metric': 'Partially Failed (Recovered Mean)',
+            'Value': saturated_collectors,
+            'Details': f'({(saturated_collectors/total_measurements)*100:.1f}% of measurements)'
+        })
+        stats_data.append({
+            'Metric': 'Fully Saturated Collectors',
+            'Value': saturated_samples,
+            'Details': f'({(saturated_samples/total_measurements)*100:.1f}% of measurements)'
+        })
 
         stats_data.append({
             'Metric': 'Final Analyses',
@@ -3269,6 +3843,21 @@ def main():
         if st.session_state.include_outliers == "No":
             # Collect outliers with their categories
             outliers_df = pd.DataFrame()
+            
+            # Failed samples (pre with empty data)
+            failed_outliers_df = data_to_process[
+                data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Failed Sample'
+            ].copy()
+            if not failed_outliers_df.empty:
+                failed_outliers_df['Category'] = 'Failed Sample'
+                outliers_df = pd.concat([outliers_df, failed_outliers_df])
+            
+            saturated_samples_df = data_to_process[
+                data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors'
+            ].copy()
+            if not saturated_samples_df.empty:
+                saturated_samples_df['Category'] = 'Fully Saturated Collectors'
+                outliers_df = pd.concat([outliers_df, saturated_samples_df])
             
             # Statistical outliers - making sure to use the correct index
             statistical_mask = pd.Series(False, index=data_to_process.index, dtype=bool)
@@ -3376,6 +3965,8 @@ def main():
                 (data_to_process['leak_rate'] < st.session_state.leak_range[0]) |
                 (data_to_process['leak_rate'] > st.session_state.leak_range[1])
             )
+            failed_out_mask = data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Failed Sample'
+            saturated_sample_out_mask = data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors'
 
             cat_bools = pd.DataFrame({
                 'Statistical': stat_mask_all,
@@ -3383,6 +3974,8 @@ def main():
                 'd18O Range': d18o_out_mask,
                 'Signal Intensity': signal_out_mask,
                 'Leak Rate': leak_out_mask,
+                'Failed Sample': failed_out_mask,
+                'Fully Saturated Collectors': saturated_sample_out_mask,
             }, index=data_to_process.index)
 
             # Join multiple categories with '; ' for rows that meet several outlier conditions
@@ -3487,6 +4080,9 @@ def main():
 
             show_statistical_outliers = st.checkbox("Show statistical outliers on chart", value=False, key="show_statistical_outliers")
             show_range_outliers = st.checkbox("Show range outliers on chart", value=False, key="show_range_outliers")
+            show_saturated_collectors = st.checkbox("Show partially failed (recovered) samples on chart", value=True, key="show_saturated_collectors")
+            show_saturated_samples = st.checkbox("Show failed samples (fully saturated) on chart", value=True, key="show_saturated_samples")
+            show_failed_samples = st.checkbox("Show failed samples (no values) on chart", value=True, key="show_failed_samples")
 
         color_param_tab3_value_col = "_tab3_color_value"
         color_source_tab3 = df_filtered[color_param_tab3]
@@ -3606,18 +4202,39 @@ def main():
             )
         else:
             subset_data['x_axis'] = range(len(subset_data))
+        # Also create x_axis for unfiltered subset (used for status overlays)
+        subset_data_unfiltered['x_axis'] = np.nan
+        if x_axis_option == "By Identifier 2":
+            subset_data_unfiltered['x_axis'] = subset_data_unfiltered['Identifier 2'].apply(
+                lambda x: float(re.search(r'\d+\.?\d*', str(x)).group()) if pd.notnull(x) and re.search(
+                    r'\d+\.?\d*', str(x)) else None
+            )
+        else:
+            subset_data_unfiltered['x_axis'] = range(len(subset_data_unfiltered))
 
         # Summary Charts
         st.subheader("Summary Charts")
         
         # Create summary chart for d13C
         d13c_summary = go.Figure()
+        d13_legend_partial_shown = False
+        d13_legend_failed_full_shown = False
+        d13_legend_failed_no_values_shown = False
         for species in unique_species:
             if species == "Unknown":
                 continue
             
             species_data = subset_data[subset_data[species_col] == species]
             species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
+            if species_data_unfiltered.empty and species_data.empty:
+                continue
+
+            status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
+            saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
+            saturated_samples_mask = status_series == 'Fully Saturated Collectors'
+            failed_mask = status_series == 'Failed Sample'
+            saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
+            failed_idx = species_data_unfiltered[failed_mask].index
             
             # Calculate statistical outliers
             mean_d13C = species_data['d 13C/12C  Mean'].mean()
@@ -3660,8 +4277,10 @@ def main():
             else:
                 range_outliers = pd.DataFrame(columns=species_data.columns)
                 
-            # Filter data to plot - exclude both statistical and range outliers
-            data_to_plot = species_data[~(outlier_mask | range_mask)].copy()
+            # Filter data to plot - exclude statistical, range outliers, and saturated samples
+            data_to_plot = species_data[
+                ~(outlier_mask | range_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+            ].copy()
             
             # Sort data by x_axis to ensure sequential line connections
             data_to_plot = data_to_plot.sort_values('x_axis')
@@ -3685,6 +4304,81 @@ def main():
                 line=dict(width=1, color=species_color),
                 legendgroup=species
             ))
+
+            # Highlight saturated collectors (compromised but valid)
+            if show_saturated_collectors and saturated_collectors_mask.any():
+                sat_collectors = species_data_unfiltered[saturated_collectors_mask]
+                d13c_summary.add_trace(go.Scatter(
+                    x=sat_collectors['x_axis'],
+                    y=sat_collectors['d 13C/12C  Mean'],
+                    mode='markers',
+                    name='Partially Failed (Recovered Mean)',
+                    marker=dict(
+                        size=12,
+                        symbol='diamond-open',
+                        color='#ff7f0e',
+                        line=dict(width=2, color='#ff7f0e')
+                    ),
+                    showlegend=not d13_legend_partial_shown,
+                    legendgroup='collector_status'
+                ))
+                d13_legend_partial_shown = True
+
+            # Plot saturated samples as outliers
+            if show_saturated_samples and saturated_samples_mask.any():
+                sat_samples = species_data_unfiltered[saturated_samples_mask]
+                y_vals_sat = pd.to_numeric(sat_samples['d 13C/12C  Mean'], errors='coerce')
+                if y_vals_sat.notna().any():
+                    y_sat = y_vals_sat.tolist()
+                else:
+                    y_vals = pd.to_numeric(species_data['d 13C/12C  Mean'], errors='coerce')
+                    y_min = y_vals.min()
+                    y_max = y_vals.max()
+                    if not np.isfinite(y_min):
+                        y_min, y_max = -1.0, 1.0
+                    y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                    y_sat = [y_min - (0.15 * y_range if y_range > 0 else 0.75)] * len(sat_samples)
+                d13c_summary.add_trace(go.Scatter(
+                    x=sat_samples['x_axis'],
+                    y=y_sat,
+                    mode='markers',
+                    name='Failed Samples (Fully Saturated)',
+                    marker=dict(
+                        size=12,
+                        symbol='triangle-down',
+                        color='#d62728',
+                        line=dict(width=2, color='#d62728')
+                    ),
+                    showlegend=not d13_legend_failed_full_shown,
+                    legendgroup='outliers'
+                ))
+                d13_legend_failed_full_shown = True
+
+            if show_failed_samples and failed_mask.any():
+                failed_samples = species_data_unfiltered[failed_mask]
+                y_vals = pd.to_numeric(species_data['d 13C/12C  Mean'], errors='coerce')
+                y_min = y_vals.min()
+                y_max = y_vals.max()
+                if not np.isfinite(y_min):
+                    y_min, y_max = -1.0, 1.0
+                y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                d13c_summary.add_trace(go.Scatter(
+                    x=failed_samples['x_axis'],
+                    y=[y_failed] * len(failed_samples),
+                    mode='markers',
+                    name='Failed Samples (No Values)',
+                    marker=dict(
+                        size=10,
+                        symbol='triangle-down',
+                        color='#7f7f7f',
+                        line=dict(width=1, color='#7f7f7f')
+                    ),
+                    showlegend=not d13_legend_failed_no_values_shown,
+                    legendgroup='outliers',
+                    text=failed_samples['Identifier 2'].astype(str)
+                ))
+                d13_legend_failed_no_values_shown = True
 
             # Plot statistical outliers if enabled
             if show_statistical_outliers and not statistical_outliers.empty:
@@ -3787,12 +4481,24 @@ def main():
         
         # Create summary chart for d18O
         d18o_summary = go.Figure()
+        d18_legend_partial_shown = False
+        d18_legend_failed_full_shown = False
+        d18_legend_failed_no_values_shown = False
         for species in unique_species:
             if species == "Unknown":
                 continue
             
             species_data = subset_data[subset_data[species_col] == species]
             species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
+            if species_data_unfiltered.empty and species_data.empty:
+                continue
+
+            status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
+            saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
+            saturated_samples_mask = status_series == 'Fully Saturated Collectors'
+            failed_mask = status_series == 'Failed Sample'
+            saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
+            failed_idx = species_data_unfiltered[failed_mask].index
             
             # Calculate statistical outliers
             mean_d13C = species_data['d 13C/12C  Mean'].mean()
@@ -3807,7 +4513,9 @@ def main():
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
             statistical_outliers = species_data[outlier_mask].copy()
-            data_to_plot = species_data[~outlier_mask].copy()
+            data_to_plot = species_data[
+                ~(outlier_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+            ].copy()
             
             # Sort data by x_axis to ensure sequential line connections
             data_to_plot = data_to_plot.sort_values('x_axis')
@@ -3856,6 +4564,81 @@ def main():
                 line=dict(width=1, color=species_color),
                 legendgroup=species
             ))
+
+            # Highlight saturated collectors (compromised but valid)
+            if show_saturated_collectors and saturated_collectors_mask.any():
+                sat_collectors = species_data_unfiltered[saturated_collectors_mask]
+                d18o_summary.add_trace(go.Scatter(
+                    x=sat_collectors['x_axis'],
+                    y=sat_collectors['d 18O/16O  Mean'],
+                    mode='markers',
+                    name='Partially Failed (Recovered Mean)',
+                    marker=dict(
+                        size=12,
+                        symbol='diamond-open',
+                        color='#ff7f0e',
+                        line=dict(width=2, color='#ff7f0e')
+                    ),
+                    showlegend=not d18_legend_partial_shown,
+                    legendgroup='collector_status'
+                ))
+                d18_legend_partial_shown = True
+
+            # Plot saturated samples as outliers
+            if show_saturated_samples and saturated_samples_mask.any():
+                sat_samples = species_data_unfiltered[saturated_samples_mask]
+                y_vals_sat = pd.to_numeric(sat_samples['d 18O/16O  Mean'], errors='coerce')
+                if y_vals_sat.notna().any():
+                    y_sat = y_vals_sat.tolist()
+                else:
+                    y_vals = pd.to_numeric(species_data['d 18O/16O  Mean'], errors='coerce')
+                    y_min = y_vals.min()
+                    y_max = y_vals.max()
+                    if not np.isfinite(y_min):
+                        y_min, y_max = -1.0, 1.0
+                    y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                    y_sat = [y_min - (0.15 * y_range if y_range > 0 else 0.75)] * len(sat_samples)
+                d18o_summary.add_trace(go.Scatter(
+                    x=sat_samples['x_axis'],
+                    y=y_sat,
+                    mode='markers',
+                    name='Failed Samples (Fully Saturated)',
+                    marker=dict(
+                        size=12,
+                        symbol='triangle-down',
+                        color='#d62728',
+                        line=dict(width=2, color='#d62728')
+                    ),
+                    showlegend=not d18_legend_failed_full_shown,
+                    legendgroup='outliers'
+                ))
+                d18_legend_failed_full_shown = True
+
+            if show_failed_samples and failed_mask.any():
+                failed_samples = species_data_unfiltered[failed_mask]
+                y_vals = pd.to_numeric(species_data['d 18O/16O  Mean'], errors='coerce')
+                y_min = y_vals.min()
+                y_max = y_vals.max()
+                if not np.isfinite(y_min):
+                    y_min, y_max = -1.0, 1.0
+                y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                d18o_summary.add_trace(go.Scatter(
+                    x=failed_samples['x_axis'],
+                    y=[y_failed] * len(failed_samples),
+                    mode='markers',
+                    name='Failed Samples (No Values)',
+                    marker=dict(
+                        size=10,
+                        symbol='triangle-down',
+                        color='#7f7f7f',
+                        line=dict(width=1, color='#7f7f7f')
+                    ),
+                    showlegend=not d18_legend_failed_no_values_shown,
+                    legendgroup='outliers',
+                    text=failed_samples['Identifier 2'].astype(str)
+                ))
+                d18_legend_failed_no_values_shown = True
 
             # Plot statistical outliers if enabled
             if show_statistical_outliers and not statistical_outliers.empty:
@@ -3960,13 +4743,23 @@ def main():
 
         # Create cross-plot: d13C vs d18O grouped by Species
         species_scatter = go.Figure()
+        scatter_legend_partial_shown = False
+        scatter_legend_failed_full_shown = False
         for species in unique_species:
             if species == "Unknown":
                 continue
 
             species_data = subset_data[subset_data[species_col] == species]
-            if species_data.empty:
+            species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
+            if species_data_unfiltered.empty and species_data.empty:
                 continue
+
+            status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
+            saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
+            saturated_samples_mask = status_series == 'Fully Saturated Collectors'
+            saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
+            failed_mask = status_series == 'Failed Sample'
+            failed_idx = species_data_unfiltered[failed_mask].index
 
             # Compute statistical thresholds per species
             mean_d13C = species_data['d 13C/12C  Mean'].mean()
@@ -3993,7 +4786,9 @@ def main():
             )
 
             # Filter to non-outliers for main scatter
-            data_to_plot = species_data[~(outlier_mask | range_mask)].copy()
+            data_to_plot = species_data[
+                ~(outlier_mask | range_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+            ].copy()
             # Drop rows with missing isotope values
             data_to_plot = data_to_plot[
                 data_to_plot['d 13C/12C  Mean'].notna() & data_to_plot['d 18O/16O  Mean'].notna()
@@ -4025,6 +4820,54 @@ def main():
                 text=data_to_plot['Identifier 2'].astype(str)
             ))
 
+            # Overlay saturated collectors (valid means)
+            if show_saturated_collectors and saturated_collectors_mask.any():
+                sat_collectors = species_data_unfiltered[saturated_collectors_mask]
+                sat_collectors = sat_collectors[
+                    sat_collectors['d 13C/12C  Mean'].notna() & sat_collectors['d 18O/16O  Mean'].notna()
+                ]
+                if not sat_collectors.empty:
+                    species_scatter.add_trace(go.Scatter(
+                        x=sat_collectors['d 18O/16O  Mean'],
+                        y=sat_collectors['d 13C/12C  Mean'],
+                        mode='markers',
+                        name='Partially Failed (Recovered Mean)',
+                        marker=dict(
+                            size=12,
+                            symbol='diamond-open',
+                            color='#ff7f0e',
+                            line=dict(width=2, color='#ff7f0e')
+                        ),
+                        showlegend=not scatter_legend_partial_shown,
+                        legendgroup='collector_status',
+                        text=sat_collectors['Identifier 2'].astype(str)
+                    ))
+                    scatter_legend_partial_shown = True
+
+            # Overlay saturated samples as outliers
+            if show_saturated_samples and saturated_samples_mask.any():
+                sat_samples = species_data_unfiltered[saturated_samples_mask]
+                sat_samples = sat_samples[
+                    sat_samples['d 13C/12C  Mean'].notna() & sat_samples['d 18O/16O  Mean'].notna()
+                ]
+                if not sat_samples.empty:
+                    species_scatter.add_trace(go.Scatter(
+                        x=sat_samples['d 18O/16O  Mean'],
+                        y=sat_samples['d 13C/12C  Mean'],
+                        mode='markers',
+                        name='Failed Samples (Fully Saturated)',
+                        marker=dict(
+                            size=12,
+                            symbol='triangle-down',
+                            color='#d62728',
+                            line=dict(width=2, color='#d62728')
+                        ),
+                        showlegend=not scatter_legend_failed_full_shown,
+                        legendgroup='outliers',
+                        text=sat_samples['Identifier 2'].astype(str)
+                    ))
+                    scatter_legend_failed_full_shown = True
+
         species_scatter.update_layout(
             title="d13C vs d18O by Species",
             xaxis_title="d18O",
@@ -4038,10 +4881,19 @@ def main():
         for species in unique_species:
             # Filter data for this specific species
             species_data = subset_data[subset_data[species_col] == species]
+            species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
+            if species_data_unfiltered.empty and species_data.empty:
+                continue
 
             # Skip if Identifier 2 is empty
-            if species_data['Identifier 2'].isna().all():
+            if species_data['Identifier 2'].isna().all() and species_data_unfiltered['Identifier 2'].isna().all():
                 continue
+
+            status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
+            saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
+            saturated_samples_mask = status_series == 'Fully Saturated Collectors'
+            failed_mask = status_series == 'Failed Sample'
+            saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
 
             col1, col2 = st.columns([3, 1])
             with col1:
@@ -4078,13 +4930,14 @@ def main():
             # Apply mask and include necessary columns (including x_axis)
             statistical_outliers = species_data[outlier_mask].copy()
 
-            # Remove statistical outliers from data_to_plot
-            data_to_plot = species_data[~outlier_mask].copy()
+            # Remove statistical outliers and saturated samples from data_to_plot
+            data_to_plot = species_data[
+                ~(outlier_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+            ].copy()
 
             # Identify range bar outliers from unfiltered data
             # Identify and process range outliers if enabled
             if show_range_outliers:
-                species_data_unfiltered = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
                 # Create mask for range outliers
                 range_mask = (
                     (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
@@ -4138,7 +4991,21 @@ def main():
                 # Filter data for the current identifier
                 data_for_identifier = data_to_plot[data_to_plot['Identifier 1'] == identifier]
 
-                if data_for_identifier.empty:
+                has_status_markers = False
+                if show_saturated_collectors and not species_data_unfiltered[
+                    (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask
+                ].empty:
+                    has_status_markers = True
+                if show_saturated_samples and not species_data_unfiltered[
+                    (species_data_unfiltered['Identifier 1'] == identifier) & saturated_samples_mask
+                ].empty:
+                    has_status_markers = True
+                if show_failed_samples and not species_data_unfiltered[
+                    (species_data_unfiltered['Identifier 1'] == identifier) & failed_mask
+                ].empty:
+                    has_status_markers = True
+
+                if data_for_identifier.empty and not has_status_markers:
                     continue  # Skip if there is no data to plot for this identifier
 
                 # Plot d13C data for this identifier and comment
@@ -4206,6 +5073,65 @@ def main():
                                 marker=dict(color='red', symbol='x', size=12, line=dict(width=2)),
                                 name='d18O Range'
                             ))
+
+                # Highlight saturated collectors (valid means)
+                if show_saturated_collectors:
+                    identifier_sat_collectors = species_data_unfiltered[
+                        (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask
+                    ]
+                    if not identifier_sat_collectors.empty:
+                        fig_d13C.add_trace(go.Scatter(
+                            x=identifier_sat_collectors['x_axis'],
+                            y=identifier_sat_collectors['d 13C/12C  Mean'],
+                            mode='markers',
+                            marker=dict(color='#ff7f0e', symbol='diamond-open', size=12, line=dict(width=2)),
+                            name='Partially Failed (Recovered Mean)'
+                        ))
+
+                # Show saturated samples as outliers
+                if show_saturated_samples:
+                    identifier_sat_samples = species_data_unfiltered[
+                        (species_data_unfiltered['Identifier 1'] == identifier) & saturated_samples_mask
+                    ]
+                    if not identifier_sat_samples.empty:
+                        y_vals_sat = pd.to_numeric(identifier_sat_samples['d 13C/12C  Mean'], errors='coerce')
+                        if y_vals_sat.notna().any():
+                            y_sat = y_vals_sat.tolist()
+                        else:
+                            y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
+                            y_min = y_vals.min()
+                            y_max = y_vals.max()
+                            if not np.isfinite(y_min):
+                                y_min, y_max = -1.0, 1.0
+                            y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                            y_sat = [y_min - (0.15 * y_range if y_range > 0 else 0.75)] * len(identifier_sat_samples)
+                        fig_d13C.add_trace(go.Scatter(
+                            x=identifier_sat_samples['x_axis'],
+                            y=y_sat,
+                            mode='markers',
+                            marker=dict(color='#d62728', symbol='triangle-down', size=12, line=dict(width=2)),
+                            name='Failed Samples (Fully Saturated)'
+                        ))
+
+                if show_failed_samples:
+                    identifier_failed = species_data_unfiltered[
+                        (species_data_unfiltered['Identifier 1'] == identifier) & failed_mask
+                    ]
+                    if not identifier_failed.empty:
+                        y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
+                        y_min = y_vals.min()
+                        y_max = y_vals.max()
+                        if not np.isfinite(y_min):
+                            y_min, y_max = -1.0, 1.0
+                        y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                        y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                        fig_d13C.add_trace(go.Scatter(
+                            x=identifier_failed['x_axis'],
+                            y=[y_failed] * len(identifier_failed),
+                            mode='markers',
+                            marker=dict(color='#7f7f7f', symbol='triangle-down', size=10, line=dict(width=1)),
+                            name='Failed Samples (No Values)'
+                        ))
 
                 fig_d13C.add_trace(go.Scatter(
                     x=display_data[display_data['Identifier 1'] == identifier]['x_axis'],
@@ -4313,7 +5239,7 @@ def main():
                                 marker=dict(color='red', symbol='star', size=12, line=dict(width=2)),
                                 name='Leak Rate Range'
                             ))
-    
+
                     # Add main data trace using display_data
                     fig_d18O.add_trace(go.Scatter(
                         x=display_data[display_data['Identifier 1'] == identifier]['x_axis'],
@@ -4363,6 +5289,66 @@ def main():
 
                 # Plot main data trace with correct sorting
                 sorted_data = data_for_identifier.sort_values(by='x_axis')
+
+                # Highlight saturated collectors (valid means)
+                if show_saturated_collectors:
+                    identifier_sat_collectors = species_data_unfiltered[
+                        (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask
+                    ]
+                    if not identifier_sat_collectors.empty:
+                        fig_d18O.add_trace(go.Scatter(
+                            x=identifier_sat_collectors['x_axis'],
+                            y=identifier_sat_collectors['d 18O/16O  Mean'],
+                            mode='markers',
+                            marker=dict(color='#ff7f0e', symbol='diamond-open', size=12, line=dict(width=2)),
+                            name='Partially Failed (Recovered Mean)'
+                        ))
+
+                # Show saturated samples as outliers
+                if show_saturated_samples:
+                    identifier_sat_samples = species_data_unfiltered[
+                        (species_data_unfiltered['Identifier 1'] == identifier) & saturated_samples_mask
+                    ]
+                    if not identifier_sat_samples.empty:
+                        y_vals_sat = pd.to_numeric(identifier_sat_samples['d 18O/16O  Mean'], errors='coerce')
+                        if y_vals_sat.notna().any():
+                            y_sat = y_vals_sat.tolist()
+                        else:
+                            y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
+                            y_min = y_vals.min()
+                            y_max = y_vals.max()
+                            if not np.isfinite(y_min):
+                                y_min, y_max = -1.0, 1.0
+                            y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                            y_sat = [y_min - (0.15 * y_range if y_range > 0 else 0.75)] * len(identifier_sat_samples)
+                        fig_d18O.add_trace(go.Scatter(
+                            x=identifier_sat_samples['x_axis'],
+                            y=y_sat,
+                            mode='markers',
+                            marker=dict(color='#d62728', symbol='triangle-down', size=12, line=dict(width=2)),
+                            name='Failed Samples (Fully Saturated)'
+                        ))
+
+                if show_failed_samples:
+                    identifier_failed = species_data_unfiltered[
+                        (species_data_unfiltered['Identifier 1'] == identifier) & failed_mask
+                    ]
+                    if not identifier_failed.empty:
+                        y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
+                        y_min = y_vals.min()
+                        y_max = y_vals.max()
+                        if not np.isfinite(y_min):
+                            y_min, y_max = -1.0, 1.0
+                        y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                        y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                        fig_d18O.add_trace(go.Scatter(
+                            x=identifier_failed['x_axis'],
+                            y=[y_failed] * len(identifier_failed),
+                            mode='markers',
+                            marker=dict(color='#7f7f7f', symbol='triangle-down', size=10, line=dict(width=1)),
+                            name='Failed Samples (No Values)'
+                        ))
+
                 fig_d18O.add_trace(go.Scatter(
                     x=sorted_data['x_axis'],
                     y=sorted_data['d 18O/16O  Mean'],
@@ -4517,6 +5503,40 @@ def main():
                         st.dataframe(styled_leak, width='stretch')
                     else:
                         st.info("No leak rate outliers detected")
+
+                # Collector Status (Partial / Full / Failed)
+                with st.expander("Collector Status (Partial / Full / Failed)", expanded=True):
+                    src_df = species_data_unfiltered if 'species_data_unfiltered' in locals() else species_data
+                    status_series = src_df.get('Collector Status', pd.Series(False, index=src_df.index))
+                    failed_samples = src_df[status_series == 'Failed Sample'].copy()
+                    saturated_samples = src_df[status_series == 'Partially Saturated Collectors'].copy()
+                    saturated_all = src_df[status_series == 'Fully Saturated Collectors'].copy()
+                    if failed_samples.empty and saturated_samples.empty and saturated_all.empty:
+                        st.info("No saturated collectors or failed samples detected")
+                    else:
+                        if not saturated_samples.empty:
+                            st.markdown("**Partially Failed (Recovered Mean)**")
+                            cols = ['Identifier 2', species_col, 'd 13C/12C  Mean', 'd 18O/16O  Mean',
+                                    'd13C Cycles Excluded', 'd18O Cycles Excluded']
+                            cols = [c for c in cols if c in saturated_samples.columns]
+                            styled_sat = saturated_samples[cols].copy()
+                            styled_sat = styled_sat.rename(columns={species_col: 'Species'})
+                            st.dataframe(styled_sat, width='stretch')
+                        if not saturated_all.empty:
+                            st.markdown("**Failed Samples (Fully Saturated)**")
+                            cols = ['Identifier 2', species_col, 'd 13C/12C  Mean', 'd 18O/16O  Mean',
+                                    'Cycles Total', 'd13C Cycles Excluded', 'd18O Cycles Excluded']
+                            cols = [c for c in cols if c in saturated_all.columns]
+                            styled_sat_all = saturated_all[cols].copy()
+                            styled_sat_all = styled_sat_all.rename(columns={species_col: 'Species'})
+                            st.dataframe(styled_sat_all, width='stretch')
+                        if not failed_samples.empty:
+                            st.markdown("**Failed Samples (No Values)**")
+                            cols = ['Identifier 2', species_col, 'd 13C/12C  Mean', 'd 18O/16O  Mean']
+                            cols = [c for c in cols if c in failed_samples.columns]
+                            styled_fail = failed_samples[cols].copy()
+                            styled_fail = styled_fail.rename(columns={species_col: 'Species'})
+                            st.dataframe(styled_fail, width='stretch')
 
             # with st.expander("Leak Rate Outliers", expanded=True):
             #     if not leak_outliers.empty:
