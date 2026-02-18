@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import io
+import hashlib
 
 # Enable pandas copy-on-write mode to prevent SettingWithCopyWarning
 pd.options.mode.copy_on_write = True
@@ -85,11 +86,583 @@ def _compose_label_series(identifier_series, species_series):
     labels = labels.replace({'': 'Unknown'})
     return labels
 
+
+def _build_delta_point_customdata(df, isotope_key):
+    """Attach row/index metadata to chart points so clicks can edit source rows."""
+    if df is None or df.empty:
+        return None
+    idx_vals = pd.Series(df.index, index=df.index).astype(str).to_numpy()
+    id1_vals = df.get('Identifier 1', pd.Series(index=df.index, dtype=object)).fillna('').astype(str).to_numpy()
+    id2_vals = df.get('Identifier 2', pd.Series(index=df.index, dtype=object)).fillna('').astype(str).to_numpy()
+    iso_vals = np.full(len(df), str(isotope_key), dtype=object)
+    return np.column_stack((idx_vals, iso_vals, id1_vals, id2_vals))
+
+
+def _get_selected_plotly_points(chart_state):
+    """Return all selected Plotly points from a Streamlit chart event."""
+    if chart_state is None:
+        return []
+    selection = None
+    try:
+        selection = chart_state.selection
+    except Exception:
+        if isinstance(chart_state, dict):
+            selection = chart_state.get('selection')
+    if selection is None:
+        return []
+    if isinstance(selection, dict):
+        points = selection.get('points', []) or []
+    else:
+        points = getattr(selection, 'points', None) or []
+    return [p for p in points if isinstance(p, dict)]
+
+
+def _resolve_index_label(index_obj, raw_value):
+    """Resolve selected-point row token back to a DataFrame index label."""
+    candidates = [raw_value, str(raw_value)]
+    try:
+        as_int = int(float(raw_value))
+        candidates.extend([as_int, str(as_int)])
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            if candidate in index_obj:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _extract_mass_from_intensity_column(col_name):
+    """Extract mass number (44/45/46) from an intensity column name."""
+    low = _normalize_column_key(col_name)
+    m = re.search(r'(?<!\d)(44|45|46)(?:\.0+)?(?!\d)', low)
+    return int(m.group(1)) if m else None
+
+
+def _pick_cycle_value_column(df, primary_col, patterns):
+    """Pick a cycle-level isotope value column, preferring explicit cycle columns."""
+    if df is None or df.empty:
+        return None
+    for col in df.columns:
+        if not isinstance(col, str):
+            continue
+        low = _normalize_column_key(col)
+        if 'standard' in low:
+            continue
+        if any(term in low for term in ('std', 'sd', 'se')):
+            continue
+        if 'mean' in low:
+            continue
+        if any(re.search(pat, low) for pat in patterns):
+            vals = pd.to_numeric(df[col], errors='coerce')
+            if vals.notna().any():
+                return col
+    if primary_col in df.columns:
+        vals = pd.to_numeric(df[primary_col], errors='coerce')
+        if vals.notna().any():
+            return primary_col
+    for col in df.columns:
+        if not isinstance(col, str):
+            continue
+        low = _normalize_column_key(col)
+        if 'standard' in low:
+            continue
+        if any(term in low for term in ('std', 'sd', 'se')):
+            continue
+        if any(re.search(pat, low) for pat in patterns):
+            vals = pd.to_numeric(df[col], errors='coerce')
+            if vals.notna().any():
+                return col
+    return primary_col if primary_col in df.columns else None
+
+
+def _build_saturation_mask_from_intensity_df(intensity_df, required_masses, threshold=48.0):
+    """Build a per-cycle saturation mask for required masses."""
+    if intensity_df is None or intensity_df.empty:
+        return pd.Series(False, index=pd.Index([], dtype=int), dtype=bool)
+    sat_mask = pd.Series(False, index=intensity_df.index, dtype=bool)
+    has_mass_cols = False
+    for mass in required_masses:
+        mass_cols = [c for c in intensity_df.columns if _extract_mass_from_intensity_column(c) == mass]
+        if not mass_cols:
+            continue
+        has_mass_cols = True
+        mass_sat = (intensity_df[mass_cols] > float(threshold)).any(axis=1)
+        sat_mask = sat_mask | mass_sat
+    if not has_mass_cols:
+        return pd.Series(False, index=intensity_df.index, dtype=bool)
+    return sat_mask
+
+
+def _get_cycles_for_selected_point(row_label, target_col):
+    """Find cycle rows corresponding to a selected processed sample row."""
+    raw_df = st.session_state.get('df_cycles_source')
+    if raw_df is None or raw_df.empty or 'Cycle Number' not in raw_df.columns:
+        return None, None
+    if st.session_state.df is None or row_label not in st.session_state.df.index:
+        return None, None
+
+    processed_row = st.session_state.df.loc[row_label]
+    if isinstance(processed_row, pd.DataFrame):
+        processed_row = processed_row.iloc[0]
+
+    work = raw_df.copy()
+    cycle_order = work['Cycle Number'].apply(_extract_cycle_order)
+    is_pre = work['Cycle Number'].astype(str).str.strip().str.lower().eq('pre')
+    cycle_order = cycle_order.where(~is_pre, 0)
+    work['_cycle_order'] = cycle_order
+    group_id = is_pre.cumsum()
+    group_id = group_id.where(is_pre | cycle_order.notna(), np.nan)
+    work['_cycle_group'] = group_id
+
+    id_cols = [
+        'Identifier 1', 'Identifier 2', 'Label', 'Species', 'Comment', 'Run ID',
+        'Line', 'Date', 'Date_ordinal', 'Sample Type', 'Reference', 'Excel File'
+    ]
+    for col in id_cols:
+        if col in work.columns:
+            work[col] = work.groupby('_cycle_group')[col].ffill()
+
+    pre_rows = work[is_pre].copy()
+    if pre_rows.empty:
+        return None, None
+
+    def _value_present(v):
+        if v is None:
+            return False
+        if isinstance(v, float) and np.isnan(v):
+            return False
+        return str(v).strip() != ''
+
+    candidates = pre_rows.copy()
+    for col in ['Excel File', 'Identifier 1', 'Identifier 2']:
+        if col not in candidates.columns:
+            continue
+        val = processed_row[col] if col in processed_row.index else None
+        if not _value_present(val):
+            continue
+        mask = candidates[col].astype(str).str.strip().eq(str(val).strip())
+        if mask.any():
+            candidates = candidates[mask]
+    if candidates.empty:
+        return None, None
+
+    for col in ['Run ID', 'Line', 'Date']:
+        if col not in candidates.columns:
+            continue
+        val = processed_row[col] if col in processed_row.index else None
+        if not _value_present(val):
+            continue
+        if col == 'Date':
+            p_date = pd.to_datetime(val, errors='coerce')
+            if pd.notna(p_date):
+                c_dates = pd.to_datetime(candidates[col], errors='coerce')
+                mask = c_dates.eq(p_date)
+                if mask.any():
+                    candidates = candidates[mask]
+        else:
+            mask = candidates[col].astype(str).str.strip().eq(str(val).strip())
+            if mask.any():
+                candidates = candidates[mask]
+    if candidates.empty:
+        return None, None
+
+    selected_pre = None
+    if len(candidates) == 1:
+        selected_pre = candidates.iloc[0]
+    else:
+        cand_vals = pd.to_numeric(candidates.get(target_col), errors='coerce')
+        proc_val = pd.to_numeric(pd.Series([processed_row.get(target_col)]), errors='coerce').iloc[0]
+        if pd.notna(proc_val) and cand_vals.notna().any():
+            selected_pre = candidates.loc[(cand_vals - float(proc_val)).abs().idxmin()]
+        else:
+            selected_pre = candidates.iloc[0]
+
+    group = selected_pre.get('_cycle_group')
+    if pd.isna(group):
+        return None, None
+    cycles = work[(work['_cycle_group'] == group) & (work['_cycle_order'] > 0)].copy()
+    if cycles.empty:
+        return None, None
+    cycles = cycles.sort_values('_cycle_order')
+    return cycles, selected_pre
+
+
+def _render_selected_point_cycle_diagnostics(target, key_prefix):
+    """Render cycle-level chart and table for the selected sample point."""
+    cycles, pre_row = _get_cycles_for_selected_point(target['row_label'], target['target_col'])
+    if cycles is None or cycles.empty:
+        st.caption("Cycle-level diagnostics are unavailable for this datapoint.")
+        return
+
+    st.markdown("##### Cycle Diagnostics")
+
+    intensity_cols = _find_cycle_intensity_columns(cycles)
+    intensity_cols = [c for c in intensity_cols if c in cycles.columns]
+    intensity_entries = []
+    for col in intensity_cols:
+        vals = _normalize_signal_intensity(cycles[col])
+        if vals.notna().sum() == 0:
+            continue
+        mass = _extract_mass_from_intensity_column(col)
+        if mass not in {44, 45, 46}:
+            continue
+        low = _normalize_column_key(col)
+        role = 'UNK'
+        if 'standard' in low or re.search(r'\bstd\b', low) or re.search(r'\bref\b', low):
+            role = 'STD'
+        elif 'sample' in low or 'samp' in low or re.search(r'\bsmp\b', low):
+            role = 'SMP'
+        median_val = float(vals.median(skipna=True)) if vals.notna().any() else -np.inf
+        intensity_entries.append({'col': col, 'mass': mass, 'role': role, 'median': median_val})
+
+    mass_roles = {44: {'SMP': None, 'STD': None}, 45: {'SMP': None, 'STD': None}, 46: {'SMP': None, 'STD': None}}
+    for mass in [44, 45, 46]:
+        entries = [e for e in intensity_entries if e['mass'] == mass]
+        if not entries:
+            continue
+        smp = [e for e in entries if e['role'] == 'SMP']
+        std = [e for e in entries if e['role'] == 'STD']
+        if smp:
+            mass_roles[mass]['SMP'] = sorted(smp, key=lambda e: e['median'], reverse=True)[0]['col']
+        if std:
+            mass_roles[mass]['STD'] = sorted(std, key=lambda e: e['median'])[0]['col']
+        if mass_roles[mass]['SMP'] is None or mass_roles[mass]['STD'] is None:
+            sorted_entries = sorted(entries, key=lambda e: e['median'], reverse=True)
+            if mass_roles[mass]['SMP'] is None and sorted_entries:
+                mass_roles[mass]['SMP'] = sorted_entries[0]['col']
+            if mass_roles[mass]['STD'] is None and len(sorted_entries) > 1:
+                mass_roles[mass]['STD'] = sorted_entries[-1]['col']
+
+    x_cycles = pd.to_numeric(cycles['_cycle_order'], errors='coerce')
+    fig = go.Figure()
+    mass_colors = {44: '#E67E22', 45: '#1E7D2B', 46: '#D4A017'}
+    for mass in [44, 45, 46]:
+        color = mass_colors[mass]
+        smp_col = mass_roles[mass]['SMP']
+        std_col = mass_roles[mass]['STD']
+        if smp_col is not None:
+            fig.add_trace(go.Scatter(
+                x=x_cycles,
+                y=_normalize_signal_intensity(cycles[smp_col]),
+                mode='lines+markers',
+                name=f'{mass:.2f} m/z SMP',
+                line=dict(color=color, width=2, dash='solid'),
+                marker=dict(size=6)
+            ))
+        if std_col is not None:
+            fig.add_trace(go.Scatter(
+                x=x_cycles,
+                y=_normalize_signal_intensity(cycles[std_col]),
+                mode='lines+markers',
+                name=f'{mass:.2f} m/z STD',
+                line=dict(color=color, width=2, dash='dash'),
+                marker=dict(size=6)
+            ))
+
+    d13_col = _pick_cycle_value_column(cycles, 'd 13C/12C  Mean', [r'd13', r'd ?13c', r'd45co2', r'\bd45\b'])
+    d18_col = _pick_cycle_value_column(cycles, 'd 18O/16O  Mean', [r'd18', r'd ?18o', r'd46co2', r'\bd46\b'])
+
+    cycle_table = pd.DataFrame({
+        'Cycle': pd.to_numeric(cycles['_cycle_order'], errors='coerce').astype('Int64')
+    }, index=cycles.index)
+    if d13_col and d13_col in cycles.columns:
+        cycle_table['d13C'] = pd.to_numeric(cycles[d13_col], errors='coerce')
+    if d18_col and d18_col in cycles.columns:
+        cycle_table['d18O'] = pd.to_numeric(cycles[d18_col], errors='coerce')
+
+    intensity_for_mask = pd.DataFrame(index=cycles.index)
+    for col in intensity_cols:
+        if col in cycles.columns:
+            intensity_for_mask[col] = _normalize_signal_intensity(cycles[col])
+    sat_d13 = _build_saturation_mask_from_intensity_df(intensity_for_mask, [44, 45]).reindex(cycles.index, fill_value=False)
+    sat_d18 = _build_saturation_mask_from_intensity_df(intensity_for_mask, [44, 45, 46]).reindex(cycles.index, fill_value=False)
+    cycle_table['Excluded d13C'] = sat_d13.to_numpy(dtype=bool)
+    cycle_table['Excluded d18O'] = sat_d18.to_numpy(dtype=bool)
+    cycle_table['Excluded (Saturation)'] = cycle_table['Excluded d13C'] | cycle_table['Excluded d18O']
+
+    def _highlight_excluded(row):
+        color = "background-color: rgba(220, 53, 69, 0.18);"
+        return [color if bool(row.get('Excluded (Saturation)', False)) else "" for _ in row]
+
+    diag_col_chart, diag_col_table = st.columns([3, 2], gap="medium")
+    with diag_col_chart:
+        if len(fig.data) > 0:
+            fig.update_layout(
+                title="Cycle Intensities (Sample vs Reference Gas)",
+                xaxis_title="Cycles",
+                yaxis_title="Intensity (V)",
+                height=460,
+                margin=dict(l=20, r=20, t=40, b=20),
+                legend=dict(orientation='h', yanchor='top', y=-0.25, x=0.0)
+            )
+            st.plotly_chart(
+                fig,
+                width='stretch',
+                key=f"cycle_diag_fig_{key_prefix}_{target['isotope_key']}_{target['row_key']}"
+            )
+        else:
+            st.caption("No cycle intensity columns were detected for this datapoint.")
+
+    with diag_col_table:
+        if isinstance(pre_row, pd.Series):
+            status_val = pre_row.get('Collector Status')
+            if pd.notna(status_val) and str(status_val).strip() != '':
+                st.caption(f"Collector Status: `{status_val}`")
+        st.dataframe(
+            cycle_table.reset_index(drop=True).style.apply(_highlight_excluded, axis=1),
+            hide_index=True,
+            width='stretch'
+        )
+
+def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
+    """Render a delta-value editor when the user selects a valid chart point."""
+    col_map = {
+        'd13C': 'd 13C/12C  Mean',
+        'd18O': 'd 18O/16O  Mean',
+    }
+    if st.session_state.df is None:
+        return
+
+    chart_nonce_key = f"{editor_key_prefix}_chart_nonce"
+    nav_token_key = f"{editor_key_prefix}_nav_token"
+
+    def _build_target(isotope_key, row_label, identifier_1=None, identifier_2=None):
+        target_col = col_map.get(str(isotope_key).strip())
+        if target_col is None or target_col not in st.session_state.df.columns:
+            return None
+        if row_label not in st.session_state.df.index:
+            return None
+        source_excel = "Unknown"
+        if 'Excel File' in st.session_state.df.columns:
+            source_val = st.session_state.df.at[row_label, 'Excel File']
+            if pd.notna(source_val) and str(source_val).strip() != '':
+                source_excel = str(source_val).strip()
+        if identifier_1 is None and 'Identifier 1' in st.session_state.df.columns:
+            identifier_1 = st.session_state.df.at[row_label, 'Identifier 1']
+        if identifier_2 is None and 'Identifier 2' in st.session_state.df.columns:
+            identifier_2 = st.session_state.df.at[row_label, 'Identifier 2']
+        current_value = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, target_col]]), errors='coerce').iloc[0]
+        current_value = float(current_value) if pd.notna(current_value) else 0.0
+        return {
+            'row_label': row_label,
+            'row_key': str(row_label),
+            'isotope_key': str(isotope_key).strip(),
+            'identifier_1': '' if identifier_1 is None or pd.isna(identifier_1) else str(identifier_1),
+            'identifier_2': '' if identifier_2 is None or pd.isna(identifier_2) else str(identifier_2),
+            'target_col': target_col,
+            'source_excel': source_excel,
+            'current_value': current_value,
+        }
+
+    def _token_for_target(target):
+        return f"{target['isotope_key']}|{target['row_key']}"
+
+    def _target_from_token(token):
+        if not token or '|' not in str(token):
+            return None
+        isotope_key, raw_row_key = str(token).split('|', 1)
+        row_label = _resolve_index_label(st.session_state.df.index, raw_row_key)
+        if row_label is None:
+            return None
+        return _build_target(isotope_key, row_label)
+
+    def _build_navigation_targets(active_target):
+        target_col = active_target['target_col']
+        id1 = active_target.get('identifier_1', '')
+        base = st.session_state.df.copy()
+        y_vals = pd.to_numeric(base[target_col], errors='coerce')
+        base = base[y_vals.notna()].copy()
+        if 'Identifier 1' in base.columns and str(id1).strip() != '':
+            id_mask = base['Identifier 1'].astype(str).str.strip().eq(str(id1).strip())
+            if id_mask.any():
+                base = base[id_mask].copy()
+        if base.empty:
+            return [active_target]
+
+        sort_rows = []
+        for idx, row in base.iterrows():
+            id2_val = row.get('Identifier 2', None)
+            id2_num = _parse_numeric_token(id2_val)
+            key = (
+                id2_num is None,
+                float(id2_num) if id2_num is not None else float('inf'),
+                '' if id2_val is None or pd.isna(id2_val) else str(id2_val),
+                int(idx) if isinstance(idx, (int, np.integer)) else str(idx),
+            )
+            sort_rows.append((key, idx, row))
+        sort_rows.sort(key=lambda x: x[0])
+
+        nav_targets = []
+        for _, idx, row in sort_rows:
+            built = _build_target(
+                active_target['isotope_key'],
+                idx,
+                identifier_1=row.get('Identifier 1', None),
+                identifier_2=row.get('Identifier 2', None),
+            )
+            if built is not None:
+                nav_targets.append(built)
+        return nav_targets if nav_targets else [active_target]
+
+    points = _get_selected_plotly_points(chart_state)
+    selected_targets = []
+    seen_targets = set()
+    for point in points:
+        customdata = point.get('customdata')
+        if not isinstance(customdata, (list, tuple, np.ndarray)) or len(customdata) < 4:
+            continue
+        raw_row_label = customdata[0]
+        isotope_key = str(customdata[1]).strip()
+        identifier_1 = str(customdata[2]).strip()
+        identifier_2 = str(customdata[3]).strip()
+        row_label = _resolve_index_label(st.session_state.df.index, raw_row_label)
+        if row_label is None:
+            continue
+        target_token = (isotope_key, str(row_label))
+        if target_token in seen_targets:
+            continue
+        built = _build_target(isotope_key, row_label, identifier_1=identifier_1, identifier_2=identifier_2)
+        if built is None:
+            continue
+        seen_targets.add(target_token)
+        selected_targets.append(built)
+
+    if len(selected_targets) == 1:
+        st.session_state[nav_token_key] = _token_for_target(selected_targets[0])
+    elif len(selected_targets) == 0:
+        nav_target = _target_from_token(st.session_state.get(nav_token_key))
+        if nav_target is not None:
+            selected_targets = [nav_target]
+
+    if not selected_targets:
+        st.caption("Select a primary data marker to edit its delta value or apply an offset.")
+        return
+
+    single_mode = len(selected_targets) == 1
+    nav_targets = []
+    nav_index = -1
+    if single_mode:
+        nav_targets = _build_navigation_targets(selected_targets[0])
+        current_token = _token_for_target(selected_targets[0])
+        for i, t in enumerate(nav_targets):
+            if _token_for_target(t) == current_token:
+                nav_index = i
+                break
+        if nav_index < 0 and nav_targets:
+            nav_index = 0
+            selected_targets = [nav_targets[0]]
+            st.session_state[nav_token_key] = _token_for_target(nav_targets[0])
+
+    selection_signature = '|'.join(sorted([f"{t['isotope_key']}:{t['row_key']}" for t in selected_targets]))
+    selection_hash = hashlib.md5(selection_signature.encode('utf-8')).hexdigest()[:10]
+
+    header_col, prev_col, next_col, close_col, _spacer_col = st.columns([6, 1, 1, 1, 22], gap="small")
+    with header_col:
+        st.markdown("#### Edit Selected Delta Value")
+
+    prev_disabled = not single_mode or nav_index <= 0
+    next_disabled = not single_mode or nav_index < 0 or nav_index >= (len(nav_targets) - 1)
+    with prev_col:
+        if st.button("<", key=f"{editor_key_prefix}_prev", help="Previous datapoint", disabled=prev_disabled):
+            prev_target = nav_targets[nav_index - 1]
+            st.session_state[nav_token_key] = _token_for_target(prev_target)
+            st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
+            st.rerun()
+    with next_col:
+        if st.button(">", key=f"{editor_key_prefix}_next", help="Next datapoint", disabled=next_disabled):
+            next_target = nav_targets[nav_index + 1]
+            st.session_state[nav_token_key] = _token_for_target(next_target)
+            st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
+            st.rerun()
+    with close_col:
+        if st.button("X", key=f"{editor_key_prefix}_close", help="Exit edit mode", type="secondary"):
+            st.session_state.pop(nav_token_key, None)
+            st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
+            st.rerun()
+
+    submitted_offset = False
+    if single_mode:
+        target = selected_targets[0]
+        st.caption(
+            f"Identifier 1: `{target['identifier_1']}` | Identifier 2: `{target['identifier_2']}` | "
+            f"Origin Excel File: `{target['source_excel']}` | "
+            f"Current {target['isotope_key']}: `{target['current_value']:.4f}`"
+        )
+        _render_selected_point_cycle_diagnostics(target, editor_key_prefix)
+        form_col_set, form_col_offset = st.columns(2, gap="medium")
+        with form_col_set:
+            with st.form(key=f"{editor_key_prefix}_set_form_{selection_hash}"):
+                new_value = st.number_input(
+                    f"New {target['isotope_key']} value",
+                    value=target['current_value'],
+                    step=0.001,
+                    format="%.4f",
+                    key=f"{editor_key_prefix}_set_input_{selection_hash}",
+                )
+                submitted_set = st.form_submit_button(f"Update {target['isotope_key']}")
+        with form_col_offset:
+            with st.form(key=f"{editor_key_prefix}_offset_form_{selection_hash}"):
+                offset_value = st.number_input(
+                    "Offset to add",
+                    value=0.0,
+                    step=0.001,
+                    format="%.4f",
+                    key=f"{editor_key_prefix}_offset_input_{selection_hash}",
+                )
+                submitted_offset = st.form_submit_button("Apply Offset")
+
+        if submitted_set:
+            st.session_state.df.at[target['row_label'], target['target_col']] = float(new_value)
+            st.success(
+                f"Updated {target['isotope_key']} to {float(new_value):.4f} for "
+                f"{target['identifier_1']} / {target['identifier_2']}."
+            )
+            st.info("If calibrated columns exist, rerun calibration to refresh calibrated values.")
+            st.rerun()
+    else:
+        isotopes = sorted({t['isotope_key'] for t in selected_targets})
+        st.caption(
+            f"{len(selected_targets)} datapoints selected ({', '.join(isotopes)}). "
+            "Single-point absolute value edit is hidden for multi-select."
+        )
+        with st.form(key=f"{editor_key_prefix}_offset_form_{selection_hash}"):
+            offset_value = st.number_input(
+                "Offset to add",
+                value=0.0,
+                step=0.001,
+                format="%.4f",
+                key=f"{editor_key_prefix}_offset_input_{selection_hash}",
+            )
+            submitted_offset = st.form_submit_button(
+                f"Apply Offset to {len(selected_targets)} point{'s' if len(selected_targets) != 1 else ''}"
+            )
+
+    if submitted_offset:
+        offset_value = float(offset_value)
+        for target in selected_targets:
+            current_value = pd.to_numeric(
+                pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
+                errors='coerce'
+            ).iloc[0]
+            current_value = float(current_value) if pd.notna(current_value) else 0.0
+            st.session_state.df.at[target['row_label'], target['target_col']] = current_value + offset_value
+        st.success(
+            f"Applied offset {offset_value:+.4f} to {len(selected_targets)} "
+            f"datapoint{'s' if len(selected_targets) != 1 else ''}."
+        )
+        st.info("If calibrated columns exist, rerun calibration to refresh calibrated values.")
+        st.rerun()
+
 # Initialize session state variables if they don't exist
 if 'df' not in st.session_state:
     st.session_state.df = None
 if 'file_processed' not in st.session_state:
     st.session_state.file_processed = False
+if 'df_cycles_source' not in st.session_state:
+    st.session_state.df_cycles_source = None
 if 'include_outliers' not in st.session_state:
     st.session_state.include_outliers = "No"
 if 'selected_ids' not in st.session_state:
@@ -2389,6 +2962,8 @@ def main():
     # Initialize session state variables if they don't exist
     if 'df' not in st.session_state:
         st.session_state.df = None
+    if 'df_cycles_source' not in st.session_state:
+        st.session_state.df_cycles_source = None
     if 'file_processed' not in st.session_state:
         st.session_state.file_processed = False
     if 'confirm_reset' not in st.session_state:
@@ -2423,6 +2998,7 @@ def main():
                 # Reset session state to allow a new file upload
                 st.session_state.file_processed = False
                 st.session_state.df = None
+                st.session_state.df_cycles_source = None
                 st.session_state.confirm_reset = False  # Reset confirmation state
             elif col2.button("Cancel", key="cancel_load_btn"):
                 st.session_state.confirm_reset = False  # Cancel reset and close prompt
@@ -2431,6 +3007,7 @@ def main():
         if uploaded_files and not st.session_state.file_processed:
             try:
                 dfs = []
+                dfs_cycles_source = []
                 for uploaded_file in uploaded_files:
                     try:
                         # First try with openpyxl engine (check for multi-row headers)
@@ -2552,6 +3129,9 @@ def main():
                         if col not in df.columns:
                             df[col] = np.nan
 
+                    # Preserve full rows (including cycle rows) for point-level diagnostics.
+                    dfs_cycles_source.append(df.copy())
+
                     # Compute per-sample means from cycles when Cycle Number is present
                     df = _apply_cycle_averages(df)
 
@@ -2566,9 +3146,15 @@ def main():
                     return
 
                 df = pd.concat(dfs, ignore_index=True, sort=False) if len(dfs) > 1 else dfs[0]
+                df_cycles_source = (
+                    pd.concat(dfs_cycles_source, ignore_index=True, sort=False)
+                    if len(dfs_cycles_source) > 1 else
+                    (dfs_cycles_source[0] if dfs_cycles_source else None)
+                )
 
                 # Save df to session_state
                 st.session_state.df = df
+                st.session_state.df_cycles_source = df_cycles_source
                 st.session_state.file_processed = True
 
             except Exception as e:
@@ -4288,6 +4874,7 @@ def main():
             # Plot main data
             # Generate unique color based on species/comment
             species_color = f'rgb({hash(species) % 255}, {(hash(species) >> 8) % 255}, {(hash(species) >> 16) % 255})'
+            d13_customdata = _build_delta_point_customdata(data_to_plot, 'd13C')
             
             d13c_summary.add_trace(go.Scatter(
                 x=data_to_plot['x_axis'],
@@ -4302,7 +4889,13 @@ def main():
                     symbol=species_symbol_map.get(species, 'circle')
                 ),
                 line=dict(width=1, color=species_color),
-                legendgroup=species
+                legendgroup=species,
+                customdata=d13_customdata,
+                hovertemplate=(
+                    'Identifier 1: %{customdata[2]}<br>'
+                    'Identifier 2: %{customdata[3]}<br>'
+                    'd13C: %{y:.4f}<extra></extra>'
+                )
             ))
 
             # Highlight saturated collectors (compromised but valid)
@@ -4475,9 +5068,19 @@ def main():
             xaxis_title="Sample Number" if x_axis_option == "By Sequence" else "Identifier 2",
             yaxis_title="d13C",
             showlegend=True,
-            height=500
+            height=500,
+            clickmode='event+select'
         )
-        st.plotly_chart(d13c_summary, width='stretch')
+        d13_summary_editor_prefix = "tab3_d13c_summary_editor"
+        d13_summary_nonce = int(st.session_state.get(f"{d13_summary_editor_prefix}_chart_nonce", 0))
+        d13c_summary_state = st.plotly_chart(
+            d13c_summary,
+            width='stretch',
+            key=f'tab3_d13c_summary_{d13_summary_nonce}',
+            on_select='rerun',
+            selection_mode='points'
+        )
+        _render_delta_editor_from_chart_selection(d13c_summary_state, d13_summary_editor_prefix)
         
         # Create summary chart for d18O
         d18o_summary = go.Figure()
@@ -4547,6 +5150,7 @@ def main():
             # Plot main data
             # Generate unique color for this species
             species_color = f'rgb({hash(species) % 255}, {(hash(species) >> 8) % 255}, {(hash(species) >> 16) % 255})'
+            d18_customdata = _build_delta_point_customdata(data_to_plot, 'd18O')
             
             # Plot main data with consistent color
             d18o_summary.add_trace(go.Scatter(
@@ -4562,7 +5166,13 @@ def main():
                     symbol=species_symbol_map.get(species, 'circle')
                 ),
                 line=dict(width=1, color=species_color),
-                legendgroup=species
+                legendgroup=species,
+                customdata=d18_customdata,
+                hovertemplate=(
+                    'Identifier 1: %{customdata[2]}<br>'
+                    'Identifier 2: %{customdata[3]}<br>'
+                    'd18O: %{y:.4f}<extra></extra>'
+                )
             ))
 
             # Highlight saturated collectors (compromised but valid)
@@ -4735,11 +5345,21 @@ def main():
             xaxis_title="Sample Number" if x_axis_option == "By Sequence" else "Identifier 2",
             yaxis_title="d18O",
             showlegend=True,
-            height=500
+            height=500,
+            clickmode='event+select'
         )
         # Invert y-axis so increasing d18O plots downward
         d18o_summary.update_yaxes(autorange='reversed')
-        st.plotly_chart(d18o_summary, width='stretch')
+        d18_summary_editor_prefix = "tab3_d18o_summary_editor"
+        d18_summary_nonce = int(st.session_state.get(f"{d18_summary_editor_prefix}_chart_nonce", 0))
+        d18o_summary_state = st.plotly_chart(
+            d18o_summary,
+            width='stretch',
+            key=f'tab3_d18o_summary_{d18_summary_nonce}',
+            on_select='rerun',
+            selection_mode='points'
+        )
+        _render_delta_editor_from_chart_selection(d18o_summary_state, d18_summary_editor_prefix)
 
         # Create cross-plot: d13C vs d18O grouped by Species
         species_scatter = go.Figure()
@@ -5133,29 +5753,38 @@ def main():
                             name='Failed Samples (No Values)'
                         ))
 
+                identifier_display_data = display_data[display_data['Identifier 1'] == identifier]
+                d13_identifier_customdata = _build_delta_point_customdata(identifier_display_data, 'd13C')
+
                 fig_d13C.add_trace(go.Scatter(
-                    x=display_data[display_data['Identifier 1'] == identifier]['x_axis'],
-                    y=display_data[display_data['Identifier 1'] == identifier]['d 13C/12C  Mean'],
+                    x=identifier_display_data['x_axis'],
+                    y=identifier_display_data['d 13C/12C  Mean'],
                     mode='lines+markers',
                     line=dict(color='blue', dash='dot', width=2),
                     marker=dict(
-                        color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3_value_col],
+                        color=identifier_display_data[color_param_tab3_value_col],
                         colorscale="Viridis",
                         symbol='circle',
                         size=8,
                         showscale=False  # Hide individual colorbar
                     ),
-                    name=f'Raw d13C - {identifier}'
+                    name=f'Raw d13C - {identifier}',
+                    customdata=d13_identifier_customdata,
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd13C: %{y:.4f}<extra></extra>'
+                    )
                 ))
 
                 if 'd13C_calibrated' in data_for_identifier.columns:
                     fig_d13C.add_trace(go.Scatter(
-                        x=display_data[display_data['Identifier 1'] == identifier]['x_axis'],
-                        y=display_data[display_data['Identifier 1'] == identifier]['d13C_calibrated'],
+                        x=identifier_display_data['x_axis'],
+                        y=identifier_display_data['d13C_calibrated'],
                         mode='lines+markers',
                         line=dict(color='orange', dash='dot', width=2),
                         marker=dict(
-                            color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3_value_col],
+                            color=identifier_display_data[color_param_tab3_value_col],
                             colorscale="Viridis",
                             symbol='square',
                             size=8,
@@ -5183,7 +5812,20 @@ def main():
                     )
                 )
 
-                st.plotly_chart(fig_d13C, width='stretch', height=chart_height)
+                fig_d13C.update_layout(clickmode='event+select')
+                d13_key_suffix = re.sub(r'[^0-9A-Za-z_]+', '_', f"{species}_{identifier}")
+                d13_key_suffix = f"{d13_key_suffix}_{abs(hash((species, identifier))) % 10000000}"
+                d13_editor_prefix = f"tab3_d13c_editor_{d13_key_suffix}"
+                d13_chart_nonce = int(st.session_state.get(f"{d13_editor_prefix}_chart_nonce", 0))
+                d13_chart_state = st.plotly_chart(
+                    fig_d13C,
+                    width='stretch',
+                    height=chart_height,
+                    key=f"tab3_d13c_{d13_key_suffix}_{d13_chart_nonce}",
+                    on_select='rerun',
+                    selection_mode='points'
+                )
+                _render_delta_editor_from_chart_selection(d13_chart_state, d13_editor_prefix)
 
                 # Plot Î´18O data for this identifier and comment
                 # Create figure for Î´18O
@@ -5242,28 +5884,34 @@ def main():
 
                     # Add main data trace using display_data
                     fig_d18O.add_trace(go.Scatter(
-                        x=display_data[display_data['Identifier 1'] == identifier]['x_axis'],
-                        y=display_data[display_data['Identifier 1'] == identifier]['d 18O/16O  Mean'],
+                        x=identifier_display_data['x_axis'],
+                        y=identifier_display_data['d 18O/16O  Mean'],
                         mode='lines+markers',
                         line=dict(color='blue', dash='dot', width=2),
                         marker=dict(
-                            color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3_value_col],
+                            color=identifier_display_data[color_param_tab3_value_col],
                             colorscale="Viridis",
                             symbol='circle',
                             size=8,
                             showscale=False  # Hide individual colorbar
                         ),
-                        name=f'Raw d18O - {identifier}'
+                        name=f'Raw d18O - {identifier}',
+                        customdata=_build_delta_point_customdata(identifier_display_data, 'd18O'),
+                        hovertemplate=(
+                            'Identifier 1: %{customdata[2]}<br>'
+                            'Identifier 2: %{customdata[3]}<br>'
+                            'd18O: %{y:.4f}<extra></extra>'
+                        )
                     ))
     
                     if 'd18O_calibrated' in display_data.columns:
                         fig_d18O.add_trace(go.Scatter(
-                            x=display_data[display_data['Identifier 1'] == identifier]['x_axis'],
-                            y=display_data[display_data['Identifier 1'] == identifier]['d18O_calibrated'],
+                            x=identifier_display_data['x_axis'],
+                            y=identifier_display_data['d18O_calibrated'],
                             mode='lines+markers',
                             line=dict(color='orange', dash='dot', width=2),
                             marker=dict(
-                                color=display_data[display_data['Identifier 1'] == identifier][color_param_tab3_value_col],
+                                color=identifier_display_data[color_param_tab3_value_col],
                                 colorscale="Viridis",
                                 symbol='square',
                                 size=8
@@ -5361,7 +6009,13 @@ def main():
                         size=8,
                         showscale=False  # Hide individual colorbar
                     ),
-                    name=f'Raw d18O - {identifier}'
+                    name=f'Raw d18O - {identifier}',
+                    customdata=_build_delta_point_customdata(sorted_data, 'd18O'),
+                    hovertemplate=(
+                        'Identifier 1: %{customdata[2]}<br>'
+                        'Identifier 2: %{customdata[3]}<br>'
+                        'd18O: %{y:.4f}<extra></extra>'
+                    )
                 ))
 
                 if 'd18O_calibrated' in data_for_identifier.columns:
@@ -5400,7 +6054,20 @@ def main():
                 # Invert y-axis so increasing d18O plots downward
                 fig_d18O.update_yaxes(autorange='reversed')
 
-                st.plotly_chart(fig_d18O, width='stretch', height=chart_height)
+                fig_d18O.update_layout(clickmode='event+select')
+                d18_key_suffix = re.sub(r'[^0-9A-Za-z_]+', '_', f"{species}_{identifier}")
+                d18_key_suffix = f"{d18_key_suffix}_{abs(hash((species, identifier))) % 10000000}"
+                d18_editor_prefix = f"tab3_d18o_editor_{d18_key_suffix}"
+                d18_chart_nonce = int(st.session_state.get(f"{d18_editor_prefix}_chart_nonce", 0))
+                d18_chart_state = st.plotly_chart(
+                    fig_d18O,
+                    width='stretch',
+                    height=chart_height,
+                    key=f"tab3_d18o_{d18_key_suffix}_{d18_chart_nonce}",
+                    on_select='rerun',
+                    selection_mode='points'
+                )
+                _render_delta_editor_from_chart_selection(d18_chart_state, d18_editor_prefix)
 
             # Display outliers header for each comment if detected
             if not species_data['Identifier 2'].isna().all():
