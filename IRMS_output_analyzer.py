@@ -477,6 +477,7 @@ def _write_autosave_metadata():
         "event_count": int(st.session_state.get(AUTOSAVE_EVENT_COUNT_KEY, 0)),
         "resumed": bool(st.session_state.get(AUTOSAVE_RESUMED_KEY, False)),
         "calibration_state": _extract_calibration_session_state(),
+        "manual_outlier_overrides": st.session_state.get("manual_outlier_overrides", {}),
     }
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -529,6 +530,7 @@ def _reset_processing_session_state(discard_autosave_files=False):
     st.session_state.df_cycles_source = None
     st.session_state.edited_delta_rows = set()
     st.session_state.original_delta_values = {}
+    st.session_state.manual_outlier_overrides = {}
     st.session_state.calibration_coefficients = {}
     st.session_state.linearity_fits = {}
     st.session_state.selected_standards = []
@@ -676,6 +678,7 @@ def _initialize_autosave_session(upload_files, base_df=None):
         meta_path = save_dir / f"{base_name}_session_meta.json"
         meta_payload = {}
         calibration_state = {}
+        manual_outlier_overrides = {}
 
         if meta_path.exists():
             try:
@@ -686,6 +689,12 @@ def _initialize_autosave_session(upload_files, base_df=None):
                 meta_payload = {}
         if isinstance(meta_payload.get("calibration_state"), dict):
             calibration_state = meta_payload.get("calibration_state", {})
+        if isinstance(meta_payload.get("manual_outlier_overrides"), dict):
+            manual_outlier_overrides = {
+                str(k): bool(v)
+                for k, v in meta_payload.get("manual_outlier_overrides", {}).items()
+                if str(k).strip() != ""
+            }
 
         resumed_df = None
         resumed = False
@@ -744,6 +753,7 @@ def _initialize_autosave_session(upload_files, base_df=None):
             "edited_rows": edited_rows,
             "original_delta_values": restored_original_delta_values,
             "calibration_state": calibration_state,
+            "manual_outlier_overrides": manual_outlier_overrides,
         }
     except Exception as exc:
         st.session_state[AUTOSAVE_LOG_PATH_KEY] = None
@@ -760,6 +770,7 @@ def _initialize_autosave_session(upload_files, base_df=None):
             "edited_rows": set(),
             "original_delta_values": {},
             "calibration_state": {},
+            "manual_outlier_overrides": {},
         }
 
 
@@ -900,6 +911,155 @@ def _get_edited_row_tokens():
 def _is_row_edited(row_label):
     """Check whether a sample row has been edited in this session."""
     return str(row_label) in _get_edited_row_tokens()
+
+
+def _get_manual_outlier_override_map():
+    """Return per-row manual outlier overrides as {row_key: bool}."""
+    raw = st.session_state.get("manual_outlier_overrides", {})
+    if not isinstance(raw, dict):
+        return {}
+    cleaned = {}
+    for key, value in raw.items():
+        row_key = str(key).strip()
+        if row_key == "":
+            continue
+        cleaned[row_key] = bool(value)
+    return cleaned
+
+
+def _get_row_manual_outlier_override(row_label):
+    """Return manual override for row label, or None when unset."""
+    overrides = _get_manual_outlier_override_map()
+    row_key = str(row_label)
+    if row_key not in overrides:
+        return None
+    return bool(overrides[row_key])
+
+
+def _set_row_manual_outlier_override(row_label, is_outlier):
+    """Persist manual outlier override for one row."""
+    overrides = _get_manual_outlier_override_map()
+    overrides[str(row_label)] = bool(is_outlier)
+    st.session_state["manual_outlier_overrides"] = overrides
+    return overrides
+
+
+def _register_statistical_outlier_rows(row_labels):
+    """Track rows currently identified as statistical outliers in rendered charts."""
+    key = "_current_statistical_outlier_rows"
+    current = st.session_state.get(key, set())
+    if not isinstance(current, set):
+        if isinstance(current, (list, tuple, pd.Index, np.ndarray)):
+            current = {str(x) for x in current}
+        else:
+            current = set()
+    for row_label in row_labels:
+        token = str(row_label).strip()
+        if token != "":
+            current.add(token)
+    st.session_state[key] = current
+
+
+def _clear_registered_statistical_outlier_rows():
+    """Clear transient chart-derived statistical outlier row tracking."""
+    st.session_state["_current_statistical_outlier_rows"] = set()
+
+
+def _apply_manual_outlier_overrides(mask, row_index=None, apply_true=True, apply_false=True):
+    """Apply manual per-row outlier overrides on a boolean outlier mask."""
+    if row_index is None:
+        if isinstance(mask, pd.Series):
+            mask_series = mask.copy()
+        else:
+            mask_series = pd.Series(mask)
+    else:
+        mask_series = pd.Series(mask, index=row_index)
+    mask_series = mask_series.fillna(False).astype(bool)
+
+    overrides = _get_manual_outlier_override_map()
+    if not overrides:
+        return mask_series
+
+    override_for_rows = pd.Series(
+        [overrides.get(str(idx), None) for idx in mask_series.index],
+        index=mask_series.index,
+        dtype=object,
+    )
+    if apply_false:
+        mask_series = mask_series.mask(override_for_rows.eq(False), False)
+    if apply_true:
+        mask_series = mask_series.mask(override_for_rows.eq(True), True)
+    return mask_series
+
+
+def _is_row_outlier_effective(row_label):
+    """Return True when the row is currently treated as outlier."""
+    df = st.session_state.get("df")
+    if df is None or row_label not in df.index:
+        override = _get_row_manual_outlier_override(row_label)
+        return bool(override) if override is not None else False
+
+    row = df.loc[row_label]
+    if isinstance(row, pd.DataFrame):
+        row = row.iloc[0]
+
+    status_val = str(row.get("Collector Status", "")).strip()
+    status_outlier = status_val in {
+        "Failed Sample",
+        "Fully Saturated Collectors",
+        "Partially Saturated Collectors",
+    }
+
+    d13 = pd.to_numeric(pd.Series([row.get("d 13C/12C  Mean")]), errors="coerce").iloc[0]
+    d18 = pd.to_numeric(pd.Series([row.get("d 18O/16O  Mean")]), errors="coerce").iloc[0]
+    sig = pd.to_numeric(pd.Series([row.get("1  Cycle Int  Samp  44")]), errors="coerce").iloc[0]
+    leak = pd.to_numeric(pd.Series([row.get("leak_rate")]), errors="coerce").iloc[0]
+
+    range_outlier = bool(
+        (pd.notna(d13) and (d13 < float(st.session_state.d13c_range[0]) or d13 > float(st.session_state.d13c_range[1])))
+        or (pd.notna(d18) and (d18 < float(st.session_state.d18o_range[0]) or d18 > float(st.session_state.d18o_range[1])))
+        or (pd.notna(sig) and (sig < float(st.session_state.signal_range[0])))
+        or (pd.notna(leak) and (leak < float(st.session_state.leak_range[0]) or leak > float(st.session_state.leak_range[1])))
+    )
+
+    stat_outlier = False
+    try:
+        sigma_level = float(st.session_state.get("sigma_level_data", 4.0))
+        if sigma_level > 0 and "Identifier 1" in df.columns:
+            id1_val = str(row.get("Identifier 1", "")).strip()
+            species_all = _get_species_series(df)
+            species_val = ""
+            if row_label in species_all.index:
+                raw_species = species_all.loc[row_label]
+                species_val = "" if pd.isna(raw_species) else str(raw_species).strip()
+            group_mask = df["Identifier 1"].astype(str).str.strip().eq(id1_val)
+            if species_val != "":
+                group_mask = group_mask & species_all.astype(str).str.strip().eq(species_val)
+            group_df = df[group_mask]
+            if len(group_df) > 1:
+                mean_d13 = pd.to_numeric(group_df["d 13C/12C  Mean"], errors="coerce").mean()
+                std_d13 = pd.to_numeric(group_df["d 13C/12C  Mean"], errors="coerce").std()
+                mean_d18 = pd.to_numeric(group_df["d 18O/16O  Mean"], errors="coerce").mean()
+                std_d18 = pd.to_numeric(group_df["d 18O/16O  Mean"], errors="coerce").std()
+                stat_outlier = bool(
+                    (pd.notna(d13) and np.isfinite(std_d13) and std_d13 > 0 and np.isfinite(mean_d13) and (
+                        d13 < (mean_d13 - sigma_level * std_d13) or d13 > (mean_d13 + sigma_level * std_d13)
+                    ))
+                    or
+                    (pd.notna(d18) and np.isfinite(std_d18) and std_d18 > 0 and np.isfinite(mean_d18) and (
+                        d18 < (mean_d18 - sigma_level * std_d18) or d18 > (mean_d18 + sigma_level * std_d18)
+                    ))
+                )
+    except Exception:
+        stat_outlier = False
+
+    chart_stat_rows = st.session_state.get("_current_statistical_outlier_rows", set())
+    if isinstance(chart_stat_rows, (set, list, tuple, pd.Index, np.ndarray)):
+        stat_outlier = bool(stat_outlier) or (str(row_label) in {str(x) for x in chart_stat_rows})
+
+    computed = bool(status_outlier or range_outlier or stat_outlier)
+    override = _get_row_manual_outlier_override(row_label)
+    return bool(override) if override is not None else computed
 
 
 def _get_selected_plotly_points(chart_state):
@@ -1056,6 +1216,52 @@ def _refresh_collector_status_after_delta_edit(row_label):
         st.session_state.df.at[row_label, 'Collector Status'] = 'Failed Sample'
     elif status == 'Failed Sample':
         st.session_state.df.at[row_label, 'Collector Status'] = 'Partially Saturated Collectors'
+
+
+def _partial_saturation_isotope_masks(df):
+    """Return isotope-specific masks for partially saturated collector rows."""
+    if df is None:
+        empty = pd.Series(dtype=bool)
+        return {'d13C': empty, 'd18O': empty, 'any': empty}
+
+    idx = df.index
+    status_series = df.get('Collector Status', pd.Series('', index=idx)).astype(str).str.strip()
+    partial_any = status_series == 'Partially Saturated Collectors'
+
+    d13_excl = pd.to_numeric(
+        df.get('d13C Cycles Excluded', pd.Series(0, index=idx)),
+        errors='coerce'
+    ).fillna(0) > 0
+    d18_excl = pd.to_numeric(
+        df.get('d18O Cycles Excluded', pd.Series(0, index=idx)),
+        errors='coerce'
+    ).fillna(0) > 0
+
+    # Plot partial-saturation symbols on the isotope chart that still has a recovered value.
+    d13_has_value = pd.to_numeric(
+        df.get('d 13C/12C  Mean', pd.Series(np.nan, index=idx)),
+        errors='coerce'
+    ).notna()
+    d18_has_value = pd.to_numeric(
+        df.get('d 18O/16O  Mean', pd.Series(np.nan, index=idx)),
+        errors='coerce'
+    ).notna()
+
+    d13_mask = partial_any & d13_has_value
+    d18_mask = partial_any & d18_has_value
+
+    unresolved = partial_any & ~(d13_mask | d18_mask)
+    if unresolved.any():
+        # Fallback when values are unavailable: infer by exclusion counters.
+        d13_mask = d13_mask | (unresolved & ~d13_excl)
+        d18_mask = d18_mask | (unresolved & ~d18_excl)
+
+        unresolved = partial_any & ~(d13_mask | d18_mask)
+        # If still unresolved, mark both so behavior stays conservative.
+        d13_mask = d13_mask | unresolved
+        d18_mask = d18_mask | unresolved
+
+    return {'d13C': d13_mask.astype(bool), 'd18O': d18_mask.astype(bool), 'any': partial_any.astype(bool)}
 
 
 def _get_isotope_columns(isotope_key):
@@ -1840,7 +2046,9 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                         ((d18_vals < (mean_d18 - sigma_level * std_d18)) | (d18_vals > (mean_d18 + sigma_level * std_d18)))
                     )
 
-        candidate_mask = ~(status_excluded | range_excluded | sigma_excluded)
+        excluded_mask = (status_excluded | range_excluded | sigma_excluded)
+        excluded_mask = _apply_manual_outlier_overrides(excluded_mask, row_index=base.index)
+        candidate_mask = ~excluded_mask
 
         prev_neighbor = None
         for i in range(anchor_idx - 1, -1, -1):
@@ -2104,6 +2312,40 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             f"**Origin Excel File:** `{target['source_excel']}` | "
             f"**Original {target['isotope_key']}:** `{original_display}`"
         )
+        current_override = _get_row_manual_outlier_override(target['row_label'])
+        effective_outlier = _is_row_outlier_effective(target['row_label'])
+        override_sig = "none" if current_override is None else ("1" if bool(current_override) else "0")
+        outlier_checkbox_key = (
+            f"{editor_key_prefix}_outlier_checkbox_{selection_hash}_{target['row_key']}_"
+            f"{override_sig}_{int(bool(effective_outlier))}"
+        )
+        outlier_checked = st.checkbox(
+            "Outlier",
+            value=bool(effective_outlier),
+            key=outlier_checkbox_key,
+            help="Checked = treat sample as outlier. Unchecked = treat sample as normal.",
+        )
+        if outlier_checked != bool(effective_outlier):
+            _set_row_manual_outlier_override(target['row_label'], bool(outlier_checked))
+            _autosave_session_update(
+                "set_outlier_override",
+                changes=[
+                    {
+                        "row_label": str(target['row_label']),
+                        "identifier_1": target['identifier_1'],
+                        "identifier_2": target['identifier_2'],
+                        "excel_file": target['source_excel'],
+                        "previous_override": None if current_override is None else bool(current_override),
+                        "new_override": bool(outlier_checked),
+                    }
+                ],
+                context={"editor": editor_key_prefix},
+            )
+            st.success(
+                f"Outlier override set to {bool(outlier_checked)} for "
+                f"{target['identifier_1']} / {target['identifier_2']}."
+            )
+            st.rerun()
         form_cols = st.columns(3, gap="medium")
         form_col_set = form_cols[0]
         form_col_offset = form_cols[1]
@@ -2407,6 +2649,8 @@ if 'edited_delta_rows' not in st.session_state:
     st.session_state.edited_delta_rows = set()
 if 'original_delta_values' not in st.session_state:
     st.session_state.original_delta_values = {}
+if 'manual_outlier_overrides' not in st.session_state:
+    st.session_state.manual_outlier_overrides = {}
 if 'calibration_coefficients' not in st.session_state:
     st.session_state.calibration_coefficients = {}
 if 'linearity_fits' not in st.session_state:
@@ -3027,6 +3271,10 @@ def _apply_cycle_averages(df):
             pre_rows.at[sample_idx, 'Collector Status'] = 'Partially Saturated Collectors'
         elif both_missing or one_missing:
             pre_rows.at[sample_idx, 'Collector Status'] = 'Failed Sample'
+            pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = np.nan
+            pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = np.nan
+            pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = np.nan
+            pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = np.nan
 
     # Keep non-cycle rows (rows without Cycle Number)
     other_rows = work[work['_cycle_order'].isna()].copy()
@@ -5170,9 +5418,19 @@ def main():
                     if autosave_state.get("resumed")
                     else {}
                 )
+                restored_outlier_overrides = (
+                    autosave_state.get("manual_outlier_overrides", {})
+                    if autosave_state.get("resumed")
+                    else {}
+                )
                 st.session_state.edited_delta_rows = set(restored_rows)
                 st.session_state.original_delta_values = (
                     dict(restored_originals) if isinstance(restored_originals, dict) else {}
+                )
+                st.session_state.manual_outlier_overrides = (
+                    {str(k): bool(v) for k, v in restored_outlier_overrides.items()}
+                    if isinstance(restored_outlier_overrides, dict)
+                    else {}
                 )
                 calibration_state = autosave_state.get("calibration_state", {})
                 if autosave_state.get("resumed") and isinstance(calibration_state, dict):
@@ -6361,9 +6619,19 @@ def main():
         
         # Keep an unfiltered copy for outlier detection
         df_unfiltered = df_copy.copy()
-        
-        # Apply all filters to a filtered copy for plotting
-        df_filtered = df_copy.loc[signal_mask & leak_mask & d13c_mask & d18o_mask]
+
+        # Apply all filters to a filtered copy for plotting.
+        # Keep partially saturated rows when their recoverable isotope passes its own range.
+        sat_masks_for_plot = _partial_saturation_isotope_masks(df_copy)
+        partial_recovered_keep = (
+            signal_mask
+            & leak_mask
+            & (
+                (sat_masks_for_plot['d13C'] & d13c_mask)
+                | (sat_masks_for_plot['d18O'] & d18o_mask)
+            )
+        )
+        df_filtered = df_copy.loc[(signal_mask & leak_mask & d13c_mask & d18o_mask) | partial_recovered_keep]
 
         # Exclude selected standards from plotting data
         standards_to_exclude = st.session_state.get('selected_standards', selected_standards if 'selected_standards' in locals() else [])
@@ -6437,6 +6705,7 @@ def main():
                     )
                     statistical_mask.loc[group_mask] = group_stat_outliers.astype(bool).to_numpy()
         statistical_mask = statistical_mask & ~edited_mask_data
+        statistical_mask = _apply_manual_outlier_overrides(statistical_mask, row_index=data_to_process.index)
                     
         # Get standards from calibration table
         try:
@@ -6467,6 +6736,7 @@ def main():
             not_failed_samples &
             ~edited_mask_data
         )
+        within_ranges = ~_apply_manual_outlier_overrides(~within_ranges, row_index=data_to_process.index)
 
         # Combine range and statistical masks
         within_all = within_ranges & within_statistical
@@ -6491,6 +6761,48 @@ def main():
         failed_mask = (status_series_no_std == 'Failed Sample') & ~edited_mask_no_std
         saturated_mask = (status_series_no_std == 'Partially Saturated Collectors') & ~edited_mask_no_std
         saturated_sample_mask = (status_series_no_std == 'Fully Saturated Collectors') & ~edited_mask_no_std
+        d13c_mask = _apply_manual_outlier_overrides(
+            d13c_mask,
+            row_index=data_without_standards.index,
+            apply_true=False,
+            apply_false=True,
+        )
+        d18o_mask = _apply_manual_outlier_overrides(
+            d18o_mask,
+            row_index=data_without_standards.index,
+            apply_true=False,
+            apply_false=True,
+        )
+        signal_mask = _apply_manual_outlier_overrides(
+            signal_mask,
+            row_index=data_without_standards.index,
+            apply_true=False,
+            apply_false=True,
+        )
+        leak_mask = _apply_manual_outlier_overrides(
+            leak_mask,
+            row_index=data_without_standards.index,
+            apply_true=False,
+            apply_false=True,
+        )
+        failed_mask = _apply_manual_outlier_overrides(
+            failed_mask,
+            row_index=data_without_standards.index,
+            apply_true=False,
+            apply_false=True,
+        )
+        saturated_mask = _apply_manual_outlier_overrides(
+            saturated_mask,
+            row_index=data_without_standards.index,
+            apply_true=False,
+            apply_false=True,
+        )
+        saturated_sample_mask = _apply_manual_outlier_overrides(
+            saturated_sample_mask,
+            row_index=data_without_standards.index,
+            apply_true=False,
+            apply_false=True,
+        )
 
         # Count outliers
         d13c_outliers = sum(d13c_mask)
@@ -6657,18 +6969,30 @@ def main():
             outliers_df = pd.DataFrame()
             
             # Failed samples (pre with empty data)
-            failed_outliers_df = data_to_process[
+            failed_mask_out = (
                 data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Failed Sample'
-            ].copy()
-            failed_outliers_df = failed_outliers_df[~failed_outliers_df.index.map(_is_row_edited)]
+            ) & ~edited_mask_out
+            failed_mask_out = _apply_manual_outlier_overrides(
+                failed_mask_out,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            failed_outliers_df = data_to_process[failed_mask_out].copy()
             if not failed_outliers_df.empty:
                 failed_outliers_df['Category'] = 'Failed Sample'
                 outliers_df = pd.concat([outliers_df, failed_outliers_df])
             
-            saturated_samples_df = data_to_process[
+            saturated_mask_out = (
                 data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors'
-            ].copy()
-            saturated_samples_df = saturated_samples_df[~saturated_samples_df.index.map(_is_row_edited)]
+            ) & ~edited_mask_out
+            saturated_mask_out = _apply_manual_outlier_overrides(
+                saturated_mask_out,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            saturated_samples_df = data_to_process[saturated_mask_out].copy()
             if not saturated_samples_df.empty:
                 saturated_samples_df['Category'] = 'Fully Saturated Collectors'
                 outliers_df = pd.concat([outliers_df, saturated_samples_df])
@@ -6697,6 +7021,7 @@ def main():
                         )
                         statistical_mask.loc[group_mask] = group_stat_outliers.astype(bool).to_numpy()
             statistical_mask = statistical_mask & ~edited_mask_out
+            statistical_mask = _apply_manual_outlier_overrides(statistical_mask, row_index=data_to_process.index)
             
             statistical_outliers = data_to_process[statistical_mask].copy()
             if not statistical_outliers.empty:
@@ -6704,37 +7029,61 @@ def main():
                 outliers_df = pd.concat([outliers_df, statistical_outliers])
             
             # Range outliers by category
-            d13c_outliers = data_to_process[
+            d13c_mask_out = (
                 (data_to_process['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
                 (data_to_process['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
-            ].copy()
-            d13c_outliers = d13c_outliers[~d13c_outliers.index.map(_is_row_edited)]
+            ) & ~edited_mask_out
+            d13c_mask_out = _apply_manual_outlier_overrides(
+                d13c_mask_out,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            d13c_outliers = data_to_process[d13c_mask_out].copy()
             if not d13c_outliers.empty:
                 d13c_outliers['Category'] = 'd13C Range'
                 outliers_df = pd.concat([outliers_df, d13c_outliers])
             
-            d18o_outliers = data_to_process[
+            d18o_mask_out = (
                 (data_to_process['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                 (data_to_process['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
-            ].copy()
-            d18o_outliers = d18o_outliers[~d18o_outliers.index.map(_is_row_edited)]
+            ) & ~edited_mask_out
+            d18o_mask_out = _apply_manual_outlier_overrides(
+                d18o_mask_out,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            d18o_outliers = data_to_process[d18o_mask_out].copy()
             if not d18o_outliers.empty:
                 d18o_outliers['Category'] = 'd18O Range'
                 outliers_df = pd.concat([outliers_df, d18o_outliers])
             
-            signal_outliers = data_to_process[
+            signal_mask_out = (
                 data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]
-            ].copy()
-            signal_outliers = signal_outliers[~signal_outliers.index.map(_is_row_edited)]
+            ) & ~edited_mask_out
+            signal_mask_out = _apply_manual_outlier_overrides(
+                signal_mask_out,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            signal_outliers = data_to_process[signal_mask_out].copy()
             if not signal_outliers.empty:
                 signal_outliers['Category'] = 'Signal Intensity'
                 outliers_df = pd.concat([outliers_df, signal_outliers])
             
-            leak_outliers = data_to_process[
+            leak_mask_out = (
                 (data_to_process['leak_rate'] < st.session_state.leak_range[0]) |
                 (data_to_process['leak_rate'] > st.session_state.leak_range[1])
-            ].copy()
-            leak_outliers = leak_outliers[~leak_outliers.index.map(_is_row_edited)]
+            ) & ~edited_mask_out
+            leak_mask_out = _apply_manual_outlier_overrides(
+                leak_mask_out,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            leak_outliers = data_to_process[leak_mask_out].copy()
             if not leak_outliers.empty:
                 leak_outliers['Category'] = 'Leak Rate'
                 outliers_df = pd.concat([outliers_df, leak_outliers])
@@ -6782,13 +7131,66 @@ def main():
                 (data_to_process['leak_rate'] < st.session_state.leak_range[0]) |
                 (data_to_process['leak_rate'] > st.session_state.leak_range[1])
             ) & ~edited_mask_out
+            sat_masks_export = _partial_saturation_isotope_masks(data_to_process)
+            sat_d13_out_mask = sat_masks_export['d13C'] & ~edited_mask_out
+            sat_d18_out_mask = sat_masks_export['d18O'] & ~edited_mask_out
             failed_out_mask = (data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Failed Sample') & ~edited_mask_out
             saturated_sample_out_mask = (data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors') & ~edited_mask_out
+            d13c_out_mask = _apply_manual_outlier_overrides(
+                d13c_out_mask,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            d18o_out_mask = _apply_manual_outlier_overrides(
+                d18o_out_mask,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            signal_out_mask = _apply_manual_outlier_overrides(
+                signal_out_mask,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            leak_out_mask = _apply_manual_outlier_overrides(
+                leak_out_mask,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            sat_d13_out_mask = _apply_manual_outlier_overrides(
+                sat_d13_out_mask,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            sat_d18_out_mask = _apply_manual_outlier_overrides(
+                sat_d18_out_mask,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            failed_out_mask = _apply_manual_outlier_overrides(
+                failed_out_mask,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            saturated_sample_out_mask = _apply_manual_outlier_overrides(
+                saturated_sample_out_mask,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
 
             cat_bools = pd.DataFrame({
                 'Statistical': stat_mask_all,
                 'd13C Range': d13c_out_mask,
                 'd18O Range': d18o_out_mask,
+                'd13C Saturation': sat_d13_out_mask,
+                'd18O Saturation': sat_d18_out_mask,
                 'Signal Intensity': signal_out_mask,
                 'Leak Rate': leak_out_mask,
                 'Failed Sample': failed_out_mask,
@@ -7031,6 +7433,7 @@ def main():
 
         # Summary Charts
         st.subheader("Summary Charts")
+        _clear_registered_statistical_outlier_rows()
         d13_summary_editor_prefix = "tab3_d13c_summary_editor"
         d18_summary_editor_prefix = "tab3_d18o_summary_editor"
         
@@ -7053,9 +7456,22 @@ def main():
             edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
 
             status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
-            saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
+            sat_masks = _partial_saturation_isotope_masks(species_data_unfiltered)
+            saturated_collectors_mask = sat_masks['d13C']
             saturated_samples_mask = status_series == 'Fully Saturated Collectors'
             failed_mask = status_series == 'Failed Sample'
+            saturated_samples_mask = _apply_manual_outlier_overrides(
+                saturated_samples_mask,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            failed_mask = _apply_manual_outlier_overrides(
+                failed_mask,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
             saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
             failed_idx = species_data_unfiltered[failed_mask].index
             edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
@@ -7086,8 +7502,11 @@ def main():
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
             outlier_mask = outlier_mask & ~edited_mask_species
+            outlier_mask = _apply_manual_outlier_overrides(outlier_mask, row_index=species_data.index)
             # Store statistical outliers
             statistical_outliers = species_data[outlier_mask].copy()
+            if not statistical_outliers.empty:
+                _register_statistical_outlier_rows(statistical_outliers.index)
 
             # Calculate range outliers mask using unfiltered data so signal/leak outliers aren't dropped
             range_mask_unfiltered = (
@@ -7100,6 +7519,12 @@ def main():
                 (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
             )
             range_mask_unfiltered = range_mask_unfiltered & ~edited_mask_species_unfiltered
+            range_mask_unfiltered = _apply_manual_outlier_overrides(
+                range_mask_unfiltered,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
             range_mask_for_plot = range_mask_unfiltered.reindex(species_data.index, fill_value=False)
 
             # Store range outliers if showing them
@@ -7117,8 +7542,10 @@ def main():
                 range_outliers = pd.DataFrame(columns=species_data_unfiltered.columns)
                 
             # Filter data to plot - exclude statistical, range outliers, and saturated samples
+            partial_idx_mask = saturated_collectors_mask.reindex(species_data.index, fill_value=False)
+            outlier_drop_mask = (outlier_mask | range_mask_for_plot) & ~partial_idx_mask
             data_to_plot = species_data[
-                ~(outlier_mask | range_mask_for_plot | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+                ~(outlier_drop_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
             ].copy()
             
             # Sort data by x_axis to ensure sequential line connections
@@ -7240,31 +7667,7 @@ def main():
                 failed_vals = pd.to_numeric(failed_samples['d 13C/12C  Mean'], errors='coerce')
                 failed_is_edited = pd.Series(failed_samples.index.map(_is_row_edited), index=failed_samples.index)
                 failed_interp = failed_samples[failed_vals.notna() & failed_is_edited].copy()
-                failed_recovered = failed_samples[failed_vals.notna() & ~failed_is_edited].copy()
-                failed_missing = failed_samples[failed_vals.isna()].copy()
-                if not failed_recovered.empty:
-                    failed_recovered_customdata = _build_delta_point_customdata(failed_recovered, 'd13C')
-                    d13c_summary.add_trace(go.Scatter(
-                        x=failed_recovered['x_axis'],
-                        y=pd.to_numeric(failed_recovered['d 13C/12C  Mean'], errors='coerce'),
-                        mode='markers',
-                        name='Partially Failed (Recovered Mean)',
-                        marker=dict(
-                            size=12,
-                            symbol='diamond-open',
-                            color='#ff7f0e',
-                            line=dict(width=2, color='#ff7f0e')
-                        ),
-                        showlegend=not d13_legend_partial_shown,
-                        legendgroup='collector_status',
-                        customdata=failed_recovered_customdata,
-                        hovertemplate=(
-                            'Identifier 1: %{customdata[2]}<br>'
-                            'Identifier 2: %{customdata[3]}<br>'
-                            'd13C: %{y:.4f}<extra></extra>'
-                        )
-                    ))
-                    d13_legend_partial_shown = True
+                failed_missing = failed_samples[(failed_vals.isna()) | (failed_vals.notna() & ~failed_is_edited)].copy()
                 if not failed_interp.empty:
                     failed_interp_customdata = _build_delta_point_customdata(failed_interp, 'd13C')
                     d13c_summary.add_trace(go.Scatter(
@@ -7527,9 +7930,22 @@ def main():
             edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
 
             status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
-            saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
+            sat_masks = _partial_saturation_isotope_masks(species_data_unfiltered)
+            saturated_collectors_mask = sat_masks['d18O']
             saturated_samples_mask = status_series == 'Fully Saturated Collectors'
             failed_mask = status_series == 'Failed Sample'
+            saturated_samples_mask = _apply_manual_outlier_overrides(
+                saturated_samples_mask,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            failed_mask = _apply_manual_outlier_overrides(
+                failed_mask,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
             saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
             failed_idx = species_data_unfiltered[failed_mask].index
             
@@ -7546,7 +7962,10 @@ def main():
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
             outlier_mask = outlier_mask & ~edited_mask_species
+            outlier_mask = _apply_manual_outlier_overrides(outlier_mask, row_index=species_data.index)
             statistical_outliers = species_data[outlier_mask].copy()
+            if not statistical_outliers.empty:
+                _register_statistical_outlier_rows(statistical_outliers.index)
             
             # Calculate range outliers
             if show_range_outliers:
@@ -7561,6 +7980,12 @@ def main():
                 )
                 edited_mask_species_unf = pd.Series(species_data_unfiltered.index.map(_is_row_edited), index=species_data_unfiltered.index, dtype=bool)
                 range_mask_unfiltered = range_mask_unfiltered & ~edited_mask_species_unf
+                range_mask_unfiltered = _apply_manual_outlier_overrides(
+                    range_mask_unfiltered,
+                    row_index=species_data_unfiltered.index,
+                    apply_true=False,
+                    apply_false=True,
+                )
                 range_outliers = species_data_unfiltered[range_mask_unfiltered].copy()
                 range_mask_for_plot = range_mask_unfiltered.reindex(species_data.index, fill_value=False)
                 # Add x_axis values to range outliers
@@ -7575,8 +8000,10 @@ def main():
                 range_outliers = pd.DataFrame(columns=species_data.columns)
                 range_mask_for_plot = pd.Series(False, index=species_data.index, dtype=bool)
 
+            partial_idx_mask = saturated_collectors_mask.reindex(species_data.index, fill_value=False)
+            outlier_drop_mask = (outlier_mask | range_mask_for_plot) & ~partial_idx_mask
             data_to_plot = species_data[
-                ~(outlier_mask | range_mask_for_plot | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+                ~(outlier_drop_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
             ].copy()
             
             # Sort data by x_axis to ensure sequential line connections
@@ -7699,31 +8126,7 @@ def main():
                 failed_vals = pd.to_numeric(failed_samples['d 18O/16O  Mean'], errors='coerce')
                 failed_is_edited = pd.Series(failed_samples.index.map(_is_row_edited), index=failed_samples.index)
                 failed_interp = failed_samples[failed_vals.notna() & failed_is_edited].copy()
-                failed_recovered = failed_samples[failed_vals.notna() & ~failed_is_edited].copy()
-                failed_missing = failed_samples[failed_vals.isna()].copy()
-                if not failed_recovered.empty:
-                    failed_recovered_customdata = _build_delta_point_customdata(failed_recovered, 'd18O')
-                    d18o_summary.add_trace(go.Scatter(
-                        x=failed_recovered['x_axis'],
-                        y=pd.to_numeric(failed_recovered['d 18O/16O  Mean'], errors='coerce'),
-                        mode='markers',
-                        name='Partially Failed (Recovered Mean)',
-                        marker=dict(
-                            size=12,
-                            symbol='diamond-open',
-                            color='#ff7f0e',
-                            line=dict(width=2, color='#ff7f0e')
-                        ),
-                        showlegend=not d18_legend_partial_shown,
-                        legendgroup='collector_status',
-                        customdata=failed_recovered_customdata,
-                        hovertemplate=(
-                            'Identifier 1: %{customdata[2]}<br>'
-                            'Identifier 2: %{customdata[3]}<br>'
-                            'd18O: %{y:.4f}<extra></extra>'
-                        )
-                    ))
-                    d18_legend_partial_shown = True
+                failed_missing = failed_samples[(failed_vals.isna()) | (failed_vals.notna() & ~failed_is_edited)].copy()
                 if not failed_interp.empty:
                     failed_interp_customdata = _build_delta_point_customdata(failed_interp, 'd18O')
                     d18o_summary.add_trace(go.Scatter(
@@ -7984,10 +8387,23 @@ def main():
                 continue
 
             status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
-            saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
+            sat_masks = _partial_saturation_isotope_masks(species_data_unfiltered)
+            saturated_collectors_mask = sat_masks['any']
             saturated_samples_mask = status_series == 'Fully Saturated Collectors'
+            saturated_samples_mask = _apply_manual_outlier_overrides(
+                saturated_samples_mask,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
             saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
             failed_mask = status_series == 'Failed Sample'
+            failed_mask = _apply_manual_outlier_overrides(
+                failed_mask,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
             failed_idx = species_data_unfiltered[failed_mask].index
 
             # Compute statistical thresholds per species
@@ -8004,6 +8420,10 @@ def main():
                 (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
             )
             outlier_mask = outlier_mask & ~edited_mask_species
+            outlier_mask = _apply_manual_outlier_overrides(outlier_mask, row_index=species_data.index)
+            stat_outliers_scatter_all = species_data[outlier_mask].copy()
+            if not stat_outliers_scatter_all.empty:
+                _register_statistical_outlier_rows(stat_outliers_scatter_all.index)
 
             range_mask_unfiltered = (
                 (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
@@ -8020,6 +8440,12 @@ def main():
                 dtype=bool
             )
             range_mask_unfiltered = range_mask_unfiltered & ~edited_mask_species_unfiltered
+            range_mask_unfiltered = _apply_manual_outlier_overrides(
+                range_mask_unfiltered,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
             range_mask_for_plot = range_mask_unfiltered.reindex(species_data.index, fill_value=False)
 
             # Filter to non-outliers for main scatter
@@ -8059,7 +8485,7 @@ def main():
 
             # Overlay sigma-based outliers on the species cross-plot.
             if show_statistical_outliers:
-                stat_outliers_scatter = species_data[outlier_mask].copy()
+                stat_outliers_scatter = stat_outliers_scatter_all.copy()
                 stat_outliers_scatter = stat_outliers_scatter[
                     stat_outliers_scatter['d 13C/12C  Mean'].notna() & stat_outliers_scatter['d 18O/16O  Mean'].notna()
                 ]
@@ -8158,9 +8584,24 @@ def main():
                 continue
 
             status_series = species_data_unfiltered.get('Collector Status', pd.Series(False, index=species_data_unfiltered.index))
-            saturated_collectors_mask = status_series == 'Partially Saturated Collectors'
+            sat_masks = _partial_saturation_isotope_masks(species_data_unfiltered)
+            saturated_collectors_mask_d13 = sat_masks['d13C']
+            saturated_collectors_mask_d18 = sat_masks['d18O']
+            saturated_collectors_mask_any = sat_masks['any']
             saturated_samples_mask = status_series == 'Fully Saturated Collectors'
             failed_mask = status_series == 'Failed Sample'
+            saturated_samples_mask = _apply_manual_outlier_overrides(
+                saturated_samples_mask,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            failed_mask = _apply_manual_outlier_overrides(
+                failed_mask,
+                row_index=species_data_unfiltered.index,
+                apply_true=False,
+                apply_false=True,
+            )
             saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
             failed_idx = species_data_unfiltered[failed_mask].index
             edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
@@ -8203,13 +8644,18 @@ def main():
                 (species_data['d 18O/16O  Mean'] > upper_threshold_d18O)
             )
             outlier_mask = outlier_mask & ~edited_mask_species
+            outlier_mask = _apply_manual_outlier_overrides(outlier_mask, row_index=species_data.index)
             # Apply mask and include necessary columns (including x_axis)
             statistical_outliers = species_data[outlier_mask].copy()
+            if not statistical_outliers.empty:
+                _register_statistical_outlier_rows(statistical_outliers.index)
 
             # Remove statistical outliers and saturated samples from data_to_plot
             saturated_idx_mask = pd.Series(species_data.index.isin(saturated_samples_idx), index=species_data.index, dtype=bool)
             failed_idx_mask = pd.Series(species_data.index.isin(failed_idx), index=species_data.index, dtype=bool)
-            drop_mask = outlier_mask.reindex(species_data.index, fill_value=False) | saturated_idx_mask | failed_idx_mask
+            partial_idx_mask = saturated_collectors_mask_any.reindex(species_data.index, fill_value=False)
+            non_partial_outlier_mask = outlier_mask.reindex(species_data.index, fill_value=False) & ~partial_idx_mask
+            drop_mask = non_partial_outlier_mask | saturated_idx_mask | failed_idx_mask
             data_to_plot = species_data[~drop_mask].copy()
 
             # Identify range bar outliers from unfiltered data
@@ -8226,6 +8672,12 @@ def main():
                     (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
                 )
                 range_mask = range_mask & ~edited_mask_species_unfiltered
+                range_mask = _apply_manual_outlier_overrides(
+                    range_mask,
+                    row_index=species_data_unfiltered.index,
+                    apply_true=False,
+                    apply_false=True,
+                )
                 # Apply mask and include necessary columns
                 range_bar_outliers = species_data_unfiltered[range_mask].copy()
 
@@ -8270,7 +8722,7 @@ def main():
 
                 has_status_markers = False
                 if show_saturated_collectors and not species_data_unfiltered[
-                    (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask
+                    (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask_any
                 ].empty:
                     has_status_markers = True
                 if show_saturated_samples and not species_data_unfiltered[
@@ -8408,7 +8860,7 @@ def main():
                 # Highlight saturated collectors (valid means)
                 if show_saturated_collectors:
                     identifier_sat_collectors = species_data_unfiltered[
-                        (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask
+                        (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask_d13
                     ]
                     if not identifier_sat_collectors.empty:
                         sat_collectors_customdata = _build_delta_point_customdata(identifier_sat_collectors, 'd13C')
@@ -8463,23 +8915,9 @@ def main():
                         failed_vals = pd.to_numeric(identifier_failed['d 13C/12C  Mean'], errors='coerce')
                         failed_is_edited = pd.Series(identifier_failed.index.map(_is_row_edited), index=identifier_failed.index)
                         identifier_failed_interp = identifier_failed[failed_vals.notna() & failed_is_edited].copy()
-                        identifier_failed_recovered = identifier_failed[failed_vals.notna() & ~failed_is_edited].copy()
-                        identifier_failed_missing = identifier_failed[failed_vals.isna()].copy()
-                        if not identifier_failed_recovered.empty:
-                            failed_recovered_customdata = _build_delta_point_customdata(identifier_failed_recovered, 'd13C')
-                            fig_d13C.add_trace(go.Scatter(
-                                x=identifier_failed_recovered['x_axis'],
-                                y=pd.to_numeric(identifier_failed_recovered['d 13C/12C  Mean'], errors='coerce'),
-                                mode='markers',
-                                marker=dict(color='#ff7f0e', symbol='diamond-open', size=12, line=dict(width=2)),
-                                name='Partially Failed (Recovered Mean)',
-                                customdata=failed_recovered_customdata,
-                                hovertemplate=(
-                                    'Identifier 1: %{customdata[2]}<br>'
-                                    'Identifier 2: %{customdata[3]}<br>'
-                                    'd13C: %{y:.4f}<extra></extra>'
-                                )
-                            ))
+                        identifier_failed_missing = identifier_failed[
+                            (failed_vals.isna()) | (failed_vals.notna() & ~failed_is_edited)
+                        ].copy()
                         if not identifier_failed_interp.empty:
                             failed_interp_customdata = _build_delta_point_customdata(identifier_failed_interp, 'd13C')
                             fig_d13C.add_trace(go.Scatter(
@@ -8840,7 +9278,7 @@ def main():
                 # Highlight saturated collectors (valid means)
                 if show_saturated_collectors:
                     identifier_sat_collectors = species_data_unfiltered[
-                        (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask
+                        (species_data_unfiltered['Identifier 1'] == identifier) & saturated_collectors_mask_d18
                     ]
                     if not identifier_sat_collectors.empty:
                         sat_collectors_customdata = _build_delta_point_customdata(identifier_sat_collectors, 'd18O')
@@ -8895,23 +9333,9 @@ def main():
                         failed_vals = pd.to_numeric(identifier_failed['d 18O/16O  Mean'], errors='coerce')
                         failed_is_edited = pd.Series(identifier_failed.index.map(_is_row_edited), index=identifier_failed.index)
                         identifier_failed_interp = identifier_failed[failed_vals.notna() & failed_is_edited].copy()
-                        identifier_failed_recovered = identifier_failed[failed_vals.notna() & ~failed_is_edited].copy()
-                        identifier_failed_missing = identifier_failed[failed_vals.isna()].copy()
-                        if not identifier_failed_recovered.empty:
-                            failed_recovered_customdata = _build_delta_point_customdata(identifier_failed_recovered, 'd18O')
-                            fig_d18O.add_trace(go.Scatter(
-                                x=identifier_failed_recovered['x_axis'],
-                                y=pd.to_numeric(identifier_failed_recovered['d 18O/16O  Mean'], errors='coerce'),
-                                mode='markers',
-                                marker=dict(color='#ff7f0e', symbol='diamond-open', size=12, line=dict(width=2)),
-                                name='Partially Failed (Recovered Mean)',
-                                customdata=failed_recovered_customdata,
-                                hovertemplate=(
-                                    'Identifier 1: %{customdata[2]}<br>'
-                                    'Identifier 2: %{customdata[3]}<br>'
-                                    'd18O: %{y:.4f}<extra></extra>'
-                                )
-                            ))
+                        identifier_failed_missing = identifier_failed[
+                            (failed_vals.isna()) | (failed_vals.notna() & ~failed_is_edited)
+                        ].copy()
                         if not identifier_failed_interp.empty:
                             failed_interp_customdata = _build_delta_point_customdata(identifier_failed_interp, 'd18O')
                             fig_d18O.add_trace(go.Scatter(
@@ -9110,34 +9534,69 @@ def main():
             
             # Get outliers data
             stat_outliers_only = statistical_outliers[statistical_outliers[species_col] == species]
-            stat_outliers_only = stat_outliers_only[~stat_outliers_only.index.map(_is_row_edited)]
+            stat_keep_mask = ~pd.Series(
+                stat_outliers_only.index.map(_is_row_edited),
+                index=stat_outliers_only.index,
+                dtype=bool,
+            )
+            stat_keep_mask = _apply_manual_outlier_overrides(stat_keep_mask, row_index=stat_outliers_only.index)
+            stat_outliers_only = stat_outliers_only[stat_keep_mask]
             
             # Get original data for this species before any filtering
             species_data = subset_data_unfiltered[subset_data_unfiltered[species_col] == species]
             
             # Create masks for each range category
-            d13c_outliers = species_data[
+            edited_mask_species_unfiltered = pd.Series(
+                species_data.index.map(_is_row_edited),
+                index=species_data.index,
+                dtype=bool,
+            )
+            d13c_mask = (
                 (species_data['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
                 (species_data['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
-            ]
-            d13c_outliers = d13c_outliers[~d13c_outliers.index.map(_is_row_edited)]
-            
-            d18o_outliers = species_data[
+            ) & ~edited_mask_species_unfiltered
+            d13c_mask = _apply_manual_outlier_overrides(
+                d13c_mask,
+                row_index=species_data.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            d13c_outliers = species_data[d13c_mask]
+
+            d18o_mask = (
                 (species_data['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                 (species_data['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
-            ]
-            d18o_outliers = d18o_outliers[~d18o_outliers.index.map(_is_row_edited)]
-            
-            signal_outliers = species_data[
+            ) & ~edited_mask_species_unfiltered
+            d18o_mask = _apply_manual_outlier_overrides(
+                d18o_mask,
+                row_index=species_data.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            d18o_outliers = species_data[d18o_mask]
+
+            signal_mask = (
                 species_data['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]
-            ]
-            signal_outliers = signal_outliers[~signal_outliers.index.map(_is_row_edited)]
-            
-            leak_outliers = species_data[
+            ) & ~edited_mask_species_unfiltered
+            signal_mask = _apply_manual_outlier_overrides(
+                signal_mask,
+                row_index=species_data.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            signal_outliers = species_data[signal_mask]
+
+            leak_mask = (
                 (species_data['leak_rate'] < st.session_state.leak_range[0]) |
                 (species_data['leak_rate'] > st.session_state.leak_range[1])
-            ]
-            leak_outliers = leak_outliers[~leak_outliers.index.map(_is_row_edited)]
+            ) & ~edited_mask_species_unfiltered
+            leak_mask = _apply_manual_outlier_overrides(
+                leak_mask,
+                row_index=species_data.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            leak_outliers = species_data[leak_mask]
         
             # Create two columns for outlier information
             col1, col2 = st.columns(2)
@@ -9214,9 +9673,30 @@ def main():
                 with st.expander("Collector Status (Partial / Full / Failed)", expanded=True):
                     src_df = species_data_unfiltered if 'species_data_unfiltered' in locals() else species_data
                     status_series = src_df.get('Collector Status', pd.Series(False, index=src_df.index))
-                    failed_samples = src_df[status_series == 'Failed Sample'].copy()
-                    saturated_samples = src_df[status_series == 'Partially Saturated Collectors'].copy()
-                    saturated_all = src_df[status_series == 'Fully Saturated Collectors'].copy()
+                    failed_mask = status_series == 'Failed Sample'
+                    partial_mask = status_series == 'Partially Saturated Collectors'
+                    full_mask = status_series == 'Fully Saturated Collectors'
+                    failed_mask = _apply_manual_outlier_overrides(
+                        failed_mask,
+                        row_index=src_df.index,
+                        apply_true=False,
+                        apply_false=True,
+                    )
+                    partial_mask = _apply_manual_outlier_overrides(
+                        partial_mask,
+                        row_index=src_df.index,
+                        apply_true=False,
+                        apply_false=True,
+                    )
+                    full_mask = _apply_manual_outlier_overrides(
+                        full_mask,
+                        row_index=src_df.index,
+                        apply_true=False,
+                        apply_false=True,
+                    )
+                    failed_samples = src_df[failed_mask].copy()
+                    saturated_samples = src_df[partial_mask].copy()
+                    saturated_all = src_df[full_mask].copy()
                     if failed_samples.empty and saturated_samples.empty and saturated_all.empty:
                         st.info("No saturated collectors or failed samples detected")
                     else:
