@@ -4,7 +4,7 @@ import numpy as np
 import io
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 # Enable pandas copy-on-write mode to prevent SettingWithCopyWarning
@@ -53,6 +53,7 @@ AUTOSAVE_SOURCE_FILES_KEY = "autosave_source_files"
 AUTOSAVE_META_PATH_KEY = "autosave_meta_path"
 AUTOSAVE_RESUMED_KEY = "autosave_resumed"
 AUTOSAVE_SESSION_TOKEN_KEY = "autosave_session_token"
+AUTOSAVE_DIR_INPUT_KEY = "autosave_dir_override_input"
 
 
 def _safe_filename_fragment(value):
@@ -69,6 +70,132 @@ def _numeric_or_none(value):
     """Convert numeric-like values to float; return None for NaN/invalid."""
     num = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]
     return float(num) if pd.notna(num) else None
+
+
+def _pick_folder_via_explorer(initial_dir=None):
+    """Open a native folder picker and return (selected_path, error)."""
+    root = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        start_dir = str(initial_dir) if initial_dir else str(Path.home())
+        selected = filedialog.askdirectory(initialdir=start_dir, title="Select autosave folder")
+        if selected:
+            return str(Path(selected).resolve()), None
+        return None, None
+    except Exception as exc:
+        return None, str(exc)
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+def _json_safe_value(value):
+    """Convert values to JSON-safe primitives recursively."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        if np.isnan(value):
+            return None
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return None if np.isnan(value) else value
+    if isinstance(value, (int, str, bool)):
+        return value
+    return str(value)
+
+
+def _extract_calibration_session_state():
+    """Collect calibration-related session fields for autosave metadata."""
+    keys = [
+        "calibration_coefficients",
+        "linearity_fits",
+        "selected_standards",
+        "calibration_type",
+        "sigma_level",
+        "irq_multiplier",
+        "outliers_independence",
+        "apply_linearity_toggle",
+        "precision_date_range",
+        "precision_date_range_input",
+    ]
+    payload = {}
+    for key in keys:
+        if key in st.session_state:
+            payload[key] = _json_safe_value(st.session_state.get(key))
+    return payload
+
+
+def _restore_calibration_session_state(state_payload):
+    """Restore calibration-related state from autosave metadata."""
+    if not isinstance(state_payload, dict):
+        return
+
+    for key in [
+        "calibration_coefficients",
+        "linearity_fits",
+        "selected_standards",
+        "calibration_type",
+        "sigma_level",
+        "irq_multiplier",
+        "outliers_independence",
+        "apply_linearity_toggle",
+    ]:
+        if key in state_payload:
+            st.session_state[key] = state_payload.get(key)
+
+    for key in ["precision_date_range", "precision_date_range_input"]:
+        raw = state_payload.get(key)
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            continue
+        try:
+            d0 = pd.Timestamp(raw[0]).date()
+            d1 = pd.Timestamp(raw[1]).date()
+            st.session_state[key] = (d0, d1)
+        except Exception:
+            continue
+
+
+def _read_autosave_log_entries(log_path, max_entries=500):
+    """Read autosave JSONL entries and return newest first."""
+    path = Path(str(log_path))
+    if not path.exists() or not path.is_file():
+        return []
+    entries = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if text == "":
+                    continue
+                try:
+                    entries.append(json.loads(text))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    if len(entries) > max_entries:
+        entries = entries[-max_entries:]
+    return list(reversed(entries))
 
 
 def _normalize_upload_spec(upload_item):
@@ -286,6 +413,54 @@ def _summarize_autosave_log(log_path):
     return event_count, edited_rows
 
 
+def _rebuild_original_delta_values_from_dataframes(current_df, base_df, atol=1e-9):
+    """Reconstruct original delta values by diffing resumed data against fresh import."""
+    if not isinstance(current_df, pd.DataFrame) or not isinstance(base_df, pd.DataFrame):
+        return {}
+    if current_df.empty or base_df.empty:
+        return {}
+
+    common_index = current_df.index.intersection(base_df.index)
+    if len(common_index) == 0:
+        return {}
+
+    isotope_cols = {
+        "d13C": "d 13C/12C  Mean",
+        "d18O": "d 18O/16O  Mean",
+    }
+    restored = {}
+
+    for isotope_key, col_name in isotope_cols.items():
+        if col_name not in current_df.columns or col_name not in base_df.columns:
+            continue
+
+        current_vals = pd.to_numeric(current_df.loc[common_index, col_name], errors="coerce").to_numpy(dtype=float)
+        base_vals = pd.to_numeric(base_df.loc[common_index, col_name], errors="coerce").to_numpy(dtype=float)
+
+        both_numeric = np.isfinite(current_vals) & np.isfinite(base_vals)
+        numeric_changed = np.zeros(len(common_index), dtype=bool)
+        numeric_changed[both_numeric] = ~np.isclose(
+            current_vals[both_numeric],
+            base_vals[both_numeric],
+            rtol=0.0,
+            atol=float(atol),
+        )
+        missing_changed = np.isnan(current_vals) ^ np.isnan(base_vals)
+        changed_mask = numeric_changed | missing_changed
+
+        if not bool(np.any(changed_mask)):
+            continue
+
+        changed_indices = common_index[changed_mask]
+        changed_originals = base_vals[changed_mask]
+        for row_label, original_value in zip(changed_indices, changed_originals):
+            if not np.isfinite(original_value):
+                continue
+            restored[f"{isotope_key}|{str(row_label)}"] = float(original_value)
+
+    return restored
+
+
 def _write_autosave_metadata():
     """Persist autosave session metadata."""
     meta_path_raw = st.session_state.get(AUTOSAVE_META_PATH_KEY)
@@ -301,6 +476,7 @@ def _write_autosave_metadata():
         "source_files": st.session_state.get(AUTOSAVE_SOURCE_FILES_KEY, []),
         "event_count": int(st.session_state.get(AUTOSAVE_EVENT_COUNT_KEY, 0)),
         "resumed": bool(st.session_state.get(AUTOSAVE_RESUMED_KEY, False)),
+        "calibration_state": _extract_calibration_session_state(),
     }
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -322,6 +498,153 @@ def _reset_autosave_state():
         AUTOSAVE_SESSION_TOKEN_KEY,
     ]:
         st.session_state.pop(key, None)
+
+
+def _delete_current_autosave_artifacts():
+    """Delete current autosave files (log/snapshot/meta) if they exist."""
+    delete_errors = []
+    for key in [AUTOSAVE_LOG_PATH_KEY, AUTOSAVE_SNAPSHOT_PATH_KEY, AUTOSAVE_META_PATH_KEY]:
+        path_raw = st.session_state.get(key)
+        if not path_raw:
+            continue
+        try:
+            path_obj = Path(str(path_raw))
+            if path_obj.exists() and path_obj.is_file():
+                path_obj.unlink()
+        except Exception as exc:
+            delete_errors.append(f"{path_raw}: {exc}")
+    if delete_errors:
+        st.session_state[AUTOSAVE_ERROR_KEY] = "Failed to delete autosave file(s): " + " | ".join(delete_errors)
+        return False
+    return True
+
+
+def _reset_processing_session_state(discard_autosave_files=False):
+    """Reset loaded dataset/session fields; optionally delete autosave artifacts."""
+    if discard_autosave_files:
+        _delete_current_autosave_artifacts()
+
+    st.session_state.file_processed = False
+    st.session_state.df = None
+    st.session_state.df_cycles_source = None
+    st.session_state.edited_delta_rows = set()
+    st.session_state.original_delta_values = {}
+    st.session_state.calibration_coefficients = {}
+    st.session_state.linearity_fits = {}
+    st.session_state.selected_standards = []
+    st.session_state.confirm_reset = False
+    st.session_state.confirm_discard_session = False
+    st.session_state.confirm_reset_all_edits = False
+    _reset_autosave_state()
+
+
+def _reset_all_edited_points_to_original(editor_context="tab3_global"):
+    """Reset all edited delta points back to original imported values."""
+    df = st.session_state.get("df")
+    if df is None:
+        return {"count": 0, "remaining": 0}
+
+    original_map = st.session_state.get("original_delta_values", {})
+    if not isinstance(original_map, dict) or not original_map:
+        return {"count": 0, "remaining": 0}
+
+    col_map = {
+        "d13C": "d 13C/12C  Mean",
+        "d18O": "d 18O/16O  Mean",
+    }
+    autosave_changes = []
+    remaining = {}
+
+    for token, stored_original in original_map.items():
+        if "|" not in str(token):
+            remaining[token] = stored_original
+            continue
+
+        isotope_key, raw_row_key = str(token).split("|", 1)
+        isotope_key = str(isotope_key).strip()
+        target_col = col_map.get(isotope_key)
+        row_label = _resolve_index_label(df.index, raw_row_key)
+        if target_col is None or target_col not in df.columns or row_label is None or row_label not in df.index:
+            remaining[token] = stored_original
+            continue
+
+        original_value = pd.to_numeric(pd.Series([stored_original]), errors="coerce").iloc[0]
+        if pd.isna(original_value):
+            remaining[token] = stored_original
+            continue
+
+        prev_raw = pd.to_numeric(pd.Series([df.at[row_label, target_col]]), errors="coerce").iloc[0]
+        prev_status = None
+        if "Collector Status" in df.columns:
+            prev_status = df.at[row_label, "Collector Status"]
+        _, cal_col, _ = _get_isotope_columns(isotope_key)
+        prev_cal = np.nan
+        if cal_col in df.columns:
+            prev_cal = pd.to_numeric(pd.Series([df.at[row_label, cal_col]]), errors="coerce").iloc[0]
+
+        df.at[row_label, target_col] = float(original_value)
+        _refresh_collector_status_after_delta_edit(row_label)
+        _refresh_calibrated_after_delta_edit(
+            row_label,
+            isotope_key,
+            previous_raw=prev_raw,
+            previous_calibrated=prev_cal,
+        )
+
+        new_cal = np.nan
+        if cal_col in df.columns:
+            new_cal = pd.to_numeric(pd.Series([df.at[row_label, cal_col]]), errors="coerce").iloc[0]
+        new_status = None
+        if "Collector Status" in df.columns:
+            new_status = df.at[row_label, "Collector Status"]
+
+        identifier_1 = None
+        if "Identifier 1" in df.columns:
+            identifier_1 = df.at[row_label, "Identifier 1"]
+        identifier_2 = None
+        if "Identifier 2" in df.columns:
+            identifier_2 = df.at[row_label, "Identifier 2"]
+        source_excel = None
+        if "Excel File" in df.columns:
+            source_excel = df.at[row_label, "Excel File"]
+
+        autosave_changes.append(
+            {
+                "isotope": isotope_key,
+                "row_label": str(row_label),
+                "column": target_col,
+                "identifier_1": None if pd.isna(identifier_1) else str(identifier_1),
+                "identifier_2": None if pd.isna(identifier_2) else str(identifier_2),
+                "excel_file": None if pd.isna(source_excel) else str(source_excel),
+                "previous_value": _numeric_or_none(prev_raw),
+                "restored_value": _numeric_or_none(original_value),
+                "previous_calibrated": _numeric_or_none(prev_cal),
+                "new_calibrated": _numeric_or_none(new_cal),
+                "previous_status": None if pd.isna(prev_status) else str(prev_status),
+                "new_status": None if pd.isna(new_status) else str(new_status),
+            }
+        )
+
+    st.session_state["original_delta_values"] = remaining
+    remaining_rows = set()
+    for token in remaining.keys():
+        if "|" in str(token):
+            _, row_key = str(token).split("|", 1)
+            if row_key != "":
+                remaining_rows.add(str(row_key))
+    st.session_state["edited_delta_rows"] = remaining_rows
+
+    if autosave_changes:
+        _autosave_session_update(
+            "reset_all_to_original",
+            changes=autosave_changes,
+            context={
+                "editor": editor_context,
+                "count": len(autosave_changes),
+            },
+        )
+
+    return {"count": len(autosave_changes), "remaining": len(remaining)}
 
 
 def _initialize_autosave_session(upload_files, base_df=None):
@@ -351,6 +674,18 @@ def _initialize_autosave_session(upload_files, base_df=None):
         log_path = save_dir / f"{base_name}_session_edits.jsonl"
         snapshot_path = save_dir / f"{base_name}_session_snapshot.csv"
         meta_path = save_dir / f"{base_name}_session_meta.json"
+        meta_payload = {}
+        calibration_state = {}
+
+        if meta_path.exists():
+            try:
+                parsed = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    meta_payload = parsed
+            except Exception:
+                meta_payload = {}
+        if isinstance(meta_payload.get("calibration_state"), dict):
+            calibration_state = meta_payload.get("calibration_state", {})
 
         resumed_df = None
         resumed = False
@@ -377,6 +712,20 @@ def _initialize_autosave_session(upload_files, base_df=None):
             snapshot_path.write_text("", encoding="utf-8")
 
         event_count, edited_rows = _summarize_autosave_log(log_path)
+        restored_original_delta_values = {}
+        if resumed_df is not None and base_df is not None:
+            restored_original_delta_values = _rebuild_original_delta_values_from_dataframes(
+                resumed_df,
+                base_df,
+            )
+            restored_rows_from_map = set()
+            for token in restored_original_delta_values.keys():
+                if "|" not in str(token):
+                    continue
+                _, row_key = str(token).split("|", 1)
+                if row_key != "":
+                    restored_rows_from_map.add(str(row_key))
+            edited_rows = set(edited_rows) | restored_rows_from_map
 
         st.session_state[AUTOSAVE_LOG_PATH_KEY] = str(log_path)
         st.session_state[AUTOSAVE_SNAPSHOT_PATH_KEY] = str(snapshot_path)
@@ -393,6 +742,8 @@ def _initialize_autosave_session(upload_files, base_df=None):
             "resumed": bool(resumed),
             "resumed_df": resumed_df,
             "edited_rows": edited_rows,
+            "original_delta_values": restored_original_delta_values,
+            "calibration_state": calibration_state,
         }
     except Exception as exc:
         st.session_state[AUTOSAVE_LOG_PATH_KEY] = None
@@ -407,6 +758,8 @@ def _initialize_autosave_session(upload_files, base_df=None):
             "resumed": False,
             "resumed_df": None,
             "edited_rows": set(),
+            "original_delta_values": {},
+            "calibration_state": {},
         }
 
 
@@ -495,6 +848,20 @@ def _prepare_color_values(values):
     codes, uniques = pd.factorize(categories, sort=True)
     ticks = (list(range(len(uniques))), [str(u) for u in uniques])
     return pd.Series(codes, index=series.index), ticks
+
+def _exclusive_outlier_masks(mask_items):
+    """Return mutually-exclusive boolean masks in priority order."""
+    exclusive = {}
+    assigned = None
+    for name, mask in mask_items:
+        mask_series = pd.Series(mask).fillna(False).astype(bool)
+        if assigned is None:
+            exclusive[name] = mask_series
+            assigned = mask_series.copy()
+        else:
+            exclusive[name] = mask_series & ~assigned
+            assigned = assigned | mask_series
+    return exclusive
 
 def _compose_label_series(identifier_series, species_series):
     """Compose labels as 'Identifier 1 - Species' when species exists."""
@@ -1148,6 +1515,13 @@ def _render_selected_point_cycle_diagnostics(target, key_prefix):
     cycle_table = pd.DataFrame({
         'Cycle': pd.to_numeric(cycles['_cycle_order'], errors='coerce').astype('Int64')
     }, index=cycles.index)
+    for mass in [44, 45, 46]:
+        smp_col = mass_roles[mass]['SMP']
+        table_col = f"SMP Int m/z {mass} (V)"
+        if smp_col is not None and smp_col in cycles.columns:
+            cycle_table[table_col] = _normalize_signal_intensity(cycles[smp_col])
+        else:
+            cycle_table[table_col] = np.nan
     if d13_col and d13_col in cycles.columns:
         cycle_table['d13C'] = pd.to_numeric(cycles[d13_col], errors='coerce')
     if d18_col and d18_col in cycles.columns:
@@ -1163,9 +1537,50 @@ def _render_selected_point_cycle_diagnostics(target, key_prefix):
     cycle_table['Excluded d18O'] = sat_d18.to_numpy(dtype=bool)
     cycle_table['Excluded (Saturation)'] = cycle_table['Excluded d13C'] | cycle_table['Excluded d18O']
 
-    def _highlight_excluded(row):
-        color = "background-color: rgba(220, 53, 69, 0.18);"
-        return [color if bool(row.get('Excluded (Saturation)', False)) else "" for _ in row]
+    def _highlight_excluded_cells(row):
+        red = "background-color: rgba(220, 53, 69, 0.18);"
+        green = "background-color: rgba(40, 167, 69, 0.18);"
+        styles = [""] * len(row)
+
+        col_to_idx = {col: i for i, col in enumerate(row.index)}
+
+        excluded_d13 = bool(row.get('Excluded d13C', False))
+        excluded_d18 = bool(row.get('Excluded d18O', False))
+        excluded_sat = bool(row.get('Excluded (Saturation)', False))
+
+        for col_name, is_excluded in [
+            ('Excluded d13C', excluded_d13),
+            ('Excluded d18O', excluded_d18),
+            ('Excluded (Saturation)', excluded_sat),
+        ]:
+            idx = col_to_idx.get(col_name)
+            if idx is not None:
+                styles[idx] = red if is_excluded else green
+
+        d13_idx = col_to_idx.get('d13C')
+        if d13_idx is not None:
+            styles[d13_idx] = red if excluded_d13 else green
+
+        d18_idx = col_to_idx.get('d18O')
+        if d18_idx is not None:
+            styles[d18_idx] = red if excluded_d18 else green
+
+        smp_44_idx = col_to_idx.get('SMP Int m/z 44 (V)')
+        if smp_44_idx is not None:
+            v44 = pd.to_numeric(pd.Series([row.get('SMP Int m/z 44 (V)')]), errors='coerce').iloc[0]
+            styles[smp_44_idx] = red if pd.notna(v44) and float(v44) > 48.0 else green
+
+        smp_45_idx = col_to_idx.get('SMP Int m/z 45 (V)')
+        if smp_45_idx is not None:
+            v45 = pd.to_numeric(pd.Series([row.get('SMP Int m/z 45 (V)')]), errors='coerce').iloc[0]
+            styles[smp_45_idx] = red if pd.notna(v45) and float(v45) > 48.0 else green
+
+        smp_46_idx = col_to_idx.get('SMP Int m/z 46 (V)')
+        if smp_46_idx is not None:
+            v46 = pd.to_numeric(pd.Series([row.get('SMP Int m/z 46 (V)')]), errors='coerce').iloc[0]
+            styles[smp_46_idx] = red if pd.notna(v46) and float(v46) > 48.0 else green
+
+        return styles
 
     diag_col_chart, diag_col_table = st.columns([3, 2], gap="medium")
     with diag_col_chart:
@@ -1192,7 +1607,7 @@ def _render_selected_point_cycle_diagnostics(target, key_prefix):
             if pd.notna(status_val) and str(status_val).strip() != '':
                 st.markdown(f"**Collector Status:** `{status_val}`")
         st.dataframe(
-            cycle_table.reset_index(drop=True).style.apply(_highlight_excluded, axis=1),
+            cycle_table.reset_index(drop=True).style.apply(_highlight_excluded_cells, axis=1),
             hide_index=True,
             width='stretch'
         )
@@ -1209,6 +1624,15 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
     chart_nonce_key = f"{editor_key_prefix}_chart_nonce"
     nav_token_key = f"{editor_key_prefix}_nav_token"
     selected_tokens_key = f"{editor_key_prefix}_selected_tokens"
+    prev_selected_tokens_state = st.session_state.get(selected_tokens_key, [])
+    prev_nav_token_state = st.session_state.get(nav_token_key)
+
+    def _normalize_tokens(tokens):
+        if isinstance(tokens, str):
+            tokens = [tokens]
+        if isinstance(tokens, (list, tuple, set, pd.Index, np.ndarray)):
+            return tuple(str(t) for t in tokens if str(t).strip() != '')
+        return tuple()
 
     def _build_target(isotope_key, row_label, identifier_1=None, identifier_2=None):
         target_col = col_map.get(str(isotope_key).strip())
@@ -1383,7 +1807,7 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 sig_vals = pd.to_numeric(base['1  Cycle Int  Samp  44'], errors='coerce')
                 range_excluded = range_excluded | (
                     sig_vals.notna() &
-                    ((sig_vals < float(st.session_state.signal_range[0])) | (sig_vals > float(st.session_state.signal_range[1])))
+                    (sig_vals < float(st.session_state.signal_range[0]))
                 )
             if 'leak_rate' in base.columns:
                 leak_vals = pd.to_numeric(base['leak_rate'], errors='coerce')
@@ -1504,6 +1928,16 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             else:
                 st.session_state.pop(selected_tokens_key, None)
 
+    # Selection highlights are rendered before this function runs; force one
+    # extra rerun when click-selection state changes so rings appear immediately.
+    if points and selected_targets:
+        updated_tokens = _normalize_tokens(st.session_state.get(selected_tokens_key, []))
+        prev_tokens = _normalize_tokens(prev_selected_tokens_state)
+        updated_nav = '' if st.session_state.get(nav_token_key) is None else str(st.session_state.get(nav_token_key))
+        prev_nav = '' if prev_nav_token_state is None else str(prev_nav_token_state)
+        if updated_tokens != prev_tokens or updated_nav != prev_nav:
+            st.rerun()
+
     if not selected_targets:
         st.markdown("Select a primary data marker to edit its delta value or apply an offset.")
         return
@@ -1527,7 +1961,7 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
     selection_signature = '|'.join(sorted([f"{t['isotope_key']}:{t['row_key']}" for t in selected_targets]))
     selection_hash = hashlib.md5(selection_signature.encode('utf-8')).hexdigest()[:10]
 
-    header_col, spacer_col, prev_col, next_col, close_col = st.columns([8, 8, 2, 2, 1], gap="small")
+    header_col, spacer_col, prev_col, next_col, reset_col, close_col = st.columns([8, 7, 2, 2, 2, 1], gap="small")
     with header_col:
         st.markdown("#### Edit Selected Delta Value")
     with spacer_col:
@@ -1535,6 +1969,18 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
 
     prev_disabled = not single_mode or nav_index <= 0
     next_disabled = not single_mode or nav_index < 0 or nav_index >= (len(nav_targets) - 1)
+    original_map_for_reset = st.session_state.get("original_delta_values", {})
+    reset_targets = []
+    for t in selected_targets:
+        key = f"{t['isotope_key']}|{t['row_key']}"
+        if key not in original_map_for_reset:
+            continue
+        raw_val = pd.to_numeric(pd.Series([original_map_for_reset.get(key)]), errors='coerce').iloc[0]
+        if pd.notna(raw_val):
+            reset_targets.append(t)
+    reset_disabled = len(reset_targets) == 0
+    submitted_reset_original = False
+
     with prev_col:
         if st.button("Prev <", key=f"{editor_key_prefix}_prev", help="Previous datapoint", disabled=prev_disabled, use_container_width=True):
             prev_target = nav_targets[nav_index - 1]
@@ -1549,12 +1995,102 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             st.session_state[selected_tokens_key] = [st.session_state[nav_token_key]]
             st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
             st.rerun()
+    with reset_col:
+        submitted_reset_original = st.button(
+            "Reset",
+            key=f"{editor_key_prefix}_reset_original",
+            help="Reset selected datapoint(s) to their original imported value.",
+            disabled=reset_disabled,
+            use_container_width=True,
+        )
     with close_col:
         if st.button("X", key=f"{editor_key_prefix}_close", help="Exit edit mode", type="secondary"):
             st.session_state.pop(nav_token_key, None)
             st.session_state.pop(selected_tokens_key, None)
             st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
             st.rerun()
+
+    if submitted_reset_original:
+        original_map = st.session_state.setdefault("original_delta_values", {})
+        edited_rows = _get_edited_row_tokens()
+        autosave_changes = []
+
+        for target in reset_targets:
+            original_key = f"{target['isotope_key']}|{target['row_key']}"
+            original_value = pd.to_numeric(pd.Series([original_map.get(original_key)]), errors='coerce').iloc[0]
+            if pd.isna(original_value):
+                continue
+
+            prev_raw = pd.to_numeric(
+                pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
+                errors='coerce'
+            ).iloc[0]
+            prev_status = None
+            if 'Collector Status' in st.session_state.df.columns:
+                prev_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+            _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
+            prev_cal = np.nan
+            if cal_col in st.session_state.df.columns:
+                prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+
+            st.session_state.df.at[target['row_label'], target['target_col']] = float(original_value)
+            _refresh_collector_status_after_delta_edit(target['row_label'])
+            _refresh_calibrated_after_delta_edit(
+                target['row_label'],
+                target['isotope_key'],
+                previous_raw=prev_raw,
+                previous_calibrated=prev_cal
+            )
+
+            new_cal = np.nan
+            if cal_col in st.session_state.df.columns:
+                new_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+            new_status = None
+            if 'Collector Status' in st.session_state.df.columns:
+                new_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+
+            original_map.pop(original_key, None)
+            row_key = str(target['row_key'])
+            still_edited = any(
+                ('|' in str(k)) and str(k).split('|', 1)[1] == row_key
+                for k in original_map.keys()
+            )
+            if still_edited:
+                edited_rows.add(row_key)
+            else:
+                edited_rows.discard(row_key)
+
+            autosave_changes.append(
+                {
+                    "isotope": target['isotope_key'],
+                    "row_label": str(target['row_label']),
+                    "column": target['target_col'],
+                    "identifier_1": target.get('identifier_1'),
+                    "identifier_2": target.get('identifier_2'),
+                    "excel_file": target.get('source_excel'),
+                    "previous_value": _numeric_or_none(prev_raw),
+                    "restored_value": _numeric_or_none(original_value),
+                    "previous_calibrated": _numeric_or_none(prev_cal),
+                    "new_calibrated": _numeric_or_none(new_cal),
+                    "previous_status": None if pd.isna(prev_status) else str(prev_status),
+                    "new_status": None if pd.isna(new_status) else str(new_status),
+                }
+            )
+
+        st.session_state['edited_delta_rows'] = edited_rows
+        _autosave_session_update(
+            "reset_to_original" if len(autosave_changes) == 1 else "reset_to_original_multi",
+            changes=autosave_changes,
+            context={
+                "editor": editor_key_prefix,
+                "count": len(autosave_changes),
+            },
+        )
+        if len(autosave_changes) == 1:
+            st.success("Reset selected datapoint to original value.")
+        else:
+            st.success(f"Reset {len(autosave_changes)} datapoints to original values.")
+        st.rerun()
 
     submitted_offset = False
     submitted_interpolate = False
@@ -1873,12 +2409,22 @@ if 'original_delta_values' not in st.session_state:
     st.session_state.original_delta_values = {}
 if 'calibration_coefficients' not in st.session_state:
     st.session_state.calibration_coefficients = {}
+if 'linearity_fits' not in st.session_state:
+    st.session_state.linearity_fits = {}
+if 'selected_standards' not in st.session_state:
+    st.session_state.selected_standards = []
 if 'include_outliers' not in st.session_state:
     st.session_state.include_outliers = "No"
+if 'outliers_independence' not in st.session_state:
+    st.session_state.outliers_independence = False
 if 'selected_ids' not in st.session_state:
     st.session_state.selected_ids = ["All"]
 if 'interpolate_outliers_export' not in st.session_state:
     st.session_state.interpolate_outliers_export = False
+if 'confirm_discard_session' not in st.session_state:
+    st.session_state.confirm_discard_session = False
+if 'confirm_reset_all_edits' not in st.session_state:
+    st.session_state.confirm_reset_all_edits = False
 if AUTOSAVE_LOG_PATH_KEY not in st.session_state:
     st.session_state[AUTOSAVE_LOG_PATH_KEY] = None
 if AUTOSAVE_SNAPSHOT_PATH_KEY not in st.session_state:
@@ -1901,10 +2447,21 @@ if AUTOSAVE_RESUMED_KEY not in st.session_state:
     st.session_state[AUTOSAVE_RESUMED_KEY] = False
 if AUTOSAVE_SESSION_TOKEN_KEY not in st.session_state:
     st.session_state[AUTOSAVE_SESSION_TOKEN_KEY] = None
+if AUTOSAVE_DIR_INPUT_KEY not in st.session_state:
+    st.session_state[AUTOSAVE_DIR_INPUT_KEY] = st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY, "")
 
 # Initialize range variables in session state with safe defaults
 if 'signal_range' not in st.session_state:
     st.session_state.signal_range = (1.0, 50.0)  # Signal intensity in volts (default low cutoff 1V)
+else:
+    try:
+        signal_low = float(st.session_state.signal_range[0])
+        if not np.isfinite(signal_low):
+            raise ValueError("signal_range lower bound is not finite")
+        signal_low = max(0.0, min(50.0, signal_low))
+        st.session_state.signal_range = (signal_low, 50.0)
+    except Exception:
+        st.session_state.signal_range = (1.0, 50.0)
 if 'leak_range' not in st.session_state:
     st.session_state.leak_range = (0.0, 1000.0)  # Conservative default range
 if 'd13c_range' not in st.session_state:
@@ -2502,7 +3059,7 @@ def _normalize_column_key(name):
     if not isinstance(name, str):
         return ''
     text = name.strip()
-    # Normalize common unicode variants (CO₂, µ/μ)
+    # Normalize common unicode variants (COâ‚‚, Âµ/Î¼)
     text = text.replace('\u2082', '2')
     text = text.replace('\u00b5', 'u').replace('\u03bc', 'u')
     text = re.sub(r'\s+', ' ', text)
@@ -2618,7 +3175,7 @@ def _parse_new_table_layout(raw_df):
                 data_start_idx = i
                 break
 
-    unit_tokens = {'\u2030', 'â€°', '%', 'ppm', 'ppb', 'mv', 'v', 'c'}
+    unit_tokens = {'\u2030', 'Ã¢â‚¬Â°', '%', 'ppm', 'ppb', 'mv', 'v', 'c'}
     cols = []
     for col_idx in range(raw_df.shape[1]):
         parts = []
@@ -2674,12 +3231,12 @@ def _standardize_isotope_columns(df):
         if not isinstance(col, str):
             continue
         low = col.strip().lower()
-        if 'd13' in low or 'δ13' in low:
+        if 'd13' in low or 'Î´13' in low:
             if 'mean' in low:
                 rename_map[col] = 'd 13C/12C  Mean'
             elif 'sd' in low or 'std' in low:
                 rename_map[col] = 'd 13C/12C  Std Dev'
-        if 'd18' in low or 'δ18' in low:
+        if 'd18' in low or 'Î´18' in low:
             if 'mean' in low:
                 rename_map[col] = 'd 18O/16O  Mean'
             elif 'sd' in low or 'std' in low:
@@ -2848,10 +3405,10 @@ try:
             'dVSMOW(18O)': ISOTYPE_D18O,
             '?VPDB(13C)': ISOTYPE_D13C,
             '?VSMOW(18O)': ISOTYPE_D18O,
-            'δVPDB(13C)': ISOTYPE_D13C,
-            'δVSMOW(18O)': ISOTYPE_D18O,
             'Î´VPDB(13C)': ISOTYPE_D13C,
             'Î´VSMOW(18O)': ISOTYPE_D18O,
+            'ÃŽÂ´VPDB(13C)': ISOTYPE_D13C,
+            'ÃŽÂ´VSMOW(18O)': ISOTYPE_D18O,
             '??VPDB(13C)': ISOTYPE_D13C,
             '??VSMOW(18O)': ISOTYPE_D18O,
         })
@@ -2882,8 +3439,13 @@ def double_point_calibration(raw_sample, raw_rm1, true_rm1, raw_rm2, true_rm2):
     calibrated_value = m * raw_sample + b
     return calibrated_value
 
-def _filter_standards_remove_outliers(df, standards, method, sigma, iqr_mult):
+def _filter_standards_remove_outliers(df, standards, method, sigma, iqr_mult, independent_isotope_outliers=None):
     '''Return selected standards with outliers removed.'''
+    if independent_isotope_outliers is None:
+        try:
+            independent_isotope_outliers = bool(st.session_state.get("outliers_independence", False))
+        except Exception:
+            independent_isotope_outliers = False
     if not standards:
         return pd.DataFrame(columns=df.columns)
     parts = []
@@ -2898,8 +3460,16 @@ def _filter_standards_remove_outliers(df, standards, method, sigma, iqr_mult):
             else:
                 out13 = identify_outliers_iqr(std_df, 'd 13C/12C  Mean', iqr_mult)
                 out18 = identify_outliers_iqr(std_df, 'd 18O/16O  Mean', iqr_mult)
-            keep = ~(out13 | out18)
-            parts.append(std_df.loc[keep])
+            out13 = out13.reindex(std_df.index, fill_value=False)
+            out18 = out18.reindex(std_df.index, fill_value=False)
+            if independent_isotope_outliers:
+                std_df.loc[out13, 'd 13C/12C  Mean'] = np.nan
+                std_df.loc[out18, 'd 18O/16O  Mean'] = np.nan
+                keep = ~(out13 & out18)
+                parts.append(std_df.loc[keep])
+            else:
+                keep = ~(out13 | out18)
+                parts.append(std_df.loc[keep])
         except Exception:
             parts.append(std_df)
     if not parts:
@@ -3713,12 +4283,12 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 'Identifier': df['Identifier 1'],
                 'Sample #': df.get('Identifier 2', pd.Series(index=df.index, dtype=object)),
                 'Species': species_series,
-                'd13C (‰, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
-                'd13C (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
-                'd18O (‰, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
-                'd18O (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
-                'Corrected d13C (‰, VPDB)': corrected_d13,
-                'Corrected d18O (‰, VPDB)': corrected_d18,
+                'd13C (â€°, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
+                'd13C (â€°, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
+                'd18O (â€°, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
+                'd18O (â€°, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
+                'Corrected d13C (â€°, VPDB)': corrected_d13,
+                'Corrected d18O (â€°, VPDB)': corrected_d18,
             })
 
             # Keep only non-standards entries if selected_standards is provided
@@ -3727,9 +4297,9 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
 
             # Round numeric columns to 2 decimals specifically for Client Output
             round_cols = [
-                'd13C (‰, VPDB)  Mean', 'd13C (‰, VPDB)  Std Dev',
-                'd18O (‰, VPDB)  Mean', 'd18O (‰, VPDB)  Std Dev',
-                'Corrected d13C (‰, VPDB)', 'Corrected d18O (‰, VPDB)'
+                'd13C (â€°, VPDB)  Mean', 'd13C (â€°, VPDB)  Std Dev',
+                'd18O (â€°, VPDB)  Mean', 'd18O (â€°, VPDB)  Std Dev',
+                'Corrected d13C (â€°, VPDB)', 'Corrected d18O (â€°, VPDB)'
             ]
             for rc in round_cols:
                 if rc in client_df.columns:
@@ -3763,9 +4333,9 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
 
             # Apply numeric format to measure columns
             meas_cols = [
-                'd13C (‰, VPDB)  Mean', 'd13C (‰, VPDB)  Std Dev',
-                'd18O (‰, VPDB)  Mean', 'd18O (‰, VPDB)  Std Dev',
-                'Corrected d13C (‰, VPDB)', 'Corrected d18O (‰, VPDB)'
+                'd13C (â€°, VPDB)  Mean', 'd13C (â€°, VPDB)  Std Dev',
+                'd18O (â€°, VPDB)  Mean', 'd18O (â€°, VPDB)  Std Dev',
+                'Corrected d13C (â€°, VPDB)', 'Corrected d18O (â€°, VPDB)'
             ]
             for col_name in meas_cols:
                 if col_name in headers:
@@ -3776,10 +4346,12 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             d13c_sd_val = np.nan
             d18o_sd_val = np.nan
             n_used = 0
+            n_used_text = "0 n"
             try:
                 _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
                 _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
                 _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
+                _independent = bool(st.session_state.get("outliers_independence", False))
 
                 shp = df[df['Identifier 1'] == 'SHP2L'].copy() if 'Identifier 1' in df.columns else pd.DataFrame()
                 if not shp.empty:
@@ -3790,18 +4362,34 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                     else:
                         m13 = identify_outliers_iqr(shp, 'd 13C/12C  Mean', _iqr)
                         m18 = identify_outliers_iqr(shp, 'd 18O/16O  Mean', _iqr)
-                    clean_shp = shp.loc[~(m13 | m18)].copy()
-                    n_used = len(clean_shp)
+                    m13 = m13.reindex(shp.index, fill_value=False)
+                    m18 = m18.reindex(shp.index, fill_value=False)
+                    combined_mask = ~(m13 | m18)
+                    clean_shp = shp.loc[combined_mask].copy()
+                    if _independent:
+                        clean_shp_d13 = shp.loc[~m13].copy()
+                        clean_shp_d18 = shp.loc[~m18].copy()
+                    else:
+                        clean_shp_d13 = clean_shp.copy()
+                        clean_shp_d18 = clean_shp.copy()
+                    n_used_d13 = len(clean_shp_d13)
+                    n_used_d18 = len(clean_shp_d18)
+                    n_used = min(n_used_d13, n_used_d18)
+                    n_used_text = (
+                        f"d13C n={n_used_d13}, d18O n={n_used_d18}"
+                        if _independent else f"{n_used} n"
+                    )
 
                     # Ensure we have fits; compute from selected standards or SHP2L itself
                     if not fits:
                         try:
                             if selected_standards:
                                 clean_all = _filter_standards_remove_outliers(df, selected_standards, _method, _sigma, _iqr)
+                                f13 = _compute_linearity_fit(clean_all, 'd 13C/12C  Mean', intensity_col)
+                                f18 = _compute_linearity_fit(clean_all, 'd 18O/16O  Mean', intensity_col)
                             else:
-                                clean_all = clean_shp
-                            f13 = _compute_linearity_fit(clean_all, 'd 13C/12C  Mean', intensity_col)
-                            f18 = _compute_linearity_fit(clean_all, 'd 18O/16O  Mean', intensity_col)
+                                f13 = _compute_linearity_fit(clean_shp_d13, 'd 13C/12C  Mean', intensity_col)
+                                f18 = _compute_linearity_fit(clean_shp_d18, 'd 18O/16O  Mean', intensity_col)
                             fits = {
                                 'd13C': {'slope': f13.get('slope', np.nan), 'x_ref': f13.get('x_ref', np.nan)},
                                 'd18O': {'slope': f18.get('slope', np.nan), 'x_ref': f18.get('x_ref', np.nan)},
@@ -3810,13 +4398,13 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                             fits = None
 
                     # Compute linearity-corrected precision
-                    y13s = pd.to_numeric(clean_shp.get('d 13C/12C  Mean'), errors='coerce')
-                    y18s = pd.to_numeric(clean_shp.get('d 18O/16O  Mean'), errors='coerce')
-                    if fits and np.isfinite(fits.get('d13C', {}).get('slope', np.nan)) and intensity_col in clean_shp.columns:
-                        i = pd.to_numeric(clean_shp[intensity_col], errors='coerce')
+                    y13s = pd.to_numeric(clean_shp_d13.get('d 13C/12C  Mean'), errors='coerce')
+                    y18s = pd.to_numeric(clean_shp_d18.get('d 18O/16O  Mean'), errors='coerce')
+                    if fits and np.isfinite(fits.get('d13C', {}).get('slope', np.nan)) and intensity_col in clean_shp_d13.columns:
+                        i = pd.to_numeric(clean_shp_d13[intensity_col], errors='coerce')
                         y13s = (y13s - fits['d13C']['slope'] * (i - fits['d13C']['x_ref'])).where(np.isfinite(y13s) & np.isfinite(i))
-                    if fits and np.isfinite(fits.get('d18O', {}).get('slope', np.nan)) and intensity_col in clean_shp.columns:
-                        i = pd.to_numeric(clean_shp[intensity_col], errors='coerce')
+                    if fits and np.isfinite(fits.get('d18O', {}).get('slope', np.nan)) and intensity_col in clean_shp_d18.columns:
+                        i = pd.to_numeric(clean_shp_d18[intensity_col], errors='coerce')
                         y18s = (y18s - fits['d18O']['slope'] * (i - fits['d18O']['x_ref'])).where(np.isfinite(y18s) & np.isfinite(i))
                     d13c_sd_val = float(y13s.std()) if y13s is not None else np.nan
                     d18o_sd_val = float(y18s.std()) if y18s is not None else np.nan
@@ -3829,14 +4417,14 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             worksheet.write(1, 11, "ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer")
             worksheet.write(2, 11, "Kiel IV automated carbonate preparation device")
             worksheet.write(4, 10, "Standard deviation of SHP2L over measurement period:", equip_title_fmt)
-            worksheet.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} ‰ for d13C")
-            worksheet.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} ‰ for d18O")
-            worksheet.write(7, 11, f"{n_used} n")
+            worksheet.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} â€° for d13C")
+            worksheet.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} â€° for d18O")
+            worksheet.write(7, 11, n_used_text)
 
             # Insert textbox with provided content
             materials_text = (
-                "When results produced at P2L are being published, we suggest to use the following text in the “Material and Methods” section of the publication:\n\n"
-                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of Sāo Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientific™ MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientific™ Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70°C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) ‰ for d13C and (please use the value informed by P2L) ‰ for d18O (±1 s, n = please use the value informed by P2L).\"\n\n"
+                "When results produced at P2L are being published, we suggest to use the following text in the â€œMaterial and Methodsâ€ section of the publication:\n\n"
+                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of SÄo Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientificâ„¢ MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientificâ„¢ Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70Â°C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) â€° for d13C and (please use the value informed by P2L) â€° for d18O (Â±1 s, n = please use the value informed by P2L).\"\n\n"
                 "Reference\nCrivellari, S., Viana, P.J., Campos, M.D., Kuhnert, H., Lopes, A.B.M., da Cruz, F.W., Chiessi, C.M., 2021. Development and characterization of a new in-house reference material for stable carbon and oxygen isotopes analyses. Journal of Analytical Atomic Spectrometry 36, 1125-1134. DOI: 10.1039/D1JA00030F."
             )
             # Skip adding textbox since the sheet is not created in this workbook
@@ -3985,7 +4573,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 except Exception:
                     pass
 
-                _method_label = f"Z-Score (Ïƒ={_sigma})" if _method == "Z-Score" else f"IQR (Ã—{_iqr})"
+                _method_label = f"Z-Score (ÃÆ’={_sigma})" if _method == "Z-Score" else f"IQR (Ãƒâ€”{_iqr})"
 
                 standards_rows.append({
                     'Standard': _std,
@@ -4184,12 +4772,12 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             'Identifier': df['Identifier 1'],
             'Sample #': df.get('Identifier 2', pd.Series(index=df.index, dtype=object)),
             'Species': species_series,
-            'd13C (‰, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
-            'd13C (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
-            'd18O (‰, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
-            'd18O (‰, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
-            'Corrected d13C (‰, VPDB)': corrected_d13,
-            'Corrected d18O (‰, VPDB)': corrected_d18,
+            'd13C (â€°, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
+            'd13C (â€°, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
+            'd18O (â€°, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
+            'd18O (â€°, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
+            'Corrected d13C (â€°, VPDB)': corrected_d13,
+            'Corrected d18O (â€°, VPDB)': corrected_d18,
         })
         # Apply species replacements if provided
         if comment_map:
@@ -4200,16 +4788,17 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
         if selected_standards:
             client_df = client_df[~df['Identifier 1'].isin(selected_standards)]
 
-        for rc in ['d13C (‰, VPDB)  Mean','d13C (‰, VPDB)  Std Dev','d18O (‰, VPDB)  Mean','d18O (‰, VPDB)  Std Dev','Corrected d13C (‰, VPDB)','Corrected d18O (‰, VPDB)']:
+        for rc in ['d13C (â€°, VPDB)  Mean','d13C (â€°, VPDB)  Std Dev','d18O (â€°, VPDB)  Mean','d18O (â€°, VPDB)  Std Dev','Corrected d13C (â€°, VPDB)','Corrected d18O (â€°, VPDB)']:
             if rc in client_df.columns:
                 client_df[rc] = pd.to_numeric(client_df[rc], errors='coerce').round(2)
 
         # SHP2L precision
-        d13c_sd_val = np.nan; d18o_sd_val = np.nan; n_used = 0
+        d13c_sd_val = np.nan; d18o_sd_val = np.nan; n_used = 0; n_used_text = "0 n"
         try:
             _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
             _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
             _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
+            _independent = bool(st.session_state.get("outliers_independence", False))
             base_df = st.session_state.df if 'df' in st.session_state else df
             shp = base_df[base_df['Identifier 1'] == 'SHP2L'].copy() if 'Identifier 1' in base_df.columns else pd.DataFrame()
             if not shp.empty:
@@ -4219,15 +4808,30 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 else:
                     m13 = identify_outliers_iqr(shp, 'd 13C/12C  Mean', _iqr)
                     m18 = identify_outliers_iqr(shp, 'd 18O/16O  Mean', _iqr)
-                clean_shp = shp.loc[~(m13 | m18)].copy()
-                n_used = len(clean_shp)
-                y13s = pd.to_numeric(clean_shp.get('d 13C/12C  Mean'), errors='coerce')
-                y18s = pd.to_numeric(clean_shp.get('d 18O/16O  Mean'), errors='coerce')
-                if fits and np.isfinite(fits.get('d13C', {}).get('slope', np.nan)) and intensity_col in clean_shp.columns:
-                    i = pd.to_numeric(clean_shp[intensity_col], errors='coerce')
+                m13 = m13.reindex(shp.index, fill_value=False)
+                m18 = m18.reindex(shp.index, fill_value=False)
+                combined_mask = ~(m13 | m18)
+                clean_shp = shp.loc[combined_mask].copy()
+                if _independent:
+                    clean_shp_d13 = shp.loc[~m13].copy()
+                    clean_shp_d18 = shp.loc[~m18].copy()
+                else:
+                    clean_shp_d13 = clean_shp.copy()
+                    clean_shp_d18 = clean_shp.copy()
+                n_used_d13 = len(clean_shp_d13)
+                n_used_d18 = len(clean_shp_d18)
+                n_used = min(n_used_d13, n_used_d18)
+                n_used_text = (
+                    f"d13C n={n_used_d13}, d18O n={n_used_d18}"
+                    if _independent else f"{n_used} n"
+                )
+                y13s = pd.to_numeric(clean_shp_d13.get('d 13C/12C  Mean'), errors='coerce')
+                y18s = pd.to_numeric(clean_shp_d18.get('d 18O/16O  Mean'), errors='coerce')
+                if fits and np.isfinite(fits.get('d13C', {}).get('slope', np.nan)) and intensity_col in clean_shp_d13.columns:
+                    i = pd.to_numeric(clean_shp_d13[intensity_col], errors='coerce')
                     y13s = (y13s - fits['d13C']['slope'] * (i - fits['d13C']['x_ref'])).where(np.isfinite(y13s) & np.isfinite(i))
-                if fits and np.isfinite(fits.get('d18O', {}).get('slope', np.nan)) and intensity_col in clean_shp.columns:
-                    i = pd.to_numeric(clean_shp[intensity_col], errors='coerce')
+                if fits and np.isfinite(fits.get('d18O', {}).get('slope', np.nan)) and intensity_col in clean_shp_d18.columns:
+                    i = pd.to_numeric(clean_shp_d18[intensity_col], errors='coerce')
                     y18s = (y18s - fits['d18O']['slope'] * (i - fits['d18O']['x_ref'])).where(np.isfinite(y18s) & np.isfinite(i))
                 d13c_sd_val = float(y13s.std()) if y13s is not None else np.nan
                 d18o_sd_val = float(y18s.std()) if y18s is not None else np.nan
@@ -4244,18 +4848,18 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             for col_idx, col_name in enumerate(headers):
                 ws.write(0, col_idx, col_name, corrected_hdr_fmt if 'Corrected' in col_name else header_fmt)
                 width = 18 if col_name in ('Identifier','Species') else (22 if 'Corrected' in col_name else 15)
-                ws.set_column(col_idx, col_idx, width, num_fmt if col_name in ['d13C (‰, VPDB)  Mean','d13C (‰, VPDB)  Std Dev','d18O (‰, VPDB)  Mean','d18O (‰, VPDB)  Std Dev','Corrected d13C (‰, VPDB)','Corrected d18O (‰, VPDB)'] else None)
+                ws.set_column(col_idx, col_idx, width, num_fmt if col_name in ['d13C (â€°, VPDB)  Mean','d13C (â€°, VPDB)  Std Dev','d18O (â€°, VPDB)  Mean','d18O (â€°, VPDB)  Std Dev','Corrected d13C (â€°, VPDB)','Corrected d18O (â€°, VPDB)'] else None)
             equip_title_fmt = wb.add_format({'bold': True})
             ws.write(1, 10, 'Equiment:', equip_title_fmt)
             ws.write(1, 11, 'ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer')
             ws.write(2, 11, 'Kiel IV automated carbonate preparation device')
             ws.write(4, 10, 'Standard deviation of SHP2L over measurement period:', equip_title_fmt)
-            ws.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} ‰ for d13C")
-            ws.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} ‰ for d18O")
-            ws.write(7, 11, f"{n_used} n")
+            ws.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} â€° for d13C")
+            ws.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} â€° for d18O")
+            ws.write(7, 11, n_used_text)
             materials_text = (
-                "When results produced at P2L are being published, we suggest to use the following text in the “Material and Methods” section of the publication:\n\n"
-                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of Sāo Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientific™ MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientific™ Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70°C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) ‰ for d13C and (please use the value informed by P2L) ‰ for d18O (±1 s, n = please use the value informed by P2L).\"\n\n"
+                "When results produced at P2L are being published, we suggest to use the following text in the â€œMaterial and Methodsâ€ section of the publication:\n\n"
+                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of SÄo Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientificâ„¢ MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientificâ„¢ Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70Â°C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) â€° for d13C and (please use the value informed by P2L) â€° for d18O (Â±1 s, n = please use the value informed by P2L).\"\n\n"
                 "Reference\nCrivellari, S., Viana, P.J., Campos, M.D., Kuhnert, H., Lopes, A.B.M., da Cruz, F.W., Chiessi, C.M., 2021. Development and characterization of a new in-house reference material for stable carbon and oxygen isotopes analyses. Journal of Analytical Atomic Spectrometry 36, 1125-1134. DOI: 10.1039/D1JA00030F."
             )
             ws.insert_textbox('L10', materials_text, {'width': 820, 'height': 580, 'line': {'color': '#4F81BD'}})
@@ -4294,6 +4898,10 @@ def main():
         st.session_state.file_processed = False
     if 'confirm_reset' not in st.session_state:
         st.session_state.confirm_reset = False
+    if 'confirm_discard_session' not in st.session_state:
+        st.session_state.confirm_discard_session = False
+    if 'confirm_reset_all_edits' not in st.session_state:
+        st.session_state.confirm_reset_all_edits = False
     if AUTOSAVE_LOG_PATH_KEY not in st.session_state:
         st.session_state[AUTOSAVE_LOG_PATH_KEY] = None
     if AUTOSAVE_SNAPSHOT_PATH_KEY not in st.session_state:
@@ -4316,6 +4924,8 @@ def main():
         st.session_state[AUTOSAVE_RESUMED_KEY] = False
     if AUTOSAVE_SESSION_TOKEN_KEY not in st.session_state:
         st.session_state[AUTOSAVE_SESSION_TOKEN_KEY] = None
+    if AUTOSAVE_DIR_INPUT_KEY not in st.session_state:
+        st.session_state[AUTOSAVE_DIR_INPUT_KEY] = st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY, "")
 
     tab_import, tab1, tab2, tab3 = st.tabs([
         'Data import',
@@ -4327,15 +4937,27 @@ def main():
     has_data = False
 
     with tab_import:
-        autosave_dir_override = st.text_input(
-            "Session autosave folder (optional)",
-            value=st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY, ""),
-            help=(
-                "Leave blank to auto-detect from uploaded filenames (fallback: current app folder). "
-                "Set this path to force autosave into a specific Excel folder."
-            ),
-        )
-        st.session_state[AUTOSAVE_DIR_OVERRIDE_KEY] = str(autosave_dir_override).strip()
+        folder_col, browse_col = st.columns([8, 1], gap="small")
+        with folder_col:
+            autosave_dir_override = st.text_input(
+                "Session autosave folder (optional)",
+                key=AUTOSAVE_DIR_INPUT_KEY,
+                help=(
+                    "Leave blank to auto-detect from uploaded workbooks. "
+                    "Use Browse to choose a folder in Explorer."
+                ),
+            )
+        with browse_col:
+            st.write("")
+            if st.button("Browse", key="browse_autosave_folder_btn", use_container_width=True):
+                selected_path, pick_err = _pick_folder_via_explorer(autosave_dir_override)
+                if selected_path:
+                    st.session_state[AUTOSAVE_DIR_INPUT_KEY] = selected_path
+                    st.session_state[AUTOSAVE_DIR_OVERRIDE_KEY] = selected_path
+                    st.rerun()
+                elif pick_err:
+                    st.warning(f"Unable to open folder picker: {pick_err}")
+        st.session_state[AUTOSAVE_DIR_OVERRIDE_KEY] = str(st.session_state.get(AUTOSAVE_DIR_INPUT_KEY, "")).strip()
 
         # File uploader
         uploaded_files = st.file_uploader(
@@ -4344,26 +4966,34 @@ def main():
             accept_multiple_files=True
         )
 
-        # Reset file processing with confirmation
-        if st.button("Load a New File", key="load_new_file_btn"):
-            st.session_state.confirm_reset = True  # Trigger confirmation prompt
+        # Session/file reset controls
+        reset_col1, reset_col2 = st.columns(2)
+        if reset_col1.button("Load a New File", key="load_new_file_btn"):
+            st.session_state.confirm_reset = True
+            st.session_state.confirm_discard_session = False
+        if reset_col2.button("Reset Entire Session (Discard Changes)", key="discard_session_btn", type="secondary"):
+            st.session_state.confirm_discard_session = True
+            st.session_state.confirm_reset = False
 
         # Confirmation prompt
         if st.session_state.confirm_reset:
             st.warning("Are you sure you want to load a new file? This will overwrite the current data.")
             col1, col2 = st.columns(2)
             if col1.button("Yes, load new file", key="confirm_load_btn"):
-                # Reset session state to allow a new file upload
-                st.session_state.file_processed = False
-                st.session_state.df = None
-                st.session_state.df_cycles_source = None
-                st.session_state.edited_delta_rows = set()
-                st.session_state.original_delta_values = {}
-                st.session_state.calibration_coefficients = {}
-                _reset_autosave_state()
-                st.session_state.confirm_reset = False  # Reset confirmation state
+                _reset_processing_session_state(discard_autosave_files=False)
+                st.session_state.confirm_reset = False
+                st.rerun()
             elif col2.button("Cancel", key="cancel_load_btn"):
-                st.session_state.confirm_reset = False  # Cancel reset and close prompt
+                st.session_state.confirm_reset = False
+
+        if st.session_state.confirm_discard_session:
+            st.error("Discard the entire current session and all saved edits for this dataset?")
+            col1, col2 = st.columns(2)
+            if col1.button("Yes, discard session", key="confirm_discard_session_btn"):
+                _reset_processing_session_state(discard_autosave_files=True)
+                st.rerun()
+            elif col2.button("Cancel", key="cancel_discard_session_btn"):
+                st.session_state.confirm_discard_session = False
 
         # Only load files if they haven't been processed yet
         if uploaded_files and not st.session_state.file_processed:
@@ -4445,9 +5075,9 @@ def main():
                         intensity_candidates = [
                             'Pressure Adjust Result Intensity',
                             'Pressure Adjust Initial Intensity',
-                            'Initial Intensity from µ-Volume',
-                            'Initial Intensity from μ-Volume',
-                            'Initial Intensity from Âµ-Volume'
+                            'Initial Intensity from Âµ-Volume',
+                            'Initial Intensity from Î¼-Volume',
+                            'Initial Intensity from Ã‚Âµ-Volume'
                         ]
                         for cand in intensity_candidates:
                             col = _find_column(df, cand)
@@ -4535,9 +5165,21 @@ def main():
                 st.session_state.df = active_df
                 st.session_state.df_cycles_source = df_cycles_source
                 restored_rows = autosave_state.get("edited_rows", set()) if autosave_state.get("resumed") else set()
+                restored_originals = (
+                    autosave_state.get("original_delta_values", {})
+                    if autosave_state.get("resumed")
+                    else {}
+                )
                 st.session_state.edited_delta_rows = set(restored_rows)
-                st.session_state.original_delta_values = {}
-                st.session_state.calibration_coefficients = {}
+                st.session_state.original_delta_values = (
+                    dict(restored_originals) if isinstance(restored_originals, dict) else {}
+                )
+                calibration_state = autosave_state.get("calibration_state", {})
+                if autosave_state.get("resumed") and isinstance(calibration_state, dict):
+                    _restore_calibration_session_state(calibration_state)
+                else:
+                    st.session_state.calibration_coefficients = {}
+                    st.session_state.linearity_fits = {}
                 st.session_state.file_processed = True
 
                 autosave_initialized = bool(autosave_state.get("ok"))
@@ -4559,32 +5201,6 @@ def main():
         if st.session_state.df is None:
             st.warning("Please upload a file to begin analysis.")
         else:
-            autosave_log = st.session_state.get(AUTOSAVE_LOG_PATH_KEY)
-            autosave_snapshot = st.session_state.get(AUTOSAVE_SNAPSHOT_PATH_KEY)
-            autosave_error = st.session_state.get(AUTOSAVE_ERROR_KEY)
-            autosave_events = int(st.session_state.get(AUTOSAVE_EVENT_COUNT_KEY, 0))
-            autosave_resumed = bool(st.session_state.get(AUTOSAVE_RESUMED_KEY, False))
-            if autosave_log:
-                st.caption(f"Session edit log: {autosave_log}")
-            if autosave_snapshot:
-                st.caption(f"Session autosave snapshot: {autosave_snapshot}")
-            st.caption(f"Autosave events written: {autosave_events}")
-            if autosave_resumed:
-                st.caption("Autosave status: resumed existing session snapshot.")
-            if autosave_error:
-                st.warning(f"Session autosave warning: {autosave_error}")
-            if not st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY):
-                st.info(
-                    "Autosave folder is auto-detected from matching workbook files on this computer. "
-                    "If detection picked the wrong folder, set 'Session autosave folder (optional)' above."
-                )
-            if st.button("Save Session Now", key="save_session_now_btn"):
-                wrote = _autosave_session_update("manual_save", changes=[], context={"trigger": "manual_button"})
-                if wrote:
-                    st.success("Session saved to autosave files.")
-                else:
-                    st.warning("Session save did not run. Check autosave warning above.")
-
             # Display data preview if available
             with st.expander("Data Table", expanded=True):
                 # Display the DataFrame using Streamlit's native table component
@@ -4621,6 +5237,54 @@ def main():
             metrics_col1, metrics_col2 = st.columns(2)
             metrics_col1.metric("Total Unique Samples", total_unique)
             metrics_col2.metric("Total Measurements", total_measurements)
+
+            st.divider()
+            autosave_log = st.session_state.get(AUTOSAVE_LOG_PATH_KEY)
+            autosave_snapshot = st.session_state.get(AUTOSAVE_SNAPSHOT_PATH_KEY)
+            autosave_error = st.session_state.get(AUTOSAVE_ERROR_KEY)
+            autosave_events = int(st.session_state.get(AUTOSAVE_EVENT_COUNT_KEY, 0))
+            autosave_resumed = bool(st.session_state.get(AUTOSAVE_RESUMED_KEY, False))
+            if autosave_log:
+                st.markdown(f"Session edit log: {autosave_log}")
+            if autosave_snapshot:
+                st.markdown(f"Session autosave snapshot: {autosave_snapshot}")
+            st.markdown(f"Autosave events written: {autosave_events}")
+            if autosave_resumed:
+                st.markdown("Autosave status: resumed existing session snapshot.")
+            if not st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY):
+                st.markdown(
+                    "Autosave folder is auto-detected from matching workbook files on this computer. "
+                    "If detection picked the wrong folder, set 'Session autosave folder (optional)' above."
+                )
+            if autosave_error:
+                st.warning(f"Session autosave warning: {autosave_error}")
+
+            if st.button("Save Session Now", key="save_session_now_btn"):
+                wrote = _autosave_session_update("manual_save", changes=[], context={"trigger": "manual_button"})
+                if wrote:
+                    st.success("Session saved to autosave files.")
+                else:
+                    st.warning("Session save did not run. Check autosave warning above.")
+
+            st.markdown("#### Session Edit Log Entries")
+            if autosave_log and Path(str(autosave_log)).exists():
+                entries = _read_autosave_log_entries(autosave_log, max_entries=2000)
+                if entries:
+                    rows = []
+                    for entry in entries:
+                        rows.append({
+                            "timestamp": entry.get("timestamp"),
+                            "action": entry.get("action"),
+                            "changes": len(entry.get("changes", []) if isinstance(entry.get("changes"), list) else []),
+                            "row_count": entry.get("row_count"),
+                        })
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch', height=260)
+                    with st.expander("Raw JSON log entries", expanded=False):
+                        st.json(entries)
+                else:
+                    st.caption("No session edit entries found yet.")
+            else:
+                st.caption("Session edit log file not available yet.")
 
         has_data = st.session_state.df is not None
 
@@ -4749,10 +5413,10 @@ def main():
                         'dVSMOW(18O)': ISOTYPE_D18O,
                         '?VPDB(13C)': ISOTYPE_D13C,
                         '?VSMOW(18O)': ISOTYPE_D18O,
-                        'δVPDB(13C)': ISOTYPE_D13C,
-                        'δVSMOW(18O)': ISOTYPE_D18O,
                         'Î´VPDB(13C)': ISOTYPE_D13C,
                         'Î´VSMOW(18O)': ISOTYPE_D18O,
+                        'ÃŽÂ´VPDB(13C)': ISOTYPE_D13C,
+                        'ÃŽÂ´VSMOW(18O)': ISOTYPE_D18O,
                         '??VPDB(13C)': ISOTYPE_D13C,
                         '??VSMOW(18O)': ISOTYPE_D18O,
                     })
@@ -4769,34 +5433,73 @@ def main():
             with col1:
                 st.markdown("#### Standard Selection")
                 # Dropdown for user to select standards (multiple selection)
+                stored_standards = st.session_state.get("selected_standards", [])
+                if not isinstance(stored_standards, (list, tuple, set)):
+                    stored_standards = []
+                stored_standards = [s for s in stored_standards if s in standards_list]
                 selected_standards = st.multiselect(
                     "Select Standards to Filter Data:",
                     standards_list,
+                    default=stored_standards,
                     help="Select 1 standard for single-point calibration or 2 standards for double-point calibration"
                 )
                 st.session_state.selected_standards = selected_standards
 
             with col2:
                 st.markdown("#### Outlier Detection")
-                sigma_level = st.number_input("Set Sigma Level for standardÂ´s Outlier Exclusion",
+                sigma_default = st.session_state.get("sigma_level", 1.0)
+                try:
+                    sigma_default = float(sigma_default)
+                except Exception:
+                    sigma_default = 1.0
+                sigma_default = min(5.0, max(0.1, sigma_default))
+                sigma_level = st.number_input("Set Sigma Level for standardÃ‚Â´s Outlier Exclusion",
                                             min_value=0.1,
                                             max_value=5.0,
-                                            value=1.0,
+                                            value=float(sigma_default),
                                             step=0.1)
 
-                irq_multiplier = st.number_input("Set IQR Multiplier for standardÂ´s Outlier Exclusion",
+                irq_default = st.session_state.get("irq_multiplier", 1.5)
+                try:
+                    irq_default = float(irq_default)
+                except Exception:
+                    irq_default = 1.5
+                irq_default = min(10.0, max(1.0, irq_default))
+                irq_multiplier = st.number_input("Set IQR Multiplier for standardÃ‚Â´s Outlier Exclusion",
                                                 min_value=1.0,
                                                 max_value=10.0,
-                                                value=1.5,
+                                                value=float(irq_default),
                                                 step=0.1)
 
                 # User selects the calibration method
-                calibration_type = st.selectbox("Choose Outlier Detection Method", options=["Z-Score", "IQR"])
+                calibration_options = ["Z-Score", "IQR"]
+                stored_cal_type = st.session_state.get("calibration_type", "IQR")
+                if stored_cal_type not in calibration_options:
+                    stored_cal_type = "IQR"
+                calibration_type = st.selectbox(
+                    "Choose Outlier Detection Method",
+                    options=calibration_options,
+                    index=calibration_options.index(stored_cal_type)
+                )
+                outliers_independence = st.checkbox(
+                    "Outliers independece",
+                    value=bool(st.session_state.get("outliers_independence", False)),
+                    help=(
+                        "When enabled, d13C and d18O outliers are treated independently. "
+                        "A d13C outlier does not automatically exclude the same row for d18O, and vice versa."
+                    ),
+                )
 
                 # Persist current calibration/outlier settings for reuse (e.g., Excel export)
                 st.session_state.calibration_type = calibration_type
                 st.session_state.sigma_level = sigma_level
                 st.session_state.irq_multiplier = irq_multiplier
+                st.session_state.outliers_independence = outliers_independence
+                if st.session_state.get(AUTOSAVE_META_PATH_KEY):
+                    try:
+                        _write_autosave_metadata()
+                    except Exception:
+                        pass
 
             with col3:
                 st.markdown("#### Visualization")
@@ -5236,38 +5939,74 @@ def main():
                     else:
                         st.write("No outliers identified at this sigma level.")
 
+                    d13c_outliers = d13c_outliers.reindex(shp2l_filtered_data.index, fill_value=False)
+                    d18o_outliers = d18o_outliers.reindex(shp2l_filtered_data.index, fill_value=False)
+                    combined_outliers = d13c_outliers | d18o_outliers
+
                     # Filter out outliers for precision and average calculations
-                    shp2l_clean = shp2l_filtered_data.loc[~(d13c_outliers | d18o_outliers)]
+                    if outliers_independence:
+                        d13_inlier_mask = ~d13c_outliers
+                        d18_inlier_mask = ~d18o_outliers
+                    else:
+                        d13_inlier_mask = ~combined_outliers
+                        d18_inlier_mask = ~combined_outliers
+
+                    shp2l_clean_d13 = shp2l_filtered_data.loc[d13_inlier_mask].copy()
+                    shp2l_clean_d18 = shp2l_filtered_data.loc[d18_inlier_mask].copy()
+                    shp2l_clean = shp2l_filtered_data.loc[~combined_outliers].copy()
 
                     # Display precision (standard deviation) and averages
-                    # Calculate the number of standards and percentage
                     total_standards = len(shp2l_filtered_data)
-                    included_standards = len(shp2l_clean)
-                    standards_percentage = (included_standards / total_standards) * 100 if total_standards > 0 else 0
+                    included_standards_d13 = len(shp2l_clean_d13)
+                    included_standards_d18 = len(shp2l_clean_d18)
+                    standards_percentage_d13 = (included_standards_d13 / total_standards) * 100 if total_standards > 0 else 0
+                    standards_percentage_d18 = (included_standards_d18 / total_standards) * 100 if total_standards > 0 else 0
 
                     # Calculate precision values (raw)
-                    d13c_precision = shp2l_clean['d 13C/12C  Mean'].std()
-                    d18o_precision = shp2l_clean['d 18O/16O  Mean'].std()
+                    d13c_precision = shp2l_clean_d13['d 13C/12C  Mean'].std()
+                    d18o_precision = shp2l_clean_d18['d 18O/16O  Mean'].std()
+                    d13c_average = shp2l_clean_d13['d 13C/12C  Mean'].mean()
+                    d18o_average = shp2l_clean_d18['d 18O/16O  Mean'].mean()
+
+                    if outliers_independence:
+                        standards_summary_text = (
+                            f"d13C {included_standards_d13} / {total_standards} ({standards_percentage_d13:.1f}%) | "
+                            f"d18O {included_standards_d18} / {total_standards} ({standards_percentage_d18:.1f}%)"
+                        )
+                        standards_percentage = min(standards_percentage_d13, standards_percentage_d18)
+                    else:
+                        standards_summary_text = (
+                            f"{included_standards_d13} out of {total_standards} ({standards_percentage_d13:.1f}%)"
+                        )
+                        standards_percentage = standards_percentage_d13
 
                     # Precision per line (1/2), excluding outliers
                     line_precision_markup = ""
-                    line_col = _find_column(shp2l_clean, 'Line')
+                    line_col = _find_column(shp2l_filtered_data, 'Line')
                     if line_col is not None:
-                        line_df = shp2l_clean.copy()
-                        line_df['_line_val'] = pd.to_numeric(line_df[line_col], errors='coerce')
-                        line_df = line_df.dropna(subset=['_line_val'])
-                        if not line_df.empty:
+                        line_df13 = shp2l_clean_d13.copy()
+                        line_df18 = shp2l_clean_d18.copy()
+                        line_df13['_line_val'] = pd.to_numeric(line_df13[line_col], errors='coerce')
+                        line_df18['_line_val'] = pd.to_numeric(line_df18[line_col], errors='coerce')
+                        line_df13 = line_df13.dropna(subset=['_line_val'])
+                        line_df18 = line_df18.dropna(subset=['_line_val'])
+                        if (not line_df13.empty) or (not line_df18.empty):
                             line_blocks = []
-                            for line_value in sorted(line_df['_line_val'].unique()):
+                            line_values = sorted(
+                                set(line_df13['_line_val'].dropna().tolist())
+                                | set(line_df18['_line_val'].dropna().tolist())
+                            )
+                            for line_value in line_values:
                                 if not np.isfinite(line_value):
                                     continue
                                 if line_value not in (1, 2):
                                     continue
-                                line_subset = line_df[line_df['_line_val'] == line_value]
-                                d13_line = pd.to_numeric(line_subset['d 13C/12C  Mean'], errors='coerce').std()
-                                d18_line = pd.to_numeric(line_subset['d 18O/16O  Mean'], errors='coerce').std()
-                                d13_text = "--" if pd.isna(d13_line) else f"{d13_line:.3f}‰"
-                                d18_text = "--" if pd.isna(d18_line) else f"{d18_line:.3f}‰"
+                                line_subset13 = line_df13[line_df13['_line_val'] == line_value]
+                                line_subset18 = line_df18[line_df18['_line_val'] == line_value]
+                                d13_line = pd.to_numeric(line_subset13['d 13C/12C  Mean'], errors='coerce').std()
+                                d18_line = pd.to_numeric(line_subset18['d 18O/16O  Mean'], errors='coerce').std()
+                                d13_text = "--" if pd.isna(d13_line) else f"{d13_line:.3f}â€°"
+                                d18_text = "--" if pd.isna(d18_line) else f"{d18_line:.3f}â€°"
                                 line_blocks.append(
                                     f"<p style='font-size: 16px; margin: 4px 0;'>"
                                     f"<b>Line {int(line_value)} precision:</b> d13C {d13_text} | d18O {d18_text}"
@@ -5284,16 +6023,17 @@ def main():
                     try:
                         fits = st.session_state.get('linearity_fits')
                         if fits:
-                            i_series = pd.to_numeric(shp2l_clean['1  Cycle Int  Samp  44'], errors='coerce')
-                            y13_series = pd.to_numeric(shp2l_clean['d 13C/12C  Mean'], errors='coerce')
-                            y18_series = pd.to_numeric(shp2l_clean['d 18O/16O  Mean'], errors='coerce')
+                            i_series13 = pd.to_numeric(shp2l_clean_d13['1  Cycle Int  Samp  44'], errors='coerce')
+                            i_series18 = pd.to_numeric(shp2l_clean_d18['1  Cycle Int  Samp  44'], errors='coerce')
+                            y13_series = pd.to_numeric(shp2l_clean_d13['d 13C/12C  Mean'], errors='coerce')
+                            y18_series = pd.to_numeric(shp2l_clean_d18['d 18O/16O  Mean'], errors='coerce')
                             if np.isfinite(fits.get('d13C', {}).get('slope', np.nan)):
                                 s = fits['d13C']['slope']; xr = fits['d13C']['x_ref']
-                                d13_corr = (y13_series - s * (i_series - xr)).where(np.isfinite(y13_series) & np.isfinite(i_series))
+                                d13_corr = (y13_series - s * (i_series13 - xr)).where(np.isfinite(y13_series) & np.isfinite(i_series13))
                                 d13c_lin_prec = float(d13_corr.std())
                             if np.isfinite(fits.get('d18O', {}).get('slope', np.nan)):
                                 s = fits['d18O']['slope']; xr = fits['d18O']['x_ref']
-                                d18_corr = (y18_series - s * (i_series - xr)).where(np.isfinite(y18_series) & np.isfinite(i_series))
+                                d18_corr = (y18_series - s * (i_series18 - xr)).where(np.isfinite(y18_series) & np.isfinite(i_series18))
                                 d18o_lin_prec = float(d18_corr.std())
                     except Exception:
                         pass
@@ -5307,35 +6047,35 @@ def main():
 
                     # Optional markup for linearity-corrected precision display
                     d13c_lin_markup = (f"<p style='font-size: 16px; margin: 2px 0;'><i>d13C Precision (linearity corrected):</i> "
-                                       f"<span style='color: {d13c_lin_color}'>{d13c_lin_prec:.3f}‰</span></p>") if d13c_lin_prec is not None else ""
+                                       f"<span style='color: {d13c_lin_color}'>{d13c_lin_prec:.3f}â€°</span></p>") if d13c_lin_prec is not None else ""
                     d18o_lin_markup = (f"<p style='font-size: 16px; margin: 2px 0;'><i>d18O Precision (linearity corrected):</i> "
-                                       f"<span style='color: {d18o_lin_color}'>{d18o_lin_prec:.3f}‰</span></p>") if d18o_lin_prec is not None else ""
+                                       f"<span style='color: {d18o_lin_color}'>{d18o_lin_prec:.3f}â€°</span></p>") if d18o_lin_prec is not None else ""
                     
                     st.markdown(f"""
                     <div style='background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin: 10px 0;'>
                         <h3 style='color: #1f77b4; margin-bottom: 15px;'>Precision and Averages for {standard} (Excluding Outliers)</h3>
                         <div style='display: flex; justify-content: space-between;'>
                             <div style='flex: 1; margin-right: 20px;'>
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Precision:</b> <span style='color: {d13c_precision_color}'>{d13c_precision:.3f}‰</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Precision:</b> <span style='color: {d13c_precision_color}'>{d13c_precision:.3f}â€°</span></p>
                                 {d13c_lin_markup}
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Average:</b> <span style='color: #000000'>{shp2l_clean['d 13C/12C  Mean'].mean():.3f}‰</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Average:</b> <span style='color: #000000'>{d13c_average:.3f}â€°</span></p>
                             </div>
                             <div style='flex: 1;'>
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Precision:</b> <span style='color: {d18o_precision_color}'>{d18o_precision:.3f}‰</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Precision:</b> <span style='color: {d18o_precision_color}'>{d18o_precision:.3f}â€°</span></p>
                                 {d18o_lin_markup}
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{shp2l_clean['d 18O/16O  Mean'].mean():.3f}‰</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{d18o_average:.3f}â€°</span></p>
                             </div>
                         </div>
                         {line_precision_markup}
                         <div style='margin-top: 15px; padding-top: 10px; border-top: 1px solid #ddd;'>
-                            <p style='font-size: 16px; color: {standards_percentage_color};'>Standards included: {included_standards} out of {total_standards} ({standards_percentage:.1f}%)</p>
+                            <p style='font-size: 16px; color: {standards_percentage_color};'>Standards included: {standards_summary_text}</p>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
 
                     # Calculate statistics for both methods
                     # IMPORTANT: compute stats from the same data shown on the plot.
-                    # Use nonâ€‘outlier points when outlier detection is enabled to avoid biased/offset lines.
+                    # Use nonÃ¢â‚¬â€˜outlier points when outlier detection is enabled to avoid biased/offset lines.
                     try:
                         stats_source = shp2l_filtered_data.loc[~(d13c_outliers | d18o_outliers)].copy()
                     except Exception:
@@ -5374,80 +6114,87 @@ def main():
 
                     # Define sequence index for plotting (full dataset for alignment)
                     seq_index = pd.Series(range(1, len(shp2l_filtered_data) + 1), index=shp2l_filtered_data.index)
-                    outlier_mask = (d13c_outliers | d18o_outliers).reindex(shp2l_filtered_data.index).fillna(False)
-                    inlier_mask = ~outlier_mask
-                    inlier_df = shp2l_filtered_data.loc[inlier_mask]
-                    outlier_df = shp2l_filtered_data.loc[outlier_mask]
+                    if outliers_independence:
+                        outlier_mask_d13 = d13c_outliers.reindex(shp2l_filtered_data.index).fillna(False)
+                        outlier_mask_d18 = d18o_outliers.reindex(shp2l_filtered_data.index).fillna(False)
+                    else:
+                        outlier_mask_shared = combined_outliers.reindex(shp2l_filtered_data.index).fillna(False)
+                        outlier_mask_d13 = outlier_mask_shared
+                        outlier_mask_d18 = outlier_mask_shared
+                    inlier_df_d13 = shp2l_filtered_data.loc[~outlier_mask_d13]
+                    outlier_df_d13 = shp2l_filtered_data.loc[outlier_mask_d13]
+                    inlier_df_d18 = shp2l_filtered_data.loc[~outlier_mask_d18]
+                    outlier_df_d18 = shp2l_filtered_data.loc[outlier_mask_d18]
 
                     # Generate plots based on user choice
                     if calibration_type == "Z-Score":
-                        # Plot for Î´13C with Z-Score thresholds
+                        # Plot for ÃŽÂ´13C with Z-Score thresholds
                         fig_d13c = px.scatter(
-                            x=seq_index.loc[inlier_df.index],
-                            y=inlier_df['d 13C/12C  Mean'],
-                            color=inlier_df[color_param],  # Add color parameter
+                            x=seq_index.loc[inlier_df_d13.index],
+                            y=inlier_df_d13['d 13C/12C  Mean'],
+                            color=inlier_df_d13[color_param],  # Add color parameter
             title=f'SHP2L d13C Calibration Values (Z-Score Method)',
-            labels={'y': 'd13C (‰)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd13C (â€°)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
-                        if not outlier_df.empty:
+                        if not outlier_df_d13.empty:
                             fig_d13c.add_trace(go.Scatter(
-                                x=seq_index.loc[outlier_df.index],
-                                y=outlier_df['d 13C/12C  Mean'],
+                                x=seq_index.loc[outlier_df_d13.index],
+                                y=outlier_df_d13['d 13C/12C  Mean'],
                                 mode='markers',
-                                name='Outliers',
+                                name='d13C Outliers',
                                 marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
                             ))
                         fig_d13c.add_hline(y=sigma_level_d13c_plus, line_color='green', line_dash='dot',
-                                           annotation_text=f'+{sigma_level}Ïƒ')
+                                           annotation_text=f'+{sigma_level}ÃÆ’')
                         fig_d13c.add_hline(y=sigma_level_d13c_minus, line_color='green', line_dash='dot',
-                                           annotation_text=f'-{sigma_level}Ïƒ')
+                                           annotation_text=f'-{sigma_level}ÃÆ’')
                         fig_d13c.add_hline(y=d13c_mean, line_color='purple', line_dash='solid',
                                            annotation_text='Mean Value')
 
-                        # Plot for Î´18O with Z-Score thresholds
+                        # Plot for ÃŽÂ´18O with Z-Score thresholds
                         fig_d18o = px.scatter(
-                            x=seq_index.loc[inlier_df.index],
-                            y=inlier_df['d 18O/16O  Mean'],
-                            color=inlier_df[color_param],  # Add color parameter
+                            x=seq_index.loc[inlier_df_d18.index],
+                            y=inlier_df_d18['d 18O/16O  Mean'],
+                            color=inlier_df_d18[color_param],  # Add color parameter
             title=f'SHP2L d18O Calibration Values (Z-Score Method)',
-            labels={'y': 'd18O (‰)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd18O (â€°)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
-                        if not outlier_df.empty:
+                        if not outlier_df_d18.empty:
                             fig_d18o.add_trace(go.Scatter(
-                                x=seq_index.loc[outlier_df.index],
-                                y=outlier_df['d 18O/16O  Mean'],
+                                x=seq_index.loc[outlier_df_d18.index],
+                                y=outlier_df_d18['d 18O/16O  Mean'],
                                 mode='markers',
-                                name='Outliers',
+                                name='d18O Outliers',
                                 marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
                             ))
                         fig_d18o.add_hline(y=sigma_level_d18o_plus, line_color='green', line_dash='dot',
-                                           annotation_text=f'+{sigma_level}Ïƒ')
+                                           annotation_text=f'+{sigma_level}ÃÆ’')
                         fig_d18o.add_hline(y=sigma_level_d18o_minus, line_color='green', line_dash='dot',
-                                           annotation_text=f'-{sigma_level}Ïƒ')
+                                           annotation_text=f'-{sigma_level}ÃÆ’')
                         fig_d18o.add_hline(y=d18o_mean, line_color='purple', line_dash='solid',
                                            annotation_text='Mean Value')
 
                     elif calibration_type == "IQR":
-                        # Plot for Î´13C with IQR thresholds
+                        # Plot for ÃŽÂ´13C with IQR thresholds
                         fig_d13c = px.scatter(
-                            x=seq_index.loc[inlier_df.index],
-                            y=inlier_df['d 13C/12C  Mean'],
-                            color=inlier_df[color_param],  # Add color parameter
+                            x=seq_index.loc[inlier_df_d13.index],
+                            y=inlier_df_d13['d 13C/12C  Mean'],
+                            color=inlier_df_d13[color_param],  # Add color parameter
             title=f'SHP2L d13C Calibration Values (IQR Method)',
-            labels={'y': 'd13C (‰)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd13C (â€°)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
-                        if not outlier_df.empty:
+                        if not outlier_df_d13.empty:
                             fig_d13c.add_trace(go.Scatter(
-                                x=seq_index.loc[outlier_df.index],
-                                y=outlier_df['d 13C/12C  Mean'],
+                                x=seq_index.loc[outlier_df_d13.index],
+                                y=outlier_df_d13['d 13C/12C  Mean'],
                                 mode='markers',
-                                name='Outliers',
+                                name='d13C Outliers',
                                 marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
                             ))
                         fig_d13c.add_hline(y=iqr_level_d13c_plus, line_color='green', line_dash='dot',
@@ -5459,22 +6206,22 @@ def main():
                         fig_d13c.add_hline(y=q1_d13c, line_color='purple', line_dash='solid',
                                            annotation_text='Q1 (25th Percentile)')
 
-                        # Plot for Î´18O with IQR thresholds
+                        # Plot for ÃŽÂ´18O with IQR thresholds
                         fig_d18o = px.scatter(
-                            x=seq_index.loc[inlier_df.index],
-                            y=inlier_df['d 18O/16O  Mean'],
-                            color=inlier_df[color_param],  # Add color parameter
+                            x=seq_index.loc[inlier_df_d18.index],
+                            y=inlier_df_d18['d 18O/16O  Mean'],
+                            color=inlier_df_d18[color_param],  # Add color parameter
             title=f'SHP2L d18O Calibration Values (IQR Method)',
-            labels={'y': 'd18O (‰)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd18O (â€°)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
-                        if not outlier_df.empty:
+                        if not outlier_df_d18.empty:
                             fig_d18o.add_trace(go.Scatter(
-                                x=seq_index.loc[outlier_df.index],
-                                y=outlier_df['d 18O/16O  Mean'],
+                                x=seq_index.loc[outlier_df_d18.index],
+                                y=outlier_df_d18['d 18O/16O  Mean'],
                                 mode='markers',
-                                name='Outliers',
+                                name='d18O Outliers',
                                 marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
                             ))
                         fig_d18o.add_hline(y=iqr_level_d18o_plus, line_color='green', line_dash='dot',
@@ -5496,6 +6243,37 @@ def main():
 
     with tab3:
         st.header('Data Processing')
+
+        original_map_global = st.session_state.get("original_delta_values", {})
+        reset_all_disabled = not (isinstance(original_map_global, dict) and len(original_map_global) > 0)
+        reset_action_col, reset_hint_col = st.columns([3, 7], gap="small")
+        with reset_action_col:
+            if st.button(
+                "Reset All Edited Points to Original",
+                key="tab3_reset_all_to_original_btn",
+                disabled=reset_all_disabled,
+                use_container_width=True,
+            ):
+                st.session_state.confirm_reset_all_edits = True
+        with reset_hint_col:
+            if reset_all_disabled:
+                st.caption("No edited delta points to reset.")
+            else:
+                st.caption(f"{len(original_map_global)} edited delta point(s) can be reset.")
+
+        if st.session_state.get("confirm_reset_all_edits", False):
+            st.warning("Reset all edited delta points to their original imported values?")
+            conf_col1, conf_col2 = st.columns(2)
+            if conf_col1.button("Yes, reset all", key="confirm_tab3_reset_all_btn"):
+                result = _reset_all_edited_points_to_original(editor_context="tab3_global")
+                st.session_state.confirm_reset_all_edits = False
+                if result.get("count", 0) > 0:
+                    st.success(f"Reset {int(result['count'])} edited point(s) to original values.")
+                else:
+                    st.info("No edited points were reset.")
+                st.rerun()
+            elif conf_col2.button("Cancel", key="cancel_tab3_reset_all_btn"):
+                st.session_state.confirm_reset_all_edits = False
 
         # Initialize the DataFrame copy at the start
         df_copy = st.session_state.df.copy()
@@ -5521,13 +6299,15 @@ def main():
             # Signal Intensity filter
             signal_min = 0.0
             signal_max = 50.0
-            # Store ranges in session state to make them available throughout the app
-            st.session_state.signal_range = st.slider(
-                'Filter by Signal Intensity',
+            signal_default = max(signal_min, min(signal_max, float(st.session_state.signal_range[0])))
+            # Signal filter uses lower threshold only; high saturation is handled separately.
+            signal_lower = st.slider(
+                'Filter by Signal Intensity (Minimum)',
                 min_value=signal_min,
                 max_value=signal_max,
-                value=(1.0, signal_max)
+                value=signal_default
             )
+            st.session_state.signal_range = (float(signal_lower), signal_max)
 
             # Leak Rate filter
             leak_min = float(df_copy['leak_rate'].min())
@@ -5568,7 +6348,7 @@ def main():
         total_samples = len(df_copy)
         
         # Create masks for each filter
-        signal_mask = (df_copy['1  Cycle Int  Samp  44'] >= st.session_state.signal_range[0]) & (df_copy['1  Cycle Int  Samp  44'] <= st.session_state.signal_range[1])
+        signal_mask = df_copy['1  Cycle Int  Samp  44'] >= st.session_state.signal_range[0]
         leak_mask = (df_copy['leak_rate'] >= st.session_state.leak_range[0]) & (df_copy['leak_rate'] <= st.session_state.leak_range[1])
         d13c_mask = (df_copy['d 13C/12C  Mean'] >= st.session_state.d13c_range[0]) & (df_copy['d 13C/12C  Mean'] <= st.session_state.d13c_range[1])
         d18o_mask = (df_copy['d 18O/16O  Mean'] >= st.session_state.d18o_range[0]) & (df_copy['d 18O/16O  Mean'] <= st.session_state.d18o_range[1])
@@ -5601,8 +6381,8 @@ def main():
         #     st.write(f"Signal Intensity: {excluded_by_signal:,d} samples")
         #     st.write(f"Leak Rate: {excluded_by_leak:,d} samples")
         # with col2:
-        #     st.write(f"Î´13C Range: {excluded_by_d13c:,d} samples")
-        #     st.write(f"Î´18O Range: {excluded_by_d18o:,d} samples")
+        #     st.write(f"ÃŽÂ´13C Range: {excluded_by_d13c:,d} samples")
+        #     st.write(f"ÃŽÂ´18O Range: {excluded_by_d18o:,d} samples")
         # st.markdown(f"**Total Samples Excluded: {total_excluded:,d} of {total_samples:,d}**")
 
         st.subheader("Statistical Outlier Settings")
@@ -5618,10 +6398,10 @@ def main():
         # Create a subheader and expander to show active filters
 
         # with st.expander("Active Filters"):
-        #     st.write("Signal Intensity Range:", f"{signal_range[0]:.2f} to {signal_range[1]:.2f}")
+        #     st.write("Minimum Signal Intensity:", f"{signal_range[0]:.2f}")
         #     st.write("Leak Rate Range:", f"{leak_range[0]:.2f} to {leak_range[1]:.2f}")
-        #     st.write("Î´13C Range:", f"{d13c_range[0]:.2f} to {d13c_range[1]:.2f}")
-        #     st.write("Î´18O Range:", f"{d18o_range[0]:.2f} to {d18o_range[1]:.2f}")
+        #     st.write("ÃŽÂ´13C Range:", f"{d13c_range[0]:.2f} to {d13c_range[1]:.2f}")
+        #     st.write("ÃŽÂ´18O Range:", f"{d18o_range[0]:.2f} to {d18o_range[1]:.2f}")
 
         # Prepare main dataset based on user selections
         data_to_process = df_copy.copy()
@@ -5681,7 +6461,6 @@ def main():
             (data_to_process['d 18O/16O  Mean'] >= st.session_state.d18o_range[0]) &
             (data_to_process['d 18O/16O  Mean'] <= st.session_state.d18o_range[1]) &
             (data_to_process['1  Cycle Int  Samp  44'] >= st.session_state.signal_range[0]) &
-            (data_to_process['1  Cycle Int  Samp  44'] <= st.session_state.signal_range[1]) &
             (data_to_process['leak_rate'] >= st.session_state.leak_range[0]) &
             (data_to_process['leak_rate'] <= st.session_state.leak_range[1]) &
             not_saturated_samples &
@@ -5706,7 +6485,7 @@ def main():
         stat_outliers = sum(statistical_mask[non_standards_mask])
         d13c_mask = ((data_without_standards['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (data_without_standards['d 13C/12C  Mean'] > st.session_state.d13c_range[1])) & ~edited_mask_no_std
         d18o_mask = ((data_without_standards['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (data_without_standards['d 18O/16O  Mean'] > st.session_state.d18o_range[1])) & ~edited_mask_no_std
-        signal_mask = ((data_without_standards['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (data_without_standards['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])) & ~edited_mask_no_std
+        signal_mask = (data_without_standards['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) & ~edited_mask_no_std
         leak_mask = ((data_without_standards['leak_rate'] < st.session_state.leak_range[0]) | (data_without_standards['leak_rate'] > st.session_state.leak_range[1])) & ~edited_mask_no_std
         status_series_no_std = data_without_standards.get('Collector Status', pd.Series(False, index=data_without_standards.index))
         failed_mask = (status_series_no_std == 'Failed Sample') & ~edited_mask_no_std
@@ -5857,7 +6636,7 @@ def main():
             except Exception:
                 unique_species_vals = []
             existing_map = st.session_state.get('comment_replacements', {}) or {}
-            with st.expander("Species labels (from Label/Species) — customize for Client Output"):
+            with st.expander("Species labels (from Label/Species) â€” customize for Client Output"):
                 new_map = {}
                 for i, sval in enumerate(unique_species_vals):
                     key = f"species_map_{i}"
@@ -5944,8 +6723,7 @@ def main():
                 outliers_df = pd.concat([outliers_df, d18o_outliers])
             
             signal_outliers = data_to_process[
-                (data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (data_to_process['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
+                data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]
             ].copy()
             signal_outliers = signal_outliers[~signal_outliers.index.map(_is_row_edited)]
             if not signal_outliers.empty:
@@ -5998,8 +6776,7 @@ def main():
                 (data_to_process['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
             ) & ~edited_mask_out
             signal_out_mask = (
-                (data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (data_to_process['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
+                data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]
             ) & ~edited_mask_out
             leak_out_mask = (
                 (data_to_process['leak_rate'] < st.session_state.leak_range[0]) |
@@ -6319,7 +7096,6 @@ def main():
                 (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                 (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
                 (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (species_data_unfiltered['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
                 (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
                 (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
             )
@@ -6429,27 +7205,24 @@ def main():
             if show_saturated_samples and saturated_samples_mask.any():
                 sat_samples = species_data_unfiltered[saturated_samples_mask]
                 sat_customdata = _build_delta_point_customdata(sat_samples, 'd13C')
-                y_vals_sat = pd.to_numeric(sat_samples['d 13C/12C  Mean'], errors='coerce')
-                if y_vals_sat.notna().any():
-                    y_sat = y_vals_sat.tolist()
-                else:
-                    y_vals = pd.to_numeric(species_data['d 13C/12C  Mean'], errors='coerce')
-                    y_min = y_vals.min()
-                    y_max = y_vals.max()
-                    if not np.isfinite(y_min):
-                        y_min, y_max = -1.0, 1.0
-                    y_range = y_max - y_min if np.isfinite(y_max) else 1.0
-                    y_sat = [y_min - (0.15 * y_range if y_range > 0 else 0.75)] * len(sat_samples)
+                y_vals = pd.to_numeric(species_data['d 13C/12C  Mean'], errors='coerce')
+                y_min = y_vals.min()
+                y_max = y_vals.max()
+                if not np.isfinite(y_min):
+                    y_min, y_max = -1.0, 1.0
+                y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                y_sat = [y_failed] * len(sat_samples)
                 d13c_summary.add_trace(go.Scatter(
                     x=sat_samples['x_axis'],
                     y=y_sat,
                     mode='markers',
                     name='Failed Samples (Fully Saturated)',
                     marker=dict(
-                        size=12,
+                        size=10,
                         symbol='triangle-down',
                         color='#d62728',
-                        line=dict(width=2, color='#d62728')
+                        line=dict(width=1, color='black')
                     ),
                     showlegend=not d13_legend_failed_full_shown,
                     legendgroup='outliers',
@@ -6457,7 +7230,7 @@ def main():
                     hovertemplate=(
                         'Identifier 1: %{customdata[2]}<br>'
                         'Identifier 2: %{customdata[3]}<br>'
-                        'd13C: %{y:.4f}<extra></extra>'
+                        'd13C: fully saturated (plotted on failed line)<extra></extra>'
                     )
                 ))
                 d13_legend_failed_full_shown = True
@@ -6503,7 +7276,7 @@ def main():
                             size=10,
                             symbol='triangle-down',
                             color='#ff00ff',
-                            line=dict(width=1, color='#ff00ff')
+                            line=dict(width=1, color='black')
                         ),
                         showlegend=not d13_legend_failed_interp_shown,
                         legendgroup='outliers',
@@ -6534,7 +7307,7 @@ def main():
                             size=10,
                             symbol='triangle-down',
                             color='#7f7f7f',
-                            line=dict(width=1, color='#7f7f7f')
+                            line=dict(width=1, color='black')
                         ),
                         showlegend=not d13_legend_failed_no_values_shown,
                         legendgroup='outliers',
@@ -6558,9 +7331,9 @@ def main():
                     name='Statistical Outliers',
                     marker=dict(
                         size=12,
-                        symbol='x',
-                        color=species_color,
-                        line=dict(width=2, color=species_color)
+                        symbol='square',
+                        color='red',
+                        line=dict(width=1.5, color='black')
                     ),
                     showlegend=True,
                     legendgroup='outliers',
@@ -6574,8 +7347,14 @@ def main():
 
             # Plot range outliers by type if enabled
             if show_range_outliers and not range_outliers.empty:
+                range_masks = _exclusive_outlier_masks([
+                    ('signal', range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]),
+                    ('leak', (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])),
+                    ('d13c', (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])),
+                    ('d18o', (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])),
+                ])
                 # Signal intensity outliers
-                signal_mask = (range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (range_outliers['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
+                signal_mask = range_masks['signal']
                 if signal_mask.any():
                     signal_outliers_df = range_outliers[signal_mask]
                     d13c_summary.add_trace(go.Scatter(
@@ -6583,10 +7362,10 @@ def main():
                         y=signal_outliers_df['d 13C/12C  Mean'],
                         mode='markers',
                         marker=dict(
-                            color=species_color,
+                            color='red',
                             symbol='diamond',
                             size=12,
-                            line=dict(width=2, color=species_color)
+                            line=dict(width=1.5, color='black')
                         ),
                         name='Signal Intensity Range',
                         showlegend=True,
@@ -6600,7 +7379,7 @@ def main():
                     ))
 
                 # Leak rate outliers
-                leak_mask = (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])
+                leak_mask = range_masks['leak']
                 if leak_mask.any():
                     leak_outliers_df = range_outliers[leak_mask]
                     d13c_summary.add_trace(go.Scatter(
@@ -6608,10 +7387,10 @@ def main():
                         y=leak_outliers_df['d 13C/12C  Mean'],
                         mode='markers',
                         marker=dict(
-                            color=species_color,
+                            color='red',
                             symbol='star',
                             size=12,
-                            line=dict(width=2, color=species_color)
+                            line=dict(width=1.5, color='black')
                         ),
                         name='Leak Rate Range',
                         showlegend=True,
@@ -6624,8 +7403,8 @@ def main():
                         )
                     ))
 
-                # Î´13C range outliers
-                d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
+                # ÃŽÂ´13C range outliers
+                d13c_mask = range_masks['d13c']
                 if d13c_mask.any():
                     d13_range_outliers_df = range_outliers[d13c_mask]
                     d13c_summary.add_trace(go.Scatter(
@@ -6633,10 +7412,10 @@ def main():
                         y=d13_range_outliers_df['d 13C/12C  Mean'],
                         mode='markers',
                         marker=dict(
-                            color=species_color,
+                            color='red',
                             symbol='cross',
                             size=12,
-                            line=dict(width=2, color=species_color)
+                            line=dict(width=1.5, color='black')
                         ),
                         name='d13C Range',
                         showlegend=True,
@@ -6649,8 +7428,8 @@ def main():
                         )
                     ))
 
-                # Î´18O range outliers
-                d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
+                # ÃŽÂ´18O range outliers
+                d18o_mask = range_masks['d18o']
                 if d18o_mask.any():
                     d18_range_outliers_df = range_outliers[d18o_mask]
                     d13c_summary.add_trace(go.Scatter(
@@ -6658,10 +7437,10 @@ def main():
                         y=d18_range_outliers_df['d 13C/12C  Mean'],
                         mode='markers',
                         marker=dict(
-                            color=species_color,
+                            color='red',
                             symbol='x',
                             size=12,
-                            line=dict(width=2, color=species_color)
+                            line=dict(width=1.5, color='black')
                         ),
                         name='d18O Range',
                         showlegend=True,
@@ -6694,20 +7473,18 @@ def main():
                         y_min, y_max = -1.0, 1.0
                     y_range = y_max - y_min if np.isfinite(y_max) else 1.0
                     y_active_plot = y_min - (0.1 * y_range if y_range > 0 else 0.5)
-                status_val = str(active_row.get('Collector Status', '')).strip()
-                marker_symbol = 'triangle-down' if status_val in ('Failed Sample', 'Fully Saturated Collectors') else 'circle'
                 d13c_summary.add_trace(go.Scatter(
                     x=[x_active],
                     y=[y_active_plot],
                     mode='markers',
-                    name='Active Selection',
+                    name='Selected sample',
                     marker=dict(
-                        size=14,
-                        symbol=marker_symbol,
+                        size=18,
+                        symbol='circle-open',
                         color='#ff00ff',
-                        line=dict(width=2, color='#ff00ff')
+                        line=dict(width=3, color='#ff00ff')
                     ),
-                    showlegend=False,
+                    showlegend=True,
                     legendgroup='active_selection'
                 ))
 
@@ -6779,7 +7556,6 @@ def main():
                     (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                     (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
                     (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                    (species_data_unfiltered['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
                     (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
                     (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
                 )
@@ -6888,27 +7664,24 @@ def main():
             if show_saturated_samples and saturated_samples_mask.any():
                 sat_samples = species_data_unfiltered[saturated_samples_mask]
                 sat_customdata = _build_delta_point_customdata(sat_samples, 'd18O')
-                y_vals_sat = pd.to_numeric(sat_samples['d 18O/16O  Mean'], errors='coerce')
-                if y_vals_sat.notna().any():
-                    y_sat = y_vals_sat.tolist()
-                else:
-                    y_vals = pd.to_numeric(species_data['d 18O/16O  Mean'], errors='coerce')
-                    y_min = y_vals.min()
-                    y_max = y_vals.max()
-                    if not np.isfinite(y_min):
-                        y_min, y_max = -1.0, 1.0
-                    y_range = y_max - y_min if np.isfinite(y_max) else 1.0
-                    y_sat = [y_min - (0.15 * y_range if y_range > 0 else 0.75)] * len(sat_samples)
+                y_vals = pd.to_numeric(species_data['d 18O/16O  Mean'], errors='coerce')
+                y_min = y_vals.min()
+                y_max = y_vals.max()
+                if not np.isfinite(y_min):
+                    y_min, y_max = -1.0, 1.0
+                y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                y_sat = [y_failed] * len(sat_samples)
                 d18o_summary.add_trace(go.Scatter(
                     x=sat_samples['x_axis'],
                     y=y_sat,
                     mode='markers',
                     name='Failed Samples (Fully Saturated)',
                     marker=dict(
-                        size=12,
+                        size=10,
                         symbol='triangle-down',
                         color='#d62728',
-                        line=dict(width=2, color='#d62728')
+                        line=dict(width=1, color='black')
                     ),
                     showlegend=not d18_legend_failed_full_shown,
                     legendgroup='outliers',
@@ -6916,7 +7689,7 @@ def main():
                     hovertemplate=(
                         'Identifier 1: %{customdata[2]}<br>'
                         'Identifier 2: %{customdata[3]}<br>'
-                        'd18O: %{y:.4f}<extra></extra>'
+                        'd18O: fully saturated (plotted on failed line)<extra></extra>'
                     )
                 ))
                 d18_legend_failed_full_shown = True
@@ -6962,7 +7735,7 @@ def main():
                             size=10,
                             symbol='triangle-down',
                             color='#ff00ff',
-                            line=dict(width=1, color='#ff00ff')
+                            line=dict(width=1, color='black')
                         ),
                         showlegend=not d18_legend_failed_interp_shown,
                         legendgroup='outliers',
@@ -6993,7 +7766,7 @@ def main():
                             size=10,
                             symbol='triangle-down',
                             color='#7f7f7f',
-                            line=dict(width=1, color='#7f7f7f')
+                            line=dict(width=1, color='black')
                         ),
                         showlegend=not d18_legend_failed_no_values_shown,
                         legendgroup='outliers',
@@ -7017,9 +7790,9 @@ def main():
                     name='Statistical Outliers',
                     marker=dict(
                         size=12,
-                        symbol='x',
-                        color=species_color,
-                        line=dict(width=2, color=species_color)
+                        symbol='square',
+                        color='red',
+                        line=dict(width=1.5, color='black')
                     ),
                     showlegend=True,
                     legendgroup='outliers',
@@ -7033,8 +7806,14 @@ def main():
 
             # Plot range outliers by type if enabled
             if show_range_outliers and not range_outliers.empty:
+                range_masks = _exclusive_outlier_masks([
+                    ('signal', range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]),
+                    ('leak', (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])),
+                    ('d13c', (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])),
+                    ('d18o', (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])),
+                ])
                 # Signal intensity outliers
-                signal_mask = (range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (range_outliers['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
+                signal_mask = range_masks['signal']
                 if signal_mask.any():
                     signal_outliers_df = range_outliers[signal_mask]
                     d18o_summary.add_trace(go.Scatter(
@@ -7042,10 +7821,10 @@ def main():
                         y=signal_outliers_df['d 18O/16O  Mean'],
                         mode='markers',
                         marker=dict(
-                            color=species_color,
+                            color='red',
                             symbol='diamond',
                             size=12,
-                            line=dict(width=2, color=species_color)
+                            line=dict(width=1.5, color='black')
                         ),
                         name='Signal Intensity Range',
                         showlegend=True,
@@ -7059,7 +7838,7 @@ def main():
                     ))
 
                 # Leak rate outliers
-                leak_mask = (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])
+                leak_mask = range_masks['leak']
                 if leak_mask.any():
                     leak_outliers_df = range_outliers[leak_mask]
                     d18o_summary.add_trace(go.Scatter(
@@ -7067,10 +7846,10 @@ def main():
                         y=leak_outliers_df['d 18O/16O  Mean'],
                         mode='markers',
                         marker=dict(
-                            color=species_color,
+                            color='red',
                             symbol='star',
                             size=12,
-                            line=dict(width=2, color=species_color)
+                            line=dict(width=1.5, color='black')
                         ),
                         name='Leak Rate Range',
                         showlegend=True,
@@ -7083,8 +7862,8 @@ def main():
                         )
                     ))
 
-                # Î´13C range outliers
-                d13c_mask = (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
+                # ÃŽÂ´13C range outliers
+                d13c_mask = range_masks['d13c']
                 if d13c_mask.any():
                     d13_range_outliers_df = range_outliers[d13c_mask]
                     d18o_summary.add_trace(go.Scatter(
@@ -7092,10 +7871,10 @@ def main():
                         y=d13_range_outliers_df['d 18O/16O  Mean'],
                         mode='markers',
                         marker=dict(
-                            color=species_color,
+                            color='red',
                             symbol='cross',
                             size=12,
-                            line=dict(width=2, color=species_color)
+                            line=dict(width=1.5, color='black')
                         ),
                         name='d13C Range',
                         showlegend=True,
@@ -7108,8 +7887,8 @@ def main():
                         )
                     ))
 
-                # Î´18O range outliers
-                d18o_mask = (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
+                # ÃŽÂ´18O range outliers
+                d18o_mask = range_masks['d18o']
                 if d18o_mask.any():
                     d18_range_outliers_df = range_outliers[d18o_mask]
                     d18o_summary.add_trace(go.Scatter(
@@ -7117,10 +7896,10 @@ def main():
                         y=d18_range_outliers_df['d 18O/16O  Mean'],
                         mode='markers',
                         marker=dict(
-                            color=species_color,
+                            color='red',
                             symbol='x',
                             size=12,
-                            line=dict(width=2, color=species_color)
+                            line=dict(width=1.5, color='black')
                         ),
                         name='d18O Range',
                         showlegend=True,
@@ -7153,20 +7932,18 @@ def main():
                         y_min, y_max = -1.0, 1.0
                     y_range = y_max - y_min if np.isfinite(y_max) else 1.0
                     y_active_plot = y_min - (0.1 * y_range if y_range > 0 else 0.5)
-                status_val = str(active_row.get('Collector Status', '')).strip()
-                marker_symbol = 'triangle-down' if status_val in ('Failed Sample', 'Fully Saturated Collectors') else 'circle'
                 d18o_summary.add_trace(go.Scatter(
                     x=[x_active],
                     y=[y_active_plot],
                     mode='markers',
-                    name='Active Selection',
+                    name='Selected sample',
                     marker=dict(
-                        size=14,
-                        symbol=marker_symbol,
+                        size=18,
+                        symbol='circle-open',
                         color='#ff00ff',
-                        line=dict(width=2, color='#ff00ff')
+                        line=dict(width=3, color='#ff00ff')
                     ),
-                    showlegend=False,
+                    showlegend=True,
                     legendgroup='active_selection'
                 ))
 
@@ -7234,7 +8011,6 @@ def main():
                 (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                 (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
                 (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (species_data_unfiltered['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
                 (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
                 (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
             )
@@ -7295,9 +8071,9 @@ def main():
                         name='Statistical Outliers',
                         marker=dict(
                             size=12,
-                            symbol='x',
+                            symbol='square',
                             color='red',
-                            line=dict(width=2, color='red')
+                            line=dict(width=1.5, color='black')
                         ),
                         showlegend=not scatter_legend_statistical_shown,
                         legendgroup='outliers',
@@ -7348,10 +8124,10 @@ def main():
                         mode='markers',
                         name='Failed Samples (Fully Saturated)',
                         marker=dict(
-                            size=12,
+                            size=10,
                             symbol='triangle-down',
                             color='#d62728',
-                            line=dict(width=2, color='#d62728')
+                            line=dict(width=1, color='black')
                         ),
                         showlegend=not scatter_legend_failed_full_shown,
                         legendgroup='outliers',
@@ -7446,7 +8222,6 @@ def main():
                     (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
                     (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
                     (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                    (species_data_unfiltered['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1]) |
                     (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
                     (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
                 )
@@ -7538,9 +8313,9 @@ def main():
                             mode='markers',
                             marker=dict(
                                 color='red',
-                                symbol='x',
+                                symbol='square',
                                 size=12,
-                                line=dict(width=2)
+                                line=dict(width=1.5, color='black')
                             ),
                             name='Statistical Outliers',
                             customdata=stat_customdata,
@@ -7557,10 +8332,16 @@ def main():
                     identifier_range_outliers = range_bar_outliers[range_bar_outliers['Identifier 1'] == identifier]
                     if not identifier_range_outliers.empty:
                         # Identify outlier types
-                        signal_range_mask = (identifier_range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (identifier_range_outliers['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
-                        leak_range_mask = (identifier_range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (identifier_range_outliers['leak_rate'] > st.session_state.leak_range[1])
-                        d13c_filter_mask = (identifier_range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (identifier_range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
-                        d18o_filter_mask = (identifier_range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (identifier_range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
+                        range_masks = _exclusive_outlier_masks([
+                            ('signal', identifier_range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]),
+                            ('leak', (identifier_range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (identifier_range_outliers['leak_rate'] > st.session_state.leak_range[1])),
+                            ('d13c', (identifier_range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (identifier_range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])),
+                            ('d18o', (identifier_range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (identifier_range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])),
+                        ])
+                        signal_range_mask = range_masks['signal']
+                        leak_range_mask = range_masks['leak']
+                        d13c_filter_mask = range_masks['d13c']
+                        d18o_filter_mask = range_masks['d18o']
 
                         # Plot each type with different symbol but same red color
                         if signal_range_mask.any():
@@ -7569,7 +8350,7 @@ def main():
                                 x=signal_df['x_axis'],
                                 y=signal_df['d 13C/12C  Mean'],
                                 mode='markers',
-                                marker=dict(color='red', symbol='diamond', size=12, line=dict(width=2)),
+                                marker=dict(color='red', symbol='diamond', size=12, line=dict(width=1.5, color='black')),
                                 name='Signal Intensity Range',
                                 customdata=_build_delta_point_customdata(signal_df, 'd13C'),
                                 hovertemplate=(
@@ -7584,7 +8365,7 @@ def main():
                                 x=leak_df['x_axis'],
                                 y=leak_df['d 13C/12C  Mean'],
                                 mode='markers',
-                                marker=dict(color='red', symbol='star', size=12, line=dict(width=2)),
+                                marker=dict(color='red', symbol='star', size=12, line=dict(width=1.5, color='black')),
                                 name='Leak Rate Range',
                                 customdata=_build_delta_point_customdata(leak_df, 'd13C'),
                                 hovertemplate=(
@@ -7599,7 +8380,7 @@ def main():
                                 x=d13_df['x_axis'],
                                 y=d13_df['d 13C/12C  Mean'],
                                 mode='markers',
-                                marker=dict(color='red', symbol='cross', size=12, line=dict(width=2)),
+                                marker=dict(color='red', symbol='cross', size=12, line=dict(width=1.5, color='black')),
                                 name='d13C Range',
                                 customdata=_build_delta_point_customdata(d13_df, 'd13C'),
                                 hovertemplate=(
@@ -7614,7 +8395,7 @@ def main():
                                 x=d18_df['x_axis'],
                                 y=d18_df['d 13C/12C  Mean'],
                                 mode='markers',
-                                marker=dict(color='red', symbol='x', size=12, line=dict(width=2)),
+                                marker=dict(color='red', symbol='x', size=12, line=dict(width=1.5, color='black')),
                                 name='d18O Range',
                                 customdata=_build_delta_point_customdata(d18_df, 'd13C'),
                                 hovertemplate=(
@@ -7652,28 +8433,25 @@ def main():
                     ]
                     if not identifier_sat_samples.empty:
                         sat_customdata = _build_delta_point_customdata(identifier_sat_samples, 'd13C')
-                        y_vals_sat = pd.to_numeric(identifier_sat_samples['d 13C/12C  Mean'], errors='coerce')
-                        if y_vals_sat.notna().any():
-                            y_sat = y_vals_sat.tolist()
-                        else:
-                            y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
-                            y_min = y_vals.min()
-                            y_max = y_vals.max()
-                            if not np.isfinite(y_min):
-                                y_min, y_max = -1.0, 1.0
-                            y_range = y_max - y_min if np.isfinite(y_max) else 1.0
-                            y_sat = [y_min - (0.15 * y_range if y_range > 0 else 0.75)] * len(identifier_sat_samples)
+                        y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
+                        y_min = y_vals.min()
+                        y_max = y_vals.max()
+                        if not np.isfinite(y_min):
+                            y_min, y_max = -1.0, 1.0
+                        y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                        y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                        y_sat = [y_failed] * len(identifier_sat_samples)
                         fig_d13C.add_trace(go.Scatter(
                             x=identifier_sat_samples['x_axis'],
                             y=y_sat,
                             mode='markers',
-                            marker=dict(color='#d62728', symbol='triangle-down', size=12, line=dict(width=2)),
+                            marker=dict(color='#d62728', symbol='triangle-down', size=10, line=dict(width=1)),
                             name='Failed Samples (Fully Saturated)',
                             customdata=sat_customdata,
                             hovertemplate=(
                                 'Identifier 1: %{customdata[2]}<br>'
                                 'Identifier 2: %{customdata[3]}<br>'
-                                'd13C: %{y:.4f}<extra></extra>'
+                                'd13C: fully saturated (plotted on failed line)<extra></extra>'
                             )
                         ))
 
@@ -7823,7 +8601,7 @@ def main():
                 fig_d13C.update_layout(
                     title=f'{identifier} - d13C for Species: {species}',
                     xaxis_title='X Axis',
-                    yaxis_title='d13C (‰)',
+                    yaxis_title='d13C (â€°)',
                     legend_title='Data Type',
                     margin=dict(r=100, t=100),  # Reduced right margin
                     xaxis=dict(
@@ -7865,20 +8643,18 @@ def main():
                                 y_min, y_max = -1.0, 1.0
                             y_range = y_max - y_min if np.isfinite(y_max) else 1.0
                             y_active_plot = y_min - (0.1 * y_range if y_range > 0 else 0.5)
-                        status_val = str(active_row.get('Collector Status', '')).strip()
-                        marker_symbol = 'triangle-down' if status_val in ('Failed Sample', 'Fully Saturated Collectors') else 'circle'
                         fig_d13C.add_trace(go.Scatter(
                             x=[x_active],
                             y=[y_active_plot],
                             mode='markers',
                             marker=dict(
                                 color='#ff00ff',
-                                symbol=marker_symbol,
-                                size=14,
-                                line=dict(width=2, color='#ff00ff')
+                                symbol='circle-open',
+                                size=18,
+                                line=dict(width=3, color='#ff00ff')
                             ),
-                            name='Active Selection',
-                            showlegend=False,
+                            name='Selected sample',
+                            showlegend=True,
                             legendgroup='active_selection'
                         ))
                 _apply_editor_selection_to_figure(fig_d13C, d13_editor_prefix)
@@ -7906,8 +8682,8 @@ def main():
                 if not d13_raw_line_only:
                     _render_delta_editor_from_chart_selection(d13_chart_state, d13_editor_prefix)
 
-                # Plot Î´18O data for this identifier and comment
-                # Create figure for Î´18O
+                # Plot ÃŽÂ´18O data for this identifier and comment
+                # Create figure for ÃŽÂ´18O
                 fig_d18O = go.Figure()
 
                 # Add statistical outliers if enabled
@@ -7921,9 +8697,9 @@ def main():
                             mode='markers',
                             marker=dict(
                                 color='red',
-                                symbol='x',
+                                symbol='square',
                                 size=12,
-                                line=dict(width=2)
+                                line=dict(width=1.5, color='black')
                             ),
                             name='Statistical Outliers',
                             customdata=stat_customdata,
@@ -7945,10 +8721,16 @@ def main():
                     identifier_range_outliers = range_bar_outliers[range_bar_outliers['Identifier 1'] == identifier]
                     if not identifier_range_outliers.empty:
                         # Identify outlier types
-                        signal_range_mask = (identifier_range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) | (identifier_range_outliers['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
-                        leak_range_mask = (identifier_range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (identifier_range_outliers['leak_rate'] > st.session_state.leak_range[1])
-                        d13c_filter_mask = (identifier_range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (identifier_range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])
-                        d18o_filter_mask = (identifier_range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (identifier_range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
+                        range_masks = _exclusive_outlier_masks([
+                            ('signal', identifier_range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]),
+                            ('leak', (identifier_range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (identifier_range_outliers['leak_rate'] > st.session_state.leak_range[1])),
+                            ('d13c', (identifier_range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (identifier_range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])),
+                            ('d18o', (identifier_range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (identifier_range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])),
+                        ])
+                        signal_range_mask = range_masks['signal']
+                        leak_range_mask = range_masks['leak']
+                        d13c_filter_mask = range_masks['d13c']
+                        d18o_filter_mask = range_masks['d18o']
 
                         # Plot each type with different symbol but same red color
                         if signal_range_mask.any():
@@ -7957,7 +8739,7 @@ def main():
                                 x=signal_df['x_axis'],
                                 y=signal_df['d 18O/16O  Mean'],
                                 mode='markers',
-                                marker=dict(color='red', symbol='diamond', size=12, line=dict(width=2)),
+                                marker=dict(color='red', symbol='diamond', size=12, line=dict(width=1.5, color='black')),
                                 name='Signal Intensity Range',
                                 customdata=_build_delta_point_customdata(signal_df, 'd18O'),
                                 hovertemplate=(
@@ -7972,7 +8754,7 @@ def main():
                                 x=leak_df['x_axis'],
                                 y=leak_df['d 18O/16O  Mean'],
                                 mode='markers',
-                                marker=dict(color='red', symbol='star', size=12, line=dict(width=2)),
+                                marker=dict(color='red', symbol='star', size=12, line=dict(width=1.5, color='black')),
                                 name='Leak Rate Range',
                                 customdata=_build_delta_point_customdata(leak_df, 'd18O'),
                                 hovertemplate=(
@@ -8023,7 +8805,7 @@ def main():
                                 x=d13_df['x_axis'],
                                 y=d13_df['d 18O/16O  Mean'],
                                 mode='markers',
-                                marker=dict(color='red', symbol='cross', size=12, line=dict(width=2)),
+                                marker=dict(color='red', symbol='cross', size=12, line=dict(width=1.5, color='black')),
                                 name='d13C Range',
                                 customdata=_build_delta_point_customdata(d13_df, 'd18O'),
                                 hovertemplate=(
@@ -8038,7 +8820,7 @@ def main():
                                 x=d18_df['x_axis'],
                                 y=d18_df['d 18O/16O  Mean'],
                                 mode='markers',
-                                marker=dict(color='red', symbol='x', size=12, line=dict(width=2)),
+                                marker=dict(color='red', symbol='x', size=12, line=dict(width=1.5, color='black')),
                                 name='d18O Range',
                                 customdata=_build_delta_point_customdata(d18_df, 'd18O'),
                                 hovertemplate=(
@@ -8083,28 +8865,25 @@ def main():
                     ]
                     if not identifier_sat_samples.empty:
                         sat_customdata = _build_delta_point_customdata(identifier_sat_samples, 'd18O')
-                        y_vals_sat = pd.to_numeric(identifier_sat_samples['d 18O/16O  Mean'], errors='coerce')
-                        if y_vals_sat.notna().any():
-                            y_sat = y_vals_sat.tolist()
-                        else:
-                            y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
-                            y_min = y_vals.min()
-                            y_max = y_vals.max()
-                            if not np.isfinite(y_min):
-                                y_min, y_max = -1.0, 1.0
-                            y_range = y_max - y_min if np.isfinite(y_max) else 1.0
-                            y_sat = [y_min - (0.15 * y_range if y_range > 0 else 0.75)] * len(identifier_sat_samples)
+                        y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
+                        y_min = y_vals.min()
+                        y_max = y_vals.max()
+                        if not np.isfinite(y_min):
+                            y_min, y_max = -1.0, 1.0
+                        y_range = y_max - y_min if np.isfinite(y_max) else 1.0
+                        y_failed = y_min - (0.1 * y_range if y_range > 0 else 0.5)
+                        y_sat = [y_failed] * len(identifier_sat_samples)
                         fig_d18O.add_trace(go.Scatter(
                             x=identifier_sat_samples['x_axis'],
                             y=y_sat,
                             mode='markers',
-                            marker=dict(color='#d62728', symbol='triangle-down', size=12, line=dict(width=2)),
+                            marker=dict(color='#d62728', symbol='triangle-down', size=10, line=dict(width=1)),
                             name='Failed Samples (Fully Saturated)',
                             customdata=sat_customdata,
                             hovertemplate=(
                                 'Identifier 1: %{customdata[2]}<br>'
                                 'Identifier 2: %{customdata[3]}<br>'
-                                'd18O: %{y:.4f}<extra></extra>'
+                                'd18O: fully saturated (plotted on failed line)<extra></extra>'
                             )
                         ))
 
@@ -8242,7 +9021,7 @@ def main():
                 fig_d18O.update_layout(
                     title=f'{identifier} - d18O for Species: {species}',
                     xaxis_title='X Axis',
-                    yaxis_title='d18O (‰)',
+                    yaxis_title='d18O (â€°)',
                     legend_title='Data Type',
                     margin=dict(r=100, t=100),  # Reduced right margin
                     xaxis=dict(
@@ -8286,20 +9065,18 @@ def main():
                                 y_min, y_max = -1.0, 1.0
                             y_range = y_max - y_min if np.isfinite(y_max) else 1.0
                             y_active_plot = y_min - (0.1 * y_range if y_range > 0 else 0.5)
-                        status_val = str(active_row.get('Collector Status', '')).strip()
-                        marker_symbol = 'triangle-down' if status_val in ('Failed Sample', 'Fully Saturated Collectors') else 'circle'
                         fig_d18O.add_trace(go.Scatter(
                             x=[x_active],
                             y=[y_active_plot],
                             mode='markers',
                             marker=dict(
                                 color='#ff00ff',
-                                symbol=marker_symbol,
-                                size=14,
-                                line=dict(width=2, color='#ff00ff')
+                                symbol='circle-open',
+                                size=18,
+                                line=dict(width=3, color='#ff00ff')
                             ),
-                            name='Active Selection',
-                            showlegend=False,
+                            name='Selected sample',
+                            showlegend=True,
                             legendgroup='active_selection'
                         ))
                 _apply_editor_selection_to_figure(fig_d18O, d18_editor_prefix)
@@ -8352,8 +9129,7 @@ def main():
             d18o_outliers = d18o_outliers[~d18o_outliers.index.map(_is_row_edited)]
             
             signal_outliers = species_data[
-                (species_data['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (species_data['1  Cycle Int  Samp  44'] > st.session_state.signal_range[1])
+                species_data['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]
             ]
             signal_outliers = signal_outliers[~signal_outliers.index.map(_is_row_edited)]
             
@@ -8378,31 +9154,31 @@ def main():
                         styled_stats = stat_outliers_only[['Identifier 2', species_col, 'd 13C/12C  Mean', 'd 18O/16O  Mean']].copy()
                         styled_stats = styled_stats.rename(columns={
                             species_col: 'Species',
-                            'd 13C/12C  Mean': 'd13C Value (‰)',
-                            'd 18O/16O  Mean': 'd18O Value (‰)'
+                            'd 13C/12C  Mean': 'd13C Value (â€°)',
+                            'd 18O/16O  Mean': 'd18O Value (â€°)'
                         })
                         st.dataframe(styled_stats, width='stretch')
                     else:
                         st.info("No statistical outliers detected")
 
-                # Î´13C Outliers
+                # ÃŽÂ´13C Outliers
                 with st.expander("d13C Range Outliers", expanded=True):
                     if not d13c_outliers.empty:
-                        st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} ‰")
+                        st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} â€°")
                         styled_d13c = d13c_outliers[['Identifier 2', species_col, 'd 13C/12C  Mean']].copy()
                         styled_d13c = styled_d13c.rename(columns={
-                            species_col: 'Species','d 13C/12C  Mean': 'd13C Value (‰)'})
+                            species_col: 'Species','d 13C/12C  Mean': 'd13C Value (â€°)'})
                         st.dataframe(styled_d13c, width='stretch')
                     else:
                         st.info("No d13C outliers detected")
 
-                # Î´18O Outliers
+                # ÃŽÂ´18O Outliers
                 with st.expander("d18O Range Outliers", expanded=True):
                     if not d18o_outliers.empty:
-                        st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} ‰")
+                        st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} â€°")
                         styled_d18o = d18o_outliers[['Identifier 2', species_col, 'd 18O/16O  Mean']].copy()
                         styled_d18o = styled_d18o.rename(columns={
-                            species_col: 'Species','d 18O/16O  Mean': 'd18O Value (‰)'})
+                            species_col: 'Species','d 18O/16O  Mean': 'd18O Value (â€°)'})
                         st.dataframe(styled_d18o, width='stretch')
                     else:
                         st.info("No d18O outliers detected")
@@ -8415,7 +9191,7 @@ def main():
                 # Signal Intensity Outliers
                 with st.expander("Signal Intensity Outliers", expanded=True):
                     if not signal_outliers.empty:
-                        st.markdown(f"**Acceptable Range:** {st.session_state.signal_range[0]:.2f} to {st.session_state.signal_range[1]:.2f}")
+                        st.markdown(f"**Minimum Acceptable Signal Intensity:** {st.session_state.signal_range[0]:.2f}")
                         styled_signal = signal_outliers[['Identifier 2', species_col, '1  Cycle Int  Samp  44']].copy()
                         styled_signal = styled_signal.rename(columns={
                             species_col: 'Species','1  Cycle Int  Samp  44': 'Signal Intensity'})
@@ -8533,5 +9309,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
