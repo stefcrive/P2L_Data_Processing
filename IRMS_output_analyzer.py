@@ -1543,6 +1543,136 @@ def _get_cycles_for_selected_point(row_label, target_col):
     return cycles, selected_pre
 
 
+def _pick_cycle_sample_intensity_column(cycles, intensity_cols, preferred_masses):
+    """Pick the best sample intensity column for a set of preferred masses."""
+    if cycles is None or cycles.empty:
+        return None
+    for mass in preferred_masses:
+        mass_cols = [c for c in intensity_cols if _extract_mass_from_intensity_column(c) == mass]
+        if not mass_cols:
+            continue
+        sample_labeled = []
+        for col in mass_cols:
+            low = _normalize_column_key(col)
+            if 'standard' in low or re.search(r'\bstd\b', low) or re.search(r'\bref\b', low):
+                continue
+            if 'sample' in low or 'samp' in low or re.search(r'\bsmp\b', low):
+                sample_labeled.append(col)
+        candidates = sample_labeled if sample_labeled else mass_cols
+        if not candidates:
+            continue
+        ranked = []
+        for col in candidates:
+            vals = _normalize_signal_intensity(cycles[col])
+            median_val = float(vals.median(skipna=True)) if vals.notna().any() else -np.inf
+            ranked.append((col, median_val))
+        ranked.sort(key=lambda t: t[1], reverse=True)
+        if ranked:
+            return ranked[0][0]
+    return None
+
+
+def _compute_cycle_mean_for_target(target, correct_linearity=False, target_intensity=15.0):
+    """Compute isotope mean from valid cycles, with optional linear extrapolation to a target intensity."""
+    result = {
+        'mean': None,
+        'valid_cycles': 0,
+        'method': 'valid_cycle_mean',
+        'linearity_applied': False,
+        'linearity_points': 0,
+        'linearity_target_intensity': float(target_intensity),
+        'intensity_col': None,
+        'reason': '',
+    }
+    if not isinstance(target, dict):
+        result['reason'] = 'invalid_target'
+        return result
+
+    cycles, _ = _get_cycles_for_selected_point(target.get('row_label'), target.get('target_col'))
+    if cycles is None or cycles.empty:
+        result['reason'] = 'no_cycle_data'
+        return result
+
+    isotope_key = str(target.get('isotope_key', '')).strip()
+    if isotope_key == 'd13C':
+        value_col = _pick_cycle_value_column(cycles, 'd 13C/12C  Mean', [r'd13', r'd ?13c', r'd45co2', r'\bd45\b'])
+        required_masses = [44, 45]
+        preferred_intensity_masses = [44, 45]
+    elif isotope_key == 'd18O':
+        value_col = _pick_cycle_value_column(cycles, 'd 18O/16O  Mean', [r'd18', r'd ?18o', r'd46co2', r'\bd46\b'])
+        required_masses = [44, 45, 46]
+        preferred_intensity_masses = [44, 46]
+    else:
+        result['reason'] = 'unsupported_isotope'
+        return result
+
+    if value_col is None or value_col not in cycles.columns:
+        result['reason'] = 'missing_cycle_delta_column'
+        return result
+
+    cycle_delta = pd.to_numeric(cycles[value_col], errors='coerce')
+    if cycle_delta.notna().sum() == 0:
+        result['reason'] = 'no_cycle_delta_values'
+        return result
+
+    intensity_cols = [c for c in _find_cycle_intensity_columns(cycles) if c in cycles.columns]
+    intensity_for_mask = pd.DataFrame(index=cycles.index)
+    for col in intensity_cols:
+        intensity_for_mask[col] = _normalize_signal_intensity(cycles[col])
+    sat_mask = _build_saturation_mask_from_intensity_df(
+        intensity_for_mask,
+        required_masses
+    ).reindex(cycles.index, fill_value=False)
+
+    valid_mask = cycle_delta.notna() & ~sat_mask
+    valid_delta = cycle_delta[valid_mask]
+    if valid_delta.empty:
+        result['reason'] = 'no_valid_cycles_after_saturation_filter'
+        return result
+
+    valid_mean = float(valid_delta.mean())
+    result['mean'] = valid_mean
+    result['valid_cycles'] = int(valid_delta.shape[0])
+
+    if not bool(correct_linearity):
+        return result
+
+    intensity_col = _pick_cycle_sample_intensity_column(cycles, intensity_cols, preferred_intensity_masses)
+    result['intensity_col'] = intensity_col
+    if intensity_col is None:
+        result['reason'] = 'missing_intensity_column'
+        return result
+
+    intensity_vals = _normalize_signal_intensity(cycles[intensity_col])
+    x = pd.to_numeric(intensity_vals[valid_mask], errors='coerce')
+    y = valid_delta.reindex(x.index)
+    xy_mask = x.notna() & y.notna()
+    x = x[xy_mask]
+    y = y[xy_mask]
+    result['linearity_points'] = int(x.shape[0])
+
+    if x.shape[0] < 2 or x.nunique(dropna=True) < 2:
+        result['reason'] = 'insufficient_points_for_linearity_fit'
+        return result
+
+    try:
+        slope, intercept = np.polyfit(x.to_numpy(dtype=float), y.to_numpy(dtype=float), 1)
+        predicted = float(slope * float(target_intensity) + intercept)
+        if np.isfinite(predicted):
+            result['mean'] = predicted
+            result['linearity_applied'] = True
+            result['method'] = 'linearity_extrapolated_to_target_intensity'
+            result['linearity_slope'] = float(slope)
+            result['linearity_intercept'] = float(intercept)
+            result['reason'] = ''
+            return result
+    except Exception:
+        pass
+
+    result['reason'] = 'linearity_fit_failed'
+    return result
+
+
 def _build_selected_point_diagnostics_inline(target, pre_row=None):
     """Build fixed diagnostics text for the selected datapoint as a single inline line."""
     if st.session_state.df is None:
@@ -2346,16 +2476,79 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 f"{target['identifier_1']} / {target['identifier_2']}."
             )
             st.rerun()
+        collector_status_text = str(target.get('collector_status', '')).strip()
+        is_partially_saturated = collector_status_text == 'Partially Saturated Collectors'
+        suggested_set_value = float(target['current_value'])
+        linearity_toggle_value = False
+        linearity_target_intensity = 15.0
+        cycle_mean_info = None
+        if is_partially_saturated and not is_failed_sample:
+            linearity_toggle_key = (
+                f"{editor_key_prefix}_correct_linearity_{selection_hash}_{target['row_key']}_{target['isotope_key']}"
+            )
+            toggle_widget = st.toggle if hasattr(st, 'toggle') else st.checkbox
+            linearity_toggle_value = toggle_widget(
+                "Correct linearity",
+                value=False,
+                key=linearity_toggle_key,
+                help=(
+                    "When enabled, fit delta vs signal intensity for valid cycles and extrapolate to a target intensity. "
+                    "When disabled, use mean of valid cycles only."
+                ),
+            )
+            if bool(linearity_toggle_value):
+                linearity_target_key = (
+                    f"{editor_key_prefix}_linearity_target_{selection_hash}_{target['row_key']}_{target['isotope_key']}"
+                )
+                linearity_target_intensity = float(st.number_input(
+                    "Signal intensity target (V)",
+                    min_value=0.001,
+                    value=15.0,
+                    step=0.1,
+                    format="%.3f",
+                    key=linearity_target_key,
+                    help="Target signal intensity used by linear extrapolation.",
+                ))
+            cycle_mean_info = _compute_cycle_mean_for_target(
+                target,
+                correct_linearity=bool(linearity_toggle_value),
+                target_intensity=float(linearity_target_intensity)
+            )
+            computed_mean = cycle_mean_info.get('mean')
+            computed_mean_num = pd.to_numeric(pd.Series([computed_mean]), errors='coerce').iloc[0]
+            if pd.notna(computed_mean_num):
+                suggested_set_value = float(computed_mean_num)
+                if bool(linearity_toggle_value) and bool(cycle_mean_info.get('linearity_applied', False)):
+                    st.caption(
+                        f"Computed {target['isotope_key']} from {int(cycle_mean_info.get('valid_cycles', 0))} valid cycle(s) "
+                        f"using {float(linearity_target_intensity):.3f} V extrapolation: `{suggested_set_value:.4f}`"
+                    )
+                else:
+                    st.caption(
+                        f"Computed {target['isotope_key']} mean from {int(cycle_mean_info.get('valid_cycles', 0))} valid cycle(s): "
+                        f"`{suggested_set_value:.4f}`"
+                    )
+                    if bool(linearity_toggle_value):
+                        reason = str(cycle_mean_info.get('reason', '')).replace('_', ' ').strip()
+                        if reason != '':
+                            st.caption(f"Linearity extrapolation not applied ({reason}); valid-cycle mean is used.")
+            else:
+                st.caption("Unable to compute cycle-derived mean for this datapoint; current value remains loaded.")
         form_cols = st.columns(3, gap="medium")
         form_col_set = form_cols[0]
         form_col_offset = form_cols[1]
         with form_col_set:
             with st.form(key=f"{editor_key_prefix}_set_form_{selection_hash}"):
-                set_value_sig = hashlib.md5(f"{target['current_value']:.8f}".encode('utf-8')).hexdigest()[:6]
+                set_seed = (
+                    f"{suggested_set_value:.8f}|{int(bool(linearity_toggle_value))}|"
+                    f"{float(linearity_target_intensity):.6f}|"
+                    f"{'' if cycle_mean_info is None else str(cycle_mean_info.get('method', ''))}"
+                )
+                set_value_sig = hashlib.md5(set_seed.encode('utf-8')).hexdigest()[:6]
                 set_input_key = f"{editor_key_prefix}_set_input_{selection_hash}_{set_value_sig}"
                 new_value = st.number_input(
                     f"{target['isotope_key']} value (per mil)",
-                    value=target['current_value'],
+                    value=float(suggested_set_value),
                     step=0.001,
                     format="%.4f",
                     key=set_input_key,
@@ -6305,23 +6498,23 @@ def main():
 
                     # Optional markup for linearity-corrected precision display
                     d13c_lin_markup = (f"<p style='font-size: 16px; margin: 2px 0;'><i>d13C Precision (linearity corrected):</i> "
-                                       f"<span style='color: {d13c_lin_color}'>{d13c_lin_prec:.3f}â€°</span></p>") if d13c_lin_prec is not None else ""
+                                       f"<span style='color: {d13c_lin_color}'>{d13c_lin_prec:.3f}\u2030</span></p>") if d13c_lin_prec is not None else ""
                     d18o_lin_markup = (f"<p style='font-size: 16px; margin: 2px 0;'><i>d18O Precision (linearity corrected):</i> "
-                                       f"<span style='color: {d18o_lin_color}'>{d18o_lin_prec:.3f}â€°</span></p>") if d18o_lin_prec is not None else ""
+                                       f"<span style='color: {d18o_lin_color}'>{d18o_lin_prec:.3f}\u2030</span></p>") if d18o_lin_prec is not None else ""
                     
                     st.markdown(f"""
                     <div style='background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin: 10px 0;'>
                         <h3 style='color: #1f77b4; margin-bottom: 15px;'>Precision and Averages for {standard} (Excluding Outliers)</h3>
                         <div style='display: flex; justify-content: space-between;'>
                             <div style='flex: 1; margin-right: 20px;'>
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Precision:</b> <span style='color: {d13c_precision_color}'>{d13c_precision:.3f}â€°</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Precision:</b> <span style='color: {d13c_precision_color}'>{d13c_precision:.3f}\u2030</span></p>
                                 {d13c_lin_markup}
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Average:</b> <span style='color: #000000'>{d13c_average:.3f}â€°</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Average:</b> <span style='color: #000000'>{d13c_average:.3f}\u2030</span></p>
                             </div>
                             <div style='flex: 1;'>
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Precision:</b> <span style='color: {d18o_precision_color}'>{d18o_precision:.3f}â€°</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Precision:</b> <span style='color: {d18o_precision_color}'>{d18o_precision:.3f}\u2030</span></p>
                                 {d18o_lin_markup}
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{d18o_average:.3f}â€°</span></p>
+                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{d18o_average:.3f}\u2030</span></p>
                             </div>
                         </div>
                         {line_precision_markup}
@@ -8969,7 +9162,7 @@ def main():
                     x=identifier_curve_data['x_axis'],
                     y=identifier_curve_data['d 13C/12C  Mean'],
                     mode='lines+markers',
-                    line=dict(color='blue', dash='dot', width=2),
+                    line=dict(color='blue', dash='solid', width=1.5),
                     marker=dict(
                         color=identifier_curve_data[color_param_tab3_value_col],
                         colorscale="Viridis",
@@ -9026,7 +9219,7 @@ def main():
                         x=identifier_curve_data['x_axis'],
                         y=identifier_curve_data['d 13C/12C  Mean'],
                         mode='lines',
-                        line=dict(color='blue', width=2),
+                        line=dict(color='blue', width=1.5),
                         name=f'Raw d13C - {identifier}',
                         customdata=d13_identifier_customdata,
                         hovertemplate=(
@@ -9207,7 +9400,7 @@ def main():
                         x=identifier_curve_data['x_axis'],
                         y=identifier_curve_data['d 18O/16O  Mean'],
                         mode='lines+markers',
-                        line=dict(color='blue', dash='dot', width=2),
+                        line=dict(color='blue', dash='solid', width=1.5),
                         marker=dict(
                             color=identifier_curve_data[color_param_tab3_value_col],
                             colorscale="Viridis",
@@ -9379,7 +9572,7 @@ def main():
                     x=sorted_data['x_axis'],
                     y=sorted_data['d 18O/16O  Mean'],
                     mode='lines+markers',
-                    line=dict(color='blue', dash='dot', width=2),
+                    line=dict(color='blue', dash='solid', width=1.5),
                     marker=dict(
                         color=sorted_data[color_param_tab3_value_col],
                         colorscale="Viridis",
@@ -9432,7 +9625,7 @@ def main():
                         x=sorted_data['x_axis'],
                         y=sorted_data['d 18O/16O  Mean'],
                         mode='lines',
-                        line=dict(color='blue', width=2),
+                        line=dict(color='blue', width=1.5),
                         name=f'Raw d18O - {identifier}',
                         customdata=_build_delta_point_customdata(sorted_data, 'd18O'),
                         hovertemplate=(
@@ -9603,7 +9796,7 @@ def main():
 
             # Column 1: Isotope Outliers
             with col1:
-                st.markdown("### ?? Isotope Outliers")
+                st.markdown("### Isotope Outliers")
                 st.markdown("---")
                 
                 # Statistical Outliers
@@ -9613,8 +9806,8 @@ def main():
                         styled_stats = stat_outliers_only[['Identifier 2', species_col, 'd 13C/12C  Mean', 'd 18O/16O  Mean']].copy()
                         styled_stats = styled_stats.rename(columns={
                             species_col: 'Species',
-                            'd 13C/12C  Mean': 'd13C Value (â€°)',
-                            'd 18O/16O  Mean': 'd18O Value (â€°)'
+                            'd 13C/12C  Mean': 'd13C Value (\u2030)',
+                            'd 18O/16O  Mean': 'd18O Value (\u2030)'
                         })
                         st.dataframe(styled_stats, width='stretch')
                     else:
@@ -9623,10 +9816,10 @@ def main():
                 # ÃŽÂ´13C Outliers
                 with st.expander("d13C Range Outliers", expanded=True):
                     if not d13c_outliers.empty:
-                        st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} â€°")
+                        st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} \u2030")
                         styled_d13c = d13c_outliers[['Identifier 2', species_col, 'd 13C/12C  Mean']].copy()
                         styled_d13c = styled_d13c.rename(columns={
-                            species_col: 'Species','d 13C/12C  Mean': 'd13C Value (â€°)'})
+                            species_col: 'Species','d 13C/12C  Mean': 'd13C Value (\u2030)'})
                         st.dataframe(styled_d13c, width='stretch')
                     else:
                         st.info("No d13C outliers detected")
@@ -9634,17 +9827,17 @@ def main():
                 # ÃŽÂ´18O Outliers
                 with st.expander("d18O Range Outliers", expanded=True):
                     if not d18o_outliers.empty:
-                        st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} â€°")
+                        st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} \u2030")
                         styled_d18o = d18o_outliers[['Identifier 2', species_col, 'd 18O/16O  Mean']].copy()
                         styled_d18o = styled_d18o.rename(columns={
-                            species_col: 'Species','d 18O/16O  Mean': 'd18O Value (â€°)'})
+                            species_col: 'Species','d 18O/16O  Mean': 'd18O Value (\u2030)'})
                         st.dataframe(styled_d18o, width='stretch')
                     else:
                         st.info("No d18O outliers detected")
 
             # Column 2: Technical Outliers
             with col2:
-                st.markdown("### ?? Technical Outliers")
+                st.markdown("### Technical Outliers")
                 st.markdown("---")
                 
                 # Signal Intensity Outliers
