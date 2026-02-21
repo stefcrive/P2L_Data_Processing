@@ -896,6 +896,141 @@ def _build_delta_point_customdata(df, isotope_key):
     return np.column_stack((idx_vals, iso_vals, id1_vals, id2_vals))
 
 
+def _build_cycle_std_lookups(df):
+    """Build per-row lookups for cycle-derived d13C/d18O standard deviations."""
+    if df is None or getattr(df, "empty", True):
+        return {}, {}
+
+    def _lookup_for(col_name, used_col_name):
+        values = pd.to_numeric(df.get(col_name, pd.Series(index=df.index, dtype=float)), errors='coerce')
+        used = pd.to_numeric(df.get(used_col_name, pd.Series(index=df.index, dtype=float)), errors='coerce')
+        valid_cycle_sd = used >= 2
+        status = df.get('Collector Status', pd.Series(index=df.index, dtype=object)).fillna('').astype(str).str.strip()
+        valid_cycle_sd = valid_cycle_sd & ~status.isin(['Fully Saturated Collectors', 'Failed Sample'])
+        return {
+            str(row_label): float(sd_val)
+            for row_label, sd_val in values.items()
+            if (
+                pd.notna(sd_val)
+                and np.isfinite(sd_val)
+                and float(sd_val) >= 0.0
+                and bool(valid_cycle_sd.get(row_label, False))
+            )
+        }
+
+    return (
+        _lookup_for('d 13C/12C  Std Dev', 'd13C Cycles Used'),
+        _lookup_for('d 18O/16O  Std Dev', 'd18O Cycles Used'),
+    )
+
+
+def _build_plotly_error_bar(row_tokens, std_lookup):
+    """Create Plotly error bar settings from row-label -> std lookup."""
+    if row_tokens is None or std_lookup is None:
+        return None
+    error_vals = []
+    has_value = False
+    for row_token in row_tokens:
+        sd_val = std_lookup.get(str(row_token), np.nan)
+        if pd.notna(sd_val) and np.isfinite(sd_val):
+            error_vals.append(float(sd_val))
+            has_value = True
+        else:
+            error_vals.append(np.nan)
+    if not has_value:
+        return None
+    return dict(
+        type='data',
+        array=error_vals,
+        visible=True,
+        thickness=1.5,
+        width=3,
+        color='rgba(40,40,40,0.9)',
+    )
+
+
+def _build_plotly_error_bar_for_df(df, isotope_key, d13_std_lookup, d18_std_lookup):
+    """Create an isotope-specific error bar dict for the provided dataframe rows."""
+    if df is None or getattr(df, "empty", True):
+        return None
+    row_tokens = pd.Series(df.index, index=df.index).astype(str).tolist()
+    if isotope_key == 'd13C':
+        return _build_plotly_error_bar(row_tokens, d13_std_lookup)
+    if isotope_key == 'd18O':
+        return _build_plotly_error_bar(row_tokens, d18_std_lookup)
+    return None
+
+
+def _apply_cycle_std_error_bars(fig, d13_std_lookup, d18_std_lookup):
+    """Attach cycle-derived std-dev error bars to traces that carry row customdata."""
+    if fig is None:
+        return
+
+    def _coerce_customdata_2d(customdata):
+        if customdata is None:
+            return None
+        if hasattr(customdata, 'tolist'):
+            customdata = customdata.tolist()
+        if isinstance(customdata, np.ndarray) and customdata.ndim == 2:
+            return customdata.astype(object, copy=False)
+        if not isinstance(customdata, (list, tuple, np.ndarray)):
+            return None
+        if len(customdata) == 0:
+            return None
+
+        first = customdata[0]
+        if isinstance(first, (list, tuple, np.ndarray)):
+            rows = []
+            for item in customdata:
+                if not isinstance(item, (list, tuple, np.ndarray)):
+                    continue
+                row = list(item)
+                if len(row) >= 2:
+                    rows.append(row)
+            if not rows:
+                return None
+            return np.asarray(rows, dtype=object)
+
+        row = list(customdata)
+        if len(row) < 2:
+            return None
+        return np.asarray([row], dtype=object)
+
+    for trace in fig.data:
+        customdata = getattr(trace, 'customdata', None)
+        custom_arr = _coerce_customdata_2d(customdata)
+        if custom_arr is None:
+            continue
+        if custom_arr.ndim != 2 or custom_arr.shape[0] == 0:
+            continue
+
+        row_tokens = custom_arr[:, 0]
+        iso_vals = (
+            {str(v).strip() for v in custom_arr[:, 1]}
+            if custom_arr.shape[1] > 1
+            else set()
+        )
+        if len(iso_vals) != 1:
+            continue
+        iso_key = next(iter(iso_vals))
+
+        if iso_key == 'd13C':
+            err_y = _build_plotly_error_bar(row_tokens, d13_std_lookup)
+            if err_y:
+                trace.error_y = err_y
+        elif iso_key == 'd18O':
+            err_y = _build_plotly_error_bar(row_tokens, d18_std_lookup)
+            if err_y:
+                trace.error_y = err_y
+        elif iso_key == 'cross':
+            err_x = _build_plotly_error_bar(row_tokens, d18_std_lookup)
+            err_y = _build_plotly_error_bar(row_tokens, d13_std_lookup)
+            if err_x:
+                trace.error_x = err_x
+            if err_y:
+                trace.error_y = err_y
+
+
 def _get_edited_row_tokens():
     """Return edited row labels as string tokens."""
     edited = st.session_state.get('edited_delta_rows', set())
@@ -1109,6 +1244,8 @@ def _token_from_customdata_payload(customdata):
     except Exception:
         row_label = None
     row_key = str(row_label) if row_label is not None else str(raw_row_label)
+    if isotope_key == 'cross':
+        isotope_key = 'd13C'
     if isotope_key == '' or row_key == '':
         return None
     return f"{isotope_key}|{row_key}"
@@ -2013,6 +2150,135 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             'original_value': original_value,
         }
 
+    def _std_display_for_target(target):
+        iso_key = str(target.get('isotope_key', '')).strip()
+        std_col = 'd 13C/12C  Std Dev' if iso_key == 'd13C' else 'd 18O/16O  Std Dev' if iso_key == 'd18O' else None
+        if std_col is None or std_col not in st.session_state.df.columns:
+            return "N/A"
+        std_raw = pd.to_numeric(
+            pd.Series([st.session_state.df.at[target['row_label'], std_col]]),
+            errors='coerce',
+        ).iloc[0]
+        return f"{float(std_raw):.4f}" if pd.notna(std_raw) else "N/A"
+
+    def _apply_set_value_to_target(target, new_value):
+        original_map = st.session_state.setdefault('original_delta_values', {})
+        original_key = f"{target['isotope_key']}|{target['row_key']}"
+        if original_key not in original_map:
+            original_map[original_key] = float(target['current_value'])
+        prev_raw = pd.to_numeric(
+            pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
+            errors='coerce'
+        ).iloc[0]
+        prev_status = None
+        if 'Collector Status' in st.session_state.df.columns:
+            prev_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+        _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
+        prev_cal = np.nan
+        if cal_col in st.session_state.df.columns:
+            prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+        edited_rows = _get_edited_row_tokens()
+        edited_rows.add(target['row_key'])
+        st.session_state['edited_delta_rows'] = edited_rows
+        st.session_state.df.at[target['row_label'], target['target_col']] = float(new_value)
+        _refresh_collector_status_after_delta_edit(target['row_label'])
+        _refresh_calibrated_after_delta_edit(
+            target['row_label'],
+            target['isotope_key'],
+            previous_raw=prev_raw,
+            previous_calibrated=prev_cal
+        )
+        new_cal = np.nan
+        if cal_col in st.session_state.df.columns:
+            new_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+        new_status = None
+        if 'Collector Status' in st.session_state.df.columns:
+            new_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+        _autosave_session_update(
+            "set_delta_value",
+            changes=[
+                {
+                    "isotope": target['isotope_key'],
+                    "row_label": str(target['row_label']),
+                    "column": target['target_col'],
+                    "identifier_1": target['identifier_1'],
+                    "identifier_2": target['identifier_2'],
+                    "excel_file": target['source_excel'],
+                    "previous_value": _numeric_or_none(prev_raw),
+                    "new_value": _numeric_or_none(new_value),
+                    "previous_calibrated": _numeric_or_none(prev_cal),
+                    "new_calibrated": _numeric_or_none(new_cal),
+                    "previous_status": None if pd.isna(prev_status) else str(prev_status),
+                    "new_status": None if pd.isna(new_status) else str(new_status),
+                }
+            ],
+            context={"editor": editor_key_prefix},
+        )
+        st.success(
+            f"Updated {target['isotope_key']} to {float(new_value):.4f} for "
+            f"{target['identifier_1']} / {target['identifier_2']}."
+        )
+        st.rerun()
+
+    def _apply_interpolated_value_to_target(target, interpolated_value):
+        original_map = st.session_state.setdefault('original_delta_values', {})
+        edited_rows = _get_edited_row_tokens()
+        prev_raw = pd.to_numeric(
+            pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
+            errors='coerce'
+        ).iloc[0]
+        prev_status = None
+        if 'Collector Status' in st.session_state.df.columns:
+            prev_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+        _, cal_col, _ = _get_isotope_columns(target['isotope_key'])
+        prev_cal = np.nan
+        if cal_col in st.session_state.df.columns:
+            prev_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+        original_key = f"{target['isotope_key']}|{target['row_key']}"
+        if original_key not in original_map and pd.notna(prev_raw):
+            original_map[original_key] = float(prev_raw)
+        edited_rows.add(target['row_key'])
+        st.session_state['edited_delta_rows'] = edited_rows
+        st.session_state.df.at[target['row_label'], target['target_col']] = float(interpolated_value)
+        _refresh_collector_status_after_delta_edit(target['row_label'])
+        _refresh_calibrated_after_delta_edit(
+            target['row_label'],
+            target['isotope_key'],
+            previous_raw=prev_raw,
+            previous_calibrated=prev_cal
+        )
+        new_cal = np.nan
+        if cal_col in st.session_state.df.columns:
+            new_cal = pd.to_numeric(pd.Series([st.session_state.df.at[target['row_label'], cal_col]]), errors='coerce').iloc[0]
+        new_status = None
+        if 'Collector Status' in st.session_state.df.columns:
+            new_status = st.session_state.df.at[target['row_label'], 'Collector Status']
+        _autosave_session_update(
+            "interpolate_delta_value",
+            changes=[
+                {
+                    "isotope": target['isotope_key'],
+                    "row_label": str(target['row_label']),
+                    "column": target['target_col'],
+                    "identifier_1": target['identifier_1'],
+                    "identifier_2": target['identifier_2'],
+                    "excel_file": target['source_excel'],
+                    "previous_value": _numeric_or_none(prev_raw),
+                    "new_value": _numeric_or_none(interpolated_value),
+                    "previous_calibrated": _numeric_or_none(prev_cal),
+                    "new_calibrated": _numeric_or_none(new_cal),
+                    "previous_status": None if pd.isna(prev_status) else str(prev_status),
+                    "new_status": None if pd.isna(new_status) else str(new_status),
+                }
+            ],
+            context={"editor": editor_key_prefix, "count": 1},
+        )
+        st.success(
+            f"Interpolated {target['isotope_key']} to {float(interpolated_value):.4f} for "
+            f"{target['identifier_1']} / {target['identifier_2']}."
+        )
+        st.rerun()
+
     def _token_for_target(target):
         return f"{target['isotope_key']}|{target['row_key']}"
 
@@ -2230,6 +2496,20 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
         row_label = _resolve_index_label(st.session_state.df.index, raw_row_label)
         if row_label is None:
             continue
+        if isotope_key == 'cross':
+            # Cross-plot clicks should behave as a single datapoint selection.
+            built = _build_target('d13C', row_label, identifier_1=identifier_1, identifier_2=identifier_2)
+            mapped_isotope = 'd13C'
+            if built is None:
+                built = _build_target('d18O', row_label, identifier_1=identifier_1, identifier_2=identifier_2)
+                mapped_isotope = 'd18O'
+            if built is not None:
+                target_token = (mapped_isotope, str(row_label))
+                if target_token not in seen_targets:
+                    seen_targets.add(target_token)
+                    selected_targets.append(built)
+            continue
+
         target_token = (isotope_key, str(row_label))
         if target_token in seen_targets:
             continue
@@ -2433,15 +2713,44 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
     submitted_offset = False
     submitted_interpolate = False
     interpolation_plan = []
+    offset_targets_for_apply = None
     if single_mode:
         target = selected_targets[0]
+        is_cross_editor = str(editor_key_prefix).startswith("tab3_crossplot_editor")
+        cross_targets = {}
+        if is_cross_editor:
+            for iso_key in ('d13C', 'd18O'):
+                built = target if target.get('isotope_key') == iso_key else _build_target(
+                    iso_key,
+                    target['row_label'],
+                    identifier_1=target.get('identifier_1'),
+                    identifier_2=target.get('identifier_2'),
+                )
+                if built is not None:
+                    cross_targets[iso_key] = built
         is_failed_sample = bool(target.get('is_failed_sample', False))
-        original_display = "N/A" if target['original_value'] is None else f"{target['original_value']:.4f}"
-        st.markdown(
-            f"**Identifier 1:** `{target['identifier_1']}` | **Identifier 2:** `{target['identifier_2']}` | "
-            f"**Origin Excel File:** `{target['source_excel']}` | "
-            f"**Original {target['isotope_key']}:** `{original_display}`"
-        )
+        if is_cross_editor and ('d13C' in cross_targets or 'd18O' in cross_targets):
+            d13_t = cross_targets.get('d13C')
+            d18_t = cross_targets.get('d18O')
+            d13_orig = "N/A" if d13_t is None or d13_t.get('original_value') is None else f"{float(d13_t['original_value']):.4f}"
+            d18_orig = "N/A" if d18_t is None or d18_t.get('original_value') is None else f"{float(d18_t['original_value']):.4f}"
+            d13_std = "N/A" if d13_t is None else _std_display_for_target(d13_t)
+            d18_std = "N/A" if d18_t is None else _std_display_for_target(d18_t)
+            st.markdown(
+                f"**Identifier 1:** `{target['identifier_1']}` | **Identifier 2:** `{target['identifier_2']}` | "
+                f"**Origin Excel File:** `{target['source_excel']}` | "
+                f"**Original d13C:** `{d13_orig}` | **Std Dev d13C:** `{d13_std}` | "
+                f"**Original d18O:** `{d18_orig}` | **Std Dev d18O:** `{d18_std}`"
+            )
+        else:
+            original_display = "N/A" if target['original_value'] is None else f"{target['original_value']:.4f}"
+            std_display = _std_display_for_target(target)
+            st.markdown(
+                f"**Identifier 1:** `{target['identifier_1']}` | **Identifier 2:** `{target['identifier_2']}` | "
+                f"**Origin Excel File:** `{target['source_excel']}` | "
+                f"**Original {target['isotope_key']}:** `{original_display}` | "
+                f"**Calculated Std Dev:** `{std_display}`"
+            )
         current_override = _get_row_manual_outlier_override(target['row_label'])
         effective_outlier = _is_row_outlier_effective(target['row_label'])
         override_sig = "none" if current_override is None else ("1" if bool(current_override) else "0")
@@ -2476,6 +2785,60 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 f"{target['identifier_1']} / {target['identifier_2']}."
             )
             st.rerun()
+        if is_cross_editor and cross_targets:
+            st.caption("Cross-plot sample editor: update both isotopes for this sample.")
+            dual_cols = st.columns(2, gap="medium")
+            entered_values = {}
+            submitted_updates = {}
+            for idx, iso_key in enumerate(['d13C', 'd18O']):
+                iso_target = cross_targets.get(iso_key)
+                if iso_target is None:
+                    continue
+                with dual_cols[idx]:
+                    with st.form(key=f"{editor_key_prefix}_set_form_{iso_key}_{selection_hash}"):
+                        value_seed = f"{float(iso_target.get('current_value', 0.0)):.8f}"
+                        value_sig = hashlib.md5(value_seed.encode('utf-8')).hexdigest()[:6]
+                        input_key = f"{editor_key_prefix}_set_input_{iso_key}_{selection_hash}_{value_sig}"
+                        entered_values[iso_key] = st.number_input(
+                            f"{iso_key} value (per mil)",
+                            value=float(iso_target.get('current_value', 0.0)),
+                            step=0.001,
+                            format="%.4f",
+                            key=input_key,
+                        )
+                        submitted_updates[iso_key] = st.form_submit_button(f"Update {iso_key}")
+
+            if submitted_updates.get('d13C') and 'd13C' in cross_targets:
+                _apply_set_value_to_target(cross_targets['d13C'], float(entered_values.get('d13C', 0.0)))
+            if submitted_updates.get('d18O') and 'd18O' in cross_targets:
+                _apply_set_value_to_target(cross_targets['d18O'], float(entered_values.get('d18O', 0.0)))
+
+            interp_cols = st.columns(2, gap="medium")
+            for idx, iso_key in enumerate(['d13C', 'd18O']):
+                iso_target = cross_targets.get(iso_key)
+                if iso_target is None:
+                    continue
+                prev_neighbor, next_neighbor = _find_interpolation_neighbors(iso_target)
+                with interp_cols[idx]:
+                    if prev_neighbor is None or next_neighbor is None:
+                        st.caption(f"{iso_key}: interpolation unavailable (missing neighbors).")
+                    else:
+                        st.caption(
+                            f"{iso_key}: from {prev_neighbor['value']:.4f} and {next_neighbor['value']:.4f} per mil."
+                        )
+                    if st.button(
+                        f"Interpolate {iso_key}",
+                        key=f"{editor_key_prefix}_interpolate_{iso_key}_{selection_hash}",
+                        disabled=(prev_neighbor is None or next_neighbor is None),
+                        use_container_width=True,
+                    ):
+                        interp_value = (prev_neighbor['value'] + next_neighbor['value']) / 2.0
+                        _apply_interpolated_value_to_target(iso_target, float(interp_value))
+
+            diag_target = cross_targets.get('d13C') or cross_targets.get('d18O')
+            if diag_target is not None and not bool(diag_target.get('is_failed_sample', False)):
+                _render_selected_point_cycle_diagnostics(diag_target, editor_key_prefix)
+            return
         collector_status_text = str(target.get('collector_status', '')).strip()
         is_partially_saturated = collector_status_text == 'Partially Saturated Collectors'
         suggested_set_value = float(target['current_value'])
@@ -2654,48 +3017,155 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             f"{len(selected_targets)} datapoints selected ({', '.join(isotopes)}). "
             "Single-point absolute value edit is hidden for multi-select."
         )
-        multi_cols = st.columns(2, gap="medium")
+        is_cross_multi = str(editor_key_prefix).startswith("tab3_crossplot_editor")
+        if is_cross_multi:
+            row_meta = {}
+            for t in selected_targets:
+                key = str(t.get('row_key', t.get('row_label')))
+                if key not in row_meta:
+                    row_meta[key] = t
+            offset_targets_by_iso = {'d13C': [], 'd18O': []}
+            for meta in row_meta.values():
+                row_label = meta.get('row_label')
+                for iso_key in ('d13C', 'd18O'):
+                    built = _build_target(
+                        iso_key,
+                        row_label,
+                        identifier_1=meta.get('identifier_1'),
+                        identifier_2=meta.get('identifier_2'),
+                    )
+                    if built is not None:
+                        offset_targets_by_iso[iso_key].append(built)
+        else:
+            offset_targets_by_iso = {
+                'd13C': [t for t in selected_targets if t.get('isotope_key') == 'd13C'],
+                'd18O': [t for t in selected_targets if t.get('isotope_key') == 'd18O'],
+            }
+
+        multi_cols = st.columns(3, gap="medium")
+        submitted_offset_d13 = False
+        submitted_offset_d18 = False
+        offset_value_d13 = 0.0
+        offset_value_d18 = 0.0
         with multi_cols[0]:
-            with st.form(key=f"{editor_key_prefix}_offset_form_{selection_hash}"):
-                offset_value = st.number_input(
-                    "Offset to add",
+            d13_count = len(offset_targets_by_iso.get('d13C', []))
+            with st.form(key=f"{editor_key_prefix}_offset_form_d13_{selection_hash}"):
+                offset_value_d13 = st.number_input(
+                    "Offset d13C (per mil)",
                     value=0.0,
-                    step=1.0,
+                    step=0.001,
                     format="%.4f",
-                    key=f"{editor_key_prefix}_offset_input_{selection_hash}",
+                    key=f"{editor_key_prefix}_offset_input_d13_{selection_hash}",
                 )
-                submitted_offset = st.form_submit_button(
-                    f"Apply Offset to {len(selected_targets)} point{'s' if len(selected_targets) != 1 else ''}"
+                submitted_offset_d13 = st.form_submit_button(
+                    f"Apply d13C Offset to {d13_count} point{'s' if d13_count != 1 else ''}",
+                    disabled=(d13_count == 0),
                 )
-        eligible_count = 0
-        for target in selected_targets:
+        with multi_cols[1]:
+            d18_count = len(offset_targets_by_iso.get('d18O', []))
+            with st.form(key=f"{editor_key_prefix}_offset_form_d18_{selection_hash}"):
+                offset_value_d18 = st.number_input(
+                    "Offset d18O (per mil)",
+                    value=0.0,
+                    step=0.001,
+                    format="%.4f",
+                    key=f"{editor_key_prefix}_offset_input_d18_{selection_hash}",
+                )
+                submitted_offset_d18 = st.form_submit_button(
+                    f"Apply d18O Offset to {d18_count} point{'s' if d18_count != 1 else ''}",
+                    disabled=(d18_count == 0),
+                )
+
+        if submitted_offset_d13:
+            submitted_offset = True
+            offset_value = float(offset_value_d13)
+            offset_targets_for_apply = list(offset_targets_by_iso.get('d13C', []))
+        elif submitted_offset_d18:
+            submitted_offset = True
+            offset_value = float(offset_value_d18)
+            offset_targets_for_apply = list(offset_targets_by_iso.get('d18O', []))
+
+        if is_cross_multi:
+            interpolation_targets = []
+            seen_interp_tokens = set()
+            for meta in row_meta.values():
+                row_label = meta.get('row_label')
+                for iso_key in ('d13C', 'd18O'):
+                    built = _build_target(
+                        iso_key,
+                        row_label,
+                        identifier_1=meta.get('identifier_1'),
+                        identifier_2=meta.get('identifier_2'),
+                    )
+                    if built is None:
+                        continue
+                    tok = _token_for_target(built)
+                    if tok in seen_interp_tokens:
+                        continue
+                    seen_interp_tokens.add(tok)
+                    interpolation_targets.append(built)
+        else:
+            interpolation_targets = list(selected_targets)
+
+        interpolation_targets_by_iso = {'d13C': [], 'd18O': []}
+        for target in interpolation_targets:
+            iso_key = str(target.get('isotope_key', '')).strip()
+            if iso_key in interpolation_targets_by_iso:
+                interpolation_targets_by_iso[iso_key].append(target)
+
+        interpolation_plan_by_iso = {'d13C': [], 'd18O': []}
+        for target in interpolation_targets:
             prev_neighbor, next_neighbor = _find_interpolation_neighbors(target)
             if prev_neighbor is None or next_neighbor is None:
                 continue
-            interpolation_plan.append(
+            iso_key = str(target.get('isotope_key', '')).strip()
+            if iso_key not in interpolation_plan_by_iso:
+                continue
+            interpolation_plan_by_iso[iso_key].append(
                 {
                     "target": target,
                     "value": (prev_neighbor['value'] + next_neighbor['value']) / 2.0,
                 }
             )
-            eligible_count += 1
-        with multi_cols[1]:
+        submitted_interpolate_d13 = False
+        submitted_interpolate_d18 = False
+        with multi_cols[2]:
             st.caption(
-                f"Interpolate available for {eligible_count}/{len(selected_targets)} selected points."
+                f"d13C interpolate: {len(interpolation_plan_by_iso['d13C'])}/{len(interpolation_targets_by_iso['d13C'])}"
             )
-            submitted_interpolate = st.button(
-                f"Interpolate {eligible_count} point{'s' if eligible_count != 1 else ''}",
-                key=f"{editor_key_prefix}_interpolate_multi_{selection_hash}",
-                disabled=(eligible_count == 0),
+            submitted_interpolate_d13 = st.button(
+                f"Interpolate d13C ({len(interpolation_plan_by_iso['d13C'])})",
+                key=f"{editor_key_prefix}_interpolate_multi_d13_{selection_hash}",
+                disabled=(len(interpolation_plan_by_iso['d13C']) == 0),
                 use_container_width=True,
             )
+            st.caption(
+                f"d18O interpolate: {len(interpolation_plan_by_iso['d18O'])}/{len(interpolation_targets_by_iso['d18O'])}"
+            )
+            submitted_interpolate_d18 = st.button(
+                f"Interpolate d18O ({len(interpolation_plan_by_iso['d18O'])})",
+                key=f"{editor_key_prefix}_interpolate_multi_d18_{selection_hash}",
+                disabled=(len(interpolation_plan_by_iso['d18O']) == 0),
+                use_container_width=True,
+            )
+        if submitted_interpolate_d13:
+            submitted_interpolate = True
+            interpolation_plan = list(interpolation_plan_by_iso['d13C'])
+        elif submitted_interpolate_d18:
+            submitted_interpolate = True
+            interpolation_plan = list(interpolation_plan_by_iso['d18O'])
 
     if submitted_offset:
         offset_value = float(offset_value)
+        targets_for_offset = (
+            list(offset_targets_for_apply)
+            if isinstance(offset_targets_for_apply, (list, tuple)) and len(offset_targets_for_apply) > 0
+            else list(selected_targets)
+        )
         original_map = st.session_state.setdefault('original_delta_values', {})
         edited_rows = _get_edited_row_tokens()
         autosave_changes = []
-        for target in selected_targets:
+        for target in targets_for_offset:
             current_value = pd.to_numeric(
                 pd.Series([st.session_state.df.at[target['row_label'], target['target_col']]]),
                 errors='coerce'
@@ -2750,13 +3220,13 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             changes=autosave_changes,
             context={
                 "offset": _numeric_or_none(offset_value),
-                "count": len(selected_targets),
+                "count": len(targets_for_offset),
                 "editor": editor_key_prefix,
             },
         )
         st.success(
-            f"Applied offset {offset_value:+.4f} to {len(selected_targets)} "
-            f"datapoint{'s' if len(selected_targets) != 1 else ''}."
+            f"Applied offset {offset_value:+.4f} to {len(targets_for_offset)} "
+            f"datapoint{'s' if len(targets_for_offset) != 1 else ''}."
         )
         st.rerun()
 
@@ -7598,7 +8068,8 @@ def main():
         # Assign a distinct marker symbol to each species for summary charts
         # Avoid symbols used for outliers ('x', 'cross', 'diamond', 'star')
         species_symbol_cycle = [
-            'circle', 'square', 'triangle-up', 'triangle-down', 'triangle-left', 'triangle-right'
+            'circle', 'square', 'triangle-up', 'triangle-down', 'triangle-left', 'triangle-right',
+            'pentagon', 'hexagon', 'hexagon2', 'octagon', 'hourglass', 'bowtie'
         ]
         species_symbol_map = {
             sp: species_symbol_cycle[i % len(species_symbol_cycle)]
@@ -7623,6 +8094,8 @@ def main():
             )
         else:
             subset_data_unfiltered['x_axis'] = range(len(subset_data_unfiltered))
+
+        d13_std_lookup, d18_std_lookup = _build_cycle_std_lookups(subset_data_unfiltered)
 
         # Summary Charts
         st.subheader("Summary Charts")
@@ -7748,6 +8221,12 @@ def main():
             # Generate unique color based on species/comment
             species_color = f'rgb({hash(species) % 255}, {(hash(species) >> 8) % 255}, {(hash(species) >> 16) % 255})'
             d13_customdata = _build_delta_point_customdata(data_to_plot, 'd13C')
+            d13_main_error = _build_plotly_error_bar_for_df(
+                data_to_plot,
+                'd13C',
+                d13_std_lookup,
+                d18_std_lookup,
+            )
             
             d13c_summary.add_trace(go.Scatter(
                 x=data_to_plot['x_axis'],
@@ -7763,6 +8242,7 @@ def main():
                 ),
                 line=dict(width=1, color=species_color),
                 legendgroup=species,
+                error_y=d13_main_error,
                 customdata=d13_customdata,
                 hovertemplate=(
                     'Identifier 1: %{customdata[2]}<br>'
@@ -8093,6 +8573,7 @@ def main():
             clickmode='event+select',
             dragmode='zoom'
         )
+        _apply_cycle_std_error_bars(d13c_summary, d13_std_lookup, d18_std_lookup)
         _apply_editor_selection_to_figure(d13c_summary, d13_summary_editor_prefix)
         d13_summary_nonce = int(st.session_state.get(f"{d13_summary_editor_prefix}_chart_nonce", 0))
         d13c_summary_state = st.plotly_chart(
@@ -8206,6 +8687,12 @@ def main():
             # Generate unique color for this species
             species_color = f'rgb({hash(species) % 255}, {(hash(species) >> 8) % 255}, {(hash(species) >> 16) % 255})'
             d18_customdata = _build_delta_point_customdata(data_to_plot, 'd18O')
+            d18_main_error = _build_plotly_error_bar_for_df(
+                data_to_plot,
+                'd18O',
+                d13_std_lookup,
+                d18_std_lookup,
+            )
             
             # Plot main data with consistent color
             d18o_summary.add_trace(go.Scatter(
@@ -8222,6 +8709,7 @@ def main():
                 ),
                 line=dict(width=1, color=species_color),
                 legendgroup=species,
+                error_y=d18_main_error,
                 customdata=d18_customdata,
                 hovertemplate=(
                     'Identifier 1: %{customdata[2]}<br>'
@@ -8554,6 +9042,7 @@ def main():
         )
         # Invert y-axis so increasing d18O plots downward
         d18o_summary.update_yaxes(autorange='reversed')
+        _apply_cycle_std_error_bars(d18o_summary, d13_std_lookup, d18_std_lookup)
         _apply_editor_selection_to_figure(d18o_summary, d18_summary_editor_prefix)
         d18_summary_nonce = int(st.session_state.get(f"{d18_summary_editor_prefix}_chart_nonce", 0))
         d18o_summary_state = st.plotly_chart(
@@ -8567,6 +9056,16 @@ def main():
 
         # Create cross-plot: d13C vs d18O grouped by Species
         species_scatter = go.Figure()
+        cross_color_series = pd.to_numeric(subset_data[color_param_tab3_value_col], errors='coerce')
+        if cross_color_series.notna().any():
+            cross_cmin = float(cross_color_series.min())
+            cross_cmax = float(cross_color_series.max())
+            if not np.isfinite(cross_cmin) or not np.isfinite(cross_cmax):
+                cross_cmin, cross_cmax = 0.0, 1.0
+            elif cross_cmin == cross_cmax:
+                cross_cmax = cross_cmin + 1.0
+        else:
+            cross_cmin, cross_cmax = 0.0, 1.0
         scatter_legend_partial_shown = False
         scatter_legend_failed_full_shown = False
         scatter_legend_statistical_shown = False
@@ -8663,9 +9162,12 @@ def main():
                 name=species,
                 marker=dict(
                     size=10,
-                    color=species_color,
-                    symbol=species_symbol,
-                    line=dict(width=1, color=species_color)
+                    color=data_to_plot[color_param_tab3_value_col],
+                    colorscale='Viridis',
+                    cmin=cross_cmin,
+                    cmax=cross_cmax,
+                    showscale=False,
+                    symbol=species_symbol
                 ),
                 hovertemplate=(
                     f'Species: {species}<br>'
@@ -8673,7 +9175,8 @@ def main():
                     'd13C: %{y:.4f}<br>'
                     'Identifier 2: %{text}<extra></extra>'
                 ),
-                text=data_to_plot['Identifier 2'].astype(str)
+                text=data_to_plot['Identifier 2'].astype(str),
+                customdata=_build_delta_point_customdata(data_to_plot, 'cross')
             ))
 
             # Overlay sigma-based outliers on the species cross-plot.
@@ -8691,8 +9194,7 @@ def main():
                         marker=dict(
                             size=12,
                             symbol='square',
-                            color='red',
-                            line=dict(width=1.5, color='black')
+                            color='red'
                         ),
                         showlegend=not scatter_legend_statistical_shown,
                         legendgroup='outliers',
@@ -8702,7 +9204,8 @@ def main():
                             'd18O: %{x:.4f}<br>'
                             'd13C: %{y:.4f}<br>'
                             'Identifier 2: %{text}<extra></extra>'
-                        )
+                        ),
+                        customdata=_build_delta_point_customdata(stat_outliers_scatter, 'cross')
                     ))
                     scatter_legend_statistical_shown = True
 
@@ -8713,20 +9216,52 @@ def main():
                     sat_collectors['d 13C/12C  Mean'].notna() & sat_collectors['d 18O/16O  Mean'].notna()
                 ]
                 if not sat_collectors.empty:
+                    # Ensure partially failed samples retain their base species symbol.
+                    # For samples filtered out of the main trace, add the base symbol here.
+                    sat_not_in_main = sat_collectors[~sat_collectors.index.isin(data_to_plot.index)]
+                    if not sat_not_in_main.empty:
+                        sat_not_in_main_colors = pd.to_numeric(
+                            sat_not_in_main.get(color_param_tab3_value_col, pd.Series(index=sat_not_in_main.index, dtype=float)),
+                            errors='coerce',
+                        )
+                        if sat_not_in_main_colors.notna().sum() == 0:
+                            sat_not_in_main_colors = pd.Series(cross_cmin, index=sat_not_in_main.index, dtype=float)
+                        species_scatter.add_trace(go.Scatter(
+                            x=sat_not_in_main['d 18O/16O  Mean'],
+                            y=sat_not_in_main['d 13C/12C  Mean'],
+                            mode='markers',
+                            name=species,
+                            marker=dict(
+                                size=10,
+                                color=sat_not_in_main_colors,
+                                colorscale='Viridis',
+                                cmin=cross_cmin,
+                                cmax=cross_cmax,
+                                showscale=False,
+                                symbol=species_symbol,
+                            ),
+                            showlegend=False,
+                            legendgroup=species,
+                            text=sat_not_in_main['Identifier 2'].astype(str),
+                            customdata=_build_delta_point_customdata(sat_not_in_main, 'cross')
+                        ))
+
+                    # Draw an orange diamond ring around partially failed samples.
                     species_scatter.add_trace(go.Scatter(
                         x=sat_collectors['d 18O/16O  Mean'],
                         y=sat_collectors['d 13C/12C  Mean'],
                         mode='markers',
                         name='Partially Failed (Recovered Mean)',
                         marker=dict(
-                            size=12,
+                            size=15,
                             symbol='diamond-open',
                             color='#ff7f0e',
-                            line=dict(width=2, color='#ff7f0e')
+                            line=dict(width=2, color='#ff7f0e'),
                         ),
                         showlegend=not scatter_legend_partial_shown,
                         legendgroup='collector_status',
-                        text=sat_collectors['Identifier 2'].astype(str)
+                        text=sat_collectors['Identifier 2'].astype(str),
+                        customdata=_build_delta_point_customdata(sat_collectors, 'cross')
                     ))
                     scatter_legend_partial_shown = True
 
@@ -8745,24 +9280,50 @@ def main():
                         marker=dict(
                             size=10,
                             symbol='triangle-down',
-                            color='#d62728',
-                            line=dict(width=1, color='black')
+                            color='#d62728'
                         ),
                         showlegend=not scatter_legend_failed_full_shown,
                         legendgroup='outliers',
-                        text=sat_samples['Identifier 2'].astype(str)
+                        text=sat_samples['Identifier 2'].astype(str),
+                        customdata=_build_delta_point_customdata(sat_samples, 'cross')
                     ))
                     scatter_legend_failed_full_shown = True
 
         species_scatter.update_layout(
             title="d13C vs d18O by Species",
-            xaxis_title="d18O",
-            yaxis_title="d13C",
+            xaxis=dict(
+                title="d18O",
+                showgrid=True,
+                gridcolor='rgba(180,180,180,0.5)',
+                gridwidth=1,
+                constrain='domain',
+            ),
+            yaxis=dict(
+                title="d13C",
+                showgrid=True,
+                gridcolor='rgba(180,180,180,0.5)',
+                gridwidth=1,
+                scaleanchor='x',
+                scaleratio=1,
+                constrain='domain',
+            ),
             showlegend=True,
-            height=500,
+            height=750,
+            clickmode='event+select',
             dragmode='zoom'
         )
-        st.plotly_chart(species_scatter, width='stretch')
+        cross_editor_prefix = "tab3_crossplot_editor"
+        _apply_cycle_std_error_bars(species_scatter, d13_std_lookup, d18_std_lookup)
+        _apply_editor_selection_to_figure(species_scatter, cross_editor_prefix)
+        cross_chart_nonce = int(st.session_state.get(f"{cross_editor_prefix}_chart_nonce", 0))
+        cross_chart_state = st.plotly_chart(
+            species_scatter,
+            width='stretch',
+            key=f"tab3_crossplot_{cross_chart_nonce}",
+            on_select='rerun',
+            selection_mode='points'
+        )
+        _render_delta_editor_from_chart_selection(cross_chart_state, cross_editor_prefix)
 
         # Process individual species
         for species in unique_species:
@@ -9157,6 +9718,12 @@ def main():
                     identifier
                 )
                 d13_identifier_customdata = _build_delta_point_customdata(identifier_curve_data, 'd13C')
+                d13_identifier_error = _build_plotly_error_bar_for_df(
+                    identifier_curve_data,
+                    'd13C',
+                    d13_std_lookup,
+                    d18_std_lookup,
+                )
 
                 fig_d13C.add_trace(go.Scatter(
                     x=identifier_curve_data['x_axis'],
@@ -9171,6 +9738,7 @@ def main():
                         showscale=False  # Hide individual colorbar
                     ),
                     name=f'Raw d13C - {identifier}',
+                    error_y=d13_identifier_error,
                     customdata=d13_identifier_customdata,
                     hovertemplate=(
                         'Identifier 1: %{customdata[2]}<br>'
@@ -9221,6 +9789,7 @@ def main():
                         mode='lines',
                         line=dict(color='blue', width=1.5),
                         name=f'Raw d13C - {identifier}',
+                        error_y=d13_identifier_error,
                         customdata=d13_identifier_customdata,
                         hovertemplate=(
                             'Identifier 1: %{customdata[2]}<br>'
@@ -9288,6 +9857,7 @@ def main():
                             showlegend=True,
                             legendgroup='active_selection'
                         ))
+                _apply_cycle_std_error_bars(fig_d13C, d13_std_lookup, d18_std_lookup)
                 _apply_editor_selection_to_figure(fig_d13C, d13_editor_prefix)
                 d13_chart_nonce = int(st.session_state.get(f"{d13_editor_prefix}_chart_nonce", 0))
                 d13_chart_col, d13_btn_col = st.columns([12, 1], gap="small")
@@ -9467,6 +10037,12 @@ def main():
                     'd18O_calibrated' in sorted_data.columns
                     and pd.to_numeric(sorted_data['d18O_calibrated'], errors='coerce').notna().any()
                 )
+                d18_identifier_error = _build_plotly_error_bar_for_df(
+                    sorted_data,
+                    'd18O',
+                    d13_std_lookup,
+                    d18_std_lookup,
+                )
 
                 # Highlight saturated collectors (valid means)
                 if show_saturated_collectors:
@@ -9581,6 +10157,7 @@ def main():
                         showscale=False  # Hide individual colorbar
                     ),
                     name=f'Raw d18O - {identifier}',
+                    error_y=d18_identifier_error,
                     customdata=_build_delta_point_customdata(sorted_data, 'd18O'),
                     hovertemplate=(
                         'Identifier 1: %{customdata[2]}<br>'
@@ -9627,6 +10204,7 @@ def main():
                         mode='lines',
                         line=dict(color='blue', width=1.5),
                         name=f'Raw d18O - {identifier}',
+                        error_y=d18_identifier_error,
                         customdata=_build_delta_point_customdata(sorted_data, 'd18O'),
                         hovertemplate=(
                             'Identifier 1: %{customdata[2]}<br>'
@@ -9696,6 +10274,7 @@ def main():
                             showlegend=True,
                             legendgroup='active_selection'
                         ))
+                _apply_cycle_std_error_bars(fig_d18O, d13_std_lookup, d18_std_lookup)
                 _apply_editor_selection_to_figure(fig_d18O, d18_editor_prefix)
                 d18_chart_nonce = int(st.session_state.get(f"{d18_editor_prefix}_chart_nonce", 0))
                 d18_chart_col, d18_btn_col = st.columns([12, 1], gap="small")
