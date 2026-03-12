@@ -41,6 +41,9 @@ st.set_page_config(layout="wide")
 # standards.csv uses the plain VPDB/VSMOW values (no leading delta)
 ISOTYPE_D13C = 'VPDB(13C)'
 ISOTYPE_D18O = 'VSMOW(18O)'
+CYCLE1_SIGNAL_SAMP44_COL = '1  Cycle Int  Samp  44'
+CYCLE1_SIGNAL_REF44_COL = '1  Cycle Int  Ref  44'
+CYCLE1_SIGNAL_DIFF44_COL = '1  Cycle Int  Diff Samp-Ref  44'
 
 AUTOSAVE_LOG_PATH_KEY = "autosave_log_path"
 AUTOSAVE_SNAPSHOT_PATH_KEY = "autosave_snapshot_path"
@@ -54,6 +57,14 @@ AUTOSAVE_META_PATH_KEY = "autosave_meta_path"
 AUTOSAVE_RESUMED_KEY = "autosave_resumed"
 AUTOSAVE_SESSION_TOKEN_KEY = "autosave_session_token"
 AUTOSAVE_DIR_INPUT_KEY = "autosave_dir_override_input"
+IMPORTED_FILE_SPECS_KEY = "imported_file_specs"
+APPEND_UPLOADER_NONCE_KEY = "append_uploader_nonce"
+TAB3_LINEARITY_OVERRIDE_ENABLED_KEY = "tab3_manual_linearity_override_enabled"
+TAB3_LINEARITY_OVERRIDE_D13_KEY = "tab3_manual_linearity_d13_per10v"
+TAB3_LINEARITY_OVERRIDE_D18_KEY = "tab3_manual_linearity_d18_per10v"
+LINEARITY_USE_DIFF_INTENSITY_KEY = "linearity_use_diff_intensity_44"
+LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY = "linearity_use_diff_intensity_44_cal_ui"
+LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY = "linearity_use_diff_intensity_44_tab3_ui"
 
 
 def _safe_filename_fragment(value):
@@ -135,8 +146,12 @@ def _extract_calibration_session_state():
         "irq_multiplier",
         "outliers_independence",
         "apply_linearity_toggle",
+        LINEARITY_USE_DIFF_INTENSITY_KEY,
         "precision_date_range",
         "precision_date_range_input",
+        TAB3_LINEARITY_OVERRIDE_ENABLED_KEY,
+        TAB3_LINEARITY_OVERRIDE_D13_KEY,
+        TAB3_LINEARITY_OVERRIDE_D18_KEY,
     ]
     payload = {}
     for key in keys:
@@ -159,6 +174,10 @@ def _restore_calibration_session_state(state_payload):
         "irq_multiplier",
         "outliers_independence",
         "apply_linearity_toggle",
+        LINEARITY_USE_DIFF_INTENSITY_KEY,
+        TAB3_LINEARITY_OVERRIDE_ENABLED_KEY,
+        TAB3_LINEARITY_OVERRIDE_D13_KEY,
+        TAB3_LINEARITY_OVERRIDE_D18_KEY,
     ]:
         if key in state_payload:
             st.session_state[key] = state_payload.get(key)
@@ -173,6 +192,11 @@ def _restore_calibration_session_state(state_payload):
             st.session_state[key] = (d0, d1)
         except Exception:
             continue
+
+    # Keep mirrored UI toggles aligned with the canonical linearity intensity basis.
+    use_diff = bool(st.session_state.get(LINEARITY_USE_DIFF_INTENSITY_KEY, False))
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY] = use_diff
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY] = use_diff
 
 
 def _read_autosave_log_entries(log_path, max_entries=500):
@@ -233,6 +257,245 @@ def _normalize_upload_spec(upload_item):
         "size": size_val,
         "md5": md5_val,
     }
+
+
+def _build_uploaded_file_spec(uploaded_file):
+    """Build a normalized file metadata dict for an uploaded workbook."""
+    raw_name = str(getattr(uploaded_file, "name", "")).strip()
+    if raw_name == "":
+        raw_name = "uploaded_file"
+
+    file_size = getattr(uploaded_file, "size", None)
+    try:
+        file_size = int(file_size) if file_size is not None else None
+    except Exception:
+        file_size = None
+
+    file_md5 = None
+    try:
+        if hasattr(uploaded_file, "getvalue"):
+            file_md5 = hashlib.md5(uploaded_file.getvalue()).hexdigest().lower()
+    except Exception:
+        file_md5 = None
+
+    return {
+        "name": raw_name,
+        "size": file_size,
+        "md5": file_md5,
+    }
+
+
+def _upload_spec_signature(upload_item):
+    """Return a stable signature tuple for upload de-duplication."""
+    spec = _normalize_upload_spec(upload_item)
+    if spec is None:
+        return None
+    return (
+        str(spec.get("name", "")).strip().lower(),
+        spec.get("size"),
+        str(spec.get("md5") or "").strip().lower(),
+    )
+
+
+def _next_append_index(existing_index, count):
+    """Build non-overlapping index labels for appended rows."""
+    if int(count) <= 0:
+        return pd.Index([])
+
+    try:
+        numeric = pd.to_numeric(pd.Series(existing_index), errors="coerce")
+        if len(existing_index) == 0:
+            return pd.Index(range(int(count)))
+        if bool(numeric.notna().all()):
+            start = int(np.nanmax(numeric.to_numpy(dtype=float))) + 1
+            return pd.Index(range(start, start + int(count)))
+    except Exception:
+        pass
+
+    used = {str(v) for v in existing_index}
+    labels = []
+    cursor = 1
+    while len(labels) < int(count):
+        token = f"append_{cursor}"
+        if token not in used:
+            labels.append(token)
+            used.add(token)
+        cursor += 1
+    return pd.Index(labels, dtype=object)
+
+
+def _append_rows_preserve_existing_index(existing_df, append_df):
+    """Append rows while keeping existing index labels unchanged."""
+    if append_df is None:
+        return existing_df.copy() if isinstance(existing_df, pd.DataFrame) else None
+    if existing_df is None:
+        return append_df.copy()
+    if append_df.empty:
+        return existing_df.copy()
+    if existing_df.empty:
+        return append_df.copy()
+
+    combined = existing_df.copy()
+    append_block = append_df.copy()
+    append_block.index = _next_append_index(combined.index, len(append_block))
+    return pd.concat([combined, append_block], axis=0, sort=False)
+
+
+def _append_cycles_source(existing_cycles_df, append_cycles_df):
+    """Append cycle-source rows for diagnostics."""
+    if append_cycles_df is None:
+        return existing_cycles_df
+    if existing_cycles_df is None:
+        return append_cycles_df.copy()
+    if append_cycles_df.empty:
+        return existing_cycles_df
+    if existing_cycles_df.empty:
+        return append_cycles_df.copy()
+    return pd.concat([existing_cycles_df, append_cycles_df], ignore_index=True, sort=False)
+
+
+def _load_uploaded_workbooks(uploaded_files):
+    """Read and normalize uploaded Excel workbooks into analysis-ready dataframes."""
+    dfs = []
+    dfs_cycles_source = []
+    loaded_file_specs = []
+    load_errors = []
+
+    for uploaded_file in (uploaded_files or []):
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+
+        try:
+            raw = pd.read_excel(uploaded_file, header=None, engine='openpyxl')
+            df = _parse_new_table_layout(raw)
+            if df is None:
+                uploaded_file.seek(0)
+                df = pd.read_excel(uploaded_file, engine='openpyxl')
+        except Exception:
+            try:
+                uploaded_file.seek(0)
+                raw = pd.read_excel(uploaded_file, header=None, engine='xlrd')
+                df = _parse_new_table_layout(raw)
+                if df is None:
+                    uploaded_file.seek(0)
+                    df = pd.read_excel(uploaded_file, engine='xlrd')
+            except Exception as exc:
+                load_errors.append(f"Failed to read Excel file '{uploaded_file.name}': {exc}")
+                continue
+
+        df = _coalesce_duplicate_columns(df)
+        df = df.convert_dtypes()
+        df.reset_index(drop=True, inplace=True)
+        df = df.map(lambda x: None if pd.isna(x) else x)
+        df['Excel File'] = uploaded_file.name
+
+        df = _standardize_isotope_columns(df)
+        df = _coalesce_duplicate_columns(df)
+        for col in ['d 13C/12C  Mean', 'd 13C/12C  Std Dev', 'd 18O/16O  Mean', 'd 18O/16O  Std Dev']:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%y', errors='coerce')
+        elif 'Start Time' in df.columns:
+            df['Date'] = pd.to_datetime(df['Start Time'], errors='coerce')
+
+        if 'Date' in df.columns:
+            df['Date_ordinal'] = pd.to_numeric(
+                df['Date'].map(lambda x: x.toordinal() if pd.notnull(x) else None)
+            )
+
+        original_columns = df.columns.tolist()
+
+        if 'Information' in df.columns:
+            df = extract_info_values(df)
+
+        leak_col = _find_column(df, 'Kiel IV Leak Rate')
+        if leak_col and 'leak_rate' not in df.columns:
+            df['leak_rate'] = _extract_numeric(df[leak_col])
+        gases_col = _find_column(df, 'Kiel IV Non Condensable Pressure', 'Kiel IV Non-Condensable Pressure')
+        if gases_col and 'p_gases' not in df.columns:
+            df['p_gases'] = _extract_numeric(df[gases_col])
+        residual_col = _find_column(df, 'Kiel IV Residual CO2 Pressure')
+        if residual_col and 'p_no_acid' not in df.columns:
+            df['p_no_acid'] = _extract_numeric(df[residual_col])
+        sample_col = _find_column(df, 'Kiel IV CO2 Sample Pressure')
+        if sample_col and 'total_co2' not in df.columns:
+            df['total_co2'] = _extract_numeric(df[sample_col])
+
+        if CYCLE1_SIGNAL_SAMP44_COL in df.columns:
+            df[CYCLE1_SIGNAL_SAMP44_COL] = _normalize_signal_intensity(df[CYCLE1_SIGNAL_SAMP44_COL])
+        else:
+            intensity_candidates = [
+                'Pressure Adjust Result Intensity',
+                'Pressure Adjust Initial Intensity',
+                'Initial Intensity from \u00b5-Volume',
+                'Initial Intensity from \u03bc-Volume',
+            ]
+            for cand in intensity_candidates:
+                col = _find_column(df, cand)
+                if col:
+                    df[CYCLE1_SIGNAL_SAMP44_COL] = _normalize_signal_intensity(df[col])
+                    break
+
+        if 'Label' in df.columns:
+            label_parts = df['Label'].apply(_split_label_species)
+            if 'Identifier 1' not in df.columns:
+                df['Identifier 1'] = label_parts.map(lambda v: v[0] if v else None)
+            if 'Species' not in df.columns:
+                df['Species'] = label_parts.map(lambda v: v[1] if v else None)
+        elif 'Identifier 1' not in df.columns:
+            if 'Sample' in df.columns:
+                df['Identifier 1'] = df['Sample']
+            else:
+                df['Identifier 1'] = None
+
+        if 'Identifier 2' not in df.columns:
+            if 'Comment' in df.columns:
+                df['Identifier 2'] = df['Comment']
+            elif 'Run ID' in df.columns:
+                df['Identifier 2'] = df['Run ID']
+            elif 'Index' in df.columns:
+                df['Identifier 2'] = df['Index']
+            else:
+                df['Identifier 2'] = None
+
+        if 'Comment' not in df.columns and 'Sample Type' in df.columns:
+            df['Comment'] = df['Sample Type']
+
+        if 'Identifier 1' in df.columns:
+            df['Label'] = _compose_label_series(
+                df['Identifier 1'],
+                df.get('Species', pd.Series(index=df.index, dtype=object))
+            )
+
+        for col in ['leak_rate', 'p_no_acid', 'total_co2', 'p_gases', CYCLE1_SIGNAL_SAMP44_COL, 'Line']:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        dfs_cycles_source.append(df.copy())
+        df = _apply_cycle_averages(df)
+        df = _ensure_cycle1_signal_difference_columns(df)
+
+        for col in original_columns:
+            if col not in df.columns:
+                df[col] = None
+
+        dfs.append(df)
+        loaded_file_specs.append(_build_uploaded_file_spec(uploaded_file))
+
+    if not dfs:
+        return None, None, loaded_file_specs, load_errors
+
+    combined_df = pd.concat(dfs, ignore_index=True, sort=False) if len(dfs) > 1 else dfs[0]
+    combined_cycles_source = (
+        pd.concat(dfs_cycles_source, ignore_index=True, sort=False)
+        if len(dfs_cycles_source) > 1 else
+        (dfs_cycles_source[0] if dfs_cycles_source else None)
+    )
+    return combined_df, combined_cycles_source, loaded_file_specs, load_errors
 
 
 def _iter_autosave_search_roots():
@@ -537,6 +800,14 @@ def _reset_processing_session_state(discard_autosave_files=False):
     st.session_state.confirm_reset = False
     st.session_state.confirm_discard_session = False
     st.session_state.confirm_reset_all_edits = False
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_KEY] = False
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY] = False
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY] = False
+    st.session_state[TAB3_LINEARITY_OVERRIDE_ENABLED_KEY] = False
+    st.session_state[TAB3_LINEARITY_OVERRIDE_D13_KEY] = 0.0
+    st.session_state[TAB3_LINEARITY_OVERRIDE_D18_KEY] = 0.0
+    st.session_state[IMPORTED_FILE_SPECS_KEY] = []
+    st.session_state[APPEND_UPLOADER_NONCE_KEY] = 0
     _reset_autosave_state()
 
 
@@ -1139,11 +1410,9 @@ def _is_row_outlier_effective(row_label):
         row = row.iloc[0]
 
     status_val = str(row.get("Collector Status", "")).strip()
-    status_outlier = status_val in {
-        "Failed Sample",
-        "Fully Saturated Collectors",
-        "Partially Saturated Collectors",
-    }
+    status_outlier = status_val in {"Failed Sample", "Fully Saturated Collectors"} or (
+        _include_saturated_in_range_outliers() and status_val == "Partially Saturated Collectors"
+    )
 
     d13 = pd.to_numeric(pd.Series([row.get("d 13C/12C  Mean")]), errors="coerce").iloc[0]
     d18 = pd.to_numeric(pd.Series([row.get("d 18O/16O  Mean")]), errors="coerce").iloc[0]
@@ -1153,7 +1422,10 @@ def _is_row_outlier_effective(row_label):
     range_outlier = bool(
         (pd.notna(d13) and (d13 < float(st.session_state.d13c_range[0]) or d13 > float(st.session_state.d13c_range[1])))
         or (pd.notna(d18) and (d18 < float(st.session_state.d18o_range[0]) or d18 > float(st.session_state.d18o_range[1])))
-        or (pd.notna(sig) and (sig < float(st.session_state.signal_range[0])))
+        or (
+            pd.notna(sig)
+            and (sig < float(st.session_state.signal_range[0]) or sig > float(st.session_state.signal_range[1]))
+        )
         or (pd.notna(leak) and (leak < float(st.session_state.leak_range[0]) or leak > float(st.session_state.leak_range[1])))
     )
 
@@ -1401,6 +1673,62 @@ def _partial_saturation_isotope_masks(df):
     return {'d13C': d13_mask.astype(bool), 'd18O': d18_mask.astype(bool), 'any': partial_any.astype(bool)}
 
 
+def _include_saturated_in_range_outliers():
+    """Return True when range outlier logic should include saturated statuses."""
+    return bool(st.session_state.get("include_saturated_in_range_outliers", False))
+
+
+def _signal_in_range_mask(signal_series):
+    """Return mask for rows within configured signal-intensity bounds."""
+    values = pd.to_numeric(signal_series, errors='coerce')
+    signal_low = float(st.session_state.signal_range[0])
+    signal_high = float(st.session_state.signal_range[1])
+    return values.ge(signal_low) & values.le(signal_high)
+
+
+def _signal_out_of_range_mask(signal_series):
+    """Return mask for rows outside configured signal-intensity bounds."""
+    values = pd.to_numeric(signal_series, errors='coerce')
+    signal_low = float(st.session_state.signal_range[0])
+    signal_high = float(st.session_state.signal_range[1])
+    return values.notna() & (values.lt(signal_low) | values.gt(signal_high))
+
+
+def _range_outlier_mask(df, include_saturated_status=None):
+    """Return mask for range-filter outliers on a dataframe."""
+    if df is None:
+        return pd.Series(dtype=bool)
+    idx = df.index
+    mask = pd.Series(False, index=idx, dtype=bool)
+
+    d13_vals = pd.to_numeric(df.get('d 13C/12C  Mean', pd.Series(np.nan, index=idx)), errors='coerce')
+    d18_vals = pd.to_numeric(df.get('d 18O/16O  Mean', pd.Series(np.nan, index=idx)), errors='coerce')
+    leak_vals = pd.to_numeric(df.get('leak_rate', pd.Series(np.nan, index=idx)), errors='coerce')
+    signal_vals = df.get('1  Cycle Int  Samp  44', pd.Series(np.nan, index=idx))
+
+    mask = mask | (
+        d13_vals.notna()
+        & ((d13_vals < float(st.session_state.d13c_range[0])) | (d13_vals > float(st.session_state.d13c_range[1])))
+    )
+    mask = mask | (
+        d18_vals.notna()
+        & ((d18_vals < float(st.session_state.d18o_range[0])) | (d18_vals > float(st.session_state.d18o_range[1])))
+    )
+    mask = mask | _signal_out_of_range_mask(signal_vals)
+    mask = mask | (
+        leak_vals.notna()
+        & ((leak_vals < float(st.session_state.leak_range[0])) | (leak_vals > float(st.session_state.leak_range[1])))
+    )
+
+    if include_saturated_status is None:
+        include_saturated_status = _include_saturated_in_range_outliers()
+    if include_saturated_status:
+        status_series = df.get('Collector Status', pd.Series('', index=idx)).astype(str).str.strip()
+        mask = mask | status_series.isin({'Partially Saturated Collectors', 'Fully Saturated Collectors'})
+
+    return mask.astype(bool)
+
+
 def _get_isotope_columns(isotope_key):
     """Return raw/calibrated/corrected column names for an isotope key."""
     key = str(isotope_key).strip()
@@ -1492,8 +1820,9 @@ def _refresh_calibrated_after_delta_edit(row_label, isotope_key, previous_raw=No
         slope_lin = pd.to_numeric(pd.Series([fit.get('slope')]), errors='coerce').iloc[0]
         x_ref = pd.to_numeric(pd.Series([fit.get('x_ref')]), errors='coerce').iloc[0]
         intensity = np.nan
-        if '1  Cycle Int  Samp  44' in st.session_state.df.columns:
-            intensity = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, '1  Cycle Int  Samp  44']]), errors='coerce').iloc[0]
+        intensity_col = _resolve_linearity_intensity_column_for_fits(fits=fits, df=st.session_state.df)
+        if intensity_col in st.session_state.df.columns:
+            intensity = pd.to_numeric(pd.Series([st.session_state.df.at[row_label, intensity_col]]), errors='coerce').iloc[0]
         if np.isfinite(slope_lin) and np.isfinite(x_ref) and np.isfinite(intensity):
             st.session_state.df.at[row_label, corrected_col] = float(new_cal - float(slope_lin) * (float(intensity) - float(x_ref)))
         else:
@@ -1709,16 +2038,32 @@ def _pick_cycle_sample_intensity_column(cycles, intensity_cols, preferred_masses
     return None
 
 
+def _get_global_signal_intensity_mean(default_value=15.0):
+    """Return the global mean of sample cup-44 signal intensity across loaded samples."""
+    if st.session_state.df is None or CYCLE1_SIGNAL_SAMP44_COL not in st.session_state.df.columns:
+        return float(default_value)
+    vals = pd.to_numeric(st.session_state.df[CYCLE1_SIGNAL_SAMP44_COL], errors='coerce')
+    vals = vals[np.isfinite(vals)]
+    if vals.empty:
+        return float(default_value)
+    mean_val = float(vals.mean())
+    return mean_val if np.isfinite(mean_val) and mean_val > 0 else float(default_value)
+
+
 def _compute_cycle_mean_for_target(target, correct_linearity=False, target_intensity=15.0):
     """Compute isotope mean from valid cycles, with optional linear extrapolation to a target intensity."""
     result = {
         'mean': None,
+        'valid_mean': None,
         'valid_cycles': 0,
         'method': 'valid_cycle_mean',
         'linearity_applied': False,
         'linearity_points': 0,
         'linearity_target_intensity': float(target_intensity),
         'intensity_col': None,
+        'fit_x': np.array([], dtype=float),
+        'fit_y': np.array([], dtype=float),
+        'linearity_prediction': None,
         'reason': '',
     }
     if not isinstance(target, dict):
@@ -1734,11 +2079,9 @@ def _compute_cycle_mean_for_target(target, correct_linearity=False, target_inten
     if isotope_key == 'd13C':
         value_col = _pick_cycle_value_column(cycles, 'd 13C/12C  Mean', [r'd13', r'd ?13c', r'd45co2', r'\bd45\b'])
         required_masses = [44, 45]
-        preferred_intensity_masses = [44, 45]
     elif isotope_key == 'd18O':
         value_col = _pick_cycle_value_column(cycles, 'd 18O/16O  Mean', [r'd18', r'd ?18o', r'd46co2', r'\bd46\b'])
         required_masses = [44, 45, 46]
-        preferred_intensity_masses = [44, 46]
     else:
         result['reason'] = 'unsupported_isotope'
         return result
@@ -1769,14 +2112,15 @@ def _compute_cycle_mean_for_target(target, correct_linearity=False, target_inten
 
     valid_mean = float(valid_delta.mean())
     result['mean'] = valid_mean
+    result['valid_mean'] = valid_mean
     result['valid_cycles'] = int(valid_delta.shape[0])
 
-    if not bool(correct_linearity):
-        return result
-
-    intensity_col = _pick_cycle_sample_intensity_column(cycles, intensity_cols, preferred_intensity_masses)
+    # Linearity always uses sample cup 44 intensity on valid cycles.
+    intensity_col = _pick_cycle_sample_intensity_column(cycles, intensity_cols, [44])
     result['intensity_col'] = intensity_col
     if intensity_col is None:
+        if not bool(correct_linearity):
+            return result
         result['reason'] = 'missing_intensity_column'
         return result
 
@@ -1786,7 +2130,12 @@ def _compute_cycle_mean_for_target(target, correct_linearity=False, target_inten
     xy_mask = x.notna() & y.notna()
     x = x[xy_mask]
     y = y[xy_mask]
+    result['fit_x'] = x.to_numpy(dtype=float)
+    result['fit_y'] = y.to_numpy(dtype=float)
     result['linearity_points'] = int(x.shape[0])
+
+    if not bool(correct_linearity):
+        return result
 
     if x.shape[0] < 2 or x.nunique(dropna=True) < 2:
         result['reason'] = 'insufficient_points_for_linearity_fit'
@@ -1799,6 +2148,7 @@ def _compute_cycle_mean_for_target(target, correct_linearity=False, target_inten
             result['mean'] = predicted
             result['linearity_applied'] = True
             result['method'] = 'linearity_extrapolated_to_target_intensity'
+            result['linearity_prediction'] = predicted
             result['linearity_slope'] = float(slope)
             result['linearity_intercept'] = float(intercept)
             result['reason'] = ''
@@ -2406,11 +2756,7 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                     ((d18_vals < float(st.session_state.d18o_range[0])) | (d18_vals > float(st.session_state.d18o_range[1])))
                 )
             if '1  Cycle Int  Samp  44' in base.columns:
-                sig_vals = pd.to_numeric(base['1  Cycle Int  Samp  44'], errors='coerce')
-                range_excluded = range_excluded | (
-                    sig_vals.notna() &
-                    (sig_vals < float(st.session_state.signal_range[0]))
-                )
+                range_excluded = range_excluded | _signal_out_of_range_mask(base['1  Cycle Int  Samp  44'])
             if 'leak_rate' in base.columns:
                 leak_vals = pd.to_numeric(base['leak_rate'], errors='coerce')
                 range_excluded = range_excluded | (
@@ -2839,64 +3185,137 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             if diag_target is not None and not bool(diag_target.get('is_failed_sample', False)):
                 _render_selected_point_cycle_diagnostics(diag_target, editor_key_prefix)
             return
-        collector_status_text = str(target.get('collector_status', '')).strip()
-        is_partially_saturated = collector_status_text == 'Partially Saturated Collectors'
         suggested_set_value = float(target['current_value'])
         linearity_toggle_value = False
-        linearity_target_intensity = 15.0
+        linearity_target_intensity = _get_global_signal_intensity_mean(default_value=15.0)
         cycle_mean_info = None
-        if is_partially_saturated and not is_failed_sample:
-            linearity_toggle_key = (
-                f"{editor_key_prefix}_correct_linearity_{selection_hash}_{target['row_key']}_{target['isotope_key']}"
-            )
-            toggle_widget = st.toggle if hasattr(st, 'toggle') else st.checkbox
-            linearity_toggle_value = toggle_widget(
-                "Correct linearity",
-                value=False,
-                key=linearity_toggle_key,
-                help=(
-                    "When enabled, fit delta vs signal intensity for valid cycles and extrapolate to a target intensity. "
-                    "When disabled, use mean of valid cycles only."
-                ),
-            )
-            if bool(linearity_toggle_value):
+        linearity_toggle_key = (
+            f"{editor_key_prefix}_correct_linearity_{selection_hash}_{target['row_key']}_{target['isotope_key']}"
+        )
+        toggle_widget = st.toggle if hasattr(st, 'toggle') else st.checkbox
+        linearity_toggle_value = toggle_widget(
+            "Correct linearity",
+            value=False,
+            key=linearity_toggle_key,
+            help=(
+                "When enabled, fit delta vs sample cup 44 signal intensity for valid cycles and extrapolate "
+                "to a target intensity. When disabled, use mean of valid cycles only."
+            ),
+        )
+        linearity_chart_col = None
+        linearity_info_col = None
+        if bool(linearity_toggle_value):
+            linearity_chart_col, linearity_info_col = st.columns([3, 2], gap="medium")
+            with linearity_info_col:
                 linearity_target_key = (
                     f"{editor_key_prefix}_linearity_target_{selection_hash}_{target['row_key']}_{target['isotope_key']}"
                 )
                 linearity_target_intensity = float(st.number_input(
                     "Signal intensity target (V)",
                     min_value=0.001,
-                    value=15.0,
+                    value=float(linearity_target_intensity),
                     step=0.1,
                     format="%.3f",
                     key=linearity_target_key,
-                    help="Target signal intensity used by linear extrapolation.",
+                    help="Preloaded with the average sample cup 44 signal intensity across all loaded samples.",
                 ))
-            cycle_mean_info = _compute_cycle_mean_for_target(
-                target,
-                correct_linearity=bool(linearity_toggle_value),
-                target_intensity=float(linearity_target_intensity)
-            )
-            computed_mean = cycle_mean_info.get('mean')
-            computed_mean_num = pd.to_numeric(pd.Series([computed_mean]), errors='coerce').iloc[0]
-            if pd.notna(computed_mean_num):
-                suggested_set_value = float(computed_mean_num)
-                if bool(linearity_toggle_value) and bool(cycle_mean_info.get('linearity_applied', False)):
-                    st.caption(
-                        f"Computed {target['isotope_key']} from {int(cycle_mean_info.get('valid_cycles', 0))} valid cycle(s) "
-                        f"using {float(linearity_target_intensity):.3f} V extrapolation: `{suggested_set_value:.4f}`"
-                    )
-                else:
-                    st.caption(
-                        f"Computed {target['isotope_key']} mean from {int(cycle_mean_info.get('valid_cycles', 0))} valid cycle(s): "
-                        f"`{suggested_set_value:.4f}`"
-                    )
-                    if bool(linearity_toggle_value):
-                        reason = str(cycle_mean_info.get('reason', '')).replace('_', ' ').strip()
-                        if reason != '':
-                            st.caption(f"Linearity extrapolation not applied ({reason}); valid-cycle mean is used.")
+        cycle_mean_info = _compute_cycle_mean_for_target(
+            target,
+            correct_linearity=bool(linearity_toggle_value),
+            target_intensity=float(linearity_target_intensity)
+        )
+        computed_mean = cycle_mean_info.get('mean')
+        computed_mean_num = pd.to_numeric(pd.Series([computed_mean]), errors='coerce').iloc[0]
+        linearity_primary_caption = None
+        linearity_secondary_caption = None
+        if pd.notna(computed_mean_num):
+            suggested_set_value = float(computed_mean_num)
+            if bool(linearity_toggle_value) and bool(cycle_mean_info.get('linearity_applied', False)):
+                linearity_primary_caption = (
+                    f"Computed {target['isotope_key']} from {int(cycle_mean_info.get('valid_cycles', 0))} valid cycle(s) "
+                    f"using {float(linearity_target_intensity):.3f} V extrapolation: `{suggested_set_value:.4f}`"
+                )
             else:
-                st.caption("Unable to compute cycle-derived mean for this datapoint; current value remains loaded.")
+                linearity_primary_caption = (
+                    f"Computed {target['isotope_key']} mean from {int(cycle_mean_info.get('valid_cycles', 0))} valid cycle(s): "
+                    f"`{suggested_set_value:.4f}`"
+                )
+                if bool(linearity_toggle_value):
+                    reason = str(cycle_mean_info.get('reason', '')).replace('_', ' ').strip()
+                    if reason != '':
+                        linearity_secondary_caption = f"Linearity extrapolation not applied ({reason}); valid-cycle mean is used."
+        else:
+            linearity_primary_caption = "Unable to compute cycle-derived mean for this datapoint; current value remains loaded."
+
+        if bool(linearity_toggle_value):
+            with linearity_info_col:
+                if linearity_primary_caption:
+                    st.caption(linearity_primary_caption)
+                if linearity_secondary_caption:
+                    st.caption(linearity_secondary_caption)
+        else:
+            if linearity_primary_caption:
+                st.caption(linearity_primary_caption)
+            if linearity_secondary_caption:
+                st.caption(linearity_secondary_caption)
+
+        if bool(linearity_toggle_value):
+            with linearity_chart_col:
+                x_vals = np.asarray(cycle_mean_info.get('fit_x', np.array([], dtype=float)), dtype=float)
+                y_vals = np.asarray(cycle_mean_info.get('fit_y', np.array([], dtype=float)), dtype=float)
+                finite_mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+                x_vals = x_vals[finite_mask]
+                y_vals = y_vals[finite_mask]
+                if x_vals.size > 0:
+                    fig_linearity = go.Figure()
+                    fig_linearity.add_trace(go.Scatter(
+                        x=x_vals,
+                        y=y_vals,
+                        mode='markers',
+                        name='Valid cycles',
+                        marker=dict(size=7, color='#1f77b4', opacity=0.85),
+                    ))
+
+                    slope_num = pd.to_numeric(pd.Series([cycle_mean_info.get('linearity_slope')]), errors='coerce').iloc[0]
+                    intercept_num = pd.to_numeric(pd.Series([cycle_mean_info.get('linearity_intercept')]), errors='coerce').iloc[0]
+                    target_x = float(linearity_target_intensity)
+                    if np.isfinite(slope_num) and np.isfinite(intercept_num):
+                        x_lo = min(float(np.nanmin(x_vals)), target_x)
+                        x_hi = max(float(np.nanmax(x_vals)), target_x)
+                        if x_lo == x_hi:
+                            x_lo -= 0.5
+                            x_hi += 0.5
+                        x_line = np.linspace(x_lo, x_hi, 100)
+                        y_line = slope_num * x_line + intercept_num
+                        fig_linearity.add_trace(go.Scatter(
+                            x=x_line,
+                            y=y_line,
+                            mode='lines',
+                            name='Linear fit',
+                            line=dict(color='#ff7f0e', width=2),
+                        ))
+
+                    pred_num = pd.to_numeric(pd.Series([cycle_mean_info.get('linearity_prediction')]), errors='coerce').iloc[0]
+                    if np.isfinite(pred_num):
+                        fig_linearity.add_trace(go.Scatter(
+                            x=[target_x],
+                            y=[float(pred_num)],
+                            mode='markers',
+                            name='Extrapolated target',
+                            marker=dict(size=10, color='#d62728', symbol='diamond'),
+                        ))
+
+                    fig_linearity.update_layout(
+                        title=f"Sample Cup 44 Intensity vs {target['isotope_key']}",
+                        xaxis_title="Signal Intensity Cup 44 (V)",
+                        yaxis_title=f"{target['isotope_key']} (\u2030)",
+                        height=420,
+                        margin=dict(l=20, r=20, t=36, b=20),
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
+                    )
+                    st.plotly_chart(fig_linearity, width='stretch')
+                else:
+                    st.caption("No valid cycle points available for cup 44 linearity plotting.")
         form_cols = st.columns(3, gap="medium")
         form_col_set = form_cols[0]
         form_col_offset = form_cols[1]
@@ -3318,12 +3737,28 @@ if 'calibration_coefficients' not in st.session_state:
     st.session_state.calibration_coefficients = {}
 if 'linearity_fits' not in st.session_state:
     st.session_state.linearity_fits = {}
+if LINEARITY_USE_DIFF_INTENSITY_KEY not in st.session_state:
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_KEY] = False
+if LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY not in st.session_state:
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY] = bool(
+        st.session_state.get(LINEARITY_USE_DIFF_INTENSITY_KEY, False)
+    )
+if LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY not in st.session_state:
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY] = bool(
+        st.session_state.get(LINEARITY_USE_DIFF_INTENSITY_KEY, False)
+    )
+if TAB3_LINEARITY_OVERRIDE_ENABLED_KEY not in st.session_state:
+    st.session_state[TAB3_LINEARITY_OVERRIDE_ENABLED_KEY] = False
+if TAB3_LINEARITY_OVERRIDE_D13_KEY not in st.session_state:
+    st.session_state[TAB3_LINEARITY_OVERRIDE_D13_KEY] = 0.0
+if TAB3_LINEARITY_OVERRIDE_D18_KEY not in st.session_state:
+    st.session_state[TAB3_LINEARITY_OVERRIDE_D18_KEY] = 0.0
 if 'selected_standards' not in st.session_state:
     st.session_state.selected_standards = []
 if 'include_outliers' not in st.session_state:
     st.session_state.include_outliers = "No"
 if 'outliers_independence' not in st.session_state:
-    st.session_state.outliers_independence = False
+    st.session_state.outliers_independence = True
 if 'selected_ids' not in st.session_state:
     st.session_state.selected_ids = ["All"]
 if 'interpolate_outliers_export' not in st.session_state:
@@ -3356,6 +3791,10 @@ if AUTOSAVE_SESSION_TOKEN_KEY not in st.session_state:
     st.session_state[AUTOSAVE_SESSION_TOKEN_KEY] = None
 if AUTOSAVE_DIR_INPUT_KEY not in st.session_state:
     st.session_state[AUTOSAVE_DIR_INPUT_KEY] = st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY, "")
+if IMPORTED_FILE_SPECS_KEY not in st.session_state:
+    st.session_state[IMPORTED_FILE_SPECS_KEY] = []
+if APPEND_UPLOADER_NONCE_KEY not in st.session_state:
+    st.session_state[APPEND_UPLOADER_NONCE_KEY] = 0
 
 # Initialize range variables in session state with safe defaults
 if 'signal_range' not in st.session_state:
@@ -3363,12 +3802,16 @@ if 'signal_range' not in st.session_state:
 else:
     try:
         signal_low = float(st.session_state.signal_range[0])
-        if not np.isfinite(signal_low):
-            raise ValueError("signal_range lower bound is not finite")
+        signal_high = float(st.session_state.signal_range[1])
+        if not np.isfinite(signal_low) or not np.isfinite(signal_high):
+            raise ValueError("signal_range bounds are not finite")
         signal_low = max(0.0, min(50.0, signal_low))
-        st.session_state.signal_range = (signal_low, 50.0)
+        signal_high = max(signal_low, min(50.0, signal_high))
+        st.session_state.signal_range = (signal_low, signal_high)
     except Exception:
         st.session_state.signal_range = (1.0, 50.0)
+if 'include_saturated_in_range_outliers' not in st.session_state:
+    st.session_state.include_saturated_in_range_outliers = False
 if 'leak_range' not in st.session_state:
     st.session_state.leak_range = (0.0, 1000.0)  # Conservative default range
 if 'd13c_range' not in st.session_state:
@@ -3379,10 +3822,7 @@ if 'd18o_range' not in st.session_state:
 
 def extract_number(text):
     """Extract the first number from a string."""
-    if pd.isna(text):
-        return None
-    matches = re.findall(r'\d+', str(text))
-    return int(matches[0]) if matches else None
+    return _parse_numeric_token(text)
 
 def _parse_numeric_token(token):
     """Parse a numeric token with optional thousands/decimal separators."""
@@ -3805,8 +4245,34 @@ def _apply_cycle_averages(df):
             sat_mask_d13 = _build_saturation_mask(intensity_df, [44, 45])
             sat_mask_d18 = _build_saturation_mask(intensity_df, [44, 45, 46])
 
-            # Use Cycle 1 m/z44 sample collector as signal intensity for outlier checks.
+            # Use Cycle 1 m/z44 sample/reference collectors to derive signal metrics.
             samp44_col = _pick_mass_sample_column(sample_cycles, 44)
+            ref44_col = None
+            def _pick_mass_reference_column(cycles_df, mass_value):
+                cols = [c for c in intensity_cols if c in cycles_df.columns and _extract_col_mass(c) == mass_value]
+                if not cols:
+                    return None
+                labeled_ref = []
+                for c in cols:
+                    low = _normalize_column_key(c)
+                    if 'standard' in low or 'reference' in low or re.search(r'\bref\b|\bstd\b', low):
+                        labeled_ref.append(c)
+                if labeled_ref:
+                    medians = []
+                    for c in labeled_ref:
+                        vals = _normalize_signal_intensity(cycles_df[c])
+                        medians.append((c, float(vals.median(skipna=True)) if vals.notna().any() else np.inf))
+                    medians.sort(key=lambda t: t[1])
+                    return medians[0][0] if medians else None
+                # Fallback: choose the column with the lowest median intensity.
+                medians = []
+                for c in cols:
+                    vals = _normalize_signal_intensity(cycles_df[c])
+                    medians.append((c, float(vals.median(skipna=True)) if vals.notna().any() else np.inf))
+                medians.sort(key=lambda t: t[1])
+                return medians[0][0] if medians else None
+
+            ref44_col = _pick_mass_reference_column(sample_cycles, 44)
             if samp44_col is not None:
                 cycle1 = sample_cycles[sample_cycles['_cycle_order'] == 1]
                 if not cycle1.empty:
@@ -3814,7 +4280,19 @@ def _apply_cycle_averages(df):
                 else:
                     cycle1_val = _normalize_signal_intensity(sample_cycles[samp44_col]).dropna().iloc[0] if _normalize_signal_intensity(sample_cycles[samp44_col]).notna().any() else np.nan
                 if pd.notna(cycle1_val):
-                    pre_rows.at[sample_idx, '1  Cycle Int  Samp  44'] = float(cycle1_val)
+                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] = float(cycle1_val)
+            if ref44_col is not None:
+                cycle1 = sample_cycles[sample_cycles['_cycle_order'] == 1]
+                if not cycle1.empty:
+                    cycle1_ref = _normalize_signal_intensity(cycle1[ref44_col]).iloc[0]
+                else:
+                    cycle1_ref = _normalize_signal_intensity(sample_cycles[ref44_col]).dropna().iloc[0] if _normalize_signal_intensity(sample_cycles[ref44_col]).notna().any() else np.nan
+                if pd.notna(cycle1_ref):
+                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] = float(cycle1_ref)
+            sample_cycle1 = pd.to_numeric(pd.Series([pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] if CYCLE1_SIGNAL_SAMP44_COL in pre_rows.columns else np.nan]), errors='coerce').iloc[0]
+            ref_cycle1 = pd.to_numeric(pd.Series([pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] if CYCLE1_SIGNAL_REF44_COL in pre_rows.columns else np.nan]), errors='coerce').iloc[0]
+            if np.isfinite(sample_cycle1) and np.isfinite(ref_cycle1):
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_DIFF44_COL] = float(sample_cycle1 - ref_cycle1)
         low_signal_failed = False
         pre_intensity_cols = [c for c in sample_intensity_cols if c in pre_rows.columns]
         if pre_intensity_cols:
@@ -3822,8 +4300,8 @@ def _apply_cycle_averages(df):
             pre_max = pre_vals.max(skipna=True)
             if pd.notna(pre_max) and pre_max < low_signal_threshold:
                 low_signal_failed = True
-        elif '1  Cycle Int  Samp  44' in pre_rows.columns:
-            pre_val = _parse_numeric_token(pre_rows.at[sample_idx, '1  Cycle Int  Samp  44'])
+        elif CYCLE1_SIGNAL_SAMP44_COL in pre_rows.columns:
+            pre_val = _parse_numeric_token(pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL])
             if pre_val is not None and pre_val < low_signal_threshold:
                 low_signal_failed = True
         # d13C
@@ -3946,6 +4424,7 @@ def _apply_cycle_averages(df):
 
     result = pd.concat([pre_rows, other_rows], axis=0).sort_index()
     result = result.drop(columns=['_cycle_order', '_cycle_group'], errors='ignore')
+    result = _ensure_cycle1_signal_difference_columns(result)
     return result
 
 def _get_species_series(df):
@@ -3970,7 +4449,7 @@ def _normalize_column_key(name):
     if not isinstance(name, str):
         return ''
     text = name.strip()
-    # Normalize common unicode variants (COâ‚‚, Âµ/Î¼)
+    # Normalize common unicode variants (CO2, \u00b5/\u03bc)
     text = text.replace('\u2082', '2')
     text = text.replace('\u00b5', 'u').replace('\u03bc', 'u')
     text = re.sub(r'\s+', ' ', text)
@@ -3988,6 +4467,204 @@ def _find_column(df, *candidates):
         if key in norm_map:
             return norm_map[key]
     return None
+
+def _pick_cycle1_signal_columns(df):
+    """Pick cycle-1 m/z44 sample/reference intensity columns from a dataframe."""
+    if df is None:
+        return None, None
+
+    explicit_sample = CYCLE1_SIGNAL_SAMP44_COL if CYCLE1_SIGNAL_SAMP44_COL in df.columns else None
+    explicit_ref = CYCLE1_SIGNAL_REF44_COL if CYCLE1_SIGNAL_REF44_COL in df.columns else None
+
+    def _is_cycle1_mz44_col(col_name):
+        low = _normalize_column_key(col_name)
+        if low == '':
+            return False
+        has_mass44 = re.search(r'(?<!\d)(44|44\.0+)(?!\d)', low) is not None
+        has_intensity = ('intensit' in low) or ('signal' in low) or bool(re.search(r'\bint\b', low))
+        has_cycle1 = bool(re.search(r'(?:^|\s)1(?:\s|$)', low))
+        if 'cycle' in low:
+            has_cycle1 = has_cycle1 or bool(re.search(r'cycle\s*0*1(?:\D|$)', low))
+        return has_mass44 and has_intensity and has_cycle1
+
+    candidates = [c for c in df.columns if isinstance(c, str) and _is_cycle1_mz44_col(c)]
+    if not candidates:
+        return explicit_sample, explicit_ref
+
+    sample_candidates = []
+    ref_candidates = []
+    unlabeled_candidates = []
+    for col in candidates:
+        low = _normalize_column_key(col)
+        is_ref = ('reference' in low) or ('standard' in low) or bool(re.search(r'\bref\b|\bstd\b', low))
+        is_sample = ('sample' in low) or ('samp' in low) or bool(re.search(r'\bsmp\b', low))
+        if is_sample and not is_ref:
+            sample_candidates.append(col)
+        elif is_ref and not is_sample:
+            ref_candidates.append(col)
+        else:
+            unlabeled_candidates.append(col)
+
+    def _rank_by_median(cols):
+        ranked = []
+        for col in cols:
+            vals = _normalize_signal_intensity(df[col]) if col in df.columns else pd.Series(dtype='float64')
+            median_val = float(vals.median(skipna=True)) if vals.notna().any() else -np.inf
+            ranked.append((col, median_val))
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        return ranked
+
+    ranked_samples = _rank_by_median(sample_candidates)
+    ranked_refs = _rank_by_median(ref_candidates)
+    ranked_unlabeled = _rank_by_median(unlabeled_candidates)
+    ranked_all = _rank_by_median(candidates)
+
+    sample_col = ranked_samples[0][0] if ranked_samples else explicit_sample
+    ref_col = ranked_refs[-1][0] if ranked_refs else explicit_ref
+
+    if sample_col is None:
+        if ranked_unlabeled:
+            sample_col = ranked_unlabeled[0][0]
+        elif ranked_all:
+            sample_col = ranked_all[0][0]
+
+    if ref_col is None:
+        remaining = [item for item in ranked_all if item[0] != sample_col]
+        if ranked_refs:
+            pick = [item for item in ranked_refs if item[0] != sample_col]
+            if pick:
+                ref_col = pick[-1][0]
+        if ref_col is None and remaining:
+            ref_col = remaining[-1][0]
+
+    if sample_col == ref_col:
+        ref_col = None
+
+    if explicit_sample is not None:
+        sample_col = explicit_sample
+    if explicit_ref is not None:
+        ref_col = explicit_ref
+
+    return sample_col, ref_col
+
+def _ensure_cycle1_signal_difference_columns(df):
+    """Ensure canonical cycle-1 sample/ref intensity columns and their difference exist."""
+    if df is None:
+        return df
+
+    sample_col, ref_col = _pick_cycle1_signal_columns(df)
+
+    if CYCLE1_SIGNAL_SAMP44_COL in df.columns:
+        df[CYCLE1_SIGNAL_SAMP44_COL] = _normalize_signal_intensity(df[CYCLE1_SIGNAL_SAMP44_COL])
+    elif sample_col is not None and sample_col in df.columns:
+        df[CYCLE1_SIGNAL_SAMP44_COL] = _normalize_signal_intensity(df[sample_col])
+    else:
+        df[CYCLE1_SIGNAL_SAMP44_COL] = np.nan
+
+    if CYCLE1_SIGNAL_REF44_COL in df.columns:
+        df[CYCLE1_SIGNAL_REF44_COL] = _normalize_signal_intensity(df[CYCLE1_SIGNAL_REF44_COL])
+    elif ref_col is not None and ref_col in df.columns:
+        df[CYCLE1_SIGNAL_REF44_COL] = _normalize_signal_intensity(df[ref_col])
+    else:
+        df[CYCLE1_SIGNAL_REF44_COL] = np.nan
+
+    samp_vals = pd.to_numeric(df[CYCLE1_SIGNAL_SAMP44_COL], errors='coerce')
+    ref_vals = pd.to_numeric(df[CYCLE1_SIGNAL_REF44_COL], errors='coerce')
+    valid = np.isfinite(samp_vals) & np.isfinite(ref_vals)
+    diff_vals = (samp_vals - ref_vals).where(valid)
+    if CYCLE1_SIGNAL_DIFF44_COL in df.columns:
+        existing_diff = pd.to_numeric(df[CYCLE1_SIGNAL_DIFF44_COL], errors='coerce')
+        df[CYCLE1_SIGNAL_DIFF44_COL] = diff_vals.where(valid, existing_diff)
+    else:
+        df[CYCLE1_SIGNAL_DIFF44_COL] = diff_vals
+
+    return df
+
+def _build_isotope_3d_scatter(df, z_col, z_label=None, color_col=None, color_label=None, title=None):
+    """Build a 3D scatter chart with d18O, d13C, and a selectable Z-axis parameter."""
+    if df is None or df.empty:
+        return None, "No data available for 3D plotting."
+
+    required = ['d 18O/16O  Mean', 'd 13C/12C  Mean', z_col]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        return None, f"Missing required column(s): {', '.join(missing)}"
+
+    x_vals = pd.to_numeric(df['d 18O/16O  Mean'], errors='coerce')
+    y_vals = pd.to_numeric(df['d 13C/12C  Mean'], errors='coerce')
+    z_vals = pd.to_numeric(df[z_col], errors='coerce')
+    valid = np.isfinite(x_vals) & np.isfinite(y_vals) & np.isfinite(z_vals)
+    if not valid.any():
+        return None, "No rows with finite d18O, d13C, and selected Z-axis values."
+
+    plot_df = df.loc[valid].copy()
+    x_vals = pd.to_numeric(plot_df['d 18O/16O  Mean'], errors='coerce')
+    y_vals = pd.to_numeric(plot_df['d 13C/12C  Mean'], errors='coerce')
+    z_vals = pd.to_numeric(plot_df[z_col], errors='coerce')
+
+    marker = dict(size=5, opacity=0.85)
+    if color_col and color_col in plot_df.columns:
+        color_values, colorbar_category_ticks = _prepare_color_values(plot_df[color_col])
+        numeric_colors = pd.to_numeric(color_values, errors='coerce') if color_values is not None else pd.Series(dtype=float)
+        if color_values is not None and numeric_colors.notna().any():
+            colorbar_cfg = dict(
+                title='Date' if color_col == 'Date_ordinal' else (color_label or color_col),
+                thickness=18,
+                len=0.7,
+                y=0.5,
+                yanchor='middle'
+            )
+            if color_col == 'Date_ordinal':
+                tickvals, ticktext = _build_date_colorbar_ticks(plot_df[color_col])
+                if tickvals and ticktext:
+                    colorbar_cfg.update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
+            elif colorbar_category_ticks is not None:
+                tickvals, ticktext = colorbar_category_ticks
+                if tickvals and ticktext:
+                    colorbar_cfg.update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
+            marker.update(
+                color=numeric_colors,
+                colorscale='Viridis',
+                showscale=True,
+                colorbar=colorbar_cfg
+            )
+        else:
+            marker.update(color='rgba(70, 130, 180, 0.85)')
+    else:
+        marker.update(color='rgba(70, 130, 180, 0.85)')
+
+    id1_series = plot_df.get('Identifier 1', pd.Series(plot_df.index, index=plot_df.index)).fillna('').astype(str)
+    id2_series = plot_df.get('Identifier 2', pd.Series(plot_df.index, index=plot_df.index)).fillna('').astype(str)
+    customdata = np.column_stack([id1_series.to_numpy(), id2_series.to_numpy()])
+    z_axis_title = z_label or z_col
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(
+        x=x_vals,
+        y=y_vals,
+        z=z_vals,
+        mode='markers',
+        marker=marker,
+        customdata=customdata,
+        hovertemplate=(
+            "Identifier 1: %{customdata[0]}<br>"
+            "Identifier 2: %{customdata[1]}<br>"
+            "d18O: %{x:.4f}<br>"
+            "d13C: %{y:.4f}<br>"
+            f"{z_axis_title}: %{{z:.4f}}<extra></extra>"
+        )
+    ))
+    fig.update_layout(
+        title=title or "d18O vs d13C (3D)",
+        scene=dict(
+            xaxis_title="d18O (per mil)",
+            yaxis_title="d13C (per mil)",
+            zaxis_title=z_axis_title
+        ),
+        height=850,
+        margin=dict(l=10, r=10, t=60, b=10)
+    )
+    return fig, None
 
 def _split_label_species(label):
     """Split Label into identifier and species using 'Label - Species' convention."""
@@ -4086,7 +4763,7 @@ def _parse_new_table_layout(raw_df):
                 data_start_idx = i
                 break
 
-    unit_tokens = {'\u2030', 'Ã¢â‚¬Â°', '%', 'ppm', 'ppb', 'mv', 'v', 'c'}
+    unit_tokens = {'\u2030', '%', 'ppm', 'ppb', 'mv', 'v', 'c'}
     cols = []
     for col_idx in range(raw_df.shape[1]):
         parts = []
@@ -4142,12 +4819,12 @@ def _standardize_isotope_columns(df):
         if not isinstance(col, str):
             continue
         low = col.strip().lower()
-        if 'd13' in low or 'Î´13' in low:
+        if 'd13' in low or '\u03b413' in low:
             if 'mean' in low:
                 rename_map[col] = 'd 13C/12C  Mean'
             elif 'sd' in low or 'std' in low:
                 rename_map[col] = 'd 13C/12C  Std Dev'
-        if 'd18' in low or 'Î´18' in low:
+        if 'd18' in low or '\u03b418' in low:
             if 'mean' in low:
                 rename_map[col] = 'd 18O/16O  Mean'
             elif 'sd' in low or 'std' in low:
@@ -4316,10 +4993,8 @@ try:
             'dVSMOW(18O)': ISOTYPE_D18O,
             '?VPDB(13C)': ISOTYPE_D13C,
             '?VSMOW(18O)': ISOTYPE_D18O,
-            'Î´VPDB(13C)': ISOTYPE_D13C,
-            'Î´VSMOW(18O)': ISOTYPE_D18O,
-            'ÃŽÂ´VPDB(13C)': ISOTYPE_D13C,
-            'ÃŽÂ´VSMOW(18O)': ISOTYPE_D18O,
+            '\u03b4VPDB(13C)': ISOTYPE_D13C,
+            '\u03b4VSMOW(18O)': ISOTYPE_D18O,
             '??VPDB(13C)': ISOTYPE_D13C,
             '??VSMOW(18O)': ISOTYPE_D18O,
         })
@@ -4354,9 +5029,9 @@ def _filter_standards_remove_outliers(df, standards, method, sigma, iqr_mult, in
     '''Return selected standards with outliers removed.'''
     if independent_isotope_outliers is None:
         try:
-            independent_isotope_outliers = bool(st.session_state.get("outliers_independence", False))
+            independent_isotope_outliers = bool(st.session_state.get("outliers_independence", True))
         except Exception:
-            independent_isotope_outliers = False
+            independent_isotope_outliers = True
     if not standards:
         return pd.DataFrame(columns=df.columns)
     parts = []
@@ -4428,6 +5103,106 @@ def _apply_linearity_correction(df, intensity_col, fits):
         df['d18O_calibrated_linearity_corrected'] = (y - slope * (i - x_ref)).where(np.isfinite(y) & np.isfinite(i))
     return df
 
+
+def _resolve_selected_linearity_intensity_column(df=None):
+    """Return the active intensity column for linearity operations."""
+    use_diff = bool(st.session_state.get(LINEARITY_USE_DIFF_INTENSITY_KEY, False))
+    preferred = CYCLE1_SIGNAL_DIFF44_COL if use_diff else CYCLE1_SIGNAL_SAMP44_COL
+    fallback = CYCLE1_SIGNAL_SAMP44_COL if preferred != CYCLE1_SIGNAL_SAMP44_COL else None
+
+    if df is None:
+        return preferred
+
+    if preferred in df.columns:
+        vals = pd.to_numeric(df[preferred], errors='coerce')
+        if vals.notna().any():
+            return preferred
+    if fallback and fallback in df.columns:
+        vals = pd.to_numeric(df[fallback], errors='coerce')
+        if vals.notna().any():
+            return fallback
+    if preferred in df.columns:
+        return preferred
+    if fallback and fallback in df.columns:
+        return fallback
+    return preferred
+
+
+def _resolve_linearity_intensity_column_for_fits(fits=None, df=None):
+    """Return intensity column matching stored fits when available."""
+    if isinstance(fits, dict):
+        stored_col = fits.get('intensity_col')
+        if stored_col in (CYCLE1_SIGNAL_SAMP44_COL, CYCLE1_SIGNAL_DIFF44_COL):
+            if df is None:
+                return stored_col
+            if stored_col in df.columns:
+                vals = pd.to_numeric(df[stored_col], errors='coerce')
+                if vals.notna().any():
+                    return stored_col
+    return _resolve_selected_linearity_intensity_column(df=df)
+
+
+def _linearity_intensity_axis_label(intensity_col):
+    """Return axis title text for the selected linearity intensity column."""
+    return f"Signal Intensity (V) - {intensity_col}"
+
+
+def _sync_linearity_intensity_basis_from_ui(source_key):
+    """Sync mirrored UI toggles to a single canonical linearity-intensity setting."""
+    use_diff = bool(st.session_state.get(source_key, False))
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_KEY] = use_diff
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY] = use_diff
+    st.session_state[LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY] = use_diff
+
+
+def _resolve_linearity_reference_intensity(df, isotope_key, intensity_col=CYCLE1_SIGNAL_SAMP44_COL, default_value=15.0):
+    """Resolve the linearity reference intensity (x_ref) for an isotope."""
+    fits = st.session_state.get('linearity_fits', {})
+    fit = fits.get(str(isotope_key).strip(), {}) if isinstance(fits, dict) else {}
+    x_ref = pd.to_numeric(pd.Series([fit.get('x_ref')]), errors='coerce').iloc[0]
+    if np.isfinite(x_ref):
+        return float(x_ref)
+
+    if df is not None and intensity_col in df.columns:
+        vals = pd.to_numeric(df[intensity_col], errors='coerce')
+        vals = vals[np.isfinite(vals)]
+        if not vals.empty:
+            median_val = float(vals.median())
+            if np.isfinite(median_val):
+                return median_val
+    return float(default_value)
+
+
+def _apply_manual_linearity_override(df, enable_override=False, d13_per_10v=0.0, d18_per_10v=0.0, intensity_col=CYCLE1_SIGNAL_SAMP44_COL):
+    """Apply manual linearity override to tab-3 working raw and calibrated isotope values."""
+    if df is None or df.empty or not bool(enable_override) or intensity_col not in df.columns:
+        return df
+
+    work = df.copy()
+    intensity = pd.to_numeric(work[intensity_col], errors='coerce')
+    valid_intensity = np.isfinite(intensity)
+
+    def _apply_single_column(column_name, isotope_key, slope_per_10v):
+        slope_num = pd.to_numeric(pd.Series([slope_per_10v]), errors='coerce').iloc[0]
+        if column_name not in work.columns or not np.isfinite(slope_num):
+            return
+        x_ref = _resolve_linearity_reference_intensity(work, isotope_key, intensity_col=intensity_col)
+        slope_per_v = float(slope_num) / 10.0
+        y_vals = pd.to_numeric(work[column_name], errors='coerce')
+        work[column_name] = (y_vals - slope_per_v * (intensity - float(x_ref))).where(np.isfinite(y_vals) & valid_intensity)
+
+    d13_num = pd.to_numeric(pd.Series([d13_per_10v]), errors='coerce').iloc[0]
+    if np.isfinite(d13_num):
+        _apply_single_column('d 13C/12C  Mean', 'd13C', d13_num)
+        _apply_single_column('d13C_calibrated', 'd13C', d13_num)
+
+    d18_num = pd.to_numeric(pd.Series([d18_per_10v]), errors='coerce').iloc[0]
+    if np.isfinite(d18_num):
+        _apply_single_column('d 18O/16O  Mean', 'd18O', d18_num)
+        _apply_single_column('d18O_calibrated', 'd18O', d18_num)
+
+    return work
+
 def _interpolate_outliers_by_identifier2(df, outlier_mask, cols, id2_col='Identifier 2'):
     """Interpolate specified columns for rows flagged as outliers, using
     the sequence defined by ``Identifier 2`` as the order reference.
@@ -4457,13 +5232,13 @@ def _interpolate_outliers_by_identifier2(df, outlier_mask, cols, id2_col='Identi
 
     work = df.copy()
 
-    # Build an order column from Identifier 2; prefer numeric, fallback to extracted number, then to original order
+    # Build an order column from Identifier 2 with locale-aware parsing, then fallback to original order.
     if id2_col in work.columns:
         order = pd.to_numeric(work[id2_col], errors='coerce')
         if order.isna().all():
-            # Try extracting numbers from strings
+            # Parse strings like "34,26-34,28" as 34.26
             try:
-                order = work[id2_col].apply(lambda v: extract_number(v))
+                order = work[id2_col].apply(_parse_numeric_token)
                 order = pd.to_numeric(order, errors='coerce')
             except Exception:
                 order = pd.Series(np.arange(len(work)), index=work.index)
@@ -5081,6 +5856,44 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
     if not any(col in df.columns for col in ['d13C_calibrated', 'd18O_calibrated']):
         if not st.warning("Data has not been calibrated. Do you want to continue downloading without calibration data?") or not st.button("Continue", key=f"continue_btn_{filename}"):
             return
+
+    def _drop_exported_outlier_rows(frame, id_col, sample_col):
+        """Drop rows present in the computed outlier table from an export frame."""
+        if frame is None or frame.empty or outliers is None or outliers.empty:
+            return frame
+
+        cleaned = frame
+
+        # Primary path: same source frame, so indexes usually align.
+        try:
+            overlap_idx = cleaned.index.intersection(outliers.index)
+            if len(overlap_idx) > 0:
+                cleaned = cleaned.drop(index=overlap_idx, errors="ignore")
+        except Exception:
+            pass
+
+        # Fallback path: align by sample keys when indexes differ.
+        try:
+            if (
+                {'Identifier 1', 'Identifier 2'}.issubset(outliers.columns)
+                and id_col in cleaned.columns
+                and sample_col in cleaned.columns
+            ):
+                out_key = (
+                    outliers['Identifier 1'].astype(str).str.strip()
+                    + "||"
+                    + outliers['Identifier 2'].astype(str).str.strip()
+                )
+                row_key = (
+                    cleaned[id_col].astype(str).str.strip()
+                    + "||"
+                    + cleaned[sample_col].astype(str).str.strip()
+                )
+                cleaned = cleaned.loc[~row_key.isin(set(out_key))]
+        except Exception:
+            pass
+
+        return cleaned
     
     # Convert the DataFrame to Excel format in memory
     towrite = io.BytesIO()
@@ -5089,6 +5902,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
         # Split data into standards and non-standards
         standards_mask = df['Identifier 1'].isin(selected_standards) if selected_standards else pd.Series(False, index=df.index)
         main_data = df[~standards_mask].copy()
+        main_data = _drop_exported_outlier_rows(main_data, 'Identifier 1', 'Identifier 2')
 
         # Calculate statistics
         total_samples = len(df)
@@ -5131,7 +5945,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
         try:
             # Determine linearity fits (reuse from session or recompute on-the-fly from standards)
             fits = st.session_state.get('linearity_fits') if isinstance(st.session_state, dict) else None
-            intensity_col = '1  Cycle Int  Samp  44'
+            intensity_col = _resolve_linearity_intensity_column_for_fits(fits=fits, df=df)
 
             # If no fits in session, compute using currently selected standards (cleaned by chosen outlier method)
             if (not fits) and selected_standards:
@@ -5140,11 +5954,13 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                     _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
                     _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
                     clean_stds_all = _filter_standards_remove_outliers(df, selected_standards, _method, _sigma, _iqr)
+                    intensity_col = _resolve_selected_linearity_intensity_column(df=clean_stds_all)
                     fit13 = _compute_linearity_fit(clean_stds_all, 'd 13C/12C  Mean', intensity_col)
                     fit18 = _compute_linearity_fit(clean_stds_all, 'd 18O/16O  Mean', intensity_col)
                     fits = {
                         'd13C': {'slope': fit13.get('slope', np.nan), 'x_ref': fit13.get('x_ref', np.nan)},
                         'd18O': {'slope': fit18.get('slope', np.nan), 'x_ref': fit18.get('x_ref', np.nan)},
+                        'intensity_col': intensity_col,
                         'raw': {'fit13': fit13, 'fit18': fit18},
                     }
                 except Exception:
@@ -5194,23 +6010,24 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 'Identifier': df['Identifier 1'],
                 'Sample #': df.get('Identifier 2', pd.Series(index=df.index, dtype=object)),
                 'Species': species_series,
-                'd13C (â€°, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
-                'd13C (â€°, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
-                'd18O (â€°, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
-                'd18O (â€°, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
-                'Corrected d13C (â€°, VPDB)': corrected_d13,
-                'Corrected d18O (â€°, VPDB)': corrected_d18,
+                'd13C (\u2030, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
+                'd13C (\u2030, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
+                'd18O (\u2030, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
+                'd18O (\u2030, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
+                'Corrected d13C (\u2030, VPDB)': corrected_d13,
+                'Corrected d18O (\u2030, VPDB)': corrected_d18,
             })
 
             # Keep only non-standards entries if selected_standards is provided
             if selected_standards:
                 client_df = client_df[~df['Identifier 1'].isin(selected_standards)]
+            client_df = _drop_exported_outlier_rows(client_df, 'Identifier', 'Sample #')
 
             # Round numeric columns to 2 decimals specifically for Client Output
             round_cols = [
-                'd13C (â€°, VPDB)  Mean', 'd13C (â€°, VPDB)  Std Dev',
-                'd18O (â€°, VPDB)  Mean', 'd18O (â€°, VPDB)  Std Dev',
-                'Corrected d13C (â€°, VPDB)', 'Corrected d18O (â€°, VPDB)'
+                'd13C (\u2030, VPDB)  Mean', 'd13C (\u2030, VPDB)  Std Dev',
+                'd18O (\u2030, VPDB)  Mean', 'd18O (\u2030, VPDB)  Std Dev',
+                'Corrected d13C (\u2030, VPDB)', 'Corrected d18O (\u2030, VPDB)'
             ]
             for rc in round_cols:
                 if rc in client_df.columns:
@@ -5244,9 +6061,9 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
 
             # Apply numeric format to measure columns
             meas_cols = [
-                'd13C (â€°, VPDB)  Mean', 'd13C (â€°, VPDB)  Std Dev',
-                'd18O (â€°, VPDB)  Mean', 'd18O (â€°, VPDB)  Std Dev',
-                'Corrected d13C (â€°, VPDB)', 'Corrected d18O (â€°, VPDB)'
+                'd13C (\u2030, VPDB)  Mean', 'd13C (\u2030, VPDB)  Std Dev',
+                'd18O (\u2030, VPDB)  Mean', 'd18O (\u2030, VPDB)  Std Dev',
+                'Corrected d13C (\u2030, VPDB)', 'Corrected d18O (\u2030, VPDB)'
             ]
             for col_name in meas_cols:
                 if col_name in headers:
@@ -5262,7 +6079,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
                 _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
                 _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
-                _independent = bool(st.session_state.get("outliers_independence", False))
+                _independent = bool(st.session_state.get("outliers_independence", True))
 
                 shp = df[df['Identifier 1'] == 'SHP2L'].copy() if 'Identifier 1' in df.columns else pd.DataFrame()
                 if not shp.empty:
@@ -5304,6 +6121,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                             fits = {
                                 'd13C': {'slope': f13.get('slope', np.nan), 'x_ref': f13.get('x_ref', np.nan)},
                                 'd18O': {'slope': f18.get('slope', np.nan), 'x_ref': f18.get('x_ref', np.nan)},
+                                'intensity_col': intensity_col,
                             }
                         except Exception:
                             fits = None
@@ -5328,14 +6146,14 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             worksheet.write(1, 11, "ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer")
             worksheet.write(2, 11, "Kiel IV automated carbonate preparation device")
             worksheet.write(4, 10, "Standard deviation of SHP2L over measurement period:", equip_title_fmt)
-            worksheet.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} â€° for d13C")
-            worksheet.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} â€° for d18O")
+            worksheet.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} \u2030 for d13C")
+            worksheet.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} \u2030 for d18O")
             worksheet.write(7, 11, n_used_text)
 
             # Insert textbox with provided content
             materials_text = (
-                "When results produced at P2L are being published, we suggest to use the following text in the â€œMaterial and Methodsâ€ section of the publication:\n\n"
-                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of SÄo Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientificâ„¢ MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientificâ„¢ Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70Â°C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) â€° for d13C and (please use the value informed by P2L) â€° for d18O (Â±1 s, n = please use the value informed by P2L).\"\n\n"
+                "When results produced at P2L are being published, we suggest using the following text in the \"Material and Methods\" section of the publication:\n\n"
+                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of Sao Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientific MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientific Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70\u00b0C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) \u2030 for d13C and (please use the value informed by P2L) \u2030 for d18O (\u00b11 s, n = please use the value informed by P2L).\"\n\n"
                 "Reference\nCrivellari, S., Viana, P.J., Campos, M.D., Kuhnert, H., Lopes, A.B.M., da Cruz, F.W., Chiessi, C.M., 2021. Development and characterization of a new in-house reference material for stable carbon and oxygen isotopes analyses. Journal of Analytical Atomic Spectrometry 36, 1125-1134. DOI: 10.1039/D1JA00030F."
             )
             # Skip adding textbox since the sheet is not created in this workbook
@@ -5433,7 +6251,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 clean_stds_all = df[df['Identifier 1'].isin(selected_standards)].copy()
 
             # Compute linearity fits on cleaned standards (used for precision-after-correction)
-            intensity_col = '1  Cycle Int  Samp  44'
+            intensity_col = _resolve_selected_linearity_intensity_column(df=clean_stds_all)
             try:
                 fit13 = _compute_linearity_fit(clean_stds_all, 'd 13C/12C  Mean', intensity_col)
             except Exception:
@@ -5484,7 +6302,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 except Exception:
                     pass
 
-                _method_label = f"Z-Score (ÃÆ’={_sigma})" if _method == "Z-Score" else f"IQR (Ãƒâ€”{_iqr})"
+                _method_label = f"Z-Score (\u03c3={_sigma})" if _method == "Z-Score" else f"IQR (\u00d7{_iqr})"
 
                 standards_rows.append({
                     'Standard': _std,
@@ -5577,6 +6395,9 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                     # Linearity correction parameters section
                     worksheet.write(start_row, 0, "Linearity Correction Parameters")
                     start_row += 1
+                    worksheet.write(start_row, 0, "Intensity basis")
+                    worksheet.write(start_row, 1, intensity_col)
+                    start_row += 1
                     # d13C
                     worksheet.write(start_row, 0, "d13C slope")
                     worksheet.write(start_row, 1, float(fit13.get('slope', np.nan)) if np.isfinite(fit13.get('slope', np.nan)) else np.nan)
@@ -5621,8 +6442,8 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
 
     # Build a separate Client Output file and download button
     try:
-        intensity_col = '1  Cycle Int  Samp  44'
         fits = st.session_state.get('linearity_fits') if isinstance(st.session_state, dict) else None
+        intensity_col = _resolve_linearity_intensity_column_for_fits(fits=fits, df=df)
         if (not fits) and selected_standards:
             _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
             _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
@@ -5630,11 +6451,13 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             # Use the full session dataset for computing fits, not the filtered export frame
             base_df = st.session_state.df if 'df' in st.session_state else df
             clean_stds_all = _filter_standards_remove_outliers(base_df, selected_standards, _method, _sigma, _iqr)
+            intensity_col = _resolve_selected_linearity_intensity_column(df=clean_stds_all)
             f13 = _compute_linearity_fit(clean_stds_all, 'd 13C/12C  Mean', intensity_col)
             f18 = _compute_linearity_fit(clean_stds_all, 'd 18O/16O  Mean', intensity_col)
             fits = {
                 'd13C': {'slope': f13.get('slope', np.nan), 'x_ref': f13.get('x_ref', np.nan)},
                 'd18O': {'slope': f18.get('slope', np.nan), 'x_ref': f18.get('x_ref', np.nan)},
+                'intensity_col': intensity_col,
             }
 
         def _build_corrected(series_cal, series_raw, isotope_key):
@@ -5683,12 +6506,12 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             'Identifier': df['Identifier 1'],
             'Sample #': df.get('Identifier 2', pd.Series(index=df.index, dtype=object)),
             'Species': species_series,
-            'd13C (â€°, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
-            'd13C (â€°, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
-            'd18O (â€°, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
-            'd18O (â€°, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
-            'Corrected d13C (â€°, VPDB)': corrected_d13,
-            'Corrected d18O (â€°, VPDB)': corrected_d18,
+            'd13C (\u2030, VPDB)  Mean': pd.to_numeric(df.get('d 13C/12C  Mean'), errors='coerce'),
+            'd13C (\u2030, VPDB)  Std Dev': pd.to_numeric(df.get('d 13C/12C  Std Dev'), errors='coerce'),
+            'd18O (\u2030, VPDB)  Mean': pd.to_numeric(df.get('d 18O/16O  Mean'), errors='coerce'),
+            'd18O (\u2030, VPDB)  Std Dev': pd.to_numeric(df.get('d 18O/16O  Std Dev'), errors='coerce'),
+            'Corrected d13C (\u2030, VPDB)': corrected_d13,
+            'Corrected d18O (\u2030, VPDB)': corrected_d18,
         })
         # Apply species replacements if provided
         if comment_map:
@@ -5698,8 +6521,9 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
                 pass
         if selected_standards:
             client_df = client_df[~df['Identifier 1'].isin(selected_standards)]
+        client_df = _drop_exported_outlier_rows(client_df, 'Identifier', 'Sample #')
 
-        for rc in ['d13C (â€°, VPDB)  Mean','d13C (â€°, VPDB)  Std Dev','d18O (â€°, VPDB)  Mean','d18O (â€°, VPDB)  Std Dev','Corrected d13C (â€°, VPDB)','Corrected d18O (â€°, VPDB)']:
+        for rc in ['d13C (\u2030, VPDB)  Mean','d13C (\u2030, VPDB)  Std Dev','d18O (\u2030, VPDB)  Mean','d18O (\u2030, VPDB)  Std Dev','Corrected d13C (\u2030, VPDB)','Corrected d18O (\u2030, VPDB)']:
             if rc in client_df.columns:
                 client_df[rc] = pd.to_numeric(client_df[rc], errors='coerce').round(2)
 
@@ -5709,7 +6533,7 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             _method = calibration_type or st.session_state.get("calibration_type") or "IQR"
             _sigma = sigma_level if sigma_level is not None else st.session_state.get("sigma_level", 1.0)
             _iqr = irq_multiplier if irq_multiplier is not None else st.session_state.get("irq_multiplier", 1.5)
-            _independent = bool(st.session_state.get("outliers_independence", False))
+            _independent = bool(st.session_state.get("outliers_independence", True))
             base_df = st.session_state.df if 'df' in st.session_state else df
             shp = base_df[base_df['Identifier 1'] == 'SHP2L'].copy() if 'Identifier 1' in base_df.columns else pd.DataFrame()
             if not shp.empty:
@@ -5759,18 +6583,18 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
             for col_idx, col_name in enumerate(headers):
                 ws.write(0, col_idx, col_name, corrected_hdr_fmt if 'Corrected' in col_name else header_fmt)
                 width = 18 if col_name in ('Identifier','Species') else (22 if 'Corrected' in col_name else 15)
-                ws.set_column(col_idx, col_idx, width, num_fmt if col_name in ['d13C (â€°, VPDB)  Mean','d13C (â€°, VPDB)  Std Dev','d18O (â€°, VPDB)  Mean','d18O (â€°, VPDB)  Std Dev','Corrected d13C (â€°, VPDB)','Corrected d18O (â€°, VPDB)'] else None)
+                ws.set_column(col_idx, col_idx, width, num_fmt if col_name in ['d13C (\u2030, VPDB)  Mean','d13C (\u2030, VPDB)  Std Dev','d18O (\u2030, VPDB)  Mean','d18O (\u2030, VPDB)  Std Dev','Corrected d13C (\u2030, VPDB)','Corrected d18O (\u2030, VPDB)'] else None)
             equip_title_fmt = wb.add_format({'bold': True})
             ws.write(1, 10, 'Equiment:', equip_title_fmt)
             ws.write(1, 11, 'ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer')
             ws.write(2, 11, 'Kiel IV automated carbonate preparation device')
             ws.write(4, 10, 'Standard deviation of SHP2L over measurement period:', equip_title_fmt)
-            ws.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} â€° for d13C")
-            ws.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} â€° for d18O")
+            ws.write(5, 11, f"{0.00 if np.isnan(d13c_sd_val) else d13c_sd_val:.2f} \u2030 for d13C")
+            ws.write(6, 11, f"{0.00 if np.isnan(d18o_sd_val) else d18o_sd_val:.2f} \u2030 for d18O")
             ws.write(7, 11, n_used_text)
             materials_text = (
-                "When results produced at P2L are being published, we suggest to use the following text in the â€œMaterial and Methodsâ€ section of the publication:\n\n"
-                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of SÄo Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientificâ„¢ MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientificâ„¢ Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70Â°C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) â€° for d13C and (please use the value informed by P2L) â€° for d18O (Â±1 s, n = please use the value informed by P2L).\"\n\n"
+                "When results produced at P2L are being published, we suggest using the following text in the \"Material and Methods\" section of the publication:\n\n"
+                "\"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology Laboratory, School of Arts, Sciences and Humanities of the University of Sao Paulo, Brazil. The laboratory is equipped with a Thermo Fisher Scientific MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientific Kiel IV carbonate preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at 70\u00b0C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) \u2030 for d13C and (please use the value informed by P2L) \u2030 for d18O (\u00b11 s, n = please use the value informed by P2L).\"\n\n"
                 "Reference\nCrivellari, S., Viana, P.J., Campos, M.D., Kuhnert, H., Lopes, A.B.M., da Cruz, F.W., Chiessi, C.M., 2021. Development and characterization of a new in-house reference material for stable carbon and oxygen isotopes analyses. Journal of Analytical Atomic Spectrometry 36, 1125-1134. DOI: 10.1039/D1JA00030F."
             )
             ws.insert_textbox('L10', materials_text, {'width': 820, 'height': 580, 'line': {'color': '#4F81BD'}})
@@ -5837,6 +6661,10 @@ def main():
         st.session_state[AUTOSAVE_SESSION_TOKEN_KEY] = None
     if AUTOSAVE_DIR_INPUT_KEY not in st.session_state:
         st.session_state[AUTOSAVE_DIR_INPUT_KEY] = st.session_state.get(AUTOSAVE_DIR_OVERRIDE_KEY, "")
+    if IMPORTED_FILE_SPECS_KEY not in st.session_state:
+        st.session_state[IMPORTED_FILE_SPECS_KEY] = []
+    if APPEND_UPLOADER_NONCE_KEY not in st.session_state:
+        st.session_state[APPEND_UPLOADER_NONCE_KEY] = 0
 
     tab_import, tab1, tab2, tab3 = st.tabs([
         'Data import',
@@ -5980,20 +6808,19 @@ def main():
                     if sample_col and 'total_co2' not in df.columns:
                         df['total_co2'] = _extract_numeric(df[sample_col])
 
-                    if '1  Cycle Int  Samp  44' in df.columns:
-                        df['1  Cycle Int  Samp  44'] = _normalize_signal_intensity(df['1  Cycle Int  Samp  44'])
+                    if CYCLE1_SIGNAL_SAMP44_COL in df.columns:
+                        df[CYCLE1_SIGNAL_SAMP44_COL] = _normalize_signal_intensity(df[CYCLE1_SIGNAL_SAMP44_COL])
                     else:
                         intensity_candidates = [
                             'Pressure Adjust Result Intensity',
                             'Pressure Adjust Initial Intensity',
-                            'Initial Intensity from Âµ-Volume',
-                            'Initial Intensity from Î¼-Volume',
-                            'Initial Intensity from Ã‚Âµ-Volume'
+                            'Initial Intensity from \u00b5-Volume',
+                            'Initial Intensity from \u03bc-Volume',
                         ]
                         for cand in intensity_candidates:
                             col = _find_column(df, cand)
                             if col:
-                                df['1  Cycle Int  Samp  44'] = _normalize_signal_intensity(df[col])
+                                df[CYCLE1_SIGNAL_SAMP44_COL] = _normalize_signal_intensity(df[col])
                                 break
 
                     if 'Label' in df.columns:
@@ -6029,7 +6856,7 @@ def main():
                         )
 
                     # Ensure required analysis columns exist
-                    for col in ['leak_rate', 'p_no_acid', 'total_co2', 'p_gases', '1  Cycle Int  Samp  44', 'Line']:
+                    for col in ['leak_rate', 'p_no_acid', 'total_co2', 'p_gases', CYCLE1_SIGNAL_SAMP44_COL, 'Line']:
                         if col not in df.columns:
                             df[col] = np.nan
 
@@ -6038,6 +6865,7 @@ def main():
 
                     # Compute per-sample means from cycles when Cycle Number is present
                     df = _apply_cycle_averages(df)
+                    df = _ensure_cycle1_signal_difference_columns(df)
 
                     # Ensure all original columns are included
                     for col in original_columns:
@@ -6073,7 +6901,7 @@ def main():
                 active_df = resumed_df if resumed_df is not None else df
 
                 # Save df to session_state
-                st.session_state.df = active_df
+                st.session_state.df = _ensure_cycle1_signal_difference_columns(active_df)
                 st.session_state.df_cycles_source = df_cycles_source
                 restored_rows = autosave_state.get("edited_rows", set()) if autosave_state.get("resumed") else set()
                 restored_originals = (
@@ -6102,6 +6930,7 @@ def main():
                     st.session_state.calibration_coefficients = {}
                     st.session_state.linearity_fits = {}
                 st.session_state.file_processed = True
+                st.session_state[IMPORTED_FILE_SPECS_KEY] = list(loaded_file_specs)
 
                 autosave_initialized = bool(autosave_state.get("ok"))
                 if autosave_initialized:
@@ -6117,6 +6946,91 @@ def main():
 
             except Exception as e:
                 st.error(f"Error loading file: {e}")
+
+        if st.session_state.file_processed and st.session_state.df is not None:
+            st.divider()
+            st.markdown("#### Add Excel Files to Current Session")
+            st.caption("Append new workbook rows without resetting current edits or analysis state.")
+            append_nonce = int(st.session_state.get(APPEND_UPLOADER_NONCE_KEY, 0))
+            append_files = st.file_uploader(
+                "Choose additional XLS files",
+                type=['xls', 'xlsx'],
+                accept_multiple_files=True,
+                key=f"append_uploader_{append_nonce}"
+            )
+            if st.button(
+                "Add Selected Files to Session",
+                key=f"append_files_btn_{append_nonce}",
+                disabled=not append_files,
+            ):
+                try:
+                    existing_specs = st.session_state.get(IMPORTED_FILE_SPECS_KEY, [])
+                    existing_signatures = set()
+                    for spec in existing_specs:
+                        signature = _upload_spec_signature(spec)
+                        if signature is not None:
+                            existing_signatures.add(signature)
+
+                    files_to_append = []
+                    skipped_files = []
+                    for uploaded_file in (append_files or []):
+                        spec = _build_uploaded_file_spec(uploaded_file)
+                        signature = _upload_spec_signature(spec)
+                        if signature is not None and signature in existing_signatures:
+                            skipped_files.append(str(spec.get("name", uploaded_file.name)))
+                            continue
+                        if signature is not None:
+                            existing_signatures.add(signature)
+                        files_to_append.append(uploaded_file)
+
+                    if not files_to_append:
+                        st.info("All selected files are already present in this session.")
+                    else:
+                        append_df, append_cycles, append_specs, append_errors = _load_uploaded_workbooks(files_to_append)
+                        for load_err in append_errors:
+                            st.error(load_err)
+
+                        if append_df is None:
+                            st.warning("No rows were appended. Check file errors above.")
+                        else:
+                            st.session_state.df = _ensure_cycle1_signal_difference_columns(
+                                _append_rows_preserve_existing_index(st.session_state.df, append_df)
+                            )
+                            st.session_state.df_cycles_source = _append_cycles_source(
+                                st.session_state.get("df_cycles_source"),
+                                append_cycles,
+                            )
+
+                            merged_specs = list(st.session_state.get(IMPORTED_FILE_SPECS_KEY, []))
+                            merged_specs.extend(append_specs)
+                            st.session_state[IMPORTED_FILE_SPECS_KEY] = merged_specs
+
+                            source_files = list(st.session_state.get(AUTOSAVE_SOURCE_FILES_KEY, []))
+                            for spec in append_specs:
+                                source_name = str(spec.get("name", "")).strip()
+                                if source_name != "" and source_name not in source_files:
+                                    source_files.append(source_name)
+                            st.session_state[AUTOSAVE_SOURCE_FILES_KEY] = source_files
+
+                            _autosave_session_update(
+                                "session_appended",
+                                changes=[],
+                                context={
+                                    "appended_files": [str(s.get("name", "")) for s in append_specs],
+                                    "skipped_duplicates": skipped_files,
+                                    "appended_rows": int(len(append_df)),
+                                    "total_rows": int(len(st.session_state.df)),
+                                },
+                            )
+
+                            message = f"Added {len(append_specs)} file(s) and {len(append_df)} row(s) to this session."
+                            if skipped_files:
+                                message += f" Skipped {len(skipped_files)} duplicate file(s)."
+                            st.success(message)
+                            st.session_state[APPEND_UPLOADER_NONCE_KEY] = append_nonce + 1
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Error appending files: {e}")
 
         # Display a warning if no file is uploaded
         if st.session_state.df is None:
@@ -6211,6 +7125,8 @@ def main():
 
     if not has_data:
         return
+
+    st.session_state.df = _ensure_cycle1_signal_difference_columns(st.session_state.df)
     # Sidebar for user-selected sigma level
     # with st.sidebar:
     #     sigma_level = st.number_input("Set Sigma Level for Outlier Exclusion",
@@ -6221,7 +7137,8 @@ def main():
 
     color_options = {
         'Line': 'Line',
-        'Signal Intensity': '1  Cycle Int  Samp  44',
+        'Signal Intensity': CYCLE1_SIGNAL_SAMP44_COL,
+        'Signal Intensity Difference (Cycle 1 Samp-Ref)': CYCLE1_SIGNAL_DIFF44_COL,
         'd18O values': 'd 18O/16O  Mean',
         'd13C values': 'd 13C/12C  Mean',
         'Leak Rate': 'leak_rate',
@@ -6230,9 +7147,19 @@ def main():
         'P no acid': 'p_no_acid',
         'Date': 'Date_ordinal'
     }
+    z_axis_options = {
+        'Signal Intensity': CYCLE1_SIGNAL_SAMP44_COL,
+        'Signal Intensity Difference (Cycle 1 Samp-Ref)': CYCLE1_SIGNAL_DIFF44_COL,
+        'Leak Rate': 'leak_rate',
+        'Total CO2': 'total_co2',
+        'P gasses': 'p_gases',
+        'P no acid': 'p_no_acid',
+        'Line': 'Line',
+    }
 
     # Get list of friendly names for dropdown
     color_param_names = list(color_options.keys())
+    z_axis_option_names = list(z_axis_options.keys())
 
     with tab1:
         st.header('Diagnostic Plots')
@@ -6316,6 +7243,21 @@ def main():
         # Display the plot
         st.plotly_chart(fig, width='stretch')
 
+        st.subheader("Cycle 1 Signal Difference vs d18O and d13C")
+        filtered_df = _ensure_cycle1_signal_difference_columns(filtered_df)
+        diag_3d_fig, diag_3d_msg = _build_isotope_3d_scatter(
+            filtered_df,
+            z_col=CYCLE1_SIGNAL_DIFF44_COL,
+            z_label='Cycle 1 Signal Difference (Samp-Ref, m/z44, V)',
+            color_col=color_param,
+            color_label=selected_color_param,
+            title='Cycle 1 Signal Difference vs d18O vs d13C'
+        )
+        if diag_3d_fig is not None:
+            st.plotly_chart(diag_3d_fig, width='stretch')
+        else:
+            st.info(diag_3d_msg)
+
     with tab2:
             st.header("Calibration")
 
@@ -6334,10 +7276,8 @@ def main():
                         'dVSMOW(18O)': ISOTYPE_D18O,
                         '?VPDB(13C)': ISOTYPE_D13C,
                         '?VSMOW(18O)': ISOTYPE_D18O,
-                        'Î´VPDB(13C)': ISOTYPE_D13C,
-                        'Î´VSMOW(18O)': ISOTYPE_D18O,
-                        'ÃŽÂ´VPDB(13C)': ISOTYPE_D13C,
-                        'ÃŽÂ´VSMOW(18O)': ISOTYPE_D18O,
+                        '\u03b4VPDB(13C)': ISOTYPE_D13C,
+                        '\u03b4VSMOW(18O)': ISOTYPE_D18O,
                         '??VPDB(13C)': ISOTYPE_D13C,
                         '??VSMOW(18O)': ISOTYPE_D18O,
                     })
@@ -6374,7 +7314,7 @@ def main():
                 except Exception:
                     sigma_default = 1.0
                 sigma_default = min(5.0, max(0.1, sigma_default))
-                sigma_level = st.number_input("Set Sigma Level for standardÃ‚Â´s Outlier Exclusion",
+                sigma_level = st.number_input("Set Sigma Level for standard's Outlier Exclusion",
                                             min_value=0.1,
                                             max_value=5.0,
                                             value=float(sigma_default),
@@ -6386,7 +7326,7 @@ def main():
                 except Exception:
                     irq_default = 1.5
                 irq_default = min(10.0, max(1.0, irq_default))
-                irq_multiplier = st.number_input("Set IQR Multiplier for standardÃ‚Â´s Outlier Exclusion",
+                irq_multiplier = st.number_input("Set IQR Multiplier for standard's Outlier Exclusion",
                                                 min_value=1.0,
                                                 max_value=10.0,
                                                 value=float(irq_default),
@@ -6403,10 +7343,11 @@ def main():
                     index=calibration_options.index(stored_cal_type)
                 )
                 outliers_independence = st.checkbox(
-                    "Outliers independece",
-                    value=bool(st.session_state.get("outliers_independence", False)),
+                    "Outliers independence (standards)",
+                    value=True,
+                    disabled=True,
                     help=(
-                        "When enabled, d13C and d18O outliers are treated independently. "
+                        "Standard outliers are treated independently per isotope. "
                         "A d13C outlier does not automatically exclude the same row for d18O, and vice versa."
                     ),
                 )
@@ -6440,6 +7381,15 @@ def main():
 
                 # Map the selected friendly name to the actual column name
                 color_param = color_options[selected_color_param]
+                default_z_axis = 'Signal Intensity'
+                default_z_axis_index = z_axis_option_names.index(default_z_axis) if default_z_axis in z_axis_option_names else 0
+                selected_z_axis_calibration = st.selectbox(
+                    "Choose the Z-axis for 3D chart:",
+                    z_axis_option_names,
+                    index=default_z_axis_index,
+                    key="calibration_z_axis_param"
+                )
+                z_axis_col_calibration = z_axis_options[selected_z_axis_calibration]
 
                 # Add some vertical spacing
                 st.write("")
@@ -6522,13 +7472,23 @@ def main():
                 date_mask_chart = (date_series_chart >= precision_date_bounds[0]) & (date_series_chart <= precision_date_bounds[1])
                 clean_stds_for_charts = clean_stds_for_charts.loc[date_mask_chart].copy()
 
+            precision_summary_container = None
+
             # Action row: Calibrate results + optional linearity correction toggle
             if selected_standards:
-                act_c1, act_c2 = st.columns([2, 1])
+                act_c1, act_c2, act_c3 = st.columns([2, 1, 2])
                 with act_c1:
                     calibrate_clicked = st.button("Calibrate results", width='stretch')
                 with act_c2:
                     apply_linearity_toggle = st.checkbox("Apply linearity correction", key="apply_linearity_toggle")
+                with act_c3:
+                    st.checkbox(
+                        "Use Samp-Ref intensity difference (Cycle 1, collector 44)",
+                        key=LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY,
+                        on_change=_sync_linearity_intensity_basis_from_ui,
+                        args=(LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY,),
+                        help="When enabled, linearity fitting/correction uses 1 Cycle Int Diff Samp-Ref 44 instead of sample-only intensity.",
+                    )
 
                 if calibrate_clicked:
                     if len(selected_standards) not in [1, 2]:
@@ -6561,7 +7521,8 @@ def main():
                         # Optionally compute and apply linearity correction across the whole dataset
                         if apply_linearity_toggle:
                             try:
-                                intensity_col = '1  Cycle Int  Samp  44'
+                                fit_src_df = clean_stds if clean_stds is not None else st.session_state.df
+                                intensity_col = _resolve_selected_linearity_intensity_column(df=fit_src_df)
                                 y13_col = 'd 13C/12C  Mean'
                                 y18_col = 'd 18O/16O  Mean'
                                 fit13 = _compute_linearity_fit(clean_stds, y13_col, intensity_col) if clean_stds is not None else {'slope': np.nan, 'x_ref': np.nan}
@@ -6569,6 +7530,7 @@ def main():
                                 fits = {
                                     'd13C': {'slope': fit13.get('slope', np.nan), 'x_ref': fit13.get('x_ref', np.nan)},
                                     'd18O': {'slope': fit18.get('slope', np.nan), 'x_ref': fit18.get('x_ref', np.nan)},
+                                    'intensity_col': intensity_col,
                                 }
                                 st.session_state.df = _apply_linearity_correction(st.session_state.df, intensity_col, fits)
                                 # Store fits for downstream display use
@@ -6584,23 +7546,39 @@ def main():
                                 if np.isfinite(fit13.get('slope', np.nan)) or np.isfinite(fit18.get('slope', np.nan)):
                                     st.success(
                                         f"Applied linearity correction. Slopes: d13C={fit13.get('slope', float('nan')):.6f} per V, "
-                                        f"d18O={fit18.get('slope', float('nan')):.6f} per V."
+                                        f"d18O={fit18.get('slope', float('nan')):.6f} per V (intensity: {intensity_col})."
                                     )
                                 else:
                                     st.info("Linearity correction requested, but insufficient data to compute fits.")
                             except Exception as e:
                                 st.error(f"Linearity correction failed: {e}")
 
+                # Place precision/averages cards immediately below the action row.
+                precision_summary_container = st.container()
+
             # Always show calibration charts when standards are selected (using cleaned standards)
             if selected_standards:
                 try:
                     chart_src = clean_stds_for_charts if clean_stds_for_charts is not None else clean_stds if clean_stds is not None else st.session_state.df
+                    chart_src = _ensure_cycle1_signal_difference_columns(chart_src.copy())
                     figs = create_calibration_plots(standards_reference, chart_src, selected_standards, color_param)
                     col_cal1, col_cal2 = st.columns(2)
                     with col_cal1:
                         st.plotly_chart(figs[ISOTYPE_D13C], width='stretch')
                     with col_cal2:
                         st.plotly_chart(figs[ISOTYPE_D18O], width='stretch')
+                    cal_3d_fig, cal_3d_msg = _build_isotope_3d_scatter(
+                        chart_src,
+                        z_col=z_axis_col_calibration,
+                        z_label=selected_z_axis_calibration,
+                        color_col=color_param,
+                        color_label=selected_color_param,
+                        title=f"Calibration 3D Chart (Z-axis: {selected_z_axis_calibration})"
+                    )
+                    if cal_3d_fig is not None:
+                        st.plotly_chart(cal_3d_fig, width='stretch')
+                    else:
+                        st.info(cal_3d_msg)
                 except Exception as e:
                     st.warning(f"Unable to render calibration charts: {e}")
 
@@ -6669,7 +7647,6 @@ def main():
             if not selected_standards:
                 st.info("Select one or more standards above to compute linearity.")
             else:
-                intensity_col = '1  Cycle Int  Samp  44'
                 y13_col = 'd 13C/12C  Mean'
                 y18_col = 'd 18O/16O  Mean'
 
@@ -6685,6 +7662,8 @@ def main():
                     date_series_chart = pd.to_datetime(linearity_src[date_col], errors='coerce')
                     date_mask_chart = (date_series_chart >= precision_date_bounds[0]) & (date_series_chart <= precision_date_bounds[1])
                     linearity_src = linearity_src.loc[date_mask_chart].copy()
+                intensity_col = _resolve_selected_linearity_intensity_column(df=linearity_src)
+                st.caption(f"Linearity intensity basis: `{intensity_col}`")
 
                 fit13 = _compute_linearity_fit(linearity_src, y13_col, intensity_col)
                 fit18 = _compute_linearity_fit(linearity_src, y18_col, intensity_col)
@@ -6713,7 +7692,7 @@ def main():
                         eq = "Insufficient data for regression"
                     fig.update_layout(
                         title=f"{title_prefix}: {y_col} vs Intensity",
-                        xaxis_title='Signal Intensity (V) - 1  Cycle Int  Samp  44',
+                        xaxis_title=_linearity_intensity_axis_label(intensity_col),
                         yaxis_title=y_col,
                         annotations=[dict(x=0.02, y=0.98, xref='paper', yref='paper',
                                           text=eq, showarrow=False,
@@ -6756,7 +7735,7 @@ def main():
                         eq = "Insufficient data for regression"
                     fig.update_layout(
                         title=f"{title_prefix}: {y_col} vs Intensity (Corrected)",
-                        xaxis_title='Signal Intensity (V) - 1  Cycle Int  Samp  44',
+                        xaxis_title=_linearity_intensity_axis_label(intensity_col),
                         yaxis_title=f"{y_col} (linearity corrected)",
                         annotations=[dict(x=0.02, y=0.98, xref='paper', yref='paper',
                                           text=eq, showarrow=False,
@@ -6782,6 +7761,7 @@ def main():
                     st.session_state.linearity_fits = {
                         'd13C': {'slope': fit13.get('slope', np.nan), 'x_ref': fit13.get('x_ref', np.nan)},
                         'd18O': {'slope': fit18.get('slope', np.nan), 'x_ref': fit18.get('x_ref', np.nan)},
+                        'intensity_col': intensity_col,
                     }
                 except Exception:
                     pass
@@ -6926,8 +7906,8 @@ def main():
                                 line_subset18 = line_df18[line_df18['_line_val'] == line_value]
                                 d13_line = pd.to_numeric(line_subset13['d 13C/12C  Mean'], errors='coerce').std()
                                 d18_line = pd.to_numeric(line_subset18['d 18O/16O  Mean'], errors='coerce').std()
-                                d13_text = "--" if pd.isna(d13_line) else f"{d13_line:.3f}â€°"
-                                d18_text = "--" if pd.isna(d18_line) else f"{d18_line:.3f}â€°"
+                                d13_text = "--" if pd.isna(d13_line) else f"{d13_line:.3f}\u2030"
+                                d18_text = "--" if pd.isna(d18_line) else f"{d18_line:.3f}\u2030"
                                 line_blocks.append(
                                     f"<p style='font-size: 16px; margin: 4px 0;'>"
                                     f"<b>Line {int(line_value)} precision:</b> d13C {d13_text} | d18O {d18_text}"
@@ -6944,8 +7924,9 @@ def main():
                     try:
                         fits = st.session_state.get('linearity_fits')
                         if fits:
-                            i_series13 = pd.to_numeric(shp2l_clean_d13['1  Cycle Int  Samp  44'], errors='coerce')
-                            i_series18 = pd.to_numeric(shp2l_clean_d18['1  Cycle Int  Samp  44'], errors='coerce')
+                            lin_intensity_col = _resolve_linearity_intensity_column_for_fits(fits=fits, df=shp2l_filtered_data)
+                            i_series13 = pd.to_numeric(shp2l_clean_d13.get(lin_intensity_col), errors='coerce')
+                            i_series18 = pd.to_numeric(shp2l_clean_d18.get(lin_intensity_col), errors='coerce')
                             y13_series = pd.to_numeric(shp2l_clean_d13['d 13C/12C  Mean'], errors='coerce')
                             y18_series = pd.to_numeric(shp2l_clean_d18['d 18O/16O  Mean'], errors='coerce')
                             if np.isfinite(fits.get('d13C', {}).get('slope', np.nan)):
@@ -6972,31 +7953,33 @@ def main():
                     d18o_lin_markup = (f"<p style='font-size: 16px; margin: 2px 0;'><i>d18O Precision (linearity corrected):</i> "
                                        f"<span style='color: {d18o_lin_color}'>{d18o_lin_prec:.3f}\u2030</span></p>") if d18o_lin_prec is not None else ""
                     
-                    st.markdown(f"""
-                    <div style='background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin: 10px 0;'>
-                        <h3 style='color: #1f77b4; margin-bottom: 15px;'>Precision and Averages for {standard} (Excluding Outliers)</h3>
-                        <div style='display: flex; justify-content: space-between;'>
-                            <div style='flex: 1; margin-right: 20px;'>
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Precision:</b> <span style='color: {d13c_precision_color}'>{d13c_precision:.3f}\u2030</span></p>
-                                {d13c_lin_markup}
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d13C Average:</b> <span style='color: #000000'>{d13c_average:.3f}\u2030</span></p>
+                    if precision_summary_container is not None:
+                        with precision_summary_container:
+                            st.markdown(f"""
+                            <div style='background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin: 10px 0;'>
+                                <h3 style='color: #1f77b4; margin-bottom: 15px;'>Precision and Averages for {standard} (Excluding Outliers)</h3>
+                                <div style='display: flex; justify-content: space-between;'>
+                                    <div style='flex: 1; margin-right: 20px;'>
+                                        <p style='font-size: 18px; margin: 5px 0;'><b>d13C Precision:</b> <span style='color: {d13c_precision_color}'>{d13c_precision:.3f}\u2030</span></p>
+                                        {d13c_lin_markup}
+                                        <p style='font-size: 18px; margin: 5px 0;'><b>d13C Average:</b> <span style='color: #000000'>{d13c_average:.3f}\u2030</span></p>
+                                    </div>
+                                    <div style='flex: 1;'>
+                                        <p style='font-size: 18px; margin: 5px 0;'><b>d18O Precision:</b> <span style='color: {d18o_precision_color}'>{d18o_precision:.3f}\u2030</span></p>
+                                        {d18o_lin_markup}
+                                        <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{d18o_average:.3f}\u2030</span></p>
+                                    </div>
+                                </div>
+                                {line_precision_markup}
+                                <div style='margin-top: 15px; padding-top: 10px; border-top: 1px solid #ddd;'>
+                                    <p style='font-size: 16px; color: {standards_percentage_color};'>Standards included: {standards_summary_text}</p>
+                                </div>
                             </div>
-                            <div style='flex: 1;'>
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Precision:</b> <span style='color: {d18o_precision_color}'>{d18o_precision:.3f}\u2030</span></p>
-                                {d18o_lin_markup}
-                                <p style='font-size: 18px; margin: 5px 0;'><b>d18O Average:</b> <span style='color: #000000'>{d18o_average:.3f}\u2030</span></p>
-                            </div>
-                        </div>
-                        {line_precision_markup}
-                        <div style='margin-top: 15px; padding-top: 10px; border-top: 1px solid #ddd;'>
-                            <p style='font-size: 16px; color: {standards_percentage_color};'>Standards included: {standards_summary_text}</p>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                            """, unsafe_allow_html=True)
 
                     # Calculate statistics for both methods
                     # IMPORTANT: compute stats from the same data shown on the plot.
-                    # Use nonÃ¢â‚¬â€˜outlier points when outlier detection is enabled to avoid biased/offset lines.
+                    # Use non-outlier points when outlier detection is enabled to avoid biased/offset lines.
                     try:
                         stats_source = shp2l_filtered_data.loc[~(d13c_outliers | d18o_outliers)].copy()
                     except Exception:
@@ -7049,13 +8032,13 @@ def main():
 
                     # Generate plots based on user choice
                     if calibration_type == "Z-Score":
-                        # Plot for ÃŽÂ´13C with Z-Score thresholds
+                        # Plot for δ13C with Z-Score thresholds
                         fig_d13c = px.scatter(
                             x=seq_index.loc[inlier_df_d13.index],
                             y=inlier_df_d13['d 13C/12C  Mean'],
                             color=inlier_df_d13[color_param],  # Add color parameter
             title=f'SHP2L d13C Calibration Values (Z-Score Method)',
-            labels={'y': 'd13C (â€°)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd13C (\u2030)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
@@ -7068,19 +8051,19 @@ def main():
                                 marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
                             ))
                         fig_d13c.add_hline(y=sigma_level_d13c_plus, line_color='green', line_dash='dot',
-                                           annotation_text=f'+{sigma_level}ÃÆ’')
+                                           annotation_text=f'+{sigma_level}\u03c3')
                         fig_d13c.add_hline(y=sigma_level_d13c_minus, line_color='green', line_dash='dot',
-                                           annotation_text=f'-{sigma_level}ÃÆ’')
+                                           annotation_text=f'-{sigma_level}\u03c3')
                         fig_d13c.add_hline(y=d13c_mean, line_color='purple', line_dash='solid',
                                            annotation_text='Mean Value')
 
-                        # Plot for ÃŽÂ´18O with Z-Score thresholds
+                        # Plot for δ18O with Z-Score thresholds
                         fig_d18o = px.scatter(
                             x=seq_index.loc[inlier_df_d18.index],
                             y=inlier_df_d18['d 18O/16O  Mean'],
                             color=inlier_df_d18[color_param],  # Add color parameter
             title=f'SHP2L d18O Calibration Values (Z-Score Method)',
-            labels={'y': 'd18O (â€°)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd18O (\u2030)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
@@ -7093,20 +8076,20 @@ def main():
                                 marker=dict(color='rgba(220, 50, 50, 0.9)', symbol='x', size=10)
                             ))
                         fig_d18o.add_hline(y=sigma_level_d18o_plus, line_color='green', line_dash='dot',
-                                           annotation_text=f'+{sigma_level}ÃÆ’')
+                                           annotation_text=f'+{sigma_level}\u03c3')
                         fig_d18o.add_hline(y=sigma_level_d18o_minus, line_color='green', line_dash='dot',
-                                           annotation_text=f'-{sigma_level}ÃÆ’')
+                                           annotation_text=f'-{sigma_level}\u03c3')
                         fig_d18o.add_hline(y=d18o_mean, line_color='purple', line_dash='solid',
                                            annotation_text='Mean Value')
 
                     elif calibration_type == "IQR":
-                        # Plot for ÃŽÂ´13C with IQR thresholds
+                        # Plot for δ13C with IQR thresholds
                         fig_d13c = px.scatter(
                             x=seq_index.loc[inlier_df_d13.index],
                             y=inlier_df_d13['d 13C/12C  Mean'],
                             color=inlier_df_d13[color_param],  # Add color parameter
             title=f'SHP2L d13C Calibration Values (IQR Method)',
-            labels={'y': 'd13C (â€°)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd13C (\u2030)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d13c.update_traces(marker=dict(showscale=False))  # Disable color scale legend
@@ -7127,13 +8110,13 @@ def main():
                         fig_d13c.add_hline(y=q1_d13c, line_color='purple', line_dash='solid',
                                            annotation_text='Q1 (25th Percentile)')
 
-                        # Plot for ÃŽÂ´18O with IQR thresholds
+                        # Plot for δ18O with IQR thresholds
                         fig_d18o = px.scatter(
                             x=seq_index.loc[inlier_df_d18.index],
                             y=inlier_df_d18['d 18O/16O  Mean'],
                             color=inlier_df_d18[color_param],  # Add color parameter
             title=f'SHP2L d18O Calibration Values (IQR Method)',
-            labels={'y': 'd18O (â€°)', 'x': 'Sequence', 'color': color_param},
+            labels={'y': 'd18O (\u2030)', 'x': 'Sequence', 'color': color_param},
                             color_continuous_scale='Viridis'  # Use the Viridis colorscale
                         )
                         fig_d18o.update_traces(marker=dict(showscale=False))  # Disable color scale legend
@@ -7208,8 +8191,22 @@ def main():
         # Initialize the DataFrame and add Sequence column
         df_copy = st.session_state.df.copy()
         df_copy['Sequence'] = df_copy['Identifier 2'].apply(
-            lambda x: int(re.search(r'\d+', str(x)).group()) if pd.notnull(x) and isinstance(x, (
-            str, float, int)) and re.search(r'\d+', str(x)) else None
+            _parse_numeric_token
+        )
+        manual_override_enabled = bool(st.session_state.get(TAB3_LINEARITY_OVERRIDE_ENABLED_KEY, False))
+        manual_d13_raw = pd.to_numeric(pd.Series([st.session_state.get(TAB3_LINEARITY_OVERRIDE_D13_KEY, 0.0)]), errors='coerce').iloc[0]
+        manual_d18_raw = pd.to_numeric(pd.Series([st.session_state.get(TAB3_LINEARITY_OVERRIDE_D18_KEY, 0.0)]), errors='coerce').iloc[0]
+        manual_d13_per_10v = float(manual_d13_raw) if np.isfinite(manual_d13_raw) else 0.0
+        manual_d18_per_10v = float(manual_d18_raw) if np.isfinite(manual_d18_raw) else 0.0
+        st.session_state[TAB3_LINEARITY_OVERRIDE_D13_KEY] = manual_d13_per_10v
+        st.session_state[TAB3_LINEARITY_OVERRIDE_D18_KEY] = manual_d18_per_10v
+        tab3_linearity_intensity_col = _resolve_selected_linearity_intensity_column(df=df_copy)
+        df_copy = _apply_manual_linearity_override(
+            df_copy,
+            enable_override=manual_override_enabled,
+            d13_per_10v=manual_d13_per_10v,
+            d18_per_10v=manual_d18_per_10v,
+            intensity_col=tab3_linearity_intensity_col,
         )
 
         # Filter ranges for data processing
@@ -7220,15 +8217,26 @@ def main():
             # Signal Intensity filter
             signal_min = 0.0
             signal_max = 50.0
-            signal_default = max(signal_min, min(signal_max, float(st.session_state.signal_range[0])))
-            # Signal filter uses lower threshold only; high saturation is handled separately.
+            signal_low_default = max(signal_min, min(signal_max, float(st.session_state.signal_range[0])))
+            signal_high_default = max(signal_low_default, min(signal_max, float(st.session_state.signal_range[1])))
             signal_lower = st.slider(
                 'Filter by Signal Intensity (Minimum)',
                 min_value=signal_min,
                 max_value=signal_max,
-                value=signal_default
+                value=signal_low_default
             )
-            st.session_state.signal_range = (float(signal_lower), signal_max)
+            signal_upper = st.slider(
+                'Filter by Signal Intensity (Maximum)',
+                min_value=float(signal_lower),
+                max_value=signal_max,
+                value=signal_high_default
+            )
+            st.session_state.signal_range = (float(signal_lower), float(signal_upper))
+            st.checkbox(
+                "Consider partially and fully saturated samples as outliers",
+                key="include_saturated_in_range_outliers",
+                help="When enabled, saturated collector statuses are also flagged in range outlier filtering.",
+            )
 
             # Leak Rate filter
             leak_min = float(df_copy['leak_rate'].min())
@@ -7269,7 +8277,7 @@ def main():
         total_samples = len(df_copy)
         
         # Create masks for each filter
-        signal_mask = df_copy['1  Cycle Int  Samp  44'] >= st.session_state.signal_range[0]
+        signal_mask = _signal_in_range_mask(df_copy['1  Cycle Int  Samp  44'])
         leak_mask = (df_copy['leak_rate'] >= st.session_state.leak_range[0]) & (df_copy['leak_rate'] <= st.session_state.leak_range[1])
         d13c_mask = (df_copy['d 13C/12C  Mean'] >= st.session_state.d13c_range[0]) & (df_copy['d 13C/12C  Mean'] <= st.session_state.d13c_range[1])
         d18o_mask = (df_copy['d 18O/16O  Mean'] >= st.session_state.d18o_range[0]) & (df_copy['d 18O/16O  Mean'] <= st.session_state.d18o_range[1])
@@ -7286,14 +8294,16 @@ def main():
         # Apply all filters to a filtered copy for plotting.
         # Keep partially saturated rows when their recoverable isotope passes its own range.
         sat_masks_for_plot = _partial_saturation_isotope_masks(df_copy)
-        partial_recovered_keep = (
-            signal_mask
-            & leak_mask
-            & (
-                (sat_masks_for_plot['d13C'] & d13c_mask)
-                | (sat_masks_for_plot['d18O'] & d18o_mask)
+        partial_recovered_keep = pd.Series(False, index=df_copy.index, dtype=bool)
+        if not _include_saturated_in_range_outliers():
+            partial_recovered_keep = (
+                signal_mask
+                & leak_mask
+                & (
+                    (sat_masks_for_plot['d13C'] & d13c_mask)
+                    | (sat_masks_for_plot['d18O'] & d18o_mask)
+                )
             )
-        )
         df_filtered = df_copy.loc[(signal_mask & leak_mask & d13c_mask & d18o_mask) | partial_recovered_keep]
 
         # Exclude selected standards from plotting data
@@ -7312,8 +8322,8 @@ def main():
         #     st.write(f"Signal Intensity: {excluded_by_signal:,d} samples")
         #     st.write(f"Leak Rate: {excluded_by_leak:,d} samples")
         # with col2:
-        #     st.write(f"ÃŽÂ´13C Range: {excluded_by_d13c:,d} samples")
-        #     st.write(f"ÃŽÂ´18O Range: {excluded_by_d18o:,d} samples")
+        #     st.write(f"δ13C Range: {excluded_by_d13c:,d} samples")
+        #     st.write(f"δ18O Range: {excluded_by_d18o:,d} samples")
         # st.markdown(f"**Total Samples Excluded: {total_excluded:,d} of {total_samples:,d}**")
 
         st.subheader("Statistical Outlier Settings")
@@ -7331,8 +8341,8 @@ def main():
         # with st.expander("Active Filters"):
         #     st.write("Minimum Signal Intensity:", f"{signal_range[0]:.2f}")
         #     st.write("Leak Rate Range:", f"{leak_range[0]:.2f} to {leak_range[1]:.2f}")
-        #     st.write("ÃŽÂ´13C Range:", f"{d13c_range[0]:.2f} to {d13c_range[1]:.2f}")
-        #     st.write("ÃŽÂ´18O Range:", f"{d18o_range[0]:.2f} to {d18o_range[1]:.2f}")
+        #     st.write("δ13C Range:", f"{d13c_range[0]:.2f} to {d13c_range[1]:.2f}")
+        #     st.write("δ18O Range:", f"{d18o_range[0]:.2f} to {d18o_range[1]:.2f}")
 
         # Prepare main dataset based on user selections
         data_to_process = df_copy.copy()
@@ -7385,17 +8395,24 @@ def main():
 
         # Create mask for data within all ranges
         status_series_all = data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index))
-        not_saturated_samples = status_series_all != 'Fully Saturated Collectors'
+        include_saturated_status_outliers = _include_saturated_in_range_outliers()
+        not_fully_saturated_samples = status_series_all != 'Fully Saturated Collectors'
+        not_partially_saturated_samples = (
+            status_series_all != 'Partially Saturated Collectors'
+            if include_saturated_status_outliers
+            else pd.Series(True, index=data_to_process.index, dtype=bool)
+        )
         not_failed_samples = status_series_all != 'Failed Sample'
         within_ranges = (
             (data_to_process['d 13C/12C  Mean'] >= st.session_state.d13c_range[0]) &
             (data_to_process['d 13C/12C  Mean'] <= st.session_state.d13c_range[1]) &
             (data_to_process['d 18O/16O  Mean'] >= st.session_state.d18o_range[0]) &
             (data_to_process['d 18O/16O  Mean'] <= st.session_state.d18o_range[1]) &
-            (data_to_process['1  Cycle Int  Samp  44'] >= st.session_state.signal_range[0]) &
+            _signal_in_range_mask(data_to_process['1  Cycle Int  Samp  44']) &
             (data_to_process['leak_rate'] >= st.session_state.leak_range[0]) &
             (data_to_process['leak_rate'] <= st.session_state.leak_range[1]) &
-            not_saturated_samples &
+            not_fully_saturated_samples &
+            not_partially_saturated_samples &
             not_failed_samples &
             ~edited_mask_data
         )
@@ -7418,7 +8435,7 @@ def main():
         stat_outliers = sum(statistical_mask[non_standards_mask])
         d13c_mask = ((data_without_standards['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (data_without_standards['d 13C/12C  Mean'] > st.session_state.d13c_range[1])) & ~edited_mask_no_std
         d18o_mask = ((data_without_standards['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (data_without_standards['d 18O/16O  Mean'] > st.session_state.d18o_range[1])) & ~edited_mask_no_std
-        signal_mask = (data_without_standards['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) & ~edited_mask_no_std
+        signal_mask = _signal_out_of_range_mask(data_without_standards['1  Cycle Int  Samp  44']) & ~edited_mask_no_std
         leak_mask = ((data_without_standards['leak_rate'] < st.session_state.leak_range[0]) | (data_without_standards['leak_rate'] > st.session_state.leak_range[1])) & ~edited_mask_no_std
         status_series_no_std = data_without_standards.get('Collector Status', pd.Series(False, index=data_without_standards.index))
         failed_mask = (status_series_no_std == 'Failed Sample') & ~edited_mask_no_std
@@ -7478,6 +8495,8 @@ def main():
 
         # Calculate final analyses (total samples minus all outliers)
         total_outliers = stat_outliers + d13c_outliers + d18o_outliers + signal_outliers + leak_outliers + failed_outliers + saturated_samples
+        if include_saturated_status_outliers:
+            total_outliers += saturated_collectors
         final_analyses = total_samples - total_outliers
 
         # Create a DataFrame for displaying statistics
@@ -7611,7 +8630,7 @@ def main():
             except Exception:
                 unique_species_vals = []
             existing_map = st.session_state.get('comment_replacements', {}) or {}
-            with st.expander("Species labels (from Label/Species) â€” customize for Client Output"):
+            with st.expander("Species labels (from Label/Species) - customize for Client Output"):
                 new_map = {}
                 for i, sval in enumerate(unique_species_vals):
                     key = f"species_map_{i}"
@@ -7646,8 +8665,24 @@ def main():
                 failed_outliers_df['Category'] = 'Failed Sample'
                 outliers_df = pd.concat([outliers_df, failed_outliers_df])
             
+            status_out_series = data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index))
+            partial_saturated_mask_out = (
+                status_out_series == 'Partially Saturated Collectors'
+            ) & ~edited_mask_out
+            partial_saturated_mask_out = _apply_manual_outlier_overrides(
+                partial_saturated_mask_out,
+                row_index=data_to_process.index,
+                apply_true=False,
+                apply_false=True,
+            )
+            if include_saturated_status_outliers:
+                partial_saturated_df = data_to_process[partial_saturated_mask_out].copy()
+                if not partial_saturated_df.empty:
+                    partial_saturated_df['Category'] = 'Partially Saturated Collectors'
+                    outliers_df = pd.concat([outliers_df, partial_saturated_df])
+
             saturated_mask_out = (
-                data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors'
+                status_out_series == 'Fully Saturated Collectors'
             ) & ~edited_mask_out
             saturated_mask_out = _apply_manual_outlier_overrides(
                 saturated_mask_out,
@@ -7723,7 +8758,7 @@ def main():
                 outliers_df = pd.concat([outliers_df, d18o_outliers])
             
             signal_mask_out = (
-                data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]
+                _signal_out_of_range_mask(data_to_process['1  Cycle Int  Samp  44'])
             ) & ~edited_mask_out
             signal_mask_out = _apply_manual_outlier_overrides(
                 signal_mask_out,
@@ -7788,17 +8823,22 @@ def main():
                 (data_to_process['d 18O/16O  Mean'] > st.session_state.d18o_range[1])
             ) & ~edited_mask_out
             signal_out_mask = (
-                data_to_process['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]
+                _signal_out_of_range_mask(data_to_process['1  Cycle Int  Samp  44'])
             ) & ~edited_mask_out
             leak_out_mask = (
                 (data_to_process['leak_rate'] < st.session_state.leak_range[0]) |
                 (data_to_process['leak_rate'] > st.session_state.leak_range[1])
             ) & ~edited_mask_out
             sat_masks_export = _partial_saturation_isotope_masks(data_to_process)
-            sat_d13_out_mask = sat_masks_export['d13C'] & ~edited_mask_out
-            sat_d18_out_mask = sat_masks_export['d18O'] & ~edited_mask_out
+            sat_d13_out_mask = sat_masks_export['d13C'] & ~edited_mask_out if include_saturated_status_outliers else pd.Series(False, index=data_to_process.index, dtype=bool)
+            sat_d18_out_mask = sat_masks_export['d18O'] & ~edited_mask_out if include_saturated_status_outliers else pd.Series(False, index=data_to_process.index, dtype=bool)
             failed_out_mask = (data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Failed Sample') & ~edited_mask_out
-            saturated_sample_out_mask = (data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors') & ~edited_mask_out
+            saturated_sample_out_mask = (
+                (data_to_process.get('Collector Status', pd.Series(False, index=data_to_process.index)) == 'Fully Saturated Collectors')
+                & ~edited_mask_out
+                if include_saturated_status_outliers
+                else pd.Series(False, index=data_to_process.index, dtype=bool)
+            )
             d13c_out_mask = _apply_manual_outlier_overrides(
                 d13c_out_mask,
                 row_index=data_to_process.index,
@@ -7959,6 +8999,15 @@ def main():
             # New dropdown selector in Tab 3 for color parameter
             selected_color_param_tab3 = st.selectbox("Choose a parameter to color the dots in Tab 3:", color_param_names, index='Date' in color_param_names)
             color_param_tab3 = color_options[selected_color_param_tab3]
+            default_z_axis = 'Signal Intensity'
+            default_z_axis_index = z_axis_option_names.index(default_z_axis) if default_z_axis in z_axis_option_names else 0
+            selected_z_axis_tab3 = st.selectbox(
+                "Choose the Z-axis for 3D chart in Tab 3:",
+                z_axis_option_names,
+                index=default_z_axis_index,
+                key="tab3_z_axis_param"
+            )
+            z_axis_col_tab3 = z_axis_options[selected_z_axis_tab3]
 
             show_statistical_outliers = st.checkbox("Show statistical outliers on chart", value=False, key="show_statistical_outliers")
             show_range_outliers = st.checkbox("Show range outliers on chart", value=False, key="show_range_outliers")
@@ -8041,6 +9090,28 @@ def main():
             subset_data = df_filtered[df_filtered['Identifier 1'] == selected_identifier]
             subset_data_unfiltered = df_unfiltered[df_unfiltered['Identifier 1'] == selected_identifier]
 
+        subset_data = _ensure_cycle1_signal_difference_columns(subset_data.copy())
+        tab3_chart_scope = "All identifiers" if selected_identifier == 'All' else f"Identifier {selected_identifier}"
+        tab3_3d_fig, tab3_3d_msg = _build_isotope_3d_scatter(
+            subset_data,
+            z_col=z_axis_col_tab3,
+            z_label=selected_z_axis_tab3,
+            color_col=color_param_tab3,
+            color_label=selected_color_param_tab3,
+            title=f"Data Processing 3D Chart ({tab3_chart_scope}) - Z-axis: {selected_z_axis_tab3}"
+        )
+        data_proc_chart_col_3d, data_proc_chart_col_cross = st.columns(2, gap="medium")
+        crossplot_container = data_proc_chart_col_cross.container()
+
+        with data_proc_chart_col_3d:
+            st.subheader("3D d18O vs d13C Chart")
+            if tab3_3d_fig is not None:
+                st.plotly_chart(tab3_3d_fig, width='stretch')
+            else:
+                st.info(tab3_3d_msg)
+
+        with crossplot_container:
+            st.subheader("d13C vs d18O by Species")
 
 
 
@@ -8076,22 +9147,81 @@ def main():
             for i, sp in enumerate([s for s in unique_species if s != "Unknown"])
         }
 
+        st.markdown("##### Manual Linearity Correction Override")
+        st.checkbox(
+            "Use Samp-Ref intensity difference (Cycle 1, collector 44)",
+            key=LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY,
+            on_change=_sync_linearity_intensity_basis_from_ui,
+            args=(LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY,),
+            help="Uses 1 Cycle Int Diff Samp-Ref 44 as the intensity basis for linearity and manual override.",
+        )
+        manual_override_enabled = st.checkbox(
+            "Enable manual linearity override",
+            key=TAB3_LINEARITY_OVERRIDE_ENABLED_KEY,
+            help="Apply user-defined d13C and d18O linearity slopes in per mil per 10V for Data Processing tab values.",
+        )
+        fit_values = st.session_state.get('linearity_fits', {})
+        fit_d13 = fit_values.get('d13C', {}) if isinstance(fit_values, dict) else {}
+        fit_d18 = fit_values.get('d18O', {}) if isinstance(fit_values, dict) else {}
+        fit_intensity_col = _resolve_linearity_intensity_column_for_fits(fits=fit_values, df=df_copy)
+        fit_d13_slope = pd.to_numeric(pd.Series([fit_d13.get('slope')]), errors='coerce').iloc[0]
+        fit_d18_slope = pd.to_numeric(pd.Series([fit_d18.get('slope')]), errors='coerce').iloc[0]
+        fit_d13_xref = pd.to_numeric(pd.Series([fit_d13.get('x_ref')]), errors='coerce').iloc[0]
+        fit_d18_xref = pd.to_numeric(pd.Series([fit_d18.get('x_ref')]), errors='coerce').iloc[0]
+        override_col_d13, override_col_d18 = st.columns(2)
+        with override_col_d13:
+            st.number_input(
+                "d13C slope (per mil/10V)",
+                step=0.001,
+                format="%.6f",
+                key=TAB3_LINEARITY_OVERRIDE_D13_KEY,
+                disabled=not manual_override_enabled,
+            )
+            if np.isfinite(fit_d13_slope):
+                fit_d13_per_10v = float(fit_d13_slope) * 10.0
+                if np.isfinite(fit_d13_xref):
+                    st.caption(
+                        f"Calibration-tab fit: {fit_d13_per_10v:.6f} per mil/10V (x_ref {float(fit_d13_xref):.3f} V, basis `{fit_intensity_col}`)."
+                    )
+                else:
+                    st.caption(f"Calibration-tab fit: {fit_d13_per_10v:.6f} per mil/10V.")
+            else:
+                st.caption("Calibration-tab fit: unavailable.")
+        with override_col_d18:
+            st.number_input(
+                "d18O slope (per mil/10V)",
+                step=0.001,
+                format="%.6f",
+                key=TAB3_LINEARITY_OVERRIDE_D18_KEY,
+                disabled=not manual_override_enabled,
+            )
+            if np.isfinite(fit_d18_slope):
+                fit_d18_per_10v = float(fit_d18_slope) * 10.0
+                if np.isfinite(fit_d18_xref):
+                    st.caption(
+                        f"Calibration-tab fit: {fit_d18_per_10v:.6f} per mil/10V (x_ref {float(fit_d18_xref):.3f} V, basis `{fit_intensity_col}`)."
+                    )
+                else:
+                    st.caption(f"Calibration-tab fit: {fit_d18_per_10v:.6f} per mil/10V.")
+            else:
+                st.caption("Calibration-tab fit: unavailable.")
+        if manual_override_enabled:
+            xref_d13 = _resolve_linearity_reference_intensity(df_copy, 'd13C', intensity_col=tab3_linearity_intensity_col)
+            xref_d18 = _resolve_linearity_reference_intensity(df_copy, 'd18O', intensity_col=tab3_linearity_intensity_col)
+            st.caption(
+                f"Applied as y_corr = y - (slope/10) * (I - Iref), using `{tab3_linearity_intensity_col}` with Iref d13C={xref_d13:.3f} V and d18O={xref_d18:.3f} V."
+            )
+
         # Create x_axis values
         subset_data['x_axis'] = np.nan
         if x_axis_option == "By Identifier 2":
-            subset_data['x_axis'] = subset_data['Identifier 2'].apply(
-                lambda x: float(re.search(r'\d+\.?\d*', str(x)).group()) if pd.notnull(x) and re.search(
-                    r'\d+\.?\d*', str(x)) else None
-            )
+            subset_data['x_axis'] = subset_data['Identifier 2'].apply(_parse_numeric_token)
         else:
             subset_data['x_axis'] = range(len(subset_data))
         # Also create x_axis for unfiltered subset (used for status overlays)
         subset_data_unfiltered['x_axis'] = np.nan
         if x_axis_option == "By Identifier 2":
-            subset_data_unfiltered['x_axis'] = subset_data_unfiltered['Identifier 2'].apply(
-                lambda x: float(re.search(r'\d+\.?\d*', str(x)).group()) if pd.notnull(x) and re.search(
-                    r'\d+\.?\d*', str(x)) else None
-            )
+            subset_data_unfiltered['x_axis'] = subset_data_unfiltered['Identifier 2'].apply(_parse_numeric_token)
         else:
             subset_data_unfiltered['x_axis'] = range(len(subset_data_unfiltered))
 
@@ -8175,15 +9305,7 @@ def main():
                 _register_statistical_outlier_rows(statistical_outliers.index)
 
             # Calculate range outliers mask using unfiltered data so signal/leak outliers aren't dropped
-            range_mask_unfiltered = (
-                (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
-                (species_data_unfiltered['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
-                (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
-                (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
-                (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
-                (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
-            )
+            range_mask_unfiltered = _range_outlier_mask(species_data_unfiltered)
             range_mask_unfiltered = range_mask_unfiltered & ~edited_mask_species_unfiltered
             range_mask_unfiltered = _apply_manual_outlier_overrides(
                 range_mask_unfiltered,
@@ -8198,10 +9320,7 @@ def main():
                 range_outliers = species_data_unfiltered[range_mask_unfiltered].copy()
                 # Add x_axis values to range outliers
                 if x_axis_option == "By Identifier 2":
-                    range_outliers['x_axis'] = range_outliers['Identifier 2'].apply(
-                        lambda x: float(re.search(r'\d+\.?\d*', str(x)).group()) if pd.notnull(x) and re.search(
-                            r'\d+\.?\d*', str(x)) else None
-                    )
+                    range_outliers['x_axis'] = range_outliers['Identifier 2'].apply(_parse_numeric_token)
                 else:
                     range_outliers['x_axis'] = range(len(range_outliers))
             else:
@@ -8209,6 +9328,8 @@ def main():
                 
             # Filter data to plot - exclude statistical, range outliers, and saturated samples
             partial_idx_mask = saturated_collectors_mask.reindex(species_data.index, fill_value=False)
+            if _include_saturated_in_range_outliers():
+                partial_idx_mask = pd.Series(False, index=species_data.index, dtype=bool)
             outlier_drop_mask = (outlier_mask | range_mask_for_plot) & ~partial_idx_mask
             data_to_plot = species_data[
                 ~(outlier_drop_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
@@ -8424,7 +9545,7 @@ def main():
             # Plot range outliers by type if enabled
             if show_range_outliers and not range_outliers.empty:
                 range_masks = _exclusive_outlier_masks([
-                    ('signal', range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]),
+                    ('signal', _signal_out_of_range_mask(range_outliers['1  Cycle Int  Samp  44'])),
                     ('leak', (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])),
                     ('d13c', (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])),
                     ('d18o', (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])),
@@ -8479,7 +9600,7 @@ def main():
                         )
                     ))
 
-                # ÃŽÂ´13C range outliers
+                            # δ13C range outliers
                 d13c_mask = range_masks['d13c']
                 if d13c_mask.any():
                     d13_range_outliers_df = range_outliers[d13c_mask]
@@ -8504,7 +9625,7 @@ def main():
                         )
                     ))
 
-                # ÃŽÂ´18O range outliers
+                            # δ18O range outliers
                 d18o_mask = range_masks['d18o']
                 if d18o_mask.any():
                     d18_range_outliers_df = range_outliers[d18o_mask]
@@ -8643,15 +9764,7 @@ def main():
             
             # Calculate range outliers
             if show_range_outliers:
-                range_mask_unfiltered = (
-                    (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
-                    (species_data_unfiltered['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
-                    (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
-                    (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
-                    (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                    (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
-                    (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
-                )
+                range_mask_unfiltered = _range_outlier_mask(species_data_unfiltered)
                 edited_mask_species_unf = pd.Series(species_data_unfiltered.index.map(_is_row_edited), index=species_data_unfiltered.index, dtype=bool)
                 range_mask_unfiltered = range_mask_unfiltered & ~edited_mask_species_unf
                 range_mask_unfiltered = _apply_manual_outlier_overrides(
@@ -8664,10 +9777,7 @@ def main():
                 range_mask_for_plot = range_mask_unfiltered.reindex(species_data.index, fill_value=False)
                 # Add x_axis values to range outliers
                 if x_axis_option == "By Identifier 2":
-                    range_outliers['x_axis'] = range_outliers['Identifier 2'].apply(
-                        lambda x: float(re.search(r'\d+\.?\d*', str(x)).group()) if pd.notnull(x) and re.search(
-                            r'\d+\.?\d*', str(x)) else None
-                    )
+                    range_outliers['x_axis'] = range_outliers['Identifier 2'].apply(_parse_numeric_token)
                 else:
                     range_outliers['x_axis'] = range(len(range_outliers))
             else:
@@ -8675,6 +9785,8 @@ def main():
                 range_mask_for_plot = pd.Series(False, index=species_data.index, dtype=bool)
 
             partial_idx_mask = saturated_collectors_mask.reindex(species_data.index, fill_value=False)
+            if _include_saturated_in_range_outliers():
+                partial_idx_mask = pd.Series(False, index=species_data.index, dtype=bool)
             outlier_drop_mask = (outlier_mask | range_mask_for_plot) & ~partial_idx_mask
             data_to_plot = species_data[
                 ~(outlier_drop_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
@@ -8891,7 +10003,7 @@ def main():
             # Plot range outliers by type if enabled
             if show_range_outliers and not range_outliers.empty:
                 range_masks = _exclusive_outlier_masks([
-                    ('signal', range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]),
+                    ('signal', _signal_out_of_range_mask(range_outliers['1  Cycle Int  Samp  44'])),
                     ('leak', (range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (range_outliers['leak_rate'] > st.session_state.leak_range[1])),
                     ('d13c', (range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])),
                     ('d18o', (range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])),
@@ -8946,7 +10058,7 @@ def main():
                         )
                     ))
 
-                # ÃŽÂ´13C range outliers
+                            # δ13C range outliers
                 d13c_mask = range_masks['d13c']
                 if d13c_mask.any():
                     d13_range_outliers_df = range_outliers[d13c_mask]
@@ -8971,7 +10083,7 @@ def main():
                         )
                     ))
 
-                # ÃŽÂ´18O range outliers
+                            # δ18O range outliers
                 d18o_mask = range_masks['d18o']
                 if d18o_mask.any():
                     d18_range_outliers_df = range_outliers[d18o_mask]
@@ -9117,15 +10229,7 @@ def main():
             if not stat_outliers_scatter_all.empty:
                 _register_statistical_outlier_rows(stat_outliers_scatter_all.index)
 
-            range_mask_unfiltered = (
-                (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
-                (species_data_unfiltered['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
-                (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
-                (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
-                (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
-                (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
-            )
+            range_mask_unfiltered = _range_outlier_mask(species_data_unfiltered)
             edited_mask_species_unfiltered = pd.Series(
                 species_data_unfiltered.index.map(_is_row_edited),
                 index=species_data_unfiltered.index,
@@ -9308,7 +10412,7 @@ def main():
                 constrain='domain',
             ),
             showlegend=True,
-            height=750,
+            height=900,
             clickmode='event+select',
             dragmode='zoom'
         )
@@ -9316,13 +10420,14 @@ def main():
         _apply_cycle_std_error_bars(species_scatter, d13_std_lookup, d18_std_lookup)
         _apply_editor_selection_to_figure(species_scatter, cross_editor_prefix)
         cross_chart_nonce = int(st.session_state.get(f"{cross_editor_prefix}_chart_nonce", 0))
-        cross_chart_state = st.plotly_chart(
-            species_scatter,
-            width='stretch',
-            key=f"tab3_crossplot_{cross_chart_nonce}",
-            on_select='rerun',
-            selection_mode='points'
-        )
+        with crossplot_container:
+            cross_chart_state = st.plotly_chart(
+                species_scatter,
+                width='stretch',
+                key=f"tab3_crossplot_{cross_chart_nonce}",
+                on_select='rerun',
+                selection_mode='points'
+            )
         _render_delta_editor_from_chart_selection(cross_chart_state, cross_editor_prefix)
 
         # Process individual species
@@ -9383,10 +10488,7 @@ def main():
             # Create x_axis values first for all data
             species_data['x_axis'] = np.nan
             if x_axis_option == "By Identifier 2":
-                species_data['x_axis'] = species_data['Identifier 2'].apply(
-                    lambda x: float(re.search(r'\d+\.?\d*', str(x)).group()) if pd.notnull(x) and re.search(
-                        r'\d+\.?\d*', str(x)) else None
-                )
+                species_data['x_axis'] = species_data['Identifier 2'].apply(_parse_numeric_token)
             else:
                 species_data['x_axis'] = range(len(species_data))
 
@@ -9408,6 +10510,8 @@ def main():
             saturated_idx_mask = pd.Series(species_data.index.isin(saturated_samples_idx), index=species_data.index, dtype=bool)
             failed_idx_mask = pd.Series(species_data.index.isin(failed_idx), index=species_data.index, dtype=bool)
             partial_idx_mask = saturated_collectors_mask_any.reindex(species_data.index, fill_value=False)
+            if _include_saturated_in_range_outliers():
+                partial_idx_mask = pd.Series(False, index=species_data.index, dtype=bool)
             non_partial_outlier_mask = outlier_mask.reindex(species_data.index, fill_value=False) & ~partial_idx_mask
             drop_mask = non_partial_outlier_mask | saturated_idx_mask | failed_idx_mask
             data_to_plot = species_data[~drop_mask].copy()
@@ -9416,15 +10520,7 @@ def main():
             # Identify and process range outliers if enabled
             if show_range_outliers:
                 # Create mask for range outliers
-                range_mask = (
-                    (species_data_unfiltered['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) |
-                    (species_data_unfiltered['d 13C/12C  Mean'] > st.session_state.d13c_range[1]) |
-                    (species_data_unfiltered['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) |
-                    (species_data_unfiltered['d 18O/16O  Mean'] > st.session_state.d18o_range[1]) |
-                    (species_data_unfiltered['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]) |
-                    (species_data_unfiltered['leak_rate'] < st.session_state.leak_range[0]) |
-                    (species_data_unfiltered['leak_rate'] > st.session_state.leak_range[1])
-                )
+                range_mask = _range_outlier_mask(species_data_unfiltered)
                 range_mask = range_mask & ~edited_mask_species_unfiltered
                 range_mask = _apply_manual_outlier_overrides(
                     range_mask,
@@ -9438,10 +10534,7 @@ def main():
                 # Add x_axis values to range outliers if any were found
                 if not range_bar_outliers.empty:
                     if x_axis_option == "By Identifier 2":
-                        range_bar_outliers['x_axis'] = range_bar_outliers['Identifier 2'].apply(
-                            lambda x: float(re.search(r'\d+\.?\d*', str(x)).group()) if pd.notnull(x) and re.search(
-                                r'\d+\.?\d*', str(x)) else None
-                        )
+                        range_bar_outliers['x_axis'] = range_bar_outliers['Identifier 2'].apply(_parse_numeric_token)
                     else:
                         range_bar_outliers['x_axis'] = range(len(range_bar_outliers))
             else:
@@ -9539,7 +10632,7 @@ def main():
                     if not identifier_range_outliers.empty:
                         # Identify outlier types
                         range_masks = _exclusive_outlier_masks([
-                            ('signal', identifier_range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]),
+                            ('signal', _signal_out_of_range_mask(identifier_range_outliers['1  Cycle Int  Samp  44'])),
                             ('leak', (identifier_range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (identifier_range_outliers['leak_rate'] > st.session_state.leak_range[1])),
                             ('d13c', (identifier_range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (identifier_range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])),
                             ('d18o', (identifier_range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (identifier_range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])),
@@ -9801,7 +10894,7 @@ def main():
                 fig_d13C.update_layout(
                     title=f'{identifier} - d13C for Species: {species}',
                     xaxis_title='X Axis',
-                    yaxis_title='d13C (â€°)',
+                    yaxis_title='d13C (\u2030)',
                     legend_title='Data Type',
                     margin=dict(r=100, t=100),  # Reduced right margin
                     xaxis=dict(
@@ -9883,8 +10976,8 @@ def main():
                 if not d13_raw_line_only:
                     _render_delta_editor_from_chart_selection(d13_chart_state, d13_editor_prefix)
 
-                # Plot ÃŽÂ´18O data for this identifier and comment
-                # Create figure for ÃŽÂ´18O
+                # Plot δ18O data for this identifier and comment
+                # Create figure for δ18O
                 fig_d18O = go.Figure()
 
                 # Add statistical outliers if enabled
@@ -9923,7 +11016,7 @@ def main():
                     if not identifier_range_outliers.empty:
                         # Identify outlier types
                         range_masks = _exclusive_outlier_masks([
-                            ('signal', identifier_range_outliers['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]),
+                            ('signal', _signal_out_of_range_mask(identifier_range_outliers['1  Cycle Int  Samp  44'])),
                             ('leak', (identifier_range_outliers['leak_rate'] < st.session_state.leak_range[0]) | (identifier_range_outliers['leak_rate'] > st.session_state.leak_range[1])),
                             ('d13c', (identifier_range_outliers['d 13C/12C  Mean'] < st.session_state.d13c_range[0]) | (identifier_range_outliers['d 13C/12C  Mean'] > st.session_state.d13c_range[1])),
                             ('d18o', (identifier_range_outliers['d 18O/16O  Mean'] < st.session_state.d18o_range[0]) | (identifier_range_outliers['d 18O/16O  Mean'] > st.session_state.d18o_range[1])),
@@ -10216,7 +11309,7 @@ def main():
                 fig_d18O.update_layout(
                     title=f'{identifier} - d18O for Species: {species}',
                     xaxis_title='X Axis',
-                    yaxis_title='d18O (â€°)',
+                    yaxis_title='d18O (\u2030)',
                     legend_title='Data Type',
                     margin=dict(r=100, t=100),  # Reduced right margin
                     xaxis=dict(
@@ -10348,7 +11441,7 @@ def main():
             d18o_outliers = species_data[d18o_mask]
 
             signal_mask = (
-                species_data['1  Cycle Int  Samp  44'] < st.session_state.signal_range[0]
+                _signal_out_of_range_mask(species_data['1  Cycle Int  Samp  44'])
             ) & ~edited_mask_species_unfiltered
             signal_mask = _apply_manual_outlier_overrides(
                 signal_mask,
@@ -10392,7 +11485,7 @@ def main():
                     else:
                         st.info("No statistical outliers detected")
 
-                # ÃŽÂ´13C Outliers
+                # δ13C Outliers
                 with st.expander("d13C Range Outliers", expanded=True):
                     if not d13c_outliers.empty:
                         st.markdown(f"**Acceptable Range:** {st.session_state.d13c_range[0]:.2f} to {st.session_state.d13c_range[1]:.2f} \u2030")
@@ -10403,7 +11496,7 @@ def main():
                     else:
                         st.info("No d13C outliers detected")
 
-                # ÃŽÂ´18O Outliers
+                # δ18O Outliers
                 with st.expander("d18O Range Outliers", expanded=True):
                     if not d18o_outliers.empty:
                         st.markdown(f"**Acceptable Range:** {st.session_state.d18o_range[0]:.2f} to {st.session_state.d18o_range[1]:.2f} \u2030")
@@ -10422,7 +11515,9 @@ def main():
                 # Signal Intensity Outliers
                 with st.expander("Signal Intensity Outliers", expanded=True):
                     if not signal_outliers.empty:
-                        st.markdown(f"**Minimum Acceptable Signal Intensity:** {st.session_state.signal_range[0]:.2f}")
+                        st.markdown(
+                            f"**Acceptable Range:** {st.session_state.signal_range[0]:.2f} to {st.session_state.signal_range[1]:.2f}"
+                        )
                         styled_signal = signal_outliers[['Identifier 2', species_col, '1  Cycle Int  Samp  44']].copy()
                         styled_signal = styled_signal.rename(columns={
                             species_col: 'Species','1  Cycle Int  Samp  44': 'Signal Intensity'})
