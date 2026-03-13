@@ -204,6 +204,37 @@ def _interpolate_outliers_by_identifier2(
     return work_sorted.drop(columns=["_order_irms", "_orig_pos_irms"])
 
 
+def _interpolate_single_target_within_identifier_group(
+    df: pd.DataFrame,
+    row_label: Any,
+    col: str,
+    id2_col: str = "Identifier 2",
+    id1_col: str = "Identifier 1",
+) -> float | None:
+    if df is None or col not in df.columns or row_label not in df.index:
+        return None
+
+    subset = df
+    if id1_col in df.columns:
+        id1_value_raw = df.at[row_label, id1_col]
+        id1_value = "" if pd.isna(id1_value_raw) else str(id1_value_raw).strip()
+        if id1_value != "":
+            group_mask = df[id1_col].astype(str).str.strip().eq(id1_value)
+            if bool(group_mask.any()):
+                subset = df.loc[group_mask].copy()
+
+    if row_label not in subset.index:
+        return None
+
+    target_mask = pd.Series(False, index=subset.index, dtype=bool)
+    target_mask.loc[row_label] = True
+    interpolated_subset = _interpolate_outliers_by_identifier2(subset, target_mask, [col], id2_col=id2_col)
+    interpolated_value = pd.to_numeric(pd.Series([interpolated_subset.at[row_label, col]]), errors="coerce").iloc[0]
+    if not np.isfinite(interpolated_value):
+        return None
+    return float(interpolated_value)
+
+
 def _ensure_edit_state(edit_state: dict[str, Any] | None) -> dict[str, Any]:
     payload = dict(edit_state or {})
     payload.setdefault("edited_rows", [])
@@ -340,23 +371,34 @@ def apply_edit_action(
             raw_col, cal_col, _ = _get_isotope_columns(isotope_key)
             if raw_col is None:
                 continue
-            mask = pd.Series(False, index=work.index, dtype=bool)
+            interpolation_base = work.copy()
             prev_cal_map: dict[str, float | None] = {}
+            prev_raw_map: dict[str, float | None] = {}
+            interpolated_map: dict[str, float] = {}
             for target in targets:
                 row_label = _resolve_target_row(target.row_label)
-                mask.loc[row_label] = True
                 key = f"{target.isotope_key}|{target.row_label}"
-                current_value = pd.to_numeric(pd.Series([work.at[row_label, raw_col]]), errors="coerce").iloc[0]
+                current_value = pd.to_numeric(pd.Series([interpolation_base.at[row_label, raw_col]]), errors="coerce").iloc[0]
                 if key not in original_map and pd.notna(current_value):
                     original_map[key] = float(current_value)
+                prev_raw_map[str(target.row_label)] = float(current_value) if pd.notna(current_value) else None
                 prev_cal_map[str(target.row_label)] = (
-                    pd.to_numeric(pd.Series([work.at[row_label, cal_col]]), errors="coerce").iloc[0]
+                    pd.to_numeric(pd.Series([interpolation_base.at[row_label, cal_col]]), errors="coerce").iloc[0]
                     if cal_col in work.columns
                     else None
                 )
-            work = _interpolate_outliers_by_identifier2(work, mask, [raw_col])
+                interpolated_value = _interpolate_single_target_within_identifier_group(
+                    interpolation_base,
+                    row_label,
+                    raw_col,
+                )
+                if interpolated_value is not None:
+                    interpolated_map[str(target.row_label)] = float(interpolated_value)
             for target in targets:
                 row_label = _resolve_target_row(target.row_label)
+                next_raw = interpolated_map.get(str(target.row_label))
+                if next_raw is not None:
+                    work.at[row_label, raw_col] = float(next_raw)
                 work = _refresh_collector_status_after_delta_edit(work, row_label)
                 work = _refresh_calibrated_after_delta_edit(
                     work,
@@ -364,6 +406,7 @@ def apply_edit_action(
                     isotope_key,
                     coeffs,
                     fits,
+                    previous_raw=prev_raw_map.get(str(target.row_label)),
                     previous_calibrated=prev_cal_map.get(str(target.row_label)),
                 )
                 edited_rows.add(str(target.row_label))

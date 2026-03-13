@@ -141,6 +141,13 @@ def _outlier_rows(std_df: pd.DataFrame, mask: pd.Series, value_col: str) -> list
     return to_json_compatible(table.to_dict(orient="records"))
 
 
+def _build_point_customdata(df: pd.DataFrame, isotope_key: str) -> np.ndarray:
+    row_labels = df.index.astype(str).to_numpy()
+    id1_values = df.get("Identifier 1", pd.Series("", index=df.index)).fillna("").astype(str).to_numpy()
+    id2_values = df.get("Identifier 2", pd.Series("", index=df.index)).fillna("").astype(str).to_numpy()
+    return np.column_stack((row_labels, np.full(len(df), isotope_key, dtype=object), id1_values, id2_values))
+
+
 def _build_standard_outlier_figure(
     std_df: pd.DataFrame,
     outlier_mask: pd.Series,
@@ -156,6 +163,7 @@ def _build_standard_outlier_figure(
     work["x_axis"] = _sequence_axis(work)
     values = pd.to_numeric(work[value_col], errors="coerce")
     inlier_mask = ~outlier_mask.reindex(work.index, fill_value=False)
+    isotope_key = "d13C" if "13" in str(value_col) else "d18O"
     fig = go.Figure()
     color_values, colorbar_category_ticks = _prepare_color_values(work[color_param] if color_param in work.columns else None)
     color_numeric = pd.to_numeric(color_values, errors="coerce") if color_values is not None else pd.Series(np.nan, index=work.index)
@@ -209,6 +217,13 @@ def _build_standard_outlier_figure(
                 mode="markers",
                 name="Included",
                 marker=inlier_marker,
+                customdata=_build_point_customdata(inliers, isotope_key),
+                hovertemplate=(
+                    "Identifier 1: %{customdata[2]}<br>"
+                    "Identifier 2: %{customdata[3]}<br>"
+                    "Row: %{customdata[0]}<br>"
+                    f"{y_label}: %{{y:.3f}}<extra></extra>"
+                ),
             )
         )
     if not outliers.empty:
@@ -224,6 +239,13 @@ def _build_standard_outlier_figure(
                 mode="markers",
                 name="Outliers",
                 marker=outlier_marker,
+                customdata=_build_point_customdata(outliers, isotope_key),
+                hovertemplate=(
+                    "Identifier 1: %{customdata[2]}<br>"
+                    "Identifier 2: %{customdata[3]}<br>"
+                    "Row: %{customdata[0]}<br>"
+                    f"{y_label}: %{{y:.3f}}<extra></extra>"
+                ),
             )
         )
     stats_series = pd.to_numeric(inliers[value_col], errors="coerce").dropna()
@@ -286,6 +308,110 @@ def _build_standard_outlier_figure(
     return _figure_json(fig)
 
 
+def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str, Any]:
+    if go is None or df is None or df.empty:
+        return {}
+
+    x_vals = pd.to_numeric(df.get("d 18O/16O  Mean"), errors="coerce")
+    y_vals = pd.to_numeric(df.get("d 13C/12C  Mean"), errors="coerce")
+    valid = x_vals.notna() & y_vals.notna()
+    if not valid.any():
+        return {}
+
+    plot_df = df.loc[valid].copy()
+    plot_df["_group"] = (
+        plot_df.get("Identifier 1", pd.Series("Standards", index=plot_df.index))
+        .fillna("Unknown")
+        .astype(str)
+        .str.strip()
+        .replace("", "Unknown")
+    )
+
+    color_values, colorbar_category_ticks = _prepare_color_values(plot_df[color_param] if color_param in plot_df.columns else None)
+    color_numeric = pd.to_numeric(color_values, errors="coerce") if color_values is not None else pd.Series(np.nan, index=plot_df.index)
+    has_color = bool(color_numeric.notna().any())
+    color_min: float | None = None
+    color_max: float | None = None
+    if has_color:
+        finite_colors = color_numeric[np.isfinite(color_numeric)]
+        if finite_colors.empty:
+            has_color = False
+        else:
+            color_min = float(finite_colors.min())
+            color_max = float(finite_colors.max())
+            if color_min == color_max:
+                color_min -= 0.5
+                color_max += 0.5
+
+    fig = go.Figure()
+    show_colorbar = has_color
+    for group, group_df in plot_df.groupby("_group", dropna=False):
+        marker: dict[str, Any] = {"size": 9, "opacity": 0.85}
+        if has_color and color_min is not None and color_max is not None:
+            marker.update(
+                color=color_numeric.loc[group_df.index],
+                colorscale="Viridis",
+                cmin=color_min,
+                cmax=color_max,
+                showscale=show_colorbar,
+            )
+            if show_colorbar:
+                colorbar_cfg: dict[str, Any] = {
+                    "title": {
+                        "text": "Date" if color_param == "Date_ordinal" else str(color_param),
+                        "side": "right",
+                    },
+                    "thickness": 16,
+                    "len": 0.7,
+                    "y": 0.5,
+                    "yanchor": "middle",
+                    "x": 1.04,
+                    "xanchor": "left",
+                }
+                if color_param == "Date_ordinal":
+                    tickvals, ticktext = _build_date_colorbar_ticks(plot_df.get(color_param))
+                    if tickvals and ticktext:
+                        colorbar_cfg.update(tickmode="array", tickvals=tickvals, ticktext=ticktext)
+                elif colorbar_category_ticks is not None:
+                    tickvals, ticktext = colorbar_category_ticks
+                    if tickvals and ticktext:
+                        colorbar_cfg.update(tickmode="array", tickvals=tickvals, ticktext=ticktext)
+                marker["colorbar"] = colorbar_cfg
+                show_colorbar = False
+        else:
+            marker["color"] = "#1d4ed8"
+
+        customdata = _build_point_customdata(group_df, "cross")
+        fig.add_trace(
+            go.Scatter(
+                x=pd.to_numeric(group_df.get("d 18O/16O  Mean"), errors="coerce"),
+                y=pd.to_numeric(group_df.get("d 13C/12C  Mean"), errors="coerce"),
+                mode="markers",
+                name=str(group),
+                marker=marker,
+                customdata=customdata,
+                hovertemplate=(
+                    "Identifier 1: %{customdata[2]}<br>"
+                    "Identifier 2: %{customdata[3]}<br>"
+                    "Row: %{customdata[0]}<br>"
+                    "d18O: %{x:.3f}<br>"
+                    "d13C: %{y:.3f}<extra></extra>"
+                ),
+            )
+        )
+
+    fig.update_layout(
+        title="d13C vs d18O",
+        xaxis={"title": "d18O", "constrain": "domain"},
+        yaxis={"title": "d13C", "constrain": "domain"},
+        hovermode="closest",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0, "xanchor": "left"},
+        margin={"l": 40, "r": 20, "t": 80, "b": 40},
+        height=720,
+    )
+    return _figure_json(fig)
+
+
 def _build_linearity_figure(
     df_src: pd.DataFrame,
     y_col: str,
@@ -300,6 +426,8 @@ def _build_linearity_figure(
     y = pd.to_numeric(df_src[y_col], errors="coerce")
     color_values, _ = _prepare_color_values(df_src[color_param] if color_param in df_src.columns else None)
     work = pd.DataFrame({"x": x, "y": y}, index=df_src.index)
+    work["identifier_1"] = df_src.get("Identifier 1", pd.Series("", index=df_src.index)).fillna("").astype(str)
+    work["identifier_2"] = df_src.get("Identifier 2", pd.Series("", index=df_src.index)).fillna("").astype(str)
     if color_values is not None and len(color_values) == len(work):
         work["color"] = pd.to_numeric(color_values, errors="coerce")
     else:
@@ -319,7 +447,32 @@ def _build_linearity_figure(
             marker_kwargs.update(color=work["color"], colorscale="Viridis", showscale=False)
         else:
             marker_kwargs.update(color="#2563eb")
-        fig.add_trace(go.Scatter(x=work["x"], y=work["y"], mode="markers", name="Standards", marker=marker_kwargs))
+        isotope_key = "d13C" if "13" in str(y_col) else "d18O"
+        customdata = np.column_stack(
+            (
+                work.index.astype(str).to_numpy(),
+                np.full(len(work), isotope_key, dtype=object),
+                work["identifier_1"].to_numpy(),
+                work["identifier_2"].to_numpy(),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=work["x"],
+                y=work["y"],
+                mode="markers",
+                name="Standards",
+                marker=marker_kwargs,
+                customdata=customdata,
+                hovertemplate=(
+                    "Identifier 1: %{customdata[2]}<br>"
+                    "Identifier 2: %{customdata[3]}<br>"
+                    "Row: %{customdata[0]}<br>"
+                    "Intensity: %{x:.3f}<br>"
+                    "Value: %{y:.3f}<extra></extra>"
+                ),
+            )
+        )
     eq_text = "Insufficient data for regression"
     if not corrected and int(fit.get("n", 0) or 0) >= 2 and np.isfinite(slope) and np.isfinite(intercept) and not work.empty:
         xs = np.linspace(float(work["x"].min()), float(work["x"].max()), 100)
@@ -493,8 +646,11 @@ def build_calibration_workspace(
             color_col=config.color_param,
             color_label=config.color_param,
             title=f"Calibration 3D Chart (Z-axis: {config.z_axis})",
+            include_row_metadata=True,
+            isotope_key="cross",
         )
         main_figures["calibration_3d"] = _figure_json(fig_3d)
+        main_figures["crossplot"] = _build_calibration_crossplot(chart_src, config.color_param)
 
     linearity_src = chart_src if chart_src is not None and not chart_src.empty else clean_stds
     display_fit13: dict[str, Any] = {}

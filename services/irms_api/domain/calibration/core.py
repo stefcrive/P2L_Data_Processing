@@ -134,7 +134,8 @@ def _filter_standards_remove_outliers(
             parts.append(std_df.loc[~(out13 | out18)])
     if not parts:
         return pd.DataFrame(columns=df.columns)
-    return pd.concat(parts, axis=0, ignore_index=True)
+    # Keep original row labels so chart clicks can map back to editable workspace rows.
+    return pd.concat(parts, axis=0, ignore_index=False)
 
 
 def _compute_linearity_fit(clean_df: pd.DataFrame, y_col: str, x_col: str) -> dict[str, float | int]:
@@ -376,6 +377,7 @@ def create_calibration_plots(
         ISOTYPE_D18O: {"y_label": "d18O", "measurement_col": "d 18O/16O  Mean"},
     }
     for isotope_type, isotope_data in isotopes.items():
+        isotope_key = "d13C" if isotope_type == ISOTYPE_D13C else "d18O"
         fig = go.Figure()
         true_values: list[float] = []
         measured_values: list[float] = []
@@ -426,23 +428,29 @@ def create_calibration_plots(
             if match.empty:
                 continue
             true_value = float(match["Value"].iloc[0])
-            measured_series = pd.to_numeric(
-                measurement_df.loc[
-                    measurement_df["Identifier 1"] == standard,
-                    isotope_data["measurement_col"],
-                ],
-                errors="coerce",
-            )
+            standard_rows = measurement_df.loc[measurement_df["Identifier 1"] == standard].copy()
+            if standard_rows.empty:
+                continue
+            measured_series = pd.to_numeric(standard_rows[isotope_data["measurement_col"]], errors="coerce")
             valid_mask = measured_series.notna() & np.isfinite(measured_series)
             measured_values_for_standard = measured_series.loc[valid_mask].values
             if len(measured_values_for_standard) == 0:
                 continue
             color_values_for_standard = None
             if color_values_all is not None:
-                color_values_for_standard = color_values_all.loc[
-                    measurement_df["Identifier 1"] == standard
-                ]
+                color_values_for_standard = color_values_all.loc[standard_rows.index]
                 color_values_for_standard = color_values_for_standard.loc[valid_mask].values
+            valid_rows = standard_rows.loc[valid_mask]
+            id1_values = valid_rows.get("Identifier 1", pd.Series("", index=valid_rows.index)).fillna("").astype(str).to_numpy()
+            id2_values = valid_rows.get("Identifier 2", pd.Series("", index=valid_rows.index)).fillna("").astype(str).to_numpy()
+            customdata = np.column_stack(
+                (
+                    valid_rows.index.astype(str).to_numpy(),
+                    np.full(len(valid_rows), isotope_key, dtype=object),
+                    id1_values,
+                    id2_values,
+                )
+            )
             true_values.extend([true_value] * len(measured_values_for_standard))
             measured_values.extend(measured_values_for_standard.tolist())
             marker_kwargs: dict[str, Any] = {"size": 10}
@@ -457,6 +465,14 @@ def create_calibration_plots(
                     mode="markers",
                     name=standard,
                     marker=marker_kwargs,
+                    customdata=customdata,
+                    hovertemplate=(
+                        "Identifier 1: %{customdata[2]}<br>"
+                        "Identifier 2: %{customdata[3]}<br>"
+                        "Row: %{customdata[0]}<br>"
+                        f"True {isotope_data['y_label']}: %{{x:.3f}}<br>"
+                        f"Measured {isotope_data['y_label']}: %{{y:.3f}}<extra></extra>"
+                    ),
                 )
             )
         true_arr = np.array(true_values, dtype=float)

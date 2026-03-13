@@ -477,6 +477,35 @@ def _add_processing_3d_overlays(
             )
 
 
+def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
+    """Tune processing 3D figure spacing so the chart fills the card and colorbar stays right-aligned."""
+    if fig is None:
+        return
+
+    colorbar_updated = False
+    for trace in fig.data:
+        marker = getattr(trace, "marker", None)
+        if marker is None:
+            continue
+        colorbar = getattr(marker, "colorbar", None)
+        if colorbar is None:
+            continue
+        # Push the colorbar into the right margin so the 3D scene can use the full chart domain.
+        colorbar.x = 1.09
+        colorbar.xanchor = "left"
+        colorbar.y = 0.5
+        colorbar.yanchor = "middle"
+        colorbar.len = 0.78
+        colorbar_updated = True
+        break
+
+    layout_updates: dict[str, Any] = {
+        "scene": {"domain": {"x": [0.0, 1.0], "y": [0.0, 1.0]}},
+        "margin": {"l": 8, "r": 130 if colorbar_updated else 24, "t": 56, "b": 8},
+    }
+    fig.update_layout(**layout_updates)
+
+
 def build_overview_figures(
     filtered_df: pd.DataFrame,
     scoped_df: pd.DataFrame,
@@ -540,6 +569,7 @@ def build_overview_figures(
                 scene_update["zaxis"] = {"range": z_range}
             if scene_update:
                 fig_3d.update_layout(scene=scene_update)
+        _apply_processing_3d_layout_tuning(fig_3d)
     figures["processing_3d"] = _figure_json(fig_3d)
     scoped_base_df = scoped_df.copy() if scoped_df is not None else pd.DataFrame()
     scoped_d13 = scoped_base_df.loc[~stat_mask_d13.reindex(scoped_base_df.index, fill_value=False).astype(bool)].copy()

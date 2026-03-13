@@ -149,6 +149,27 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertNotIn("0", reset_state["edited_rows"])
         self.assertNotIn("d13C|0", reset_state["original_delta_values"])
 
+    def test_apply_edit_action_interpolate_scopes_to_identifier_group(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["A", "A", "A", "B", "B"],
+                "Identifier 2": [1, 2, 3, 2, 3],
+                "d 13C/12C  Mean": [1.0, 99.0, 3.0, 50.0, 60.0],
+            }
+        )
+        edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        updated_df, updated_state = apply_edit_action(
+            df,
+            edit_state,
+            EditAction(action="interpolate", targets=[{"row_label": "1", "isotope_key": "d13C"}]),
+        )
+
+        self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 2.0)
+        self.assertAlmostEqual(float(updated_df.loc[3, "d 13C/12C  Mean"]), 50.0)
+        self.assertIn("1", updated_state["edited_rows"])
+        self.assertEqual(updated_state["original_delta_values"]["d13C|1"], 99.0)
+
     def test_build_processing_workspace_returns_expected_sections(self) -> None:
         df = sample_processing_df()
         metadata = {

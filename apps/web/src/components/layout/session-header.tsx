@@ -23,10 +23,10 @@ export function SessionHeader() {
     },
   });
   return (
-    <header className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+    <header className="flex flex-wrap items-center justify-between gap-4 rounded-3xl border border-stone-200 bg-white/95 px-7 py-6 shadow-sm">
       <div>
-        <div className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Active Session</div>
-        <div className="mt-1 text-lg font-semibold text-stone-900">{sessionId ?? "No session loaded"}</div>
+        <div className="text-xs font-semibold uppercase tracking-[0.22em] text-stone-500">Active Session</div>
+        <div className="mt-2 break-all text-[2.05rem] font-semibold leading-none text-stone-900">{sessionId ?? "No session loaded"}</div>
       </div>
       <div className="flex flex-col items-end gap-2">
         <div className="flex flex-wrap justify-end gap-2">

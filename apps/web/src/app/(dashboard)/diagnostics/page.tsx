@@ -76,14 +76,14 @@ function RangeSliderControl({
   const high = clampNumber(Math.max(value?.[0] ?? minBound, value?.[1] ?? maxBound), minBound, maxBound);
 
   return (
-    <div className="rounded-lg border border-stone-200 p-3">
+    <div className="rounded-xl border border-stone-200 bg-white/80 p-4">
       <div className="flex items-center justify-between gap-2">
-        <div className="text-sm text-stone-700">{label}</div>
+        <div className="text-sm font-medium tracking-[0.01em] text-stone-700">{label}</div>
         <div className="text-xs text-stone-500">
           {low.toFixed(precision)} to {high.toFixed(precision)}
         </div>
       </div>
-      <div className="mt-2 space-y-2">
+      <div className="mt-3 space-y-2">
         <label className="block text-xs text-stone-600">
           Min
           <input
@@ -96,7 +96,7 @@ function RangeSliderControl({
               const nextLow = parseFinite(event.currentTarget.value, low);
               onChange([Math.min(nextLow, high), high]);
             }}
-            className="mt-1 w-full accent-stone-700"
+            className="mt-1.5 w-full accent-stone-900"
           />
         </label>
         <label className="block text-xs text-stone-600">
@@ -111,7 +111,7 @@ function RangeSliderControl({
               const nextHigh = parseFinite(event.currentTarget.value, high);
               onChange([low, Math.max(nextHigh, low)]);
             }}
-            className="mt-1 w-full accent-stone-700"
+            className="mt-1.5 w-full accent-stone-900"
           />
         </label>
       </div>
@@ -254,10 +254,10 @@ export default function DiagnosticsPage() {
             </CardHeader>
             <CardContent className="space-y-6 xl:max-h-[calc(100vh-12rem)] xl:overflow-y-auto xl:pr-2">
               <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-700">Parameter Selection</div>
-                <label className="text-sm">
-                  <span className="mb-1 block text-stone-700">Choose a parameter to color the dots</span>
-                  <select value={colorParam} onChange={(event) => setColorParam(event.target.value)} className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2">
+                <div className="form-section-title">Parameter Selection</div>
+                <label className="form-field">
+                  <span className="form-label">Choose a parameter to color the dots</span>
+                  <select value={colorParam} onChange={(event) => setColorParam(event.target.value)} className="form-control">
                     {(availableColorParams.length ? availableColorParams : [colorParam]).map((option) => (
                       <option key={option} value={option}>
                         {option}
@@ -265,9 +265,9 @@ export default function DiagnosticsPage() {
                     ))}
                   </select>
                 </label>
-                <label className="text-sm">
-                  <span className="mb-1 block text-stone-700">3D chart Z-axis</span>
-                  <select value={zAxis} onChange={(event) => setZAxis(event.target.value)} className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2">
+                <label className="form-field">
+                  <span className="form-label">3D chart Z-axis</span>
+                  <select value={zAxis} onChange={(event) => setZAxis(event.target.value)} className="form-control">
                     {(availableZAxisOptions.length ? availableZAxisOptions : [zAxis]).map((option) => (
                       <option key={option} value={option}>
                         {option}
@@ -285,7 +285,7 @@ export default function DiagnosticsPage() {
               </div>
 
               <div className="space-y-4">
-                <div className="text-sm font-medium text-stone-700">Value Ranges</div>
+                <div className="form-section-title">Value Ranges</div>
                 <RangeSliderControl
                   label="d13C/12C Mean"
                   bounds={d13Bounds}
@@ -304,7 +304,7 @@ export default function DiagnosticsPage() {
                 />
               </div>
 
-              <div className="text-xs text-stone-500">
+              <div className="text-xs font-medium tracking-[0.01em] text-stone-500">
                 Rows in scope: {Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}
               </div>
             </CardContent>

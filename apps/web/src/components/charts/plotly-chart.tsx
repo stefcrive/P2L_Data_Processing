@@ -3,6 +3,8 @@
 import dynamic from "next/dynamic";
 import { useMemo } from "react";
 
+import { cn } from "@/lib/utils";
+
 const Plot = dynamic(() => import("react-plotly.js"), { ssr: false });
 
 export type PlotlyPoint = {
@@ -105,13 +107,13 @@ export function PlotlyChart({ figure, className, onPointClick, onSelection }: Pl
     return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">No chart data yet.</div>;
   }
   return (
-    <div className={className}>
+    <div className={cn("min-w-0 w-full overflow-hidden", className)}>
       <Plot
         data={preparedFigure.data}
         layout={preparedFigure.layout}
         config={{ responsive: true }}
         useResizeHandler
-        className="h-full w-full"
+        className="h-full w-full max-w-full"
         style={{ width: "100%", height: "100%" }}
         onClick={(event: { points?: PlotlyPoint[] }) => onPointClick?.(event.points ?? [])}
         onSelected={(event: { points?: PlotlyPoint[] } | undefined) => onSelection?.(event?.points ?? [])}

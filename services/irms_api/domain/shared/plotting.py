@@ -218,6 +218,8 @@ def _build_isotope_3d_scatter(
     color_label=None,
     title=None,
     open_circle_identifier=None,
+    include_row_metadata=False,
+    isotope_key="cross",
 ):
     """Build a 3D scatter chart with d18O, d13C, and a selectable Z-axis parameter."""
     if df is None or df.empty:
@@ -285,6 +287,7 @@ def _build_isotope_3d_scatter(
     x_array = x_vals.to_numpy()
     y_array = y_vals.to_numpy()
     z_array = z_vals.to_numpy()
+    row_array = plot_df.index.astype(str).to_numpy()
     id1_array = id1_series.to_numpy()
     id2_array = id2_series.to_numpy()
     color_array = numeric_colors.to_numpy() if has_numeric_color else None
@@ -308,7 +311,32 @@ def _build_isotope_3d_scatter(
                 marker['colorbar'] = colorbar_cfg
         else:
             marker.update(color=solid_color, showscale=False)
-        customdata = np.column_stack([id1_array[mask], id2_array[mask]])
+        if include_row_metadata:
+            customdata = np.column_stack(
+                [
+                    row_array[mask],
+                    np.full(int(np.sum(mask)), str(isotope_key), dtype=object),
+                    id1_array[mask],
+                    id2_array[mask],
+                ]
+            )
+            hovertemplate = (
+                "Identifier 1: %{customdata[2]}<br>"
+                "Identifier 2: %{customdata[3]}<br>"
+                "Row: %{customdata[0]}<br>"
+                "d18O: %{x:.3f}<br>"
+                "d13C: %{y:.3f}<br>"
+                f"{z_axis_title}: %{{z:.3f}}<extra></extra>"
+            )
+        else:
+            customdata = np.column_stack([id1_array[mask], id2_array[mask]])
+            hovertemplate = (
+                "Identifier 1: %{customdata[0]}<br>"
+                "Identifier 2: %{customdata[1]}<br>"
+                "d18O: %{x:.3f}<br>"
+                "d13C: %{y:.3f}<br>"
+                f"{z_axis_title}: %{{z:.3f}}<extra></extra>"
+            )
         fig.add_trace(go.Scatter3d(
             x=x_array[mask],
             y=y_array[mask],
@@ -318,13 +346,7 @@ def _build_isotope_3d_scatter(
             marker=marker,
             showlegend=bool(np.any(standard_mask)),
             customdata=customdata,
-            hovertemplate=(
-                "Identifier 1: %{customdata[0]}<br>"
-                "Identifier 2: %{customdata[1]}<br>"
-                "d18O: %{x:.3f}<br>"
-                "d13C: %{y:.3f}<br>"
-                f"{z_axis_title}: %{{z:.3f}}<extra></extra>"
-            )
+            hovertemplate=hovertemplate
         ))
 
     if has_numeric_color and np.any(non_standard_mask):

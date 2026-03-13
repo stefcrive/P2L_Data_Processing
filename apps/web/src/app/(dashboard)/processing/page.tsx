@@ -86,15 +86,51 @@ function applyDisplayState(
 }
 
 function pointMatchesSelectedTarget(pointCustomData: unknown, target: SelectedTarget): boolean {
-  if (!Array.isArray(pointCustomData) || pointCustomData.length < 2) {
-    return false;
+  if (Array.isArray(pointCustomData)) {
+    const rowLabel = String(pointCustomData[0] ?? "").trim();
+    const isotopeKey = String(pointCustomData[1] ?? "").trim();
+    if (!rowLabel) {
+      return false;
+    }
+    if (target.isotopeKey === "cross") {
+      return rowLabel === target.rowLabel && (isotopeKey === "d13C" || isotopeKey === "d18O" || isotopeKey === "cross" || isotopeKey === "");
+    }
+    return rowLabel === target.rowLabel && (isotopeKey === target.isotopeKey || isotopeKey === "");
   }
-  const rowLabel = String(pointCustomData[0] ?? "");
-  const isotopeKey = String(pointCustomData[1] ?? "");
-  if (target.isotopeKey === "cross") {
-    return rowLabel === target.rowLabel && (isotopeKey === "d13C" || isotopeKey === "d18O" || isotopeKey === "cross");
+  if (pointCustomData && typeof pointCustomData === "object") {
+    const payload = pointCustomData as Record<string, unknown>;
+    const rowLabel = String(payload.row_label ?? payload.rowLabel ?? "").trim();
+    const isotopeKey = String(payload.isotope_key ?? payload.isotopeKey ?? "").trim();
+    if (!rowLabel) {
+      return false;
+    }
+    if (target.isotopeKey === "cross") {
+      return rowLabel === target.rowLabel && (isotopeKey === "d13C" || isotopeKey === "d18O" || isotopeKey === "cross" || isotopeKey === "");
+    }
+    return rowLabel === target.rowLabel && (isotopeKey === target.isotopeKey || isotopeKey === "");
   }
-  return rowLabel === target.rowLabel && isotopeKey === target.isotopeKey;
+  return false;
+}
+
+function coerceVector(values: unknown): unknown[] | null {
+  if (Array.isArray(values)) {
+    return values;
+  }
+  if (values && typeof values === "object") {
+    const arrayLike = values as unknown as { [index: number]: unknown; length: number };
+    if (ArrayBuffer.isView(values)) {
+      return Array.from(arrayLike);
+    }
+    const candidate = values as { length?: unknown };
+    if (typeof candidate.length === "number") {
+      try {
+        return Array.from(arrayLike);
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
 }
 
 function highlightSelectionSourceFigure(
@@ -108,15 +144,16 @@ function highlightSelectionSourceFigure(
   const highlightTraces: Array<Record<string, unknown>> = [];
   const traces = Array.isArray(cloned.data) ? cloned.data : [];
   for (const trace of traces) {
-    const customdata = Array.isArray(trace.customdata) ? trace.customdata : null;
-    const x = Array.isArray(trace.x) ? trace.x : null;
-    const y = Array.isArray(trace.y) ? trace.y : null;
-    const z = Array.isArray(trace.z) ? trace.z : null;
+    const customdata = coerceVector(trace.customdata);
+    const x = coerceVector(trace.x);
+    const y = coerceVector(trace.y);
+    const z = coerceVector(trace.z);
     if (!customdata || !x || !y) {
       continue;
     }
     const indexes: number[] = [];
-    for (let index = 0; index < customdata.length; index += 1) {
+    const pointCount = Math.min(customdata.length, x.length, y.length);
+    for (let index = 0; index < pointCount; index += 1) {
       if (pointMatchesSelectedTarget(customdata[index], target)) {
         indexes.push(index);
       }
@@ -126,6 +163,26 @@ function highlightSelectionSourceFigure(
     }
     const traceType = String(trace.type ?? "scatter");
     const is3dTrace = traceType.includes("3d");
+    const highlightColor = "#FF00FF";
+    const traceMarker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : {};
+    const baseSize = typeof traceMarker.size === "number" ? traceMarker.size : 8;
+    trace.selectedpoints = indexes;
+    trace.selected = {
+      marker: {
+        symbol: "circle",
+        size: Math.max(baseSize + 5, 13),
+        color: "rgba(255, 0, 255, 0.28)",
+        line: {
+          color: highlightColor,
+          width: 3,
+        },
+      },
+    };
+    trace.unselected = {
+      marker: {
+        opacity: 1,
+      },
+    };
     const highlightTrace: Record<string, unknown> = {
       type: trace.type ?? "scatter",
       mode: "markers",
@@ -136,12 +193,12 @@ function highlightSelectionSourceFigure(
       y: indexes.map((index) => y[index]),
       customdata: indexes.map((index) => customdata[index]),
       marker: {
-        color: is3dTrace ? "#FF00FF" : "rgba(0,0,0,0)",
-        size: is3dTrace ? 14 : 22,
-        symbol: is3dTrace ? "circle" : "circle-open",
+        color: is3dTrace ? highlightColor : "rgba(255, 0, 255, 0.28)",
+        size: is3dTrace ? 14 : 18,
+        symbol: "circle",
         line: {
-          color: "#FF00FF",
-          width: is3dTrace ? 2.5 : 4,
+          color: highlightColor,
+          width: is3dTrace ? 2.5 : 3.5,
         },
       },
     };
@@ -387,19 +444,75 @@ function buildLinearityPreviewFigure(
   };
 }
 
+function normalizeIsotopeKey(value: unknown): "d13C" | "d18O" | "cross" | null {
+  const token = String(value ?? "").trim().toLowerCase();
+  if (!token) {
+    return null;
+  }
+  if (token === "d13c" || token === "d13") {
+    return "d13C";
+  }
+  if (token === "d18o" || token === "d18") {
+    return "d18O";
+  }
+  if (token === "cross") {
+    return "cross";
+  }
+  return null;
+}
+
+function inferIsotopeKeyFromChartKey(chartKey: string): "d13C" | "d18O" | "cross" | null {
+  const key = String(chartKey ?? "").trim();
+  if (!key) {
+    return null;
+  }
+  if (key === "crossplot" || key === "processing_3d") {
+    return "cross";
+  }
+  if (key === "d13_summary" || key.endsWith("|d13C")) {
+    return "d13C";
+  }
+  if (key === "d18_summary" || key.endsWith("|d18O")) {
+    return "d18O";
+  }
+  return null;
+}
+
+function extractPointCustomData(point: PlotlyPoint): unknown {
+  if (point.customdata != null) {
+    return point.customdata;
+  }
+  const payload = point as unknown as Record<string, unknown>;
+  const pointNumber = typeof payload.pointNumber === "number" ? payload.pointNumber : typeof payload.pointIndex === "number" ? payload.pointIndex : null;
+  if (pointNumber == null) {
+    return null;
+  }
+  const dataCandidate = (payload.data ?? payload.fullData) as Record<string, unknown> | undefined;
+  const traceCustomdata = coerceVector(dataCandidate?.customdata);
+  if (!traceCustomdata || pointNumber < 0 || pointNumber >= traceCustomdata.length) {
+    return null;
+  }
+  return traceCustomdata[pointNumber];
+}
+
 function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): SelectedTarget[] {
   const seen = new Set<string>();
   const targets: SelectedTarget[] = [];
+  const inferredIsotope = inferIsotopeKeyFromChartKey(chartKey);
   for (const point of points) {
-    const customdata = Array.isArray(point.customdata) ? point.customdata : null;
-    if (!customdata || customdata.length < 4) {
+    const rawCustomdata = extractPointCustomData(point);
+    const customdata = Array.isArray(rawCustomdata) ? rawCustomdata : null;
+    const customObj = rawCustomdata && typeof rawCustomdata === "object" ? (rawCustomdata as Record<string, unknown>) : null;
+    const hasArrayRowPayload = Boolean(customdata && customdata.length >= 4);
+    const hasObjectRowPayload = Boolean(customObj && ("row_label" in customObj || "rowLabel" in customObj));
+    if (!hasArrayRowPayload && !hasObjectRowPayload) {
       continue;
     }
-    const rowLabel = String(customdata[0] ?? "");
-    const isotopeKey = String(customdata[1] ?? "") as "d13C" | "d18O" | "cross";
-    const identifier1 = String(customdata[2] ?? "");
-    const identifier2 = String(customdata[3] ?? "");
-    if (!rowLabel || !["d13C", "d18O", "cross"].includes(isotopeKey)) {
+    const rowLabel = String(customdata?.[0] ?? customObj?.row_label ?? customObj?.rowLabel ?? "").trim();
+    const isotopeKey = normalizeIsotopeKey(customdata?.[1] ?? customObj?.isotope_key ?? customObj?.isotopeKey) ?? inferredIsotope;
+    const identifier1 = String(customdata?.[2] ?? customObj?.identifier_1 ?? customObj?.identifier1 ?? "").trim();
+    const identifier2 = String(customdata?.[3] ?? customObj?.identifier_2 ?? customObj?.identifier2 ?? "").trim();
+    if (!rowLabel || !isotopeKey) {
       continue;
     }
     const token = `${isotopeKey}|${rowLabel}`;
@@ -419,6 +532,31 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
     });
   }
   return targets;
+}
+
+function coerceStoredSelectedTarget(value: unknown): SelectedTarget | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const payload = value as Record<string, unknown>;
+  const rowLabel = String(payload.rowLabel ?? "").trim();
+  const isotope = normalizeIsotopeKey(payload.isotopeKey);
+  const chartKey = String(payload.chartKey ?? "").trim();
+  if (!rowLabel || !isotope || !chartKey) {
+    return null;
+  }
+  const toNumberOrNull = (candidate: unknown): number | null =>
+    typeof candidate === "number" && Number.isFinite(candidate) ? candidate : null;
+  return {
+    rowLabel,
+    isotopeKey: isotope,
+    identifier1: String(payload.identifier1 ?? "").trim(),
+    identifier2: String(payload.identifier2 ?? "").trim(),
+    currentValue: toNumberOrNull(payload.currentValue),
+    currentD13: toNumberOrNull(payload.currentD13),
+    currentD18: toNumberOrNull(payload.currentD18),
+    chartKey,
+  };
 }
 
 function serializeCommentMap(commentMap: Record<string, string>) {
@@ -1282,6 +1420,28 @@ export default function ProcessingPage() {
 
   const workspace = workspaceQuery.data;
   const activeConfig = config ?? workspace?.config ?? null;
+
+  useEffect(() => {
+    if (!sessionId || typeof window === "undefined" || !workspaceQuery.data) {
+      return;
+    }
+    const storageKey = `processing-selection:${sessionId}`;
+    const raw = window.sessionStorage.getItem(storageKey);
+    if (!raw) {
+      return;
+    }
+    window.sessionStorage.removeItem(storageKey);
+    try {
+      const parsed = JSON.parse(raw) as { targets?: unknown };
+      const rawTargets = Array.isArray(parsed?.targets) ? parsed.targets : [];
+      const targets = rawTargets.map(coerceStoredSelectedTarget).filter((item): item is SelectedTarget => item != null);
+      if (targets.length) {
+        setTargets(targets);
+      }
+    } catch {
+      // Ignore invalid payloads and continue loading the page.
+    }
+  }, [sessionId, workspaceQuery.data]);
 
   function setTargets(nextTargets: SelectedTarget[]) {
     setSelectedTargets(nextTargets);

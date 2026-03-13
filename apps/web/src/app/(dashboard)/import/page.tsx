@@ -101,13 +101,13 @@ export default function ImportPage() {
             Start a new session, add files to an open session, or manage session lifecycle controls.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-5">
           <input
             type="file"
             multiple
             accept=".xls,.xlsx"
             onChange={(event) => setFiles(Array.from(event.target.files ?? []))}
-            className="block w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm"
+            className="form-control block w-full text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-stone-900 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-white hover:file:bg-stone-800"
           />
           <div className="flex flex-wrap gap-3">
             <Button onClick={() => importMutation.mutate()} disabled={files.length === 0 || importMutation.isPending}>
@@ -133,10 +133,10 @@ export default function ImportPage() {
           )}
 
           <div className="space-y-3 rounded-xl border border-stone-200 p-4">
-            <div className="text-sm font-semibold text-stone-800">Open Existing Session</div>
+            <div className="form-section-title">Open Existing Session</div>
             <div className="flex flex-wrap gap-3">
               <select
-                className="min-w-[340px] flex-1 rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm"
+                className="form-control min-w-[340px] flex-1 text-sm"
                 value={selectedOpenSessionId}
                 onChange={(event) => setSelectedOpenSessionId(event.target.value)}
               >
@@ -164,7 +164,7 @@ export default function ImportPage() {
           </div>
 
           <div className="space-y-3 rounded-xl border border-stone-200 p-4">
-            <div className="text-sm font-semibold text-stone-800">Session Actions</div>
+            <div className="form-section-title">Session Actions</div>
             <div className="flex flex-wrap gap-3">
               <Button variant="outline" onClick={() => saveMutation.mutate()} disabled={!sessionId || saveMutation.isPending}>
                 {saveMutation.isPending ? "Saving..." : "Save Session Now"}

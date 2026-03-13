@@ -7,3 +7,7 @@ apply open save close session, autosave sesssion, add file to session, discard a
 Add progress bar animation when importing 
 
 add manual linearity override to standard measurements too
+
+fix excel output, file renaming, 
+
+if i interpolate 
