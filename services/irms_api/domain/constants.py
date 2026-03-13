@@ -29,3 +29,4 @@ LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY = "linearity_use_diff_intensity_44_tab3
 
 DEFAULT_SIGNAL_RANGE = (0.0, 50.0)
 DEFAULT_SESSION_DATA_DIR = ".data/irms_api_sessions"
+DEFAULT_STANDARDS_DB_PATH = ".data/irms_standards.db"

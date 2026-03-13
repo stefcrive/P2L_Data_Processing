@@ -8,7 +8,13 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
 import { api } from "@/lib/api";
-import type { CalibrationConfig, CalibrationPrecisionSummary, CalibrationWorkspace, CycleDiagnosticsPayload } from "@/lib/types";
+import type {
+  CalibrationConfig,
+  CalibrationOfficialValue,
+  CalibrationPrecisionSummary,
+  CalibrationWorkspace,
+  CycleDiagnosticsPayload,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
 
@@ -34,6 +40,8 @@ type SelectionSourceChart = {
 
 const PRECISION_PASS_THRESHOLD = 0.07;
 const INCLUSION_PASS_THRESHOLD = 80;
+const OFFICIAL_VALUE_TYPE_D13 = "VPDB(13C)";
+const OFFICIAL_VALUE_TYPE_D18 = "VSMOW(18O)";
 
 function normalizeIsotopeKey(value: unknown): "d13C" | "d18O" | "cross" | null {
   const token = String(value ?? "").trim().toLowerCase();
@@ -145,6 +153,32 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
     });
   }
   return targets;
+}
+
+function targetNumberValue(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "null";
+}
+
+function targetSignature(target: SelectedTarget): string {
+  return [
+    target.chartKey,
+    target.rowLabel,
+    target.isotopeKey,
+    target.identifier1,
+    target.identifier2,
+    targetNumberValue(target.currentValue),
+    targetNumberValue(target.currentD13),
+    targetNumberValue(target.currentD18),
+  ].join("|");
+}
+
+function areSameSelectionTargets(current: SelectedTarget[], next: SelectedTarget[]): boolean {
+  if (current.length !== next.length) {
+    return false;
+  }
+  const currentSignatures = current.map(targetSignature).sort();
+  const nextSignatures = next.map(targetSignature).sort();
+  return currentSignatures.every((value, index) => value === nextSignatures[index]);
 }
 
 function cloneFigure(figure?: Record<string, unknown>): FigureShape {
@@ -286,6 +320,47 @@ function roundDeltaValue(value: number, precision = 3): number {
 
 function formatDeltaValue(value: number | null | undefined, precision = 3): string {
   return typeof value === "number" && Number.isFinite(value) ? value.toFixed(precision) : "N/A";
+}
+
+function formatOfficialValue(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(3)} ‰` : "Not set";
+}
+
+type OfficialValuesRow = {
+  standard: string;
+  d13Value: number | null;
+  d18Value: number | null;
+  source: string | null;
+};
+
+function buildOfficialValuesRows(values: CalibrationOfficialValue[]): OfficialValuesRow[] {
+  const rowsByStandard = new Map<string, OfficialValuesRow>();
+  for (const item of values) {
+    const standard = String(item.standard ?? "").trim().toUpperCase();
+    const isotopicType = String(item.isotopic_value_type ?? "").trim();
+    if (!standard) {
+      continue;
+    }
+    const current =
+      rowsByStandard.get(standard) ??
+      {
+        standard,
+        d13Value: null,
+        d18Value: null,
+        source: null,
+      };
+    const value = typeof item.value === "number" && Number.isFinite(item.value) ? item.value : null;
+    if (isotopicType === OFFICIAL_VALUE_TYPE_D13) {
+      current.d13Value = value;
+    } else if (isotopicType === OFFICIAL_VALUE_TYPE_D18) {
+      current.d18Value = value;
+    }
+    if (item.source && item.source.trim()) {
+      current.source = item.source.trim();
+    }
+    rowsByStandard.set(standard, current);
+  }
+  return Array.from(rowsByStandard.values()).sort((a, b) => a.standard.localeCompare(b.standard));
 }
 
 function asNumber(value: unknown): number | null {
@@ -1102,6 +1177,13 @@ export default function CalibrationPage() {
   const [selectedTargets, setSelectedTargets] = useState<SelectedTarget[]>([]);
   const [activeTargetIndex, setActiveTargetIndex] = useState(0);
   const [isSelectionEditorOpen, setSelectionEditorOpen] = useState(false);
+  const [isOfficialValuesModalOpen, setOfficialValuesModalOpen] = useState(false);
+  const [isOfficialValuesEditMode, setOfficialValuesEditMode] = useState(false);
+  const [officialValuesDraftRows, setOfficialValuesDraftRows] = useState<Record<string, { d13: string; d18: string }>>({});
+  const [newStandardName, setNewStandardName] = useState("");
+  const [newStandardD13, setNewStandardD13] = useState("");
+  const [newStandardD18, setNewStandardD18] = useState("");
+  const [officialValuesError, setOfficialValuesError] = useState<string | null>(null);
   const [singleValue, setSingleValue] = useState(0);
   const [singleOffset, setSingleOffset] = useState(0);
   const [crossD13Value, setCrossD13Value] = useState(0);
@@ -1118,17 +1200,20 @@ export default function CalibrationPage() {
   const activeCrossTarget = activeTarget && activeTarget.isotopeKey === "cross" ? activeTarget : null;
 
   useEffect(() => {
-    if (!isSelectionEditorOpen || typeof window === "undefined") {
+    if (!(isSelectionEditorOpen || isOfficialValuesModalOpen) || typeof window === "undefined") {
       return;
     }
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
         setSelectionEditorOpen(false);
+        setOfficialValuesModalOpen(false);
+        setOfficialValuesEditMode(false);
+        setOfficialValuesError(null);
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isSelectionEditorOpen]);
+  }, [isOfficialValuesModalOpen, isSelectionEditorOpen]);
 
   useEffect(() => {
     if (!activeIsotopeTarget) {
@@ -1153,6 +1238,12 @@ export default function CalibrationPage() {
     queryKey: ["calibration-workspace", sessionId],
     queryFn: () => api.getCalibrationWorkspace(sessionId!),
     enabled: Boolean(sessionId),
+  });
+
+  const officialValuesQuery = useQuery({
+    queryKey: ["official-standard-values"],
+    queryFn: () => api.listOfficialStandardValues(),
+    enabled: isOfficialValuesModalOpen,
   });
 
   const singleDiagnosticsQuery = useQuery({
@@ -1214,6 +1305,13 @@ export default function CalibrationPage() {
   useEffect(() => {
     setConfig(null);
     setHasLoadedDraft(false);
+    setOfficialValuesModalOpen(false);
+    setOfficialValuesEditMode(false);
+    setOfficialValuesDraftRows({});
+    setOfficialValuesError(null);
+    setNewStandardName("");
+    setNewStandardD13("");
+    setNewStandardD18("");
   }, [sessionId]);
 
   useEffect(() => {
@@ -1248,6 +1346,21 @@ export default function CalibrationPage() {
     window.sessionStorage.setItem(draftStorageKey, JSON.stringify(config));
   }, [config, draftStorageKey]);
 
+  useEffect(() => {
+    if (!isOfficialValuesModalOpen) {
+      return;
+    }
+    const rows = buildOfficialValuesRows(officialValuesQuery.data ?? []);
+    const drafts: Record<string, { d13: string; d18: string }> = {};
+    for (const row of rows) {
+      drafts[row.standard] = {
+        d13: row.d13Value == null ? "" : row.d13Value.toFixed(3),
+        d18: row.d18Value == null ? "" : row.d18Value.toFixed(3),
+      };
+    }
+    setOfficialValuesDraftRows(drafts);
+  }, [isOfficialValuesModalOpen, officialValuesQuery.data]);
+
   const deferredConfig = useDeferredValue(config);
 
   const previewQuery = useQuery({
@@ -1263,6 +1376,29 @@ export default function CalibrationPage() {
       await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration", sessionId] });
+    },
+  });
+
+  const upsertOfficialValueMutation = useMutation({
+    mutationFn: (payload: { standard: string; isotopic_value_type: string; value: number; source?: string | null }) =>
+      api.upsertOfficialStandardValue(payload),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["official-standard-values"] });
+      if (sessionId) {
+        await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
+        await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
+      }
+    },
+  });
+
+  const deleteOfficialStandardMutation = useMutation({
+    mutationFn: (standard: string) => api.deleteOfficialStandard(standard),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["official-standard-values"] });
+      if (sessionId) {
+        await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
+        await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
+      }
     },
   });
 
@@ -1302,9 +1438,10 @@ export default function CalibrationPage() {
   }
 
   function setTargets(nextTargets: SelectedTarget[]) {
-    setSelectedTargets(nextTargets);
-    setActiveTargetIndex(0);
-    setSelectionEditorOpen(nextTargets.length > 0);
+    const shouldOpen = nextTargets.length > 0;
+    setSelectedTargets((current) => (areSameSelectionTargets(current, nextTargets) ? current : nextTargets));
+    setActiveTargetIndex((current) => (current === 0 ? current : 0));
+    setSelectionEditorOpen((current) => (current === shouldOpen ? current : shouldOpen));
   }
 
   function openProcessingSelectionEditor(chartKey: string, points: PlotlyPoint[], multi = false) {
@@ -1450,6 +1587,97 @@ export default function CalibrationPage() {
     });
   }
 
+  function updateOfficialValueDraft(standard: string, isotopeKey: "d13" | "d18", value: string) {
+    setOfficialValuesDraftRows((current) => ({
+      ...current,
+      [standard]: {
+        d13: current[standard]?.d13 ?? "",
+        d18: current[standard]?.d18 ?? "",
+        [isotopeKey]: value,
+      },
+    }));
+  }
+
+  async function saveOfficialValuesRow(standard: string) {
+    const draft = officialValuesDraftRows[standard];
+    if (!draft) {
+      return;
+    }
+    const d13 = parseStrictNumber(draft.d13);
+    const d18 = parseStrictNumber(draft.d18);
+    if (d13 == null || d18 == null) {
+      setOfficialValuesError(`Enter valid numeric d13C and d18O values for ${standard}.`);
+      return;
+    }
+    try {
+      setOfficialValuesError(null);
+      await Promise.all([
+        upsertOfficialValueMutation.mutateAsync({
+          standard,
+          isotopic_value_type: OFFICIAL_VALUE_TYPE_D13,
+          value: d13,
+          source: "manual",
+        }),
+        upsertOfficialValueMutation.mutateAsync({
+          standard,
+          isotopic_value_type: OFFICIAL_VALUE_TYPE_D18,
+          value: d18,
+          source: "manual",
+        }),
+      ]);
+    } catch (error) {
+      setOfficialValuesError(error instanceof Error ? error.message : `Failed to save values for ${standard}.`);
+    }
+  }
+
+  async function addOfficialValuesItem() {
+    const standard = String(newStandardName ?? "").trim().toUpperCase();
+    const d13 = parseStrictNumber(newStandardD13);
+    const d18 = parseStrictNumber(newStandardD18);
+    if (!standard) {
+      setOfficialValuesError("Standard name is required.");
+      return;
+    }
+    if (d13 == null || d18 == null) {
+      setOfficialValuesError("Enter valid numeric d13C and d18O values for the new standard.");
+      return;
+    }
+    try {
+      setOfficialValuesError(null);
+      await Promise.all([
+        upsertOfficialValueMutation.mutateAsync({
+          standard,
+          isotopic_value_type: OFFICIAL_VALUE_TYPE_D13,
+          value: d13,
+          source: "manual",
+        }),
+        upsertOfficialValueMutation.mutateAsync({
+          standard,
+          isotopic_value_type: OFFICIAL_VALUE_TYPE_D18,
+          value: d18,
+          source: "manual",
+        }),
+      ]);
+      setNewStandardName("");
+      setNewStandardD13("");
+      setNewStandardD18("");
+    } catch (error) {
+      setOfficialValuesError(error instanceof Error ? error.message : `Failed to add standard ${standard}.`);
+    }
+  }
+
+  async function removeOfficialValuesItem(standard: string) {
+    if (!standard) {
+      return;
+    }
+    try {
+      setOfficialValuesError(null);
+      await deleteOfficialStandardMutation.mutateAsync(standard);
+    } catch (error) {
+      setOfficialValuesError(error instanceof Error ? error.message : `Failed to remove standard ${standard}.`);
+    }
+  }
+
   if (!sessionId) {
     return (
       <Card>
@@ -1480,7 +1708,17 @@ export default function CalibrationPage() {
   const minDate = displayedWorkspace.available_values.min_date ?? undefined;
   const maxDate = displayedWorkspace.available_values.max_date ?? undefined;
   const selectedStandards = activeConfig.selected_standards;
-  const lineIntensityBasis = String(displayedWorkspace.linearity_fits?.intensity_col ?? activeConfig.z_axis ?? "N/A");
+  const selectedStandardOfficialValues = displayedWorkspace.selected_standard_official_values ?? [];
+  const selectedStandardsSet = new Set(selectedStandards.map((item) => String(item ?? "").trim().toUpperCase()).filter(Boolean));
+  const allOfficialValueRows = buildOfficialValuesRows(officialValuesQuery.data ?? selectedStandardOfficialValues);
+  const selectedOfficialValueRows = allOfficialValueRows.filter((row) => selectedStandardsSet.has(row.standard));
+  const hasMissingOfficialValues =
+    selectedStandardsSet.size > selectedOfficialValueRows.length ||
+    selectedOfficialValueRows.some((row) => row.d13Value == null || row.d18Value == null);
+  const standardsValuesBusy = upsertOfficialValueMutation.isPending || deleteOfficialStandardMutation.isPending;
+  const officialValuesLoading = isOfficialValuesModalOpen && officialValuesQuery.isLoading && !officialValuesQuery.data;
+  const officialValuesQueryError = officialValuesQuery.error instanceof Error ? officialValuesQuery.error.message : null;
+  const lineIntensityBasis = String(displayedWorkspace.linearity_fits?.intensity_col ?? activeConfig.color_param ?? "N/A");
   const previewError = previewQuery.error instanceof Error ? previewQuery.error.message : null;
   const runError = runMutation.error instanceof Error ? runMutation.error.message : null;
   const hasUnsavedPreview = JSON.stringify(activeConfig) !== JSON.stringify(workspace.config);
@@ -1607,6 +1845,193 @@ export default function CalibrationPage() {
           </div>
         </CardHeader>
       </Card>
+
+      {isOfficialValuesModalOpen ? (
+        <div
+          className="fixed inset-0 z-40 flex items-start justify-center bg-stone-950/40 p-3 pt-8 sm:p-6"
+          onClick={() => {
+            setOfficialValuesModalOpen(false);
+            setOfficialValuesEditMode(false);
+            setOfficialValuesError(null);
+          }}
+        >
+          <div
+            className="w-full max-w-5xl rounded-xl border border-stone-300 bg-white shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
+              <div>
+                <div className="text-base font-semibold text-stone-900">Official Standard Values</div>
+                <div className="text-sm text-stone-500">Values from the standards database used by calibration calculations.</div>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setOfficialValuesEditMode((current) => !current);
+                    setOfficialValuesError(null);
+                  }}
+                >
+                  {isOfficialValuesEditMode ? "Done" : "Edit"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setOfficialValuesModalOpen(false);
+                    setOfficialValuesEditMode(false);
+                    setOfficialValuesError(null);
+                  }}
+                >
+                  Close
+                </Button>
+              </div>
+            </div>
+            <div className="space-y-4 p-4">
+              {officialValuesLoading ? (
+                <div className="text-sm text-stone-500">Loading official values...</div>
+              ) : officialValuesQueryError ? (
+                <div className="text-sm text-red-600">Failed to load official values: {officialValuesQueryError}</div>
+              ) : allOfficialValueRows.length ? (
+                <>
+                  <div className="overflow-x-auto rounded-lg border border-stone-200">
+                    <table className="min-w-full border-collapse text-sm">
+                      <thead className="bg-stone-50 text-left text-xs uppercase tracking-wide text-stone-500">
+                        <tr>
+                          <th className="px-3 py-2.5 font-semibold">Standard</th>
+                          <th className="px-3 py-2.5 font-semibold">d13C ({OFFICIAL_VALUE_TYPE_D13})</th>
+                          <th className="px-3 py-2.5 font-semibold">d18O ({OFFICIAL_VALUE_TYPE_D18})</th>
+                          <th className="px-3 py-2.5 font-semibold">Source</th>
+                          {isOfficialValuesEditMode ? <th className="px-3 py-2.5 font-semibold">Actions</th> : null}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allOfficialValueRows.map((row, index) => {
+                          const draft = officialValuesDraftRows[row.standard] ?? { d13: "", d18: "" };
+                          return (
+                          <tr key={`${row.standard}:${index}`} className={index % 2 ? "bg-stone-50/60" : "bg-white"}>
+                            <td className="px-3 py-2.5 font-semibold text-stone-800">
+                              <div className="flex items-center gap-2">
+                                <span>{row.standard}</span>
+                                {selectedStandardsSet.has(row.standard) ? (
+                                  <span className="rounded-full bg-stone-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">
+                                    selected
+                                  </span>
+                                ) : null}
+                              </div>
+                            </td>
+                            <td className="px-3 py-2.5 text-stone-700">
+                              {isOfficialValuesEditMode ? (
+                                <input
+                                  type="number"
+                                  step="0.001"
+                                  value={draft.d13}
+                                  onChange={(event) => updateOfficialValueDraft(row.standard, "d13", event.target.value)}
+                                  className="w-full rounded-md border border-stone-300 px-2 py-1"
+                                />
+                              ) : (
+                                formatOfficialValue(row.d13Value)
+                              )}
+                            </td>
+                            <td className="px-3 py-2.5 text-stone-700">
+                              {isOfficialValuesEditMode ? (
+                                <input
+                                  type="number"
+                                  step="0.001"
+                                  value={draft.d18}
+                                  onChange={(event) => updateOfficialValueDraft(row.standard, "d18", event.target.value)}
+                                  className="w-full rounded-md border border-stone-300 px-2 py-1"
+                                />
+                              ) : (
+                                formatOfficialValue(row.d18Value)
+                              )}
+                            </td>
+                            <td className="px-3 py-2.5 text-stone-700">{row.source ?? "database"}</td>
+                            {isOfficialValuesEditMode ? (
+                              <td className="px-3 py-2.5 text-stone-700">
+                                <div className="flex gap-2">
+                                  <Button size="sm" variant="outline" disabled={standardsValuesBusy} onClick={() => saveOfficialValuesRow(row.standard)}>
+                                    Save
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={standardsValuesBusy}
+                                    onClick={() => removeOfficialValuesItem(row.standard)}
+                                  >
+                                    Remove
+                                  </Button>
+                                </div>
+                              </td>
+                            ) : null}
+                          </tr>
+                        );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  {hasMissingOfficialValues ? (
+                    <div className="text-xs text-red-600">
+                      One or more selected standards are missing official values in the database. Calibration may fail until these values are added.
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-600">
+                  No official standard values found in the database yet.
+                </div>
+              )}
+              {officialValuesError ? <div className="text-sm text-red-600">{officialValuesError}</div> : null}
+
+              {isOfficialValuesEditMode ? (
+                <div className="space-y-3 rounded-xl border border-stone-200 bg-stone-50/60 p-3">
+                  <div className="text-sm font-semibold text-stone-800">Add Standard</div>
+                  <div className="grid gap-3 md:grid-cols-4">
+                    <label className="form-field">
+                      <span className="form-label">Standard</span>
+                      <input
+                        type="text"
+                        value={newStandardName}
+                        onChange={(event) => setNewStandardName(event.target.value.toUpperCase())}
+                        className="form-control"
+                        placeholder="NBS18"
+                      />
+                    </label>
+                    <label className="form-field">
+                      <span className="form-label">d13C</span>
+                      <input
+                        type="number"
+                        step="0.001"
+                        value={newStandardD13}
+                        onChange={(event) => setNewStandardD13(event.target.value)}
+                        className="form-control"
+                        placeholder="-5.010"
+                      />
+                    </label>
+                    <label className="form-field">
+                      <span className="form-label">d18O</span>
+                      <input
+                        type="number"
+                        step="0.001"
+                        value={newStandardD18}
+                        onChange={(event) => setNewStandardD18(event.target.value)}
+                        className="form-control"
+                        placeholder="-23.010"
+                      />
+                    </label>
+                    <div className="flex items-end">
+                      <Button onClick={addOfficialValuesItem} disabled={standardsValuesBusy} className="w-full">
+                        Add
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {isSelectionEditorOpen ? (
         <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setSelectionEditorOpen(false)}>
@@ -1900,7 +2325,7 @@ export default function CalibrationPage() {
       ) : null}
 
       <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
-        <aside className="space-y-6 xl:sticky xl:top-6 xl:self-start">
+        <aside className="space-y-6 xl:sticky xl:top-6 xl:max-h-[calc(100vh-2rem)] xl:self-start xl:overflow-y-auto xl:pr-1">
           <Card>
             <CardHeader>
               <CardTitle>Calibration Controls</CardTitle>
@@ -1914,6 +2339,16 @@ export default function CalibrationPage() {
                 onChange={(next) => updateConfig("selected_standards", next)}
                 placeholder="Select standards"
               />
+
+              <div className="flex items-center justify-between rounded-xl border border-stone-200 bg-white/80 p-3">
+                <div className="pr-3">
+                  <div className="text-sm font-semibold tracking-[0.01em] text-stone-800">Official standard values</div>
+                  <div className="text-xs text-stone-500">Open database values used in calibration equations.</div>
+                </div>
+                <Button variant="outline" size="sm" onClick={() => setOfficialValuesModalOpen(true)}>
+                  View
+                </Button>
+              </div>
 
               <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-2">
                 <label className="form-field">
@@ -1974,24 +2409,21 @@ export default function CalibrationPage() {
                   <span className="form-label">Color parameter</span>
                   <select
                     value={activeConfig.color_param}
-                    onChange={(event) => updateConfig("color_param", event.target.value)}
+                    onChange={(event) => {
+                      const nextColorParam = event.target.value;
+                      setConfig((current) =>
+                        current
+                          ? {
+                              ...current,
+                              color_param: nextColorParam,
+                              z_axis: nextColorParam,
+                            }
+                          : current,
+                      );
+                    }}
                     className="form-control"
                   >
                     {displayedWorkspace.available_values.color_params.map((option) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="form-field">
-                  <span className="form-label">3D Z axis</span>
-                  <select
-                    value={activeConfig.z_axis}
-                    onChange={(event) => updateConfig("z_axis", event.target.value)}
-                    className="form-control"
-                  >
-                    {displayedWorkspace.available_values.z_axis_options.map((option) => (
                       <option key={option} value={option}>
                         {option}
                       </option>
@@ -2060,6 +2492,42 @@ export default function CalibrationPage() {
                     </span>
                   </span>
                 </label>
+                <label className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={activeConfig.linearity.manual_override_enabled}
+                    onChange={(event) => updateLinearity("manual_override_enabled", event.target.checked)}
+                    className="mt-1 h-4 w-4 accent-stone-900"
+                  />
+                  <span>
+                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Manual linearity override (standards)</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
+                      Applies a derived transform to selected standards only. Stored raw values are not overwritten.
+                    </span>
+                  </span>
+                </label>
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+                  <label className="form-field">
+                    <span className="form-label">d13 per 10V</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={activeConfig.linearity.manual_d13_per_10v}
+                      onChange={(event) => updateLinearity("manual_d13_per_10v", Number(event.target.value))}
+                      className="form-control"
+                    />
+                  </label>
+                  <label className="form-field">
+                    <span className="form-label">d18 per 10V</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={activeConfig.linearity.manual_d18_per_10v}
+                      onChange={(event) => updateLinearity("manual_d18_per_10v", Number(event.target.value))}
+                      className="form-control"
+                    />
+                  </label>
+                </div>
               </div>
 
               <div className="flex flex-wrap gap-2">
@@ -2145,7 +2613,7 @@ export default function CalibrationPage() {
                 <Card>
                   <CardHeader>
                     <CardTitle>Calibration 3D Chart</CardTitle>
-                    <CardDescription>Filtered standards in calibration space using the active color and Z-axis parameters.</CardDescription>
+                    <CardDescription>Filtered standards in calibration space using the active color parameter for both color and Z-axis.</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <PlotlyChart

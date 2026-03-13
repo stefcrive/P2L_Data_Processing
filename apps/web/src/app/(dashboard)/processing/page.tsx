@@ -988,36 +988,42 @@ function CheckboxField({
   );
 }
 
-function MetricTable({ workspace }: { workspace: ProcessingWorkspace }) {
+function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }) {
   if (!workspace.summary.metrics.length) {
     return null;
   }
+
+  const summaryBadges = [
+    { label: "Unique samples", value: workspace.summary.total_unique_samples },
+    { label: "Measurements", value: workspace.summary.total_measurements },
+    { label: "Outliers", value: workspace.summary.statistical_outliers },
+    { label: "Final analyses", value: workspace.summary.final_analyses },
+  ];
+
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Processing Summary</CardTitle>
-        <CardDescription>Detailed backend metrics used to build the current workspace state.</CardDescription>
+    <Card className="border-stone-200 bg-white/90">
+      <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <CardTitle>Processing Summary</CardTitle>
+          <CardDescription>Detailed backend metrics used to build the current workspace state.</CardDescription>
+        </div>
+        <div className="flex flex-wrap gap-2 text-sm text-stone-600">
+          {summaryBadges.map((badge) => (
+            <span key={badge.label} className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
+              {badge.label}: {String(badge.value)}
+            </span>
+          ))}
+        </div>
       </CardHeader>
-      <CardContent>
-        <div className="overflow-x-auto rounded-lg border border-stone-200">
-          <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
-            <thead className="bg-stone-50">
-              <tr>
-                <th className="px-3 py-2 font-medium text-stone-700">Metric</th>
-                <th className="px-3 py-2 font-medium text-stone-700">Value</th>
-                <th className="px-3 py-2 font-medium text-stone-700">Details</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-stone-100 bg-white">
-              {workspace.summary.metrics.map((metric) => (
-                <tr key={metric.metric}>
-                  <td className="px-3 py-2 font-medium text-stone-800">{metric.metric}</td>
-                  <td className="px-3 py-2 text-stone-700">{String(metric.value)}</td>
-                  <td className="px-3 py-2 text-stone-600">{metric.details}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <CardContent className="pt-0">
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {workspace.summary.metrics.map((metric) => (
+            <div key={metric.metric} className="rounded-lg border border-stone-200 bg-stone-50/70 px-4 py-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">{metric.metric}</div>
+              <div className="mt-1 text-2xl font-semibold text-stone-900">{String(metric.value)}</div>
+              <div className="mt-1 text-xs text-stone-600">{metric.details}</div>
+            </div>
+          ))}
         </div>
       </CardContent>
     </Card>
@@ -1938,24 +1944,21 @@ export default function ProcessingPage() {
                   <span className="mb-1 block font-medium text-stone-700">Color parameter</span>
                   <select
                     value={activeConfig.color_param}
-                    onChange={(event) => updateConfig("color_param", event.target.value)}
+                    onChange={(event) => {
+                      const nextColorParam = event.target.value;
+                      setConfig((current) =>
+                        current
+                          ? {
+                              ...current,
+                              color_param: nextColorParam,
+                              z_axis: nextColorParam,
+                            }
+                          : current,
+                      );
+                    }}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
                     {workspace.available_values.color_params.map((option) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="text-sm">
-                  <span className="mb-1 block font-medium text-stone-700">3D Z axis</span>
-                  <select
-                    value={activeConfig.z_axis}
-                    onChange={(event) => updateConfig("z_axis", event.target.value)}
-                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                  >
-                    {workspace.available_values.z_axis_options.map((option) => (
                       <option key={option} value={option}>
                         {option}
                       </option>
@@ -2111,7 +2114,7 @@ export default function ProcessingPage() {
         </aside>
 
         <div className="space-y-6">
-          <MetricTable workspace={workspace} />
+          <ProcessingSummaryHero workspace={workspace} />
 
           <div className="space-y-6">
             <div className="grid gap-6 xl:grid-cols-2">

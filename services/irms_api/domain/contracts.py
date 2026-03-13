@@ -83,6 +83,26 @@ class CalibrationStandardSection(BaseModel):
     d18_figure: dict[str, Any] = Field(default_factory=dict)
 
 
+class CalibrationOfficialValue(BaseModel):
+    standard: str
+    isotopic_value_type: str
+    value: float | None = None
+    source: str | None = None
+
+
+class CalibrationOfficialValueUpsertRequest(BaseModel):
+    standard: str
+    isotopic_value_type: str
+    value: float
+    source: str | None = None
+
+
+class CalibrationOfficialValueDeleteResult(BaseModel):
+    standard: str
+    isotopic_value_type: str | None = None
+    deleted_rows: int = 0
+
+
 class CalibrationWorkspace(BaseModel):
     session_id: str
     config: CalibrationConfig = Field(default_factory=CalibrationConfig)
@@ -91,6 +111,7 @@ class CalibrationWorkspace(BaseModel):
     linearity_figures: dict[str, dict[str, Any]] = Field(default_factory=dict)
     precision_summaries: list[CalibrationPrecisionSummary] = Field(default_factory=list)
     standard_sections: list[CalibrationStandardSection] = Field(default_factory=list)
+    selected_standard_official_values: list[CalibrationOfficialValue] = Field(default_factory=list)
     linearity_fits: dict[str, Any] = Field(default_factory=dict)
 
 

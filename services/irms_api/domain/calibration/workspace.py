@@ -14,6 +14,7 @@ from ..constants import CYCLE1_SIGNAL_DIFF44_COL, CYCLE1_SIGNAL_SAMP44_COL, ISOT
 from ..contracts import (
     CalibrationAvailableValues,
     CalibrationConfig,
+    CalibrationOfficialValue,
     CalibrationPrecisionSummary,
     CalibrationStandardSection,
     CalibrationWorkspace,
@@ -23,6 +24,7 @@ from ..shared.json_compat import to_json_compatible
 from ..shared.plotting import _build_date_colorbar_ticks, _build_isotope_3d_scatter, _prepare_color_values
 from ..standards import StandardsRepository
 from .core import (
+    _apply_manual_linearity_override_to_standards,
     _compute_linearity_fit,
     _filter_standards_remove_outliers,
     _linearity_intensity_axis_label,
@@ -412,6 +414,20 @@ def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str
     return _figure_json(fig)
 
 
+def _materialize_color_param_z_axis(df: pd.DataFrame, color_param: str) -> tuple[pd.DataFrame, str, str]:
+    work = df.copy() if df is not None else pd.DataFrame()
+    color_col = str(color_param or "").strip()
+    if work.empty or not color_col or color_col not in work.columns:
+        return work, color_col, color_col
+    z_values, _ = _prepare_color_values(work[color_col])
+    z_numeric = pd.to_numeric(z_values, errors="coerce") if z_values is not None else pd.Series(dtype=float)
+    if z_numeric.empty or not bool(z_numeric.notna().any()):
+        return work, color_col, color_col
+    z_axis_col = "__z_axis_from_color_param__"
+    work[z_axis_col] = pd.Series(z_numeric.to_numpy(), index=work.index, dtype=float)
+    return work, z_axis_col, color_col
+
+
 def _build_linearity_figure(
     df_src: pd.DataFrame,
     y_col: str,
@@ -608,6 +624,18 @@ def build_calibration_workspace(
     standards_repo = StandardsRepository.default()
     standards_reference = standards_repo.frame
     selected_standards = list(config.selected_standards)
+    selected_standard_official_values = [
+        CalibrationOfficialValue.model_validate(item)
+        for item in standards_repo.official_values_for_standards(selected_standards)
+    ]
+    standards_adjusted_df = _apply_manual_linearity_override_to_standards(
+        work_df,
+        selected_standards,
+        enabled=config.linearity.manual_override_enabled,
+        d13_per_10v=config.linearity.manual_d13_per_10v,
+        d18_per_10v=config.linearity.manual_d18_per_10v,
+        use_diff_intensity=config.linearity.use_diff_intensity,
+    )
     min_date, max_date, _ = _date_bounds(work_df)
     available_values = CalibrationAvailableValues(
         standards=standards_repo.standards_list(),
@@ -622,11 +650,12 @@ def build_calibration_workspace(
             session_id=session_id,
             config=config,
             available_values=available_values,
+            selected_standard_official_values=selected_standard_official_values,
             linearity_fits=to_json_compatible(calibration_meta.get("linearity_fits", {})),
         )
 
     clean_stds = _filter_standards_remove_outliers(
-        work_df,
+        standards_adjusted_df,
         selected_standards,
         config.calibration_type,
         config.sigma_level,
@@ -639,13 +668,14 @@ def build_calibration_workspace(
         calibration_figs = create_calibration_plots(standards_reference, chart_src, selected_standards, config.color_param)
         for key, value in calibration_figs.items():
             main_figures[key] = _figure_json(value)
+        chart_src_3d, z_axis_col, z_axis_label = _materialize_color_param_z_axis(chart_src, config.color_param)
         fig_3d, _ = _build_isotope_3d_scatter(
-            chart_src,
-            z_col=config.z_axis,
-            z_label=config.z_axis,
+            chart_src_3d,
+            z_col=z_axis_col,
+            z_label=z_axis_label,
             color_col=config.color_param,
             color_label=config.color_param,
-            title=f"Calibration 3D Chart (Z-axis: {config.z_axis})",
+            title=f"Calibration 3D Chart (Z-axis: {config.color_param})",
             include_row_metadata=True,
             isotope_key="cross",
         )
@@ -673,7 +703,7 @@ def build_calibration_workspace(
     precision_summaries: list[CalibrationPrecisionSummary] = []
     standard_sections: list[CalibrationStandardSection] = []
     for standard in selected_standards:
-        std_df = work_df[work_df["Identifier 1"].astype(str) == str(standard)].copy()
+        std_df = standards_adjusted_df[standards_adjusted_df["Identifier 1"].astype(str) == str(standard)].copy()
         std_df = _apply_precision_date_range(std_df, config)
         precision_summaries.append(_compute_precision_summary(standard, std_df, config, display_fits))
         out13, out18 = _standard_outlier_masks(std_df, config)
@@ -714,5 +744,6 @@ def build_calibration_workspace(
         linearity_figures=linearity_figures,
         precision_summaries=precision_summaries,
         standard_sections=standard_sections,
+        selected_standard_official_values=selected_standard_official_values,
         linearity_fits=to_json_compatible(stored_fits),
     )

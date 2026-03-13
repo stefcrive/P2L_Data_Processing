@@ -204,6 +204,53 @@ def _apply_linearity_correction(
     return work
 
 
+def _apply_manual_linearity_override_to_standards(
+    df: pd.DataFrame,
+    selected_standards: list[str],
+    enabled: bool = False,
+    d13_per_10v: float = 0.0,
+    d18_per_10v: float = 0.0,
+    use_diff_intensity: bool = False,
+    fits: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    if df is None or df.empty or not bool(enabled) or "Identifier 1" not in df.columns:
+        return df
+    standards = {str(item).strip() for item in selected_standards if str(item).strip()}
+    if not standards:
+        return df
+    work = df.copy()
+    standards_mask = work["Identifier 1"].astype(str).isin(standards)
+    if not bool(standards_mask.any()):
+        return work
+    intensity_col = _resolve_selected_linearity_intensity_column(df=work, use_diff_intensity=use_diff_intensity)
+    if intensity_col not in work.columns:
+        return work
+    intensity = pd.to_numeric(work[intensity_col], errors="coerce")
+    valid_intensity = np.isfinite(intensity)
+    standards_df = work.loc[standards_mask].copy()
+
+    def _apply_single_column(column_name: str, isotope_key: str, slope_per_10v: float) -> None:
+        slope_num = pd.to_numeric(pd.Series([slope_per_10v]), errors="coerce").iloc[0]
+        if column_name not in work.columns or not np.isfinite(slope_num):
+            return
+        x_ref = _resolve_linearity_reference_intensity(
+            standards_df,
+            isotope_key,
+            fits=fits,
+            intensity_col=intensity_col,
+        )
+        slope_per_v = float(slope_num) / 10.0
+        values = pd.to_numeric(work[column_name], errors="coerce")
+        corrected = (values - slope_per_v * (intensity - float(x_ref))).where(np.isfinite(values) & valid_intensity)
+        work.loc[standards_mask, column_name] = corrected.loc[standards_mask]
+
+    _apply_single_column("d 13C/12C  Mean", "d13C", d13_per_10v)
+    _apply_single_column("d13C_calibrated", "d13C", d13_per_10v)
+    _apply_single_column("d 18O/16O  Mean", "d18O", d18_per_10v)
+    _apply_single_column("d18O_calibrated", "d18O", d18_per_10v)
+    return work
+
+
 def _resolve_selected_linearity_intensity_column(
     df: pd.DataFrame | None = None,
     use_diff_intensity: bool = False,

@@ -506,6 +506,41 @@ def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
     fig.update_layout(**layout_updates)
 
 
+def _materialize_color_param_z_axis(
+    filtered_df: pd.DataFrame,
+    overlay_df: pd.DataFrame,
+    color_param: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, str, str]:
+    filtered = filtered_df.copy() if filtered_df is not None else pd.DataFrame()
+    overlay = overlay_df.copy() if overlay_df is not None else pd.DataFrame()
+    color_col = str(color_param or "").strip()
+    if not color_col:
+        return filtered, overlay, color_col, color_col
+    if color_col not in filtered.columns and color_col not in overlay.columns:
+        return filtered, overlay, color_col, color_col
+
+    filtered_source = filtered.get(color_col, pd.Series(np.nan, index=filtered.index))
+    overlay_source = overlay.get(color_col, pd.Series(np.nan, index=overlay.index))
+    combined = pd.concat(
+        [
+            pd.Series(filtered_source, index=filtered.index, dtype=object).reset_index(drop=True),
+            pd.Series(overlay_source, index=overlay.index, dtype=object).reset_index(drop=True),
+        ],
+        axis=0,
+        ignore_index=True,
+    )
+    z_values, _ = _prepare_color_values(combined)
+    z_numeric = pd.to_numeric(z_values, errors="coerce") if z_values is not None else pd.Series(dtype=float)
+    if z_numeric.empty or not bool(z_numeric.notna().any()):
+        return filtered, overlay, color_col, color_col
+
+    z_axis_col = "__z_axis_from_color_param__"
+    split_index = len(filtered_source)
+    filtered[z_axis_col] = pd.Series(z_numeric.iloc[:split_index].to_numpy(), index=filtered.index, dtype=float)
+    overlay[z_axis_col] = pd.Series(z_numeric.iloc[split_index:].to_numpy(), index=overlay.index, dtype=float)
+    return filtered, overlay, z_axis_col, color_col
+
+
 def build_overview_figures(
     filtered_df: pd.DataFrame,
     scoped_df: pd.DataFrame,
@@ -529,10 +564,15 @@ def build_overview_figures(
         filtered_base_df = filtered_base_df.loc[
             ~stat_mask_combined.reindex(filtered_base_df.index, fill_value=False).astype(bool)
         ].copy()
+    filtered_base_df, overlays_df, z_axis_col, z_axis_label = _materialize_color_param_z_axis(
+        filtered_base_df,
+        overlays_df,
+        str(config.color_param),
+    )
     fig_3d, _ = _build_isotope_3d_scatter(
         filtered_base_df,
-        z_col=config.z_axis,
-        z_label=config.z_axis,
+        z_col=z_axis_col,
+        z_label=z_axis_label,
         color_col=config.color_param,
         color_label=config.color_param,
         title="Processing 3D Chart",
@@ -543,11 +583,11 @@ def build_overview_figures(
             overlays_df,
             summary_masks,
             sat_masks,
-            z_col=config.z_axis,
-            z_label=config.z_axis,
+            z_col=z_axis_col,
+            z_label=z_axis_label,
             config=config,
         )
-        axis_cols = ["d 18O/16O  Mean", "d 13C/12C  Mean", str(config.z_axis)]
+        axis_cols = ["d 18O/16O  Mean", "d 13C/12C  Mean", str(z_axis_col)]
         axis_df = pd.concat(
             [
                 _numeric_axis_rows(filtered_base_df, axis_cols),
@@ -559,7 +599,7 @@ def build_overview_figures(
         if not axis_df.empty:
             x_range = _axis_range(axis_df["d 18O/16O  Mean"])
             y_range = _axis_range(axis_df["d 13C/12C  Mean"])
-            z_range = _axis_range(axis_df[str(config.z_axis)])
+            z_range = _axis_range(axis_df[str(z_axis_col)])
             scene_update: dict[str, Any] = {}
             if x_range is not None:
                 scene_update["xaxis"] = {"range": x_range}

@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from ..domain.calibration.core import (
+    _apply_manual_linearity_override_to_standards,
     _apply_linearity_correction,
     _compute_calibration_coefficients,
     _compute_linearity_fit,
@@ -23,6 +24,9 @@ from ..domain.calibration.core import (
 )
 from ..domain.contracts import (
     CalibrationConfig,
+    CalibrationOfficialValue,
+    CalibrationOfficialValueDeleteResult,
+    CalibrationOfficialValueUpsertRequest,
     CalibrationWorkspace,
     ChartBundle,
     CycleDiagnosticsPayload,
@@ -338,6 +342,48 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/standards/official-values", response_model=list[CalibrationOfficialValue])
+def list_official_standard_values() -> list[CalibrationOfficialValue]:
+    repo = StandardsRepository.default()
+    return [CalibrationOfficialValue.model_validate(item) for item in repo.all_official_values()]
+
+
+@app.post("/standards/official-values", response_model=CalibrationOfficialValue)
+def upsert_official_standard_value(payload: CalibrationOfficialValueUpsertRequest) -> CalibrationOfficialValue:
+    repo = StandardsRepository.default()
+    record = repo.upsert_official_value(
+        standard=payload.standard,
+        isotopic_value_type=payload.isotopic_value_type,
+        value=payload.value,
+        source=payload.source,
+    )
+    return CalibrationOfficialValue.model_validate(record)
+
+
+@app.delete("/standards/official-values/{standard}", response_model=CalibrationOfficialValueDeleteResult)
+def delete_standard_official_values(standard: str) -> CalibrationOfficialValueDeleteResult:
+    repo = StandardsRepository.default()
+    deleted_rows = repo.delete_standard(standard)
+    return CalibrationOfficialValueDeleteResult(standard=standard, deleted_rows=deleted_rows)
+
+
+@app.delete(
+    "/standards/official-values/{standard}/{isotopic_value_type}",
+    response_model=CalibrationOfficialValueDeleteResult,
+)
+def delete_single_official_value(
+    standard: str,
+    isotopic_value_type: str,
+) -> CalibrationOfficialValueDeleteResult:
+    repo = StandardsRepository.default()
+    deleted_rows = repo.delete_official_value(standard, isotopic_value_type)
+    return CalibrationOfficialValueDeleteResult(
+        standard=standard,
+        isotopic_value_type=isotopic_value_type,
+        deleted_rows=deleted_rows,
+    )
+
+
 @app.post("/sessions/import", response_model=ImportResult)
 async def import_session(files: list[UploadFile] = File(...)) -> ImportResult:
     uploaded = []
@@ -533,8 +579,16 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
     standards_repo = StandardsRepository.default()
     if len(config.selected_standards) not in (1, 2):
         raise HTTPException(status_code=400, detail="Please select either one or two standards for calibration.")
-    clean_stds = _filter_standards_remove_outliers(
+    standards_adjusted_df = _apply_manual_linearity_override_to_standards(
         df,
+        config.selected_standards,
+        enabled=config.linearity.manual_override_enabled,
+        d13_per_10v=config.linearity.manual_d13_per_10v,
+        d18_per_10v=config.linearity.manual_d18_per_10v,
+        use_diff_intensity=config.linearity.use_diff_intensity,
+    )
+    clean_stds = _filter_standards_remove_outliers(
+        standards_adjusted_df,
         config.selected_standards,
         config.calibration_type,
         config.sigma_level,
