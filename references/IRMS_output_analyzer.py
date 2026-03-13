@@ -1678,6 +1678,27 @@ def _include_saturated_in_range_outliers():
     return bool(st.session_state.get("include_saturated_in_range_outliers", False))
 
 
+def _partial_status_outlier_mask(df, isotope_key='any'):
+    """Return partially saturated rows currently treated as outliers."""
+    if df is None:
+        return pd.Series(dtype=bool)
+    idx = df.index
+    sat_masks = _partial_saturation_isotope_masks(df)
+    partial_mask = sat_masks.get(isotope_key, sat_masks.get('any', pd.Series(False, index=idx, dtype=bool)))
+    partial_mask = partial_mask.reindex(idx, fill_value=False).astype(bool)
+    if _include_saturated_in_range_outliers():
+        base_mask = partial_mask.copy()
+    else:
+        base_mask = pd.Series(False, index=idx, dtype=bool)
+    effective_mask = _apply_manual_outlier_overrides(
+        base_mask,
+        row_index=idx,
+        apply_true=True,
+        apply_false=True,
+    )
+    return (effective_mask & partial_mask).astype(bool)
+
+
 def _signal_in_range_mask(signal_series):
     """Return mask for rows within configured signal-intensity bounds."""
     values = pd.to_numeric(signal_series, errors='coerce')
@@ -1727,6 +1748,44 @@ def _range_outlier_mask(df, include_saturated_status=None):
         mask = mask | status_series.isin({'Partially Saturated Collectors', 'Fully Saturated Collectors'})
 
     return mask.astype(bool)
+
+
+def _compute_statistical_outlier_masks(df, sigma_level, edited_mask=None):
+    """Return per-isotope sigma masks as (d13_mask, d18_mask, combined_mask)."""
+    if df is None:
+        empty = pd.Series(dtype=bool)
+        return empty, empty, empty
+
+    idx = df.index
+    d13_vals = pd.to_numeric(df.get('d 13C/12C  Mean', pd.Series(np.nan, index=idx)), errors='coerce')
+    d18_vals = pd.to_numeric(df.get('d 18O/16O  Mean', pd.Series(np.nan, index=idx)), errors='coerce')
+
+    def _sigma_mask(series):
+        mean_val = series.mean()
+        std_val = series.std()
+        if not np.isfinite(std_val) or float(std_val) == 0.0:
+            return pd.Series(False, index=idx, dtype=bool)
+        lower = mean_val - (float(sigma_level) * std_val)
+        upper = mean_val + (float(sigma_level) * std_val)
+        return (series < lower) | (series > upper)
+
+    d13_mask = _sigma_mask(d13_vals)
+    d18_mask = _sigma_mask(d18_vals)
+
+    if edited_mask is not None:
+        edited_series = pd.Series(edited_mask, index=idx).fillna(False).astype(bool)
+        d13_mask = d13_mask & ~edited_series
+        d18_mask = d18_mask & ~edited_series
+
+    d13_mask = _apply_manual_outlier_overrides(d13_mask, row_index=idx)
+    d18_mask = _apply_manual_outlier_overrides(d18_mask, row_index=idx)
+    combined_mask = d13_mask | d18_mask
+
+    return (
+        d13_mask.fillna(False).astype(bool),
+        d18_mask.fillna(False).astype(bool),
+        combined_mask.fillna(False).astype(bool),
+    )
 
 
 def _get_isotope_columns(isotope_key):
@@ -2184,12 +2243,18 @@ def _build_selected_point_diagnostics_inline(target, pre_row=None):
         ('Signal Intensity', ['1  Cycle Int  Samp  44']),
         ('d18O values', ['d 18O/16O  Mean']),
         ('d13C values', ['d 13C/12C  Mean']),
-        ('Leak Rate', ['leak_rate']),
-        ('Total CO2', ['total_co2']),
-        ('P gasses', ['p_gases']),
-        ('P no acid', ['p_no_acid']),
+        ('Leak Rate (instrument units)', ['leak_rate']),
+        ('Total CO2 (instrument units)', ['total_co2']),
+        ('P gasses (mbar)', ['p_gases']),
+        ('P no acid (mbar)', ['p_no_acid']),
         ('Date', ['Date', 'Date_ordinal']),
     ]
+    rounded_field_labels = {
+        'Leak Rate (instrument units)',
+        'Total CO2 (instrument units)',
+        'P gasses (mbar)',
+        'P no acid (mbar)',
+    }
 
     def _has_value(value):
         if value is None:
@@ -2234,6 +2299,8 @@ def _build_selected_point_diagnostics_inline(target, pre_row=None):
             return str(int(value))
         if isinstance(value, (float, np.floating)):
             if np.isfinite(value):
+                if label in rounded_field_labels:
+                    return str(int(round(float(value))))
                 if label == 'Line' and float(value).is_integer():
                     return str(int(value))
                 return f"{float(value):.4f}"
@@ -2251,7 +2318,7 @@ def _build_selected_point_diagnostics_inline(target, pre_row=None):
                 selected_col = col
                 break
         display_value = _format_value(label, selected_value, selected_col)
-        parts.append(f"**{label}:** `{display_value}`")
+        parts.append(f"{label}: {display_value}")
 
     return " | ".join(parts)
 
@@ -2261,7 +2328,7 @@ def _render_selected_point_cycle_diagnostics(target, key_prefix):
     cycles, pre_row = _get_cycles_for_selected_point(target['row_label'], target['target_col'])
     diagnostics_line = _build_selected_point_diagnostics_inline(target, pre_row=pre_row)
     if diagnostics_line:
-        st.markdown(diagnostics_line)
+        st.caption(diagnostics_line)
 
     if cycles is None or cycles.empty:
         st.markdown("Cycle-level diagnostics are unavailable for this datapoint.")
@@ -2725,21 +2792,33 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 '' if id2_val is None or pd.isna(id2_val) else str(id2_val),
                 int(idx) if isinstance(idx, (int, np.integer)) else str(idx),
             )
-            sort_rows.append((key, idx, row))
+            sort_rows.append((key, idx, row, id2_num))
         sort_rows.sort(key=lambda x: x[0])
-        ordered_rows = [idx for _, idx, _ in sort_rows]
+        ordered_rows = [idx for _, idx, _, _ in sort_rows]
+        order_value_by_row = {
+            idx: (float(id2_num) if id2_num is not None else np.nan)
+            for _, idx, _, id2_num in sort_rows
+        }
         try:
             anchor_idx = ordered_rows.index(active_target['row_label'])
+            active_target['_interp_sort_position'] = int(anchor_idx)
         except ValueError:
             return None, None
 
         # Interpolation neighbors should ignore rows currently considered outliers.
         status_series = base.get('Collector Status', pd.Series('', index=base.index)).astype(str).str.strip()
+        target_col_norm = _normalize_column_key(target_col)
+        if '13c' in target_col_norm:
+            partial_iso_key = 'd13C'
+        elif '18o' in target_col_norm:
+            partial_iso_key = 'd18O'
+        else:
+            partial_iso_key = 'any'
+        partial_status_excluded = _partial_status_outlier_mask(base, isotope_key=partial_iso_key)
         status_excluded = status_series.isin({
             'Failed Sample',
             'Fully Saturated Collectors',
-            'Partially Saturated Collectors',
-        })
+        }) | partial_status_excluded
 
         range_excluded = pd.Series(False, index=base.index, dtype=bool)
         try:
@@ -2804,6 +2883,8 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                     'row_label': idx,
                     'identifier_2': '' if pd.isna(id2_val) else str(id2_val),
                     'value': float(val),
+                    'order_value': order_value_by_row.get(idx, np.nan),
+                    'sort_position': int(i),
                 }
                 break
 
@@ -2819,10 +2900,56 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                     'row_label': idx,
                     'identifier_2': '' if pd.isna(id2_val) else str(id2_val),
                     'value': float(val),
+                    'order_value': order_value_by_row.get(idx, np.nan),
+                    'sort_position': int(i),
                 }
                 break
 
         return prev_neighbor, next_neighbor
+
+    def _compute_neighbor_linear_interpolation(active_target, prev_neighbor, next_neighbor):
+        """Interpolate target value from neighboring points on the identifier axis."""
+        if prev_neighbor is None or next_neighbor is None:
+            return None
+        y0 = pd.to_numeric(pd.Series([prev_neighbor.get('value')]), errors='coerce').iloc[0]
+        y1 = pd.to_numeric(pd.Series([next_neighbor.get('value')]), errors='coerce').iloc[0]
+        if pd.isna(y0) or pd.isna(y1):
+            return None
+
+        # Preferred: interpolate by numeric Identifier 2 spacing.
+        xt = pd.to_numeric(
+            pd.Series([_parse_numeric_token(active_target.get('identifier_2'))]),
+            errors='coerce',
+        ).iloc[0]
+        x0 = pd.to_numeric(pd.Series([prev_neighbor.get('order_value')]), errors='coerce').iloc[0]
+        x1 = pd.to_numeric(pd.Series([next_neighbor.get('order_value')]), errors='coerce').iloc[0]
+        if (
+            pd.notna(xt)
+            and pd.notna(x0)
+            and pd.notna(x1)
+            and not np.isclose(float(x1), float(x0))
+        ):
+            ratio = (float(xt) - float(x0)) / (float(x1) - float(x0))
+            if np.isfinite(ratio):
+                ratio = float(np.clip(ratio, 0.0, 1.0))
+                return float(float(y0) + ratio * (float(y1) - float(y0)))
+
+        # Fallback: use relative rank in sorted sequence.
+        pt = pd.to_numeric(pd.Series([active_target.get('_interp_sort_position')]), errors='coerce').iloc[0]
+        p0 = pd.to_numeric(pd.Series([prev_neighbor.get('sort_position')]), errors='coerce').iloc[0]
+        p1 = pd.to_numeric(pd.Series([next_neighbor.get('sort_position')]), errors='coerce').iloc[0]
+        if (
+            pd.notna(pt)
+            and pd.notna(p0)
+            and pd.notna(p1)
+            and not np.isclose(float(p1), float(p0))
+        ):
+            ratio = (float(pt) - float(p0)) / (float(p1) - float(p0))
+            if np.isfinite(ratio):
+                ratio = float(np.clip(ratio, 0.0, 1.0))
+                return float(float(y0) + ratio * (float(y1) - float(y0)))
+
+        return float((float(y0) + float(y1)) / 2.0)
 
     points = _get_selected_plotly_points(chart_state)
     selected_targets = []
@@ -2866,31 +2993,37 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
         selected_targets.append(built)
 
     if selected_targets:
-        # In Streamlit rerun flow, shift+click can arrive as only the newest point.
-        # Merge with previous persisted selection so additive multi-select remains usable.
+        # Prefer the newly clicked sample. Only merge when the selected token was
+        # already part of the persisted set (same-point reselection).
         if len(selected_targets) == 1 and persisted_targets:
-            merged = persisted_targets[:]
-            merged_tokens = set(persisted_tokens)
-            for t in selected_targets:
-                tok = _token_for_target(t)
-                if tok not in merged_tokens:
-                    merged.append(t)
-                    merged_tokens.add(tok)
-            selected_targets = merged
+            selected_token = _token_for_target(selected_targets[0])
+            if selected_token in persisted_tokens:
+                merged = persisted_targets[:]
+                merged_tokens = set(persisted_tokens)
+                if selected_token not in merged_tokens:
+                    merged.append(selected_targets[0])
+                    merged_tokens.add(selected_token)
+                selected_targets = merged
         st.session_state[selected_tokens_key] = [_token_for_target(t) for t in selected_targets]
 
     if len(selected_targets) == 1:
         st.session_state[nav_token_key] = _token_for_target(selected_targets[0])
     elif len(selected_targets) == 0:
-        restored_targets = persisted_targets
-        if restored_targets:
-            selected_targets = restored_targets
+        # If a chart click happened but no editable target was captured, do not
+        # reopen a stale selection from a previous click.
+        if points:
+            st.session_state.pop(selected_tokens_key, None)
+            st.session_state.pop(nav_token_key, None)
         else:
-            nav_target = _target_from_token(st.session_state.get(nav_token_key))
-            if nav_target is not None:
-                selected_targets = [nav_target]
+            restored_targets = persisted_targets
+            if restored_targets:
+                selected_targets = restored_targets
             else:
-                st.session_state.pop(selected_tokens_key, None)
+                nav_target = _target_from_token(st.session_state.get(nav_token_key))
+                if nav_target is not None:
+                    selected_targets = [nav_target]
+                else:
+                    st.session_state.pop(selected_tokens_key, None)
 
     # Selection highlights are rendered before this function runs; force one
     # extra rerun when click-selection state changes so rings appear immediately.
@@ -3126,6 +3259,8 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 ],
                 context={"editor": editor_key_prefix},
             )
+            # Force chart remount so viewport/zoom recomputes after outlier status changes.
+            st.session_state[chart_nonce_key] = int(st.session_state.get(chart_nonce_key, 0)) + 1
             st.success(
                 f"Outlier override set to {bool(outlier_checked)} for "
                 f"{target['identifier_1']} / {target['identifier_2']}."
@@ -3178,10 +3313,15 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                         disabled=(prev_neighbor is None or next_neighbor is None),
                         use_container_width=True,
                     ):
-                        interp_value = (prev_neighbor['value'] + next_neighbor['value']) / 2.0
-                        _apply_interpolated_value_to_target(iso_target, float(interp_value))
+                        interp_value = _compute_neighbor_linear_interpolation(
+                            iso_target,
+                            prev_neighbor,
+                            next_neighbor,
+                        )
+                        if interp_value is not None:
+                            _apply_interpolated_value_to_target(iso_target, float(interp_value))
 
-            diag_target = cross_targets.get('d13C') or cross_targets.get('d18O')
+            diag_target = cross_targets.get('d18O') or cross_targets.get('d13C')
             if diag_target is not None and not bool(diag_target.get('is_failed_sample', False)):
                 _render_selected_point_cycle_diagnostics(diag_target, editor_key_prefix)
             return
@@ -3363,14 +3503,27 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
                 use_container_width=True,
             )
         if submitted_interpolate and prev_neighbor is not None and next_neighbor is not None:
+            interp_value = _compute_neighbor_linear_interpolation(target, prev_neighbor, next_neighbor)
             interpolation_plan = [
                 {
                     "target": target,
-                    "value": (prev_neighbor['value'] + next_neighbor['value']) / 2.0,
+                    "value": float(interp_value) if interp_value is not None else float(
+                        (prev_neighbor['value'] + next_neighbor['value']) / 2.0
+                    ),
                 }
             ]
         if not is_failed_sample:
-            _render_selected_point_cycle_diagnostics(target, editor_key_prefix)
+            diag_target = target
+            if str(target.get('isotope_key', '')).strip() != 'd18O':
+                d18_diag_target = _build_target(
+                    'd18O',
+                    target['row_label'],
+                    identifier_1=target.get('identifier_1'),
+                    identifier_2=target.get('identifier_2'),
+                )
+                if d18_diag_target is not None:
+                    diag_target = d18_diag_target
+            _render_selected_point_cycle_diagnostics(diag_target, editor_key_prefix)
 
         if submitted_set:
             original_map = st.session_state.setdefault('original_delta_values', {})
@@ -3540,10 +3693,13 @@ def _render_delta_editor_from_chart_selection(chart_state, editor_key_prefix):
             iso_key = str(target.get('isotope_key', '')).strip()
             if iso_key not in interpolation_plan_by_iso:
                 continue
+            interp_value = _compute_neighbor_linear_interpolation(target, prev_neighbor, next_neighbor)
+            if interp_value is None:
+                continue
             interpolation_plan_by_iso[iso_key].append(
                 {
                     "target": target,
-                    "value": (prev_neighbor['value'] + next_neighbor['value']) / 2.0,
+                    "value": float(interp_value),
                 }
             )
         submitted_interpolate_d13 = False
@@ -5246,27 +5402,69 @@ def _interpolate_outliers_by_identifier2(df, outlier_mask, cols, id2_col='Identi
         order = pd.Series(np.arange(len(work)), index=work.index)
 
     work['_order_irms'] = order
-    work['_orig_pos_irms'] = np.arange(len(work))
+    work['_orig_pos_irms'] = np.arange(len(work), dtype=float)
 
-    # Sort by order then by original position to keep stability; NaNs go to the end
+    # Sort by order then by original position to keep stability; NaNs go to the end.
     work_sorted = work.sort_values(['_order_irms', '_orig_pos_irms'], na_position='last')
-    mask_sorted = outlier_mask.reindex(work_sorted.index).fillna(False)
+    mask_sorted = outlier_mask.reindex(work_sorted.index).fillna(False).astype(bool)
+
+    # Use Identifier 2 numeric spacing when available; fallback to sorted position.
+    x_order = pd.to_numeric(work_sorted['_order_irms'], errors='coerce')
+    x_pos = pd.Series(np.arange(len(work_sorted), dtype=float), index=work_sorted.index)
+    x_axis = x_order.where(x_order.notna(), x_pos)
+    x_values = pd.to_numeric(x_axis, errors='coerce').to_numpy(dtype=float)
+    mask_values = mask_sorted.to_numpy(dtype=bool)
+    target_positions = np.flatnonzero(mask_values)
 
     for col in cols:
         if col not in work_sorted.columns:
             continue
-        s = pd.to_numeric(work_sorted[col], errors='coerce')
-        s_masked = s.copy()
-        s_masked[mask_sorted] = np.nan
-        s_interp = s_masked.interpolate(method='linear', limit_direction='both')
-        # Assign back only for the outlier rows
-        idx_to_update = mask_sorted[mask_sorted].index
-        work_sorted.loc[idx_to_update, col] = s_interp.loc[idx_to_update]
+        y_series = pd.to_numeric(work_sorted[col], errors='coerce')
+        y_values = y_series.to_numpy(dtype=float)
+        known_positions = np.flatnonzero((~mask_values) & np.isfinite(y_values))
+        if known_positions.size == 0 or target_positions.size == 0:
+            continue
 
-    # Restore original order
+        updates = {}
+        for pos in target_positions:
+            left = known_positions[known_positions < pos]
+            right = known_positions[known_positions > pos]
+            if left.size == 0 and right.size == 0:
+                continue
+            if left.size == 0:
+                interp_val = y_values[right[0]]
+            elif right.size == 0:
+                interp_val = y_values[left[-1]]
+            else:
+                p = int(left[-1])
+                n = int(right[0])
+                y0 = y_values[p]
+                y1 = y_values[n]
+                x0 = x_values[p]
+                x1 = x_values[n]
+                xt = x_values[pos]
+                if (
+                    np.isfinite(x0)
+                    and np.isfinite(x1)
+                    and np.isfinite(xt)
+                    and not np.isclose(float(x1), float(x0))
+                ):
+                    ratio = (float(xt) - float(x0)) / (float(x1) - float(x0))
+                else:
+                    denom = float(n - p)
+                    ratio = (float(pos) - float(p)) / denom if denom != 0 else 0.5
+                if not np.isfinite(ratio):
+                    ratio = 0.5
+                ratio = float(np.clip(ratio, 0.0, 1.0))
+                interp_val = float(y0) + ratio * (float(y1) - float(y0))
+            if np.isfinite(interp_val):
+                updates[work_sorted.index[pos]] = float(interp_val)
+
+        if updates:
+            work_sorted.loc[list(updates.keys()), col] = pd.Series(updates)
+
     work_sorted = work_sorted.sort_values('_orig_pos_irms')
-    work_sorted = work_sorted.drop(columns=['_order_irms', '_orig_pos_irms'])
-    return work_sorted
+    return work_sorted.drop(columns=['_order_irms', '_orig_pos_irms'])
 
 def _sanitize_filename(name: str) -> str:
     try:
@@ -6611,6 +6809,118 @@ def download_excel(df, outliers=None, filename="data.xlsx", selected_standards=N
     except Exception as e:
         st.warning(f"Client Output creation failed: {e}")
 
+# Rebind extracted pure-domain helpers so the Streamlit app can progressively
+# act as a thin adapter while the backend package grows around it.
+from services.irms_api.domain.import_session import (  # noqa: E402
+    _append_cycles_source,
+    _append_rows_preserve_existing_index,
+    _build_uploaded_file_spec,
+    _load_uploaded_workbooks,
+    _normalize_upload_spec,
+    _upload_spec_signature,
+)
+from services.irms_api.domain.shared.dataframe import (  # noqa: E402
+    _apply_cycle_averages,
+    _coalesce_duplicate_columns,
+    _ensure_cycle1_signal_difference_columns,
+    _extract_numeric,
+    _find_column,
+    _get_species_series,
+    _normalize_column_key,
+    _normalize_signal_intensity,
+    _parse_new_table_layout,
+    _parse_numeric_token,
+    _pick_cycle1_signal_columns,
+    _split_label_species,
+    _standardize_isotope_columns,
+    extract_info_values,
+    extract_number,
+)
+from services.irms_api.domain.shared.plotting import (  # noqa: E402
+    _apply_cycle_std_error_bars,
+    _build_cycle_std_lookups,
+    _build_date_colorbar_ticks,
+    _build_delta_point_customdata,
+    _build_isotope_3d_scatter,
+    _build_plotly_error_bar,
+    _build_plotly_error_bar_for_df,
+    _compose_label_series,
+    _exclusive_outlier_masks,
+    _prepare_color_values,
+)
+from services.irms_api.domain.calibration.core import (  # noqa: E402
+    _apply_linearity_correction,
+    _compute_calibration_coefficients,
+    _compute_linearity_fit,
+    _compute_sigma_stats,
+    _filter_standards_remove_outliers,
+    _linearity_intensity_axis_label,
+    _resolve_linearity_intensity_column_for_fits,
+    _resolve_linearity_reference_intensity,
+    create_calibration_plots,
+    calibrate_results,
+    double_point_calibration,
+    get_true_value,
+    identify_outliers,
+    identify_outliers_iqr,
+    single_point_calibration,
+)
+from services.irms_api.domain.diagnostics.core import create_diagnostic_plots  # noqa: E402
+from services.irms_api.domain.processing.core import (  # noqa: E402
+    _get_isotope_columns,
+    _interpolate_outliers_by_identifier2,
+    _partial_saturation_isotope_masks,
+    RangeConfig,
+)
+from services.irms_api.domain.processing.cycles import (  # noqa: E402
+    compute_cycle_mean_for_target as _api_compute_cycle_mean_for_target,
+    get_cycles_for_selected_point as _api_get_cycles_for_selected_point,
+)
+from services.irms_api.domain.processing.outliers import (  # noqa: E402
+    _apply_manual_outlier_overrides as _api_apply_manual_outlier_overrides,
+    _range_outlier_mask as _api_range_outlier_mask,
+)
+
+
+def _apply_manual_outlier_overrides(mask, row_index=None, apply_true=True, apply_false=True):
+    edit_state = {
+        "manual_outlier_overrides": dict(st.session_state.get("manual_outlier_overrides", {})),
+    }
+    return _api_apply_manual_outlier_overrides(
+        mask,
+        edit_state=edit_state,
+        row_index=row_index,
+        apply_true=apply_true,
+        apply_false=apply_false,
+    )
+
+
+def _range_outlier_mask(df, include_saturated_status=None):
+    if include_saturated_status is None:
+        include_saturated_status = bool(st.session_state.get("include_saturated_in_range_outliers", False))
+    return _api_range_outlier_mask(
+        df,
+        RangeConfig(include_saturated_status=bool(include_saturated_status)),
+    )
+
+
+def _get_cycles_for_selected_point(row_label, target_col):
+    return _api_get_cycles_for_selected_point(
+        st.session_state.get("df"),
+        st.session_state.get("df_cycles_source"),
+        row_label,
+        target_col,
+    )
+
+
+def _compute_cycle_mean_for_target(target, correct_linearity=False, target_intensity=15.0):
+    return _api_compute_cycle_mean_for_target(
+        st.session_state.get("df"),
+        st.session_state.get("df_cycles_source"),
+        target,
+        correct_linearity=correct_linearity,
+        target_intensity=target_intensity,
+    )
 
 if "df" not in st.session_state:
     st.session_state.df = None
@@ -9285,24 +9595,16 @@ def main():
             )
             failed_idx = species_data_unfiltered[failed_mask].index
             
-            # Calculate statistical outliers
-            mean_d13C = species_data['d 13C/12C  Mean'].mean()
-            std_d13C = species_data['d 13C/12C  Mean'].std()
-            mean_d18O = species_data['d 18O/16O  Mean'].mean()
-            std_d18O = species_data['d 18O/16O  Mean'].std()
-            
-            outlier_mask = (
-                (species_data['d 13C/12C  Mean'] < mean_d13C - (sigma_level_data * std_d13C)) |
-                (species_data['d 13C/12C  Mean'] > mean_d13C + (sigma_level_data * std_d13C)) |
-                (species_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
-                (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
+            # Calculate isotope-specific statistical outliers.
+            stat_mask_d13, _, stat_mask_any = _compute_statistical_outlier_masks(
+                species_data,
+                sigma_level_data,
+                edited_mask=edited_mask_species,
             )
-            outlier_mask = outlier_mask & ~edited_mask_species
-            outlier_mask = _apply_manual_outlier_overrides(outlier_mask, row_index=species_data.index)
-            # Store statistical outliers
-            statistical_outliers = species_data[outlier_mask].copy()
-            if not statistical_outliers.empty:
-                _register_statistical_outlier_rows(statistical_outliers.index)
+            statistical_outliers = species_data[stat_mask_d13].copy()
+            stat_rows_any = species_data[stat_mask_any].copy()
+            if not stat_rows_any.empty:
+                _register_statistical_outlier_rows(stat_rows_any.index)
 
             # Calculate range outliers mask using unfiltered data so signal/leak outliers aren't dropped
             range_mask_unfiltered = _range_outlier_mask(species_data_unfiltered)
@@ -9326,13 +9628,11 @@ def main():
             else:
                 range_outliers = pd.DataFrame(columns=species_data_unfiltered.columns)
                 
-            # Filter data to plot - exclude statistical, range outliers, and saturated samples
-            partial_idx_mask = saturated_collectors_mask.reindex(species_data.index, fill_value=False)
-            if _include_saturated_in_range_outliers():
-                partial_idx_mask = pd.Series(False, index=species_data.index, dtype=bool)
-            outlier_drop_mask = (outlier_mask | range_mask_for_plot) & ~partial_idx_mask
+            # Filter data to plot. Partially saturated rows stay in-curve unless currently treated as outliers.
+            partial_idx_mask = _partial_status_outlier_mask(species_data, isotope_key='d13C')
+            outlier_drop_mask = stat_mask_d13 | range_mask_for_plot
             data_to_plot = species_data[
-                ~(outlier_drop_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+                ~(outlier_drop_mask | partial_idx_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
             ].copy()
             
             # Sort data by x_axis to ensure sequential line connections
@@ -9744,23 +10044,16 @@ def main():
             saturated_samples_idx = species_data_unfiltered[saturated_samples_mask].index
             failed_idx = species_data_unfiltered[failed_mask].index
             
-            # Calculate statistical outliers
-            mean_d13C = species_data['d 13C/12C  Mean'].mean()
-            std_d13C = species_data['d 13C/12C  Mean'].std()
-            mean_d18O = species_data['d 18O/16O  Mean'].mean()
-            std_d18O = species_data['d 18O/16O  Mean'].std()
-            
-            outlier_mask = (
-                (species_data['d 13C/12C  Mean'] < mean_d13C - (sigma_level_data * std_d13C)) |
-                (species_data['d 13C/12C  Mean'] > mean_d13C + (sigma_level_data * std_d13C)) |
-                (species_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
-                (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
+            # Calculate isotope-specific statistical outliers.
+            _, stat_mask_d18, stat_mask_any = _compute_statistical_outlier_masks(
+                species_data,
+                sigma_level_data,
+                edited_mask=edited_mask_species,
             )
-            outlier_mask = outlier_mask & ~edited_mask_species
-            outlier_mask = _apply_manual_outlier_overrides(outlier_mask, row_index=species_data.index)
-            statistical_outliers = species_data[outlier_mask].copy()
-            if not statistical_outliers.empty:
-                _register_statistical_outlier_rows(statistical_outliers.index)
+            statistical_outliers = species_data[stat_mask_d18].copy()
+            stat_rows_any = species_data[stat_mask_any].copy()
+            if not stat_rows_any.empty:
+                _register_statistical_outlier_rows(stat_rows_any.index)
             
             # Calculate range outliers
             if show_range_outliers:
@@ -9784,12 +10077,10 @@ def main():
                 range_outliers = pd.DataFrame(columns=species_data.columns)
                 range_mask_for_plot = pd.Series(False, index=species_data.index, dtype=bool)
 
-            partial_idx_mask = saturated_collectors_mask.reindex(species_data.index, fill_value=False)
-            if _include_saturated_in_range_outliers():
-                partial_idx_mask = pd.Series(False, index=species_data.index, dtype=bool)
-            outlier_drop_mask = (outlier_mask | range_mask_for_plot) & ~partial_idx_mask
+            partial_idx_mask = _partial_status_outlier_mask(species_data, isotope_key='d18O')
+            outlier_drop_mask = stat_mask_d18 | range_mask_for_plot
             data_to_plot = species_data[
-                ~(outlier_drop_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+                ~(outlier_drop_mask | partial_idx_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
             ].copy()
             
             # Sort data by x_axis to ensure sequential line connections
@@ -10210,22 +10501,13 @@ def main():
             )
             failed_idx = species_data_unfiltered[failed_mask].index
 
-            # Compute statistical thresholds per species
-            mean_d13C = species_data['d 13C/12C  Mean'].mean()
-            std_d13C = species_data['d 13C/12C  Mean'].std()
-            mean_d18O = species_data['d 18O/16O  Mean'].mean()
-            std_d18O = species_data['d 18O/16O  Mean'].std()
             edited_mask_species = pd.Series(species_data.index.map(_is_row_edited), index=species_data.index, dtype=bool)
-
-            outlier_mask = (
-                (species_data['d 13C/12C  Mean'] < mean_d13C - (sigma_level_data * std_d13C)) |
-                (species_data['d 13C/12C  Mean'] > mean_d13C + (sigma_level_data * std_d13C)) |
-                (species_data['d 18O/16O  Mean'] < mean_d18O - (sigma_level_data * std_d18O)) |
-                (species_data['d 18O/16O  Mean'] > mean_d18O + (sigma_level_data * std_d18O))
+            _, _, stat_mask_any = _compute_statistical_outlier_masks(
+                species_data,
+                sigma_level_data,
+                edited_mask=edited_mask_species,
             )
-            outlier_mask = outlier_mask & ~edited_mask_species
-            outlier_mask = _apply_manual_outlier_overrides(outlier_mask, row_index=species_data.index)
-            stat_outliers_scatter_all = species_data[outlier_mask].copy()
+            stat_outliers_scatter_all = species_data[stat_mask_any].copy()
             if not stat_outliers_scatter_all.empty:
                 _register_statistical_outlier_rows(stat_outliers_scatter_all.index)
 
@@ -10243,10 +10525,11 @@ def main():
                 apply_false=True,
             )
             range_mask_for_plot = range_mask_unfiltered.reindex(species_data.index, fill_value=False)
+            partial_idx_mask = _partial_status_outlier_mask(species_data, isotope_key='any')
 
             # Filter to non-outliers for main scatter
             data_to_plot = species_data[
-                ~(outlier_mask | range_mask_for_plot | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
+                ~(stat_mask_any | range_mask_for_plot | partial_idx_mask | species_data.index.isin(saturated_samples_idx) | species_data.index.isin(failed_idx))
             ].copy()
             # Drop rows with missing isotope values
             data_to_plot = data_to_plot[
@@ -10393,6 +10676,45 @@ def main():
                     ))
                     scatter_legend_failed_full_shown = True
 
+        cross_active_target = _get_active_editor_target("tab3_crossplot_editor")
+        if (
+            cross_active_target is not None
+            and cross_active_target.get('row_label') in subset_data_unfiltered.index
+        ):
+            active_row = subset_data_unfiltered.loc[cross_active_target['row_label']]
+            if isinstance(active_row, pd.DataFrame):
+                active_row = active_row.iloc[0]
+            x_active = pd.to_numeric(pd.Series([active_row.get('d 18O/16O  Mean')]), errors='coerce').iloc[0]
+            y_active = pd.to_numeric(pd.Series([active_row.get('d 13C/12C  Mean')]), errors='coerce').iloc[0]
+            if pd.notna(x_active) and pd.notna(y_active):
+                species_scatter.add_trace(go.Scatter(
+                    x=[float(x_active)],
+                    y=[float(y_active)],
+                    mode='markers',
+                    name='Selected sample',
+                    marker=dict(
+                        size=18,
+                        symbol='circle-open',
+                        color='#ff00ff',
+                        line=dict(width=3, color='#ff00ff'),
+                    ),
+                    showlegend=True,
+                    legendgroup='active_selection',
+                ))
+
+        crossplot_uirevision = "|".join([
+            "tab3_crossplot",
+            str(selected_identifier),
+            str(color_param_tab3_value_col),
+            str(show_statistical_outliers),
+            str(show_range_outliers),
+            str(show_saturated_collectors),
+            str(show_saturated_samples),
+            str(show_failed_samples),
+            str(len(subset_data)),
+            str(len(subset_data_unfiltered)),
+        ])
+
         species_scatter.update_layout(
             title="d13C vs d18O by Species",
             xaxis=dict(
@@ -10414,20 +10736,126 @@ def main():
             showlegend=True,
             height=900,
             clickmode='event+select',
-            dragmode='zoom'
+            dragmode='zoom',
+            uirevision=crossplot_uirevision,
         )
         cross_editor_prefix = "tab3_crossplot_editor"
         _apply_cycle_std_error_bars(species_scatter, d13_std_lookup, d18_std_lookup)
         _apply_editor_selection_to_figure(species_scatter, cross_editor_prefix)
         cross_chart_nonce = int(st.session_state.get(f"{cross_editor_prefix}_chart_nonce", 0))
+        cross_chart_state = None
         with crossplot_container:
-            cross_chart_state = st.plotly_chart(
-                species_scatter,
-                width='stretch',
-                key=f"tab3_crossplot_{cross_chart_nonce}",
-                on_select='rerun',
-                selection_mode='points'
+            render_cross_series_mode = (
+                cross_active_target is not None
+                and cross_active_target.get('row_label') in subset_data_unfiltered.index
+                and species_col in subset_data_unfiltered.columns
             )
+            if render_cross_series_mode:
+                st.caption("Crossplot selection editor: stacked isotope series for the selected species.")
+                selected_row_label = cross_active_target['row_label']
+                selected_species_value = subset_data_unfiltered.at[selected_row_label, species_col]
+                selected_species = '' if pd.isna(selected_species_value) else str(selected_species_value).strip()
+
+                selected_species_data = subset_data_unfiltered[
+                    subset_data_unfiltered[species_col].astype(str).str.strip().eq(selected_species)
+                ].copy()
+                if selected_species_data.empty:
+                    selected_species_data = subset_data_unfiltered.loc[[selected_row_label]].copy()
+
+                if x_axis_option == "By Identifier 2":
+                    selected_species_data['_cross_series_x'] = selected_species_data['Identifier 2'].apply(_parse_numeric_token)
+                    x_title = "Identifier 2"
+                else:
+                    selected_species_data['_cross_series_x'] = np.arange(len(selected_species_data), dtype=float)
+                    x_title = "Sample Number"
+                selected_species_data = selected_species_data.sort_values('_cross_series_x', na_position='last')
+
+                chart_states = []
+                chart_specs = [
+                    ('d13C', 'd 13C/12C  Mean', "d13C (\u2030)", False),
+                    ('d18O', 'd 18O/16O  Mean', "d18O (\u2030)", True),
+                ]
+                for iso_key, y_col, y_title, reverse_axis in chart_specs:
+                    series_df = selected_species_data[
+                        selected_species_data[y_col].notna() & selected_species_data['_cross_series_x'].notna()
+                    ].copy()
+                    fig_series = go.Figure()
+                    if not series_df.empty:
+                        fig_series.add_trace(go.Scatter(
+                            x=series_df['_cross_series_x'],
+                            y=series_df[y_col],
+                            mode='lines+markers',
+                            name=f"{iso_key} series",
+                            marker=dict(size=8, symbol='circle', color='#1f77b4'),
+                            line=dict(color='#1f77b4', width=2),
+                            text=series_df['Identifier 2'].astype(str),
+                            customdata=_build_delta_point_customdata(series_df, iso_key),
+                            hovertemplate=(
+                                'Identifier 2: %{text}<br>'
+                                + f'{iso_key}: %{{y:.4f}}<extra></extra>'
+                            ),
+                        ))
+
+                    selected_y = pd.to_numeric(
+                        pd.Series([st.session_state.df.at[selected_row_label, y_col]]),
+                        errors='coerce'
+                    ).iloc[0]
+                    selected_x = np.nan
+                    if selected_row_label in selected_species_data.index:
+                        selected_x = pd.to_numeric(
+                            pd.Series([selected_species_data.at[selected_row_label, '_cross_series_x']]),
+                            errors='coerce',
+                        ).iloc[0]
+                    if pd.notna(selected_x) and pd.notna(selected_y):
+                        fig_series.add_trace(go.Scatter(
+                            x=[float(selected_x)],
+                            y=[float(selected_y)],
+                            mode='markers',
+                            name='Selected sample',
+                            marker=dict(
+                                size=18,
+                                symbol='circle-open',
+                                color='#ff00ff',
+                                line=dict(width=3, color='#ff00ff'),
+                            ),
+                            showlegend=True,
+                            legendgroup='active_selection',
+                        ))
+
+                    fig_series.update_layout(
+                        title=f"{selected_species or 'Selected sample'} - {iso_key} series",
+                        xaxis_title=x_title,
+                        yaxis_title=y_title,
+                        showlegend=True,
+                        height=360,
+                        clickmode='event+select',
+                        dragmode='zoom',
+                    )
+                    if reverse_axis:
+                        fig_series.update_yaxes(autorange='reversed')
+
+                    chart_state = st.plotly_chart(
+                        fig_series,
+                        width='stretch',
+                        key=f"tab3_crossplot_series_{iso_key}_{cross_chart_nonce}",
+                        on_select='rerun',
+                        selection_mode='points'
+                    )
+                    chart_states.append(chart_state)
+
+                merged_points = []
+                for state in chart_states:
+                    merged_points.extend(_get_selected_plotly_points(state))
+                if merged_points:
+                    cross_chart_state = {'selection': {'points': merged_points}}
+            else:
+                cross_chart_state = st.plotly_chart(
+                    species_scatter,
+                    width='stretch',
+                    key=f"tab3_crossplot_{cross_chart_nonce}",
+                    on_select='rerun',
+                    selection_mode='points'
+                )
         _render_delta_editor_from_chart_selection(cross_chart_state, cross_editor_prefix)
 
         # Process individual species
@@ -10474,17 +10902,6 @@ def main():
             with col1:
                 st.subheader(f'Species: {species}')
 
-            # Calculate thresholds for outliers for each comment subset
-            mean_d13C = species_data['d 13C/12C  Mean'].mean()
-            std_d13C = species_data['d 13C/12C  Mean'].std()
-            mean_d18O = species_data['d 18O/16O  Mean'].mean()
-            std_d18O = species_data['d 18O/16O  Mean'].std()
-
-            lower_threshold_d13C = mean_d13C - (sigma_level_data * std_d13C)
-            upper_threshold_d13C = mean_d13C + (sigma_level_data * std_d13C)
-            lower_threshold_d18O = mean_d18O - (sigma_level_data * std_d18O)
-            upper_threshold_d18O = mean_d18O + (sigma_level_data * std_d18O)
-
             # Create x_axis values first for all data
             species_data['x_axis'] = np.nan
             if x_axis_option == "By Identifier 2":
@@ -10492,29 +10909,27 @@ def main():
             else:
                 species_data['x_axis'] = range(len(species_data))
 
-            # Now identify statistical outliers (after x_axis is created)
-            outlier_mask = (
-                (species_data['d 13C/12C  Mean'] < lower_threshold_d13C) |
-                (species_data['d 13C/12C  Mean'] > upper_threshold_d13C) |
-                (species_data['d 18O/16O  Mean'] < lower_threshold_d18O) |
-                (species_data['d 18O/16O  Mean'] > upper_threshold_d18O)
+            # Compute statistical outliers independently per isotope.
+            stat_mask_d13, stat_mask_d18, stat_mask_any = _compute_statistical_outlier_masks(
+                species_data,
+                sigma_level_data,
+                edited_mask=edited_mask_species,
             )
-            outlier_mask = outlier_mask & ~edited_mask_species
-            outlier_mask = _apply_manual_outlier_overrides(outlier_mask, row_index=species_data.index)
-            # Apply mask and include necessary columns (including x_axis)
-            statistical_outliers = species_data[outlier_mask].copy()
+            statistical_outliers_d13 = species_data[stat_mask_d13].copy()
+            statistical_outliers_d18 = species_data[stat_mask_d18].copy()
+            statistical_outliers = species_data[stat_mask_any].copy()
             if not statistical_outliers.empty:
                 _register_statistical_outlier_rows(statistical_outliers.index)
 
-            # Remove statistical outliers and saturated samples from data_to_plot
+            # Remove statistical outliers and saturated/failed samples from the base curves.
             saturated_idx_mask = pd.Series(species_data.index.isin(saturated_samples_idx), index=species_data.index, dtype=bool)
             failed_idx_mask = pd.Series(species_data.index.isin(failed_idx), index=species_data.index, dtype=bool)
-            partial_idx_mask = saturated_collectors_mask_any.reindex(species_data.index, fill_value=False)
-            if _include_saturated_in_range_outliers():
-                partial_idx_mask = pd.Series(False, index=species_data.index, dtype=bool)
-            non_partial_outlier_mask = outlier_mask.reindex(species_data.index, fill_value=False) & ~partial_idx_mask
-            drop_mask = non_partial_outlier_mask | saturated_idx_mask | failed_idx_mask
-            data_to_plot = species_data[~drop_mask].copy()
+            partial_idx_mask_d13 = _partial_status_outlier_mask(species_data, isotope_key='d13C')
+            partial_idx_mask_d18 = _partial_status_outlier_mask(species_data, isotope_key='d18O')
+            drop_mask_d13 = stat_mask_d13.reindex(species_data.index, fill_value=False) | partial_idx_mask_d13 | saturated_idx_mask | failed_idx_mask
+            drop_mask_d18 = stat_mask_d18.reindex(species_data.index, fill_value=False) | partial_idx_mask_d18 | saturated_idx_mask | failed_idx_mask
+            data_to_plot_d13 = species_data[~drop_mask_d13].copy()
+            data_to_plot_d18 = species_data[~drop_mask_d18].copy()
 
             # Identify range bar outliers from unfiltered data
             # Identify and process range outliers if enabled
@@ -10546,13 +10961,16 @@ def main():
 
             # Handle range outliers
             if not show_range_outliers:
-                data_to_plot = data_to_plot[~data_to_plot.index.isin(range_bar_outliers.index)]
+                data_to_plot_d13 = data_to_plot_d13[~data_to_plot_d13.index.isin(range_bar_outliers.index)]
+                data_to_plot_d18 = data_to_plot_d18[~data_to_plot_d18.index.isin(range_bar_outliers.index)]
             
-            # Create a DataFrame for displaying points, always excluding outliers for the main curve
-            display_data = data_to_plot.copy()
+            # Create dataframes for display, excluding outliers per isotope.
+            display_data_d13 = data_to_plot_d13.copy()
+            display_data_d18 = data_to_plot_d18.copy()
                 
             # Sort the data by x_axis to ensure proper line connections
-            display_data = display_data.sort_values(by='x_axis', na_position='last')
+            display_data_d13 = display_data_d13.sort_values(by='x_axis', na_position='last')
+            display_data_d18 = display_data_d18.sort_values(by='x_axis', na_position='last')
 
             chart_height = 500
 
@@ -10564,8 +10982,9 @@ def main():
                 if identifier == 'All':
                     continue  # Skip the 'All' selection here to avoid combined plotting
 
-                # Filter data for the current identifier
-                data_for_identifier = data_to_plot[data_to_plot['Identifier 1'] == identifier]
+                # Filter data for the current identifier, independently per isotope.
+                data_for_identifier_d13 = data_to_plot_d13[data_to_plot_d13['Identifier 1'] == identifier]
+                data_for_identifier_d18 = data_to_plot_d18[data_to_plot_d18['Identifier 1'] == identifier]
 
                 has_status_markers = False
                 if show_saturated_collectors and not species_data_unfiltered[
@@ -10581,7 +11000,7 @@ def main():
                 ].empty:
                     has_status_markers = True
 
-                if data_for_identifier.empty and not has_status_markers:
+                if data_for_identifier_d13.empty and data_for_identifier_d18.empty and not has_status_markers:
                     continue  # Skip if there is no data to plot for this identifier
 
                 key_suffix_base = re.sub(r'[^0-9A-Za-z_]+', '_', f"{species}_{identifier}")
@@ -10602,8 +11021,8 @@ def main():
                 fig_d13C = go.Figure()
 
                 # Add statistical outliers as markers if enabled
-                if show_statistical_outliers and not statistical_outliers.empty:
-                    identifier_stat_outliers = statistical_outliers[statistical_outliers['Identifier 1'] == identifier]
+                if show_statistical_outliers and not statistical_outliers_d13.empty:
+                    identifier_stat_outliers = statistical_outliers_d13[statistical_outliers_d13['Identifier 1'] == identifier]
                     if not identifier_stat_outliers.empty:
                         stat_customdata = _build_delta_point_customdata(identifier_stat_outliers, 'd13C')
                         fig_d13C.add_trace(go.Scatter(
@@ -10732,7 +11151,7 @@ def main():
                     ]
                     if not identifier_sat_samples.empty:
                         sat_customdata = _build_delta_point_customdata(identifier_sat_samples, 'd13C')
-                        y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
+                        y_vals = pd.to_numeric(data_for_identifier_d13['d 13C/12C  Mean'], errors='coerce')
                         y_min = y_vals.min()
                         y_max = y_vals.max()
                         if not np.isfinite(y_min):
@@ -10782,7 +11201,7 @@ def main():
                             ))
                         if not identifier_failed_missing.empty:
                             failed_customdata = _build_delta_point_customdata(identifier_failed_missing, 'd13C')
-                        y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
+                        y_vals = pd.to_numeric(data_for_identifier_d13['d 13C/12C  Mean'], errors='coerce')
                         y_min = y_vals.min()
                         y_max = y_vals.max()
                         if not np.isfinite(y_min):
@@ -10804,7 +11223,7 @@ def main():
                                 )
                             ))
 
-                identifier_display_data = display_data[display_data['Identifier 1'] == identifier]
+                identifier_display_data = display_data_d13[display_data_d13['Identifier 1'] == identifier]
                 identifier_curve_data = _augment_curve_with_edited_rows(
                     identifier_display_data,
                     species_data_unfiltered,
@@ -10929,7 +11348,7 @@ def main():
                         if pd.notna(y_active):
                             y_active_plot = float(y_active)
                         else:
-                            y_vals = pd.to_numeric(data_for_identifier['d 13C/12C  Mean'], errors='coerce')
+                            y_vals = pd.to_numeric(data_for_identifier_d13['d 13C/12C  Mean'], errors='coerce')
                             y_min = y_vals.min()
                             y_max = y_vals.max()
                             if not np.isfinite(y_min):
@@ -10978,11 +11397,17 @@ def main():
 
                 # Plot δ18O data for this identifier and comment
                 # Create figure for δ18O
+                identifier_display_data_d18 = display_data_d18[display_data_d18['Identifier 1'] == identifier]
+                identifier_curve_data_d18 = _augment_curve_with_edited_rows(
+                    identifier_display_data_d18,
+                    species_data_unfiltered,
+                    identifier
+                )
                 fig_d18O = go.Figure()
 
                 # Add statistical outliers if enabled
                 if show_statistical_outliers:
-                    identifier_stat_outliers = statistical_outliers[statistical_outliers['Identifier 1'] == identifier]
+                    identifier_stat_outliers = statistical_outliers_d18[statistical_outliers_d18['Identifier 1'] == identifier]
                     if not identifier_stat_outliers.empty:
                         stat_customdata = _build_delta_point_customdata(identifier_stat_outliers, 'd18O')
                         fig_d18O.add_trace(go.Scatter(
@@ -11060,19 +11485,19 @@ def main():
 
                     # Add main data trace using display_data
                     fig_d18O.add_trace(go.Scatter(
-                        x=identifier_curve_data['x_axis'],
-                        y=identifier_curve_data['d 18O/16O  Mean'],
+                        x=identifier_curve_data_d18['x_axis'],
+                        y=identifier_curve_data_d18['d 18O/16O  Mean'],
                         mode='lines+markers',
                         line=dict(color='blue', dash='solid', width=1.5),
                         marker=dict(
-                            color=identifier_curve_data[color_param_tab3_value_col],
+                            color=identifier_curve_data_d18[color_param_tab3_value_col],
                             colorscale="Viridis",
                             symbol='circle',
                             size=8,
                             showscale=False  # Hide individual colorbar
                         ),
                         name=f'Raw d18O - {identifier}',
-                        customdata=_build_delta_point_customdata(identifier_curve_data, 'd18O'),
+                        customdata=_build_delta_point_customdata(identifier_curve_data_d18, 'd18O'),
                         hovertemplate=(
                             'Identifier 1: %{customdata[2]}<br>'
                             'Identifier 2: %{customdata[3]}<br>'
@@ -11081,14 +11506,14 @@ def main():
                     ))
     
                     d18_has_calibrated_curve_identifier = (
-                        'd18O_calibrated' in identifier_curve_data.columns
-                        and pd.to_numeric(identifier_curve_data['d18O_calibrated'], errors='coerce').notna().any()
+                        'd18O_calibrated' in identifier_curve_data_d18.columns
+                        and pd.to_numeric(identifier_curve_data_d18['d18O_calibrated'], errors='coerce').notna().any()
                     )
                     if d18_has_calibrated_curve_identifier:
                         if not d18_hide_calibrated and not d18_raw_line_only:
                             fig_d18O.add_trace(go.Scatter(
-                                x=identifier_curve_data['x_axis'],
-                                y=identifier_curve_data['d18O_calibrated'],
+                                x=identifier_curve_data_d18['x_axis'],
+                                y=identifier_curve_data_d18['d18O_calibrated'],
                                 mode='lines',
                                 line=dict(color='orange', width=2),
                                 name=f'Calibrated d18O - {identifier}'
@@ -11125,7 +11550,7 @@ def main():
                             ))
 
                 # Plot main data trace with correct sorting
-                sorted_data = identifier_curve_data.sort_values(by='x_axis')
+                sorted_data = identifier_curve_data_d18.sort_values(by='x_axis')
                 d18_has_calibrated_curve = (
                     'd18O_calibrated' in sorted_data.columns
                     and pd.to_numeric(sorted_data['d18O_calibrated'], errors='coerce').notna().any()
@@ -11165,7 +11590,7 @@ def main():
                     ]
                     if not identifier_sat_samples.empty:
                         sat_customdata = _build_delta_point_customdata(identifier_sat_samples, 'd18O')
-                        y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
+                        y_vals = pd.to_numeric(data_for_identifier_d18['d 18O/16O  Mean'], errors='coerce')
                         y_min = y_vals.min()
                         y_max = y_vals.max()
                         if not np.isfinite(y_min):
@@ -11215,7 +11640,7 @@ def main():
                             ))
                         if not identifier_failed_missing.empty:
                             failed_customdata = _build_delta_point_customdata(identifier_failed_missing, 'd18O')
-                        y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
+                        y_vals = pd.to_numeric(data_for_identifier_d18['d 18O/16O  Mean'], errors='coerce')
                         y_min = y_vals.min()
                         y_max = y_vals.max()
                         if not np.isfinite(y_min):
@@ -11346,7 +11771,7 @@ def main():
                         if pd.notna(y_active):
                             y_active_plot = float(y_active)
                         else:
-                            y_vals = pd.to_numeric(data_for_identifier['d 18O/16O  Mean'], errors='coerce')
+                            y_vals = pd.to_numeric(data_for_identifier_d18['d 18O/16O  Mean'], errors='coerce')
                             y_min = y_vals.min()
                             y_max = y_vals.max()
                             if not np.isfinite(y_min):

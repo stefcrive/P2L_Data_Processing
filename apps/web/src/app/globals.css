@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 38 33% 98%;
+  --foreground: 24 10% 10%;
+}
+
+body {
+  @apply bg-stone-50 text-stone-900 antialiased;
+  background-image:
+    radial-gradient(circle at top left, rgba(245, 158, 11, 0.08), transparent 28%),
+    linear-gradient(180deg, rgba(120, 113, 108, 0.03), transparent 30%);
+}
+
+* {
+  @apply border-stone-200;
+}

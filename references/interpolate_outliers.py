@@ -46,51 +46,14 @@ import argparse
 import os
 from typing import List
 
-import numpy as np
 import pandas as pd
+
+from services.irms_api.domain.processing.core import _interpolate_outliers_by_identifier2
 
 
 def interpolate_columns(df: pd.DataFrame, outlier_mask: pd.Series, cols: List[str]) -> pd.DataFrame:
-    """Interpolate specified columns on rows where ``outlier_mask`` is True.
-
-    For each column in ``cols``, the values at positions where ``outlier_mask``
-    is True are set to NaN and then linearly interpolated using surrounding
-    values.  Only the outlier rows are updated with the interpolated
-    values; all other rows retain their original values.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        DataFrame containing the data to interpolate.
-    outlier_mask : pandas.Series of bool
-        Boolean mask indicating which rows are considered outliers.
-    cols : list of str
-        Names of the columns to interpolate.
-
-    Returns
-    -------
-    pandas.DataFrame
-        A copy of ``df`` with interpolated values in the specified columns.
-    """
-    # Make a copy to avoid modifying original
-    df_interpolated = df.copy()
-
-    for col in cols:
-        # Convert to numeric; non-numeric values become NaN
-        series = pd.to_numeric(df_interpolated[col], errors="coerce")
-
-        # Mark outlier rows as NaN for interpolation
-        series_masked = series.copy()
-        series_masked[outlier_mask] = np.nan
-
-        # Perform linear interpolation across index
-        interpolated = series_masked.interpolate(method="linear",
-                                                limit_direction="both")
-
-        # Assign interpolated values back only to the outlier rows
-        df_interpolated.loc[outlier_mask, col] = interpolated.loc[outlier_mask]
-
-    return df_interpolated
+    """Interpolate outlier rows through the shared processing core helper."""
+    return _interpolate_outliers_by_identifier2(df, outlier_mask, cols)
 
 
 def process_workbook(input_path: str, output_path: str) -> None:

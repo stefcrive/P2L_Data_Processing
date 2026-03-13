@@ -9,3 +9,7 @@ scikit-learn
 reportlab
 scipy
 xlsxwriter
+fastapi
+uvicorn
+python-multipart
+pydantic

@@ -1,0 +1,31 @@
+from __future__ import annotations
+
+ISOTYPE_D13C = "VPDB(13C)"
+ISOTYPE_D18O = "VSMOW(18O)"
+CYCLE1_SIGNAL_SAMP44_COL = "1  Cycle Int  Samp  44"
+CYCLE1_SIGNAL_REF44_COL = "1  Cycle Int  Ref  44"
+CYCLE1_SIGNAL_DIFF44_COL = "1  Cycle Int  Diff Samp-Ref  44"
+
+AUTOSAVE_LOG_PATH_KEY = "autosave_log_path"
+AUTOSAVE_SNAPSHOT_PATH_KEY = "autosave_snapshot_path"
+AUTOSAVE_SAVE_DIR_KEY = "autosave_save_dir"
+AUTOSAVE_ERROR_KEY = "autosave_error"
+AUTOSAVE_EVENT_COUNT_KEY = "autosave_event_count"
+AUTOSAVE_INIT_TS_KEY = "autosave_initialized_at"
+AUTOSAVE_DIR_OVERRIDE_KEY = "autosave_dir_override"
+AUTOSAVE_SOURCE_FILES_KEY = "autosave_source_files"
+AUTOSAVE_META_PATH_KEY = "autosave_meta_path"
+AUTOSAVE_RESUMED_KEY = "autosave_resumed"
+AUTOSAVE_SESSION_TOKEN_KEY = "autosave_session_token"
+AUTOSAVE_DIR_INPUT_KEY = "autosave_dir_override_input"
+IMPORTED_FILE_SPECS_KEY = "imported_file_specs"
+APPEND_UPLOADER_NONCE_KEY = "append_uploader_nonce"
+TAB3_LINEARITY_OVERRIDE_ENABLED_KEY = "tab3_manual_linearity_override_enabled"
+TAB3_LINEARITY_OVERRIDE_D13_KEY = "tab3_manual_linearity_d13_per10v"
+TAB3_LINEARITY_OVERRIDE_D18_KEY = "tab3_manual_linearity_d18_per10v"
+LINEARITY_USE_DIFF_INTENSITY_KEY = "linearity_use_diff_intensity_44"
+LINEARITY_USE_DIFF_INTENSITY_CAL_UI_KEY = "linearity_use_diff_intensity_44_cal_ui"
+LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY = "linearity_use_diff_intensity_44_tab3_ui"
+
+DEFAULT_SIGNAL_RANGE = (0.0, 50.0)
+DEFAULT_SESSION_DATA_DIR = ".data/irms_api_sessions"

@@ -1,21 +1,64 @@
-# IRMS Output Analyzer (Streamlit)
+# IRMS Output Analyzer
 
-Streamlit-based tools for IRMS data processing and visualization.
+The repository now contains two parallel application surfaces:
 
-Key scripts:
+- `IRMS_output_analyzer.py`: the existing Streamlit application, now acting as the adapter during the refactor.
+- `services/irms_api`: the extracted Python backend package and FastAPI entrypoint.
+- `apps/web`: the new Next.js dashboard shell with sidebar navigation.
 
-- `IRMS_output_analyzer.py`: main Streamlit app for processing IRMS outputs.
-- `interpolate_outliers.py`: helper routines for outlier interpolation.
-- `Pangea_paleorecord_visualizer.py`: separate Streamlit visualizer.
+## Python Backend
 
-Quick start:
+Install backend dependencies:
 
-1. Create/activate a virtual environment (optional but recommended).
-2. Install dependencies: `pip install -r requirements.txt`.
-3. Run the analyzer:
-   - Windows: `run_analyzer.bat`
-   - Or directly: `streamlit run IRMS_output_analyzer.py`
+```bash
+pip install -r requirements.txt
+```
 
-Notes:
+Run the FastAPI app:
 
-- Keep large input files (e.g., `all_physical.tab`) outside git as configured in `.gitignore`.
+```bash
+python -m uvicorn services.irms_api.api.main:app --reload
+```
+
+## Next.js Dashboard
+
+Install frontend dependencies:
+
+```bash
+cd apps/web
+npm install
+```
+
+Run the dashboard:
+
+```bash
+npm run dev
+```
+
+The frontend expects the API at `http://localhost:8000` unless `NEXT_PUBLIC_IRMS_API_URL` is set.
+
+## One-Command Startup
+
+Use `start_app.bat` from repo root.
+
+- Default (`start_app.bat`): development mode (`uvicorn --reload` + `next dev`).
+- Faster runtime (`start_app.bat --prod`): production mode (`uvicorn` + `next start`, auto-builds once if needed).
+- Optional ports: `start_app.bat --backend-port 8100 --frontend-port 3100`.
+- If a requested/default port is already in use, the script automatically selects the next free port and prints the final URLs.
+
+## Streamlit Adapter
+
+The legacy UI is still available while parity work continues:
+
+```bash
+streamlit run IRMS_output_analyzer.py
+```
+
+## Refactor Docs
+
+Navigation docs for the ongoing extraction live in `docs/refactor`:
+
+- `helper-inventory.md`
+- `session-state-map.md`
+- `contracts.md`
+- `parity-checklist.md`

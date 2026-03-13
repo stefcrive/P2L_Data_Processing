@@ -1,0 +1,266 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+class SessionSnapshot(BaseModel):
+    session_id: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    source_files: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int = 0
+    cycles_row_count: int = 0
+    errors: list[str] = Field(default_factory=list)
+    calibration: dict[str, Any] = Field(default_factory=dict)
+    processing: dict[str, Any] = Field(default_factory=dict)
+    autosave: dict[str, Any] = Field(default_factory=dict)
+    preview: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ImportResult(BaseModel):
+    session: SessionSnapshot
+
+
+class FilterConfig(BaseModel):
+    identifier_filter: list[str] = Field(default_factory=list)
+    d13c_range: tuple[float, float] | None = None
+    d18o_range: tuple[float, float] | None = None
+    color_param: str | None = None
+
+
+class LinearityConfig(BaseModel):
+    apply: bool = False
+    use_diff_intensity: bool = False
+    manual_override_enabled: bool = False
+    manual_d13_per_10v: float = 0.0
+    manual_d18_per_10v: float = 0.0
+
+
+class CalibrationConfig(BaseModel):
+    selected_standards: list[str] = Field(default_factory=list)
+    calibration_type: Literal["Z-Score", "IQR"] = "IQR"
+    sigma_level: float = 1.0
+    iqr_multiplier: float = 1.5
+    independent_isotope_outliers: bool = True
+    color_param: str = "d 18O/16O  Mean"
+    z_axis: str = "1  Cycle Int  Samp  44"
+    precision_date_range: tuple[str | None, str | None] | None = None
+    linearity: LinearityConfig = Field(default_factory=LinearityConfig)
+
+
+class CalibrationAvailableValues(BaseModel):
+    standards: list[str] = Field(default_factory=list)
+    color_params: list[str] = Field(default_factory=list)
+    z_axis_options: list[str] = Field(default_factory=list)
+    min_date: str | None = None
+    max_date: str | None = None
+
+
+class CalibrationPrecisionSummary(BaseModel):
+    standard: str
+    total_rows: int = 0
+    included_d13: int = 0
+    included_d18: int = 0
+    included_pct_d13: float = 0.0
+    included_pct_d18: float = 0.0
+    d13_precision: float | None = None
+    d18_precision: float | None = None
+    d13_average: float | None = None
+    d18_average: float | None = None
+    d13_linearity_corrected_precision: float | None = None
+    d18_linearity_corrected_precision: float | None = None
+    line_precisions: dict[str, dict[str, float | None]] = Field(default_factory=dict)
+
+
+class CalibrationStandardSection(BaseModel):
+    standard: str
+    d13_outliers: list[dict[str, Any]] = Field(default_factory=list)
+    d18_outliers: list[dict[str, Any]] = Field(default_factory=list)
+    d13_figure: dict[str, Any] = Field(default_factory=dict)
+    d18_figure: dict[str, Any] = Field(default_factory=dict)
+
+
+class CalibrationWorkspace(BaseModel):
+    session_id: str
+    config: CalibrationConfig = Field(default_factory=CalibrationConfig)
+    available_values: CalibrationAvailableValues = Field(default_factory=CalibrationAvailableValues)
+    figures: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    linearity_figures: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    precision_summaries: list[CalibrationPrecisionSummary] = Field(default_factory=list)
+    standard_sections: list[CalibrationStandardSection] = Field(default_factory=list)
+    linearity_fits: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProcessingOverlayConfig(BaseModel):
+    show_statistical_outliers: bool = False
+    show_range_outliers: bool = False
+    show_manual_outliers: bool = False
+    show_saturated_collectors: bool = True
+    show_saturated_samples: bool = True
+    show_failed_samples: bool = True
+
+
+class ProcessingLinearityOverrideConfig(BaseModel):
+    enabled: bool = False
+    d13_per_10v: float = 0.0
+    d18_per_10v: float = 0.0
+
+
+class ProcessingExportConfig(BaseModel):
+    include_outliers: bool = False
+    selected_ids: list[str] = Field(default_factory=lambda: ["All"])
+    interpolate_outliers: bool = False
+    client_name: str | None = None
+    comment_map: dict[str, str] = Field(default_factory=dict)
+
+
+class ProcessingWorkspaceConfig(BaseModel):
+    selected_identifier: str = "All"
+    x_axis_option: Literal["By Identifier 2", "By Sequence"] = "By Identifier 2"
+    color_param: str = "Date_ordinal"
+    z_axis: str = "1  Cycle Int  Samp  44"
+    signal_range: tuple[float, float] = (0.0, 50.0)
+    leak_range: tuple[float, float] = (0.0, 1000.0)
+    d13c_range: tuple[float, float] = (-10.0, 10.0)
+    d18o_range: tuple[float, float] = (-10.0, 10.0)
+    statistical_outlier_method: Literal["Z-Score", "IQR"] = "Z-Score"
+    sigma_level_data: float = 4.0
+    iqr_multiplier_data: float = 1.5
+    overlays: ProcessingOverlayConfig = Field(default_factory=ProcessingOverlayConfig)
+    manual_linearity_override: ProcessingLinearityOverrideConfig = Field(
+        default_factory=ProcessingLinearityOverrideConfig
+    )
+    export: ProcessingExportConfig = Field(default_factory=ProcessingExportConfig)
+
+
+class ProcessingConfig(ProcessingWorkspaceConfig):
+    pass
+
+
+class EditTarget(BaseModel):
+    row_label: str
+    isotope_key: Literal["d13C", "d18O"]
+
+
+class EditAction(BaseModel):
+    action: Literal[
+        "set_value",
+        "offset",
+        "interpolate",
+        "reset_to_original",
+        "reset_all",
+        "set_outlier_override",
+    ]
+    targets: list[EditTarget] = Field(default_factory=list)
+    value: float | None = None
+    offset: float | None = None
+    is_outlier: bool | None = None
+
+
+class ChartBundle(BaseModel):
+    session_id: str
+    figures: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    tables: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class OutlierTable(BaseModel):
+    name: str
+    title: str | None = None
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ExportRequest(BaseModel):
+    include_outliers: bool = False
+    selected_ids: list[str] = Field(default_factory=lambda: ["All"])
+    interpolate_outliers: bool = False
+    client_name: str | None = None
+    comment_map: dict[str, str] = Field(default_factory=dict)
+    output_type: Literal["dataset", "client_output"] = "dataset"
+
+
+class ProcessingSummaryMetric(BaseModel):
+    metric: str
+    value: int | float | str
+    details: str = ""
+
+
+class ProcessingSummary(BaseModel):
+    total_unique_samples: int = 0
+    total_measurements: int = 0
+    statistical_outliers: int = 0
+    d13c_range_outliers: int = 0
+    d18o_range_outliers: int = 0
+    signal_intensity_outliers: int = 0
+    leak_rate_outliers: int = 0
+    failed_samples: int = 0
+    partially_failed_recovered_mean: int = 0
+    fully_saturated_collectors: int = 0
+    final_analyses: int = 0
+    metrics: list[ProcessingSummaryMetric] = Field(default_factory=list)
+
+
+class ProcessingAvailableValues(BaseModel):
+    identifiers: list[str] = Field(default_factory=list)
+    export_identifiers: list[str] = Field(default_factory=list)
+    species: list[str] = Field(default_factory=list)
+    color_params: list[str] = Field(default_factory=list)
+    z_axis_options: list[str] = Field(default_factory=list)
+
+
+class IdentifierFigureSet(BaseModel):
+    identifier: str
+    d13c: dict[str, Any] = Field(default_factory=dict)
+    d18o: dict[str, Any] = Field(default_factory=dict)
+    has_calibrated_d13c: bool = False
+    has_calibrated_d18o: bool = False
+
+
+class SpeciesSection(BaseModel):
+    species: str
+    identifier_figures: list[IdentifierFigureSet] = Field(default_factory=list)
+    outlier_tables: list[OutlierTable] = Field(default_factory=list)
+
+
+class ProcessingExportState(BaseModel):
+    filename: str = "dataset_without_outliers.xlsx"
+    client_name: str | None = None
+    selected_ids: list[str] = Field(default_factory=lambda: ["All"])
+    include_outliers: bool = False
+    interpolate_outliers: bool = False
+
+
+class ProcessingEditState(BaseModel):
+    edited_rows: list[str] = Field(default_factory=list)
+    original_delta_values: dict[str, float] = Field(default_factory=dict)
+    manual_outlier_overrides: dict[str, bool] = Field(default_factory=dict)
+
+
+class CycleDiagnosticsPayload(BaseModel):
+    session_id: str
+    target: dict[str, Any] = Field(default_factory=dict)
+    inline_summary: str = ""
+    figure: dict[str, Any] = Field(default_factory=dict)
+    table: list[dict[str, Any]] = Field(default_factory=list)
+    cycle_mean: dict[str, Any] = Field(default_factory=dict)
+
+
+class CycleDiagnosticsRequest(BaseModel):
+    target: EditTarget
+    correct_linearity: bool = False
+    target_intensity: float | None = None
+
+
+class ProcessingWorkspace(BaseModel):
+    session_id: str
+    config: ProcessingWorkspaceConfig = Field(default_factory=ProcessingWorkspaceConfig)
+    summary: ProcessingSummary = Field(default_factory=ProcessingSummary)
+    available_values: ProcessingAvailableValues = Field(default_factory=ProcessingAvailableValues)
+    overview_figures: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    species_sections: list[SpeciesSection] = Field(default_factory=list)
+    outlier_tables: list[OutlierTable] = Field(default_factory=list)
+    edit_state: ProcessingEditState = Field(default_factory=ProcessingEditState)
+    export_state: ProcessingExportState = Field(default_factory=ProcessingExportState)
