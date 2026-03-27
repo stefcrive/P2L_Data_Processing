@@ -35,6 +35,7 @@ type FigureShape = Record<string, unknown> & {
 type SelectionSourceChart = {
   title: string;
   description: string;
+  chartKey?: string;
   figure?: Record<string, unknown>;
 };
 
@@ -42,6 +43,44 @@ const PRECISION_PASS_THRESHOLD = 0.07;
 const INCLUSION_PASS_THRESHOLD = 80;
 const OFFICIAL_VALUE_TYPE_D13 = "VPDB(13C)";
 const OFFICIAL_VALUE_TYPE_D18 = "VSMOW(18O)";
+const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
+const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
+const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
+const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
+const LINEARITY_INTENSITY_OPTIONS = [
+  LINEARITY_INTENSITY_SAMP44,
+  LINEARITY_INTENSITY_DIFF44,
+  LINEARITY_INTENSITY_MISMATCH44,
+] as const;
+const LINEARITY_INTENSITY_OPTION_LABELS: Record<(typeof LINEARITY_INTENSITY_OPTIONS)[number], string> = {
+  [LINEARITY_INTENSITY_SAMP44]: "Sample intensity",
+  [LINEARITY_INTENSITY_DIFF44]: "Intensity diff",
+  [LINEARITY_INTENSITY_MISMATCH44]: "Pressure-adjusted int diff",
+};
+
+function getLinearityIntensityOptionLabel(value: string): string {
+  if (value in LINEARITY_INTENSITY_OPTION_LABELS) {
+    return LINEARITY_INTENSITY_OPTION_LABELS[value as (typeof LINEARITY_INTENSITY_OPTIONS)[number]];
+  }
+  return value;
+}
+
+function getLinearityCoefficientLabel(
+  isotope: "d13C" | "d18O",
+  intensityCol: string,
+  quadratic: boolean,
+): string {
+  const prefix = isotope === "d13C" ? "d13C" : "d18O";
+  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
+    return quadratic
+      ? `${prefix} pressure-weighted mismatch coefficient per (10V)^2`
+      : `${prefix} pressure-weighted mismatch coefficient`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
+    return quadratic ? `${prefix} intensity-diff coefficient per (10V)^2` : `${prefix} intensity-diff coefficient per 10V`;
+  }
+  return quadratic ? `${prefix} coefficient per (10V)^2` : `${prefix} coefficient per 10V`;
+}
 
 function normalizeIsotopeKey(value: unknown): "d13C" | "d18O" | "cross" | null {
   const token = String(value ?? "").trim().toLowerCase();
@@ -1039,12 +1078,24 @@ function SummaryChip({ label, value, hint, tone = "neutral" }: { label: string; 
   );
 }
 
-function PrecisionMetricPanel({ label, value }: { label: string; value?: number | null }) {
-  const styles = toneClasses(classifyPrecision(value));
+function PrecisionMetricPanel({
+  label,
+  value,
+  disabled = false,
+  disabledText = "(not enabled)",
+}: {
+  label: string;
+  value?: number | null;
+  disabled?: boolean;
+  disabledText?: string;
+}) {
+  const styles = toneClasses(disabled ? "neutral" : classifyPrecision(value));
   return (
     <div className={`rounded-xl border px-3 py-3 ${styles.shell}`}>
       <div className="text-[11px] uppercase tracking-[0.14em] text-stone-500">{label}</div>
-      <div className={`mt-2 text-2xl font-semibold leading-none tabular-nums ${styles.value}`}>{formatMetricWithUnit(value)}</div>
+      <div className={`mt-2 text-2xl font-semibold leading-none ${disabled ? "" : "tabular-nums"} ${styles.value}`}>
+        {disabled ? disabledText : formatMetricWithUnit(value)}
+      </div>
     </div>
   );
 }
@@ -1054,18 +1105,20 @@ function IsotopeSummaryTile({
   precision,
   average,
   correctedPrecision,
+  linearityEnabled,
 }: {
   label: string;
   precision?: number | null;
   average?: number | null;
   correctedPrecision?: number | null;
+  linearityEnabled: boolean;
 }) {
   return (
     <div className="rounded-xl border border-stone-200 bg-stone-50/80 p-4">
       <div className="text-xs uppercase tracking-[0.14em] text-stone-500">{label} precision</div>
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
         <PrecisionMetricPanel label="Normal" value={precision} />
-        <PrecisionMetricPanel label="Linearity corrected" value={correctedPrecision} />
+        <PrecisionMetricPanel label="Linearity corrected" value={correctedPrecision} disabled={!linearityEnabled} />
       </div>
       <div className="mt-4 space-y-2 text-sm">
         <div className="flex items-center justify-between border-t border-stone-200 pt-2 text-stone-600">
@@ -1077,7 +1130,7 @@ function IsotopeSummaryTile({
   );
 }
 
-function PrecisionCard({ summary }: { summary: CalibrationPrecisionSummary }) {
+function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrecisionSummary; linearityEnabled: boolean }) {
   const linePrecisionEntries = Object.entries(summary.line_precisions).sort(([left], [right]) => {
     const leftNumber = Number(left);
     const rightNumber = Number(right);
@@ -1121,12 +1174,14 @@ function PrecisionCard({ summary }: { summary: CalibrationPrecisionSummary }) {
             precision={summary.d13_precision}
             average={summary.d13_average}
             correctedPrecision={summary.d13_linearity_corrected_precision}
+            linearityEnabled={linearityEnabled}
           />
           <IsotopeSummaryTile
             label="δ18O (‰)"
             precision={summary.d18_precision}
             average={summary.d18_average}
             correctedPrecision={summary.d18_linearity_corrected_precision}
+            linearityEnabled={linearityEnabled}
           />
         </div>
         {linePrecisionEntries.length ? (
@@ -1135,19 +1190,27 @@ function PrecisionCard({ summary }: { summary: CalibrationPrecisionSummary }) {
               <div className="text-xs uppercase tracking-[0.14em] text-stone-500">Line precision breakdown</div>
               <div className="text-xs text-stone-500">{linePrecisionEntries.length} lines</div>
             </div>
-            <div className="overflow-hidden rounded-lg border border-stone-200">
-              <div className="grid grid-cols-[100px_minmax(0,1fr)_minmax(0,1fr)] bg-stone-100 px-3 py-2 text-xs font-medium uppercase tracking-wide text-stone-600">
+            <div className="overflow-x-auto rounded-lg border border-stone-200">
+              <div className="grid min-w-[760px] grid-cols-[100px_repeat(4,minmax(0,1fr))] bg-stone-100 px-3 py-2 text-xs font-medium uppercase tracking-wide text-stone-600">
                 <span>Line</span>
-                <span>δ13C (‰)</span>
-                <span>δ18O (‰)</span>
+                <span className="normal-case">δ13C raw (‰)</span>
+                <span className="normal-case">δ13C linearity corr (‰)</span>
+                <span className="normal-case">δ18O raw (‰)</span>
+                <span className="normal-case">δ18O linearity corr (‰)</span>
               </div>
               {linePrecisionEntries.map(([line, values], index) => {
                 const d13Tone = toneClasses(classifyPrecision(values.d13_precision));
+                const d13LinearityTone = toneClasses(
+                  linearityEnabled ? classifyPrecision(values.d13_linearity_corrected_precision) : "neutral",
+                );
                 const d18Tone = toneClasses(classifyPrecision(values.d18_precision));
+                const d18LinearityTone = toneClasses(
+                  linearityEnabled ? classifyPrecision(values.d18_linearity_corrected_precision) : "neutral",
+                );
                 return (
                   <div
                     key={line}
-                    className={`grid grid-cols-[100px_minmax(0,1fr)_minmax(0,1fr)] px-3 py-2 text-sm tabular-nums text-stone-700 ${
+                    className={`grid min-w-[760px] grid-cols-[100px_repeat(4,minmax(0,1fr))] px-3 py-2 text-sm tabular-nums text-stone-700 ${
                       index % 2 ? "bg-stone-50" : "bg-white"
                     }`}
                   >
@@ -1155,12 +1218,21 @@ function PrecisionCard({ summary }: { summary: CalibrationPrecisionSummary }) {
                     <span className={`inline-flex max-w-fit rounded-md border px-2 py-1 text-base font-semibold ${d13Tone.shell} ${d13Tone.value}`}>
                       {formatMetricWithUnit(values.d13_precision)}
                     </span>
+                    <span className={`inline-flex max-w-fit rounded-md border px-2 py-1 text-base font-semibold ${d13LinearityTone.shell} ${d13LinearityTone.value}`}>
+                      {linearityEnabled ? formatMetricWithUnit(values.d13_linearity_corrected_precision) : "(not enabled)"}
+                    </span>
                     <span className={`inline-flex max-w-fit rounded-md border px-2 py-1 text-base font-semibold ${d18Tone.shell} ${d18Tone.value}`}>
                       {formatMetricWithUnit(values.d18_precision)}
+                    </span>
+                    <span className={`inline-flex max-w-fit rounded-md border px-2 py-1 text-base font-semibold ${d18LinearityTone.shell} ${d18LinearityTone.value}`}>
+                      {linearityEnabled ? formatMetricWithUnit(values.d18_linearity_corrected_precision) : "(not enabled)"}
                     </span>
                   </div>
                 );
               })}
+            </div>
+            <div className="mt-2 text-xs text-stone-500">
+              Overall precision is computed from all included rows, so it is not the arithmetic mean of per-line precision values.
             </div>
           </div>
         ) : null}
@@ -1185,7 +1257,7 @@ export default function CalibrationPage() {
   const [newStandardD18, setNewStandardD18] = useState("");
   const [officialValuesError, setOfficialValuesError] = useState<string | null>(null);
   const [singleValue, setSingleValue] = useState(0);
-  const [singleOffset, setSingleOffset] = useState(0);
+  const [singleOffset, setSingleOffset] = useState(SELECTION_EDITOR_DEFAULT_OFFSET);
   const [crossD13Value, setCrossD13Value] = useState(0);
   const [crossD18Value, setCrossD18Value] = useState(0);
   const [multiOffsetD13, setMultiOffsetD13] = useState(0);
@@ -1219,7 +1291,7 @@ export default function CalibrationPage() {
     if (!activeIsotopeTarget) {
       return;
     }
-    setSingleOffset(0);
+    setSingleOffset(SELECTION_EDITOR_DEFAULT_OFFSET);
     setLinearityEnabled(false);
   }, [activeIsotopeTarget?.rowLabel, activeIsotopeTarget?.isotopeKey]);
 
@@ -1251,13 +1323,13 @@ export default function CalibrationPage() {
       "processing-diagnostics",
       sessionId,
       activeIsotopeTarget?.rowLabel,
-      "d18O",
+      activeIsotopeTarget?.isotopeKey,
       linearityEnabled,
       linearityTargetIntensity,
     ],
     queryFn: () =>
       api.getProcessingCycleDiagnostics(sessionId!, {
-        ...diagnosticsTargetPayload(activeIsotopeTarget!, "d18O"),
+        ...diagnosticsTargetPayload(activeIsotopeTarget!, activeIsotopeTarget!.isotopeKey as "d13C" | "d18O"),
         correct_linearity: linearityEnabled,
         target_intensity: linearityEnabled ? linearityTargetIntensity : null,
       }),
@@ -1280,10 +1352,9 @@ export default function CalibrationPage() {
     if (!activeIsotopeTarget) {
       return;
     }
+    const diagnosticsCurrentValue = asNumber(singleDiagnosticsQuery.data?.target?.current_value);
     setSingleValue(
-      activeIsotopeTarget.isotopeKey === "d18O" && typeof singleDiagnosticsQuery.data?.target?.current_value === "number"
-        ? roundDeltaValue(singleDiagnosticsQuery.data.target.current_value as number)
-        : roundDeltaValue(activeIsotopeTarget.currentValue ?? 0),
+      diagnosticsCurrentValue != null ? roundDeltaValue(diagnosticsCurrentValue) : roundDeltaValue(activeIsotopeTarget.currentValue ?? 0),
     );
   }, [activeIsotopeTarget, singleDiagnosticsQuery.data?.target]);
 
@@ -1336,7 +1407,18 @@ export default function CalibrationPage() {
     if (!workspaceQuery.data || !hasLoadedDraft) {
       return;
     }
-    setConfig((current) => current ?? workspaceQuery.data.config);
+    setConfig((current) =>
+      current
+        ? {
+            ...workspaceQuery.data.config,
+            ...current,
+            linearity: {
+              ...workspaceQuery.data.config.linearity,
+              ...current.linearity,
+            },
+          }
+        : workspaceQuery.data.config,
+    );
   }, [hasLoadedDraft, workspaceQuery.data]);
 
   useEffect(() => {
@@ -1379,6 +1461,24 @@ export default function CalibrationPage() {
     },
   });
 
+  const resetCalibrationMutation = useMutation({
+    mutationFn: () => api.resetCalibration(sessionId!),
+    onSuccess: async () => {
+      if (draftStorageKey && typeof window !== "undefined") {
+        window.sessionStorage.removeItem(draftStorageKey);
+      }
+      setConfig(null);
+      await queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["calibration", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
+    },
+  });
+
   const upsertOfficialValueMutation = useMutation({
     mutationFn: (payload: { standard: string; isotopic_value_type: string; value: number; source?: string | null }) =>
       api.upsertOfficialStandardValue(payload),
@@ -1413,6 +1513,9 @@ export default function CalibrationPage() {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration", sessionId] });
@@ -1423,7 +1526,7 @@ export default function CalibrationPage() {
     setConfig((current) => (current ? { ...current, [key]: value } : current));
   }
 
-  function updateLinearity(key: keyof CalibrationConfig["linearity"], value: boolean | number) {
+  function updateLinearity(key: keyof CalibrationConfig["linearity"], value: boolean | number | string) {
     setConfig((current) =>
       current
         ? {
@@ -1431,6 +1534,21 @@ export default function CalibrationPage() {
             linearity: {
               ...current.linearity,
               [key]: value,
+            },
+          }
+        : current,
+    );
+  }
+
+  function updateLinearityIntensityCol(intensityCol: string) {
+    setConfig((current) =>
+      current
+        ? {
+            ...current,
+            linearity: {
+              ...current.linearity,
+              intensity_col: intensityCol,
+              use_diff_intensity: intensityCol === LINEARITY_INTENSITY_DIFF44,
             },
           }
         : current,
@@ -1489,14 +1607,31 @@ export default function CalibrationPage() {
     setSetValueHighlightNonce((current) => current + 1);
   }
 
+  function resolveSetValuePayload(
+    isotopeKey: "d13C" | "d18O",
+    requestedDisplayValue: number,
+    selectedDisplayValue: number | null,
+    diagnosticsCurrentValue: number | null,
+  ): number {
+    if (selectedDisplayValue == null || diagnosticsCurrentValue == null) {
+      return requestedDisplayValue;
+    }
+    const displayToRawDelta = selectedDisplayValue - diagnosticsCurrentValue;
+    return requestedDisplayValue - displayToRawDelta;
+  }
+
   async function applySingleValue() {
     if (!sessionId || !activeIsotopeTarget) {
       return;
     }
+    const isotopeKey = activeIsotopeTarget.isotopeKey as "d13C" | "d18O";
+    const selectedDisplayValue = typeof activeIsotopeTarget.currentValue === "number" ? activeIsotopeTarget.currentValue : null;
+    const diagnosticsCurrentValue = asNumber(singleDiagnosticsQuery.data?.target?.current_value);
+    const payloadValue = resolveSetValuePayload(isotopeKey, singleValue, selectedDisplayValue, diagnosticsCurrentValue);
     await editMutation.mutateAsync({
       action: "set_value",
-      targets: [{ row_label: activeIsotopeTarget.rowLabel, isotope_key: activeIsotopeTarget.isotopeKey as "d13C" | "d18O" }],
-      value: singleValue,
+      targets: [{ row_label: activeIsotopeTarget.rowLabel, isotope_key: isotopeKey }],
+      value: payloadValue,
     });
   }
 
@@ -1518,6 +1653,7 @@ export default function CalibrationPage() {
     await editMutation.mutateAsync({
       action: "interpolate",
       targets: [{ row_label: activeIsotopeTarget.rowLabel, isotope_key: activeIsotopeTarget.isotopeKey as "d13C" | "d18O" }],
+      offset: singleOffset,
     });
   }
 
@@ -1525,15 +1661,21 @@ export default function CalibrationPage() {
     if (!sessionId || !activeCrossTarget) {
       return;
     }
+    const d13DiagnosticsCurrent = asNumber(crossD13DiagnosticsQuery.data?.target?.current_value);
+    const d18DiagnosticsCurrent = asNumber(crossD18DiagnosticsQuery.data?.target?.current_value);
+    const d13SelectedDisplay = typeof activeCrossTarget.currentD13 === "number" ? activeCrossTarget.currentD13 : null;
+    const d18SelectedDisplay = typeof activeCrossTarget.currentD18 === "number" ? activeCrossTarget.currentD18 : null;
+    const payloadD13 = resolveSetValuePayload("d13C", crossD13Value, d13SelectedDisplay, d13DiagnosticsCurrent);
+    const payloadD18 = resolveSetValuePayload("d18O", crossD18Value, d18SelectedDisplay, d18DiagnosticsCurrent);
     await editMutation.mutateAsync({
       action: "set_value",
       targets: [{ row_label: activeCrossTarget.rowLabel, isotope_key: "d13C" }],
-      value: crossD13Value,
+      value: payloadD13,
     });
     await editMutation.mutateAsync({
       action: "set_value",
       targets: [{ row_label: activeCrossTarget.rowLabel, isotope_key: "d18O" }],
-      value: crossD18Value,
+      value: payloadD18,
     });
   }
 
@@ -1718,13 +1860,27 @@ export default function CalibrationPage() {
   const standardsValuesBusy = upsertOfficialValueMutation.isPending || deleteOfficialStandardMutation.isPending;
   const officialValuesLoading = isOfficialValuesModalOpen && officialValuesQuery.isLoading && !officialValuesQuery.data;
   const officialValuesQueryError = officialValuesQuery.error instanceof Error ? officialValuesQuery.error.message : null;
-  const lineIntensityBasis = String(displayedWorkspace.linearity_fits?.intensity_col ?? activeConfig.color_param ?? "N/A");
+  const selectedLinearityIntensityCol = LINEARITY_INTENSITY_OPTIONS.includes(
+    activeConfig.linearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number],
+  )
+    ? activeConfig.linearity.intensity_col
+    : activeConfig.linearity.use_diff_intensity
+      ? LINEARITY_INTENSITY_DIFF44
+      : LINEARITY_INTENSITY_SAMP44;
+  const linearityControlsEnabled = activeConfig.linearity.apply || activeConfig.linearity.manual_override_enabled;
+  const line1OffsetD13 = activeConfig.linearity.line_1_offset_d13 ?? activeConfig.linearity.line_1_offset ?? 0;
+  const line1OffsetD18 = activeConfig.linearity.line_1_offset_d18 ?? activeConfig.linearity.line_1_offset ?? 0;
+  const line2OffsetD13 = activeConfig.linearity.line_2_offset_d13 ?? activeConfig.linearity.line_2_offset ?? 0;
+  const line2OffsetD18 = activeConfig.linearity.line_2_offset_d18 ?? activeConfig.linearity.line_2_offset ?? 0;
+  const selectedLinearityBasisLabel = getLinearityIntensityOptionLabel(selectedLinearityIntensityCol);
+  const lineIntensityBasis = String(displayedWorkspace.linearity_fits?.intensity_col ?? selectedLinearityIntensityCol ?? "N/A");
   const previewError = previewQuery.error instanceof Error ? previewQuery.error.message : null;
   const runError = runMutation.error instanceof Error ? runMutation.error.message : null;
+  const resetError = resetCalibrationMutation.error instanceof Error ? resetCalibrationMutation.error.message : null;
   const hasUnsavedPreview = JSON.stringify(activeConfig) !== JSON.stringify(workspace.config);
   const precisionSummaries = displayedWorkspace.precision_summaries;
   const linePrecisionCount = precisionSummaries.reduce((count, summary) => count + Object.keys(summary.line_precisions).length, 0);
-  const busy = runMutation.isPending || editMutation.isPending;
+  const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
   const crossSharedDiagnostics = crossD18DiagnosticsQuery.data ?? crossD13DiagnosticsQuery.data;
   const crossSharedDiagnosticsLoading =
@@ -1763,41 +1919,49 @@ export default function CalibrationPage() {
       "VPDB(13C)": {
         title: "d13C Calibration",
         description: "Source chart for current selection.",
+        chartKey: "VPDB(13C)",
         figure: displayedWorkspace.figures["VPDB(13C)"],
       },
       "VSMOW(18O)": {
         title: "d18O Calibration",
         description: "Source chart for current selection.",
+        chartKey: "VSMOW(18O)",
         figure: displayedWorkspace.figures["VSMOW(18O)"],
       },
       calibration_3d: {
         title: "Calibration 3D Chart",
         description: "Source chart for current selection.",
+        chartKey: "calibration_3d",
         figure: displayedWorkspace.figures.calibration_3d,
       },
       crossplot: {
         title: "Calibration Crossplot",
         description: "Source chart for current selection.",
+        chartKey: "crossplot",
         figure: displayedWorkspace.figures.crossplot,
       },
       "linearity|d13_raw": {
         title: "Linearity d13C Raw",
         description: "Source chart for current selection.",
+        chartKey: "linearity|d13_raw",
         figure: displayedWorkspace.linearity_figures.d13_raw,
       },
       "linearity|d13_corrected": {
         title: "Linearity d13C Corrected",
         description: "Source chart for current selection.",
+        chartKey: "linearity|d13_corrected",
         figure: displayedWorkspace.linearity_figures.d13_corrected,
       },
       "linearity|d18_raw": {
         title: "Linearity d18O Raw",
         description: "Source chart for current selection.",
+        chartKey: "linearity|d18_raw",
         figure: displayedWorkspace.linearity_figures.d18_raw,
       },
       "linearity|d18_corrected": {
         title: "Linearity d18O Corrected",
         description: "Source chart for current selection.",
+        chartKey: "linearity|d18_corrected",
         figure: displayedWorkspace.linearity_figures.d18_corrected,
       },
     };
@@ -1821,6 +1985,7 @@ export default function CalibrationPage() {
     return {
       title: `${standardName} ${standardSuffix} Outlier Trace`,
       description: "Source chart for current selection.",
+      chartKey,
       figure: highlightSelectionSourceFigure(figure, activeTarget),
     };
   })();
@@ -1838,7 +2003,9 @@ export default function CalibrationPage() {
           <div className="flex flex-wrap gap-2 text-sm text-stone-600">
             <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Standards: {selectedStandards.length}</span>
             <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Method: {activeConfig.calibration_type}</span>
-            <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Linearity basis: {lineIntensityBasis}</span>
+            <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
+              Linearity basis: {getLinearityIntensityOptionLabel(lineIntensityBasis)}
+            </span>
             <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
               {previewQuery.isFetching ? "Refreshing preview..." : hasUnsavedPreview ? "Preview mode" : "Saved config"}
             </span>
@@ -2058,7 +2225,16 @@ export default function CalibrationPage() {
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <PlotlyChart figure={selectionSourceChart.figure} className="h-[360px] w-full" />
+                    <PlotlyChart
+                      figure={selectionSourceChart.figure}
+                      className="h-[360px] w-full"
+                      onPointClick={(points) =>
+                        openProcessingSelectionEditor(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "", points, false)
+                      }
+                      onSelection={(points) =>
+                        openProcessingSelectionEditor(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "", points, true)
+                      }
+                    />
                   </CardContent>
                 </Card>
               ) : null}
@@ -2184,7 +2360,7 @@ export default function CalibrationPage() {
                         </Button>
                       </div>
                       <DiagnosticsPanel
-                        title="d18O cycle diagnostics"
+                        title={`${activeIsotopeTarget.isotopeKey} cycle diagnostics`}
                         diagnostics={singleDiagnosticsQuery.data}
                         loading={singleDiagnosticsQuery.isLoading}
                         showLinearityChart={linearityEnabled}
@@ -2329,7 +2505,7 @@ export default function CalibrationPage() {
           <Card>
             <CardHeader>
               <CardTitle>Calibration Controls</CardTitle>
-              <CardDescription>Configure standards, outlier detection, visualization, date range, and linearity settings.</CardDescription>
+              <CardDescription>Configure standards, visualization, linearity, outlier detection, and precision date range settings.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
               <MultiSelectDropdown
@@ -2340,87 +2516,12 @@ export default function CalibrationPage() {
                 placeholder="Select standards"
               />
 
-              <div className="flex items-center justify-between rounded-xl border border-stone-200 bg-white/80 p-3">
-                <div className="pr-3">
-                  <div className="text-sm font-semibold tracking-[0.01em] text-stone-800">Official standard values</div>
-                  <div className="text-xs text-stone-500">Open database values used in calibration equations.</div>
-                </div>
-                <Button variant="outline" size="sm" onClick={() => setOfficialValuesModalOpen(true)}>
-                  View
-                </Button>
-              </div>
-
               <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-2">
-                <label className="form-field">
-                  <span className="form-label">Sigma level</span>
-                  <input
-                    type="number"
-                    min="0.1"
-                    max="5"
-                    step="0.1"
-                    value={activeConfig.sigma_level}
-                    onChange={(event) => updateConfig("sigma_level", Number(event.target.value))}
-                    className="form-control"
-                  />
-                </label>
-                <label className="form-field">
-                  <span className="form-label">IQR multiplier</span>
-                  <input
-                    type="number"
-                    min="1"
-                    max="10"
-                    step="0.1"
-                    value={activeConfig.iqr_multiplier}
-                    onChange={(event) => updateConfig("iqr_multiplier", Number(event.target.value))}
-                    className="form-control"
-                  />
-                </label>
-              </div>
-
-              <label className="form-field">
-                <span className="form-label">Outlier method</span>
-                <select
-                  value={activeConfig.calibration_type}
-                  onChange={(event) => updateConfig("calibration_type", event.target.value as CalibrationConfig["calibration_type"])}
-                  className="form-control"
-                >
-                  <option value="Z-Score">Z-Score</option>
-                  <option value="IQR">IQR</option>
-                </select>
-              </label>
-
-              <label className="flex items-start gap-3 rounded-xl border border-stone-200 bg-white/80 p-4">
-                <input
-                  type="checkbox"
-                  checked={activeConfig.independent_isotope_outliers}
-                  onChange={(event) => updateConfig("independent_isotope_outliers", event.target.checked)}
-                  className="mt-1 h-4 w-4 accent-stone-900"
-                />
-                <span>
-                  <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Independent isotope outliers</span>
-                  <span className="mt-1 block text-xs leading-relaxed text-stone-500">
-                    d13C and d18O outlier filtering stays independent per standard row.
-                  </span>
-                </span>
-              </label>
-
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
                 <label className="form-field">
                   <span className="form-label">Color parameter</span>
                   <select
                     value={activeConfig.color_param}
-                    onChange={(event) => {
-                      const nextColorParam = event.target.value;
-                      setConfig((current) =>
-                        current
-                          ? {
-                              ...current,
-                              color_param: nextColorParam,
-                              z_axis: nextColorParam,
-                            }
-                          : current,
-                      );
-                    }}
+                    onChange={(event) => updateConfig("color_param", event.target.value)}
                     className="form-control"
                   >
                     {displayedWorkspace.available_values.color_params.map((option) => (
@@ -2429,6 +2530,254 @@ export default function CalibrationPage() {
                       </option>
                     ))}
                   </select>
+                </label>
+                <label className="form-field">
+                  <span className="form-label">3D Z axis</span>
+                  <select
+                    value={activeConfig.z_axis}
+                    onChange={(event) => updateConfig("z_axis", event.target.value)}
+                    className="form-control"
+                  >
+                    {displayedWorkspace.available_values.z_axis_options.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">
+                <div className="form-section-title">Linearity</div>
+                <label className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={activeConfig.linearity.apply}
+                    onChange={(event) => updateLinearity("apply", event.target.checked)}
+                    className="mt-1 h-4 w-4 accent-stone-900"
+                  />
+                  <span>
+                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Enable linearity correction</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
+                      Corrects selected-standard fits and sample raw measurements with the same linearity relationship before calibration is applied.
+                    </span>
+                  </span>
+                </label>
+
+                {linearityControlsEnabled ? (
+                  <>
+                    <label className="flex items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(activeConfig.linearity.quadratic)}
+                        onChange={(event) => updateLinearity("quadratic", event.target.checked)}
+                        className="mt-1 h-4 w-4 accent-stone-900"
+                      />
+                      <span>
+                        <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Use quadratic linearity relationship</span>
+                        <span className="mt-1 block text-xs leading-relaxed text-stone-500">
+                          Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I for the selected linearity basis.
+                        </span>
+                      </span>
+                    </label>
+
+                    <label className="form-field">
+                      <span className="form-label">Linearity basis</span>
+                      <select
+                        value={selectedLinearityIntensityCol}
+                        onChange={(event) => updateLinearityIntensityCol(event.target.value)}
+                        className="form-control"
+                      >
+                        {LINEARITY_INTENSITY_OPTIONS.map((option) => (
+                          <option key={option} value={option}>
+                            {getLinearityIntensityOptionLabel(option)}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="mt-2 block text-xs leading-relaxed text-stone-500">
+                        Used for standards-side linearity fits, sample-side linearity correction, and manual override coefficients.
+                      </span>
+                    </label>
+                  </>
+                ) : null}
+
+                <label className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={activeConfig.linearity.manual_override_enabled}
+                    onChange={(event) => updateLinearity("manual_override_enabled", event.target.checked)}
+                    className="mt-1 h-4 w-4 accent-stone-900"
+                  />
+                  <span>
+                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Manual linearity override (all samples)</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
+                      Applies a manual transform to all rows before outlier filtering and calibration. Stored imported values are preserved.
+                    </span>
+                  </span>
+                </label>
+
+                {activeConfig.linearity.manual_override_enabled ? (
+                  <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+                    <label className="form-field">
+                      <span className="form-label">
+                        {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, Boolean(activeConfig.linearity.quadratic))}
+                      </span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={
+                          activeConfig.linearity.quadratic
+                            ? (activeConfig.linearity.manual_d13_per_10v2 ?? 0)
+                            : (activeConfig.linearity.manual_d13_per_10v ?? 0)
+                        }
+                        onChange={(event) =>
+                          updateLinearity(
+                            activeConfig.linearity.quadratic ? "manual_d13_per_10v2" : "manual_d13_per_10v",
+                            Number(event.target.value),
+                          )
+                        }
+                        className="form-control"
+                      />
+                    </label>
+                    <label className="form-field">
+                      <span className="form-label">
+                        {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, Boolean(activeConfig.linearity.quadratic))}
+                      </span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={
+                          activeConfig.linearity.quadratic
+                            ? (activeConfig.linearity.manual_d18_per_10v2 ?? 0)
+                            : (activeConfig.linearity.manual_d18_per_10v ?? 0)
+                        }
+                        onChange={(event) =>
+                          updateLinearity(
+                            activeConfig.linearity.quadratic ? "manual_d18_per_10v2" : "manual_d18_per_10v",
+                            Number(event.target.value),
+                          )
+                        }
+                        className="form-control"
+                      />
+                    </label>
+                  </div>
+                ) : null}
+
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+                  <div className="space-y-3">
+                    <span className="form-label">Line 1 offset</span>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <label className="form-field">
+                        <span className="form-label">d13C</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={line1OffsetD13}
+                          onChange={(event) => updateLinearity("line_1_offset_d13", Number(event.target.value))}
+                          className="form-control"
+                          disabled={!linearityControlsEnabled}
+                        />
+                      </label>
+                      <label className="form-field">
+                        <span className="form-label">d18O</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={line1OffsetD18}
+                          onChange={(event) => updateLinearity("line_1_offset_d18", Number(event.target.value))}
+                          className="form-control"
+                          disabled={!linearityControlsEnabled}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <span className="form-label">Line 2 offset</span>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <label className="form-field">
+                        <span className="form-label">d13C</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={line2OffsetD13}
+                          onChange={(event) => updateLinearity("line_2_offset_d13", Number(event.target.value))}
+                          className="form-control"
+                          disabled={!linearityControlsEnabled}
+                        />
+                      </label>
+                      <label className="form-field">
+                        <span className="form-label">d18O</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={line2OffsetD18}
+                          onChange={(event) => updateLinearity("line_2_offset_d18", Number(event.target.value))}
+                          className="form-control"
+                          disabled={!linearityControlsEnabled}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                </div>
+                <div className="text-xs leading-relaxed text-stone-500">
+                  Line offsets shift the selected linearity basis by sample line before fits and corrections are applied.
+                </div>
+              </div>
+
+              <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">
+                <div className="form-section-title">Outlier detection</div>
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-2">
+                  <label className="form-field">
+                    <span className="form-label">Sigma level</span>
+                    <input
+                      type="number"
+                      min="0.1"
+                      max="5"
+                      step="0.1"
+                      value={activeConfig.sigma_level}
+                      onChange={(event) => updateConfig("sigma_level", Number(event.target.value))}
+                      className="form-control"
+                    />
+                  </label>
+                  <label className="form-field">
+                    <span className="form-label">IQR multiplier</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="10"
+                      step="0.1"
+                      value={activeConfig.iqr_multiplier}
+                      onChange={(event) => updateConfig("iqr_multiplier", Number(event.target.value))}
+                      className="form-control"
+                    />
+                  </label>
+                </div>
+
+                <label className="form-field">
+                  <span className="form-label">Outlier method</span>
+                  <select
+                    value={activeConfig.calibration_type}
+                    onChange={(event) => updateConfig("calibration_type", event.target.value as CalibrationConfig["calibration_type"])}
+                    className="form-control"
+                  >
+                    <option value="Z-Score">Z-Score</option>
+                    <option value="IQR">IQR</option>
+                  </select>
+                </label>
+
+                <label className="flex items-start gap-3 rounded-xl border border-stone-200 bg-white/80 p-4">
+                  <input
+                    type="checkbox"
+                    checked={activeConfig.independent_isotope_outliers}
+                    onChange={(event) => updateConfig("independent_isotope_outliers", event.target.checked)}
+                    className="mt-1 h-4 w-4 accent-stone-900"
+                  />
+                  <span>
+                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Independent isotope outliers</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
+                      d13C and d18O outlier filtering stays independent per standard row.
+                    </span>
+                  </span>
                 </label>
               </div>
 
@@ -2464,70 +2813,14 @@ export default function CalibrationPage() {
                 </div>
               </div>
 
-              <div className="space-y-3 rounded-xl border border-stone-200 bg-white/80 p-4">
-                <div className="form-section-title">Linearity</div>
-                <label className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={activeConfig.linearity.apply}
-                    onChange={(event) => updateLinearity("apply", event.target.checked)}
-                    className="mt-1 h-4 w-4 accent-stone-900"
-                  />
-                  <span>
-                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Apply linearity correction on calibration run</span>
-                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">Uses the currently selected standards and intensity basis.</span>
-                  </span>
-                </label>
-                <label className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={activeConfig.linearity.use_diff_intensity}
-                    onChange={(event) => updateLinearity("use_diff_intensity", event.target.checked)}
-                    className="mt-1 h-4 w-4 accent-stone-900"
-                  />
-                  <span>
-                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Use Samp-Ref intensity difference</span>
-                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
-                      Switches the linearity basis from sample intensity to cycle-1 sample-reference difference.
-                    </span>
-                  </span>
-                </label>
-                <label className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={activeConfig.linearity.manual_override_enabled}
-                    onChange={(event) => updateLinearity("manual_override_enabled", event.target.checked)}
-                    className="mt-1 h-4 w-4 accent-stone-900"
-                  />
-                  <span>
-                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Manual linearity override (standards)</span>
-                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
-                      Applies a derived transform to selected standards only. Stored raw values are not overwritten.
-                    </span>
-                  </span>
-                </label>
-                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
-                  <label className="form-field">
-                    <span className="form-label">d13 per 10V</span>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={activeConfig.linearity.manual_d13_per_10v}
-                      onChange={(event) => updateLinearity("manual_d13_per_10v", Number(event.target.value))}
-                      className="form-control"
-                    />
-                  </label>
-                  <label className="form-field">
-                    <span className="form-label">d18 per 10V</span>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={activeConfig.linearity.manual_d18_per_10v}
-                      onChange={(event) => updateLinearity("manual_d18_per_10v", Number(event.target.value))}
-                      className="form-control"
-                    />
-                  </label>
+              <div className="flex items-center justify-between rounded-xl border border-stone-200 bg-white/80 p-3">
+                <div className="pr-3">
+                  <div className="text-sm font-semibold tracking-[0.01em] text-stone-800">Official standard values</div>
+                  <div className="text-xs text-stone-500">Open database values used in calibration equations.</div>
                 </div>
+                <Button variant="outline" size="sm" onClick={() => setOfficialValuesModalOpen(true)}>
+                  View
+                </Button>
               </div>
 
               <div className="flex flex-wrap gap-2">
@@ -2537,13 +2830,18 @@ export default function CalibrationPage() {
                 >
                   {runMutation.isPending ? "Running..." : "Calibrate results"}
                 </Button>
-                <Button variant="outline" onClick={() => setConfig(workspace.config)} disabled={runMutation.isPending}>
-                  Restore saved
+                <Button
+                  variant="outline"
+                  onClick={() => resetCalibrationMutation.mutate()}
+                  disabled={runMutation.isPending || resetCalibrationMutation.isPending}
+                >
+                  {resetCalibrationMutation.isPending ? "Resetting..." : "Reset calibration"}
                 </Button>
               </div>
               <div className="text-xs text-stone-500">Select exactly one or two standards to run calibration.</div>
               {previewError ? <div className="text-xs text-red-600">Preview error: {previewError}</div> : null}
               {runError ? <div className="text-xs text-red-600">Calibration error: {runError}</div> : null}
+              {resetError ? <div className="text-xs text-red-600">Reset error: {resetError}</div> : null}
             </CardContent>
           </Card>
         </aside>
@@ -2565,7 +2863,7 @@ export default function CalibrationPage() {
               </Card>
               <div className="grid gap-4">
                 {precisionSummaries.map((summary) => (
-                  <PrecisionCard key={summary.standard} summary={summary} />
+                  <PrecisionCard key={summary.standard} summary={summary} linearityEnabled={Boolean(activeConfig.linearity.apply)} />
                 ))}
               </div>
             </div>
@@ -2613,7 +2911,7 @@ export default function CalibrationPage() {
                 <Card>
                   <CardHeader>
                     <CardTitle>Calibration 3D Chart</CardTitle>
-                    <CardDescription>Filtered standards in calibration space using the active color parameter for both color and Z-axis.</CardDescription>
+                    <CardDescription>Filtered standards in calibration space using the active color and Z-axis parameters.</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <PlotlyChart
@@ -2641,9 +2939,16 @@ export default function CalibrationPage() {
               </div>
 
               <Card>
-                <CardHeader>
-                  <CardTitle>Linearity Correction</CardTitle>
-                  <CardDescription>Standards-only linearity fits built from the active precision date window and intensity basis.</CardDescription>
+                <CardHeader className="gap-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <CardTitle>Linearity Correction</CardTitle>
+                    <span className="rounded-full bg-stone-50 px-3 py-1.5 text-sm text-stone-700 ring-1 ring-stone-200">
+                      Basis: {selectedLinearityBasisLabel}
+                    </span>
+                  </div>
+                  <CardDescription>
+                    Standards-only linearity fits built from the active precision date window and the selected basis used during calibration.
+                  </CardDescription>
                 </CardHeader>
                 <CardContent className="grid gap-6 2xl:grid-cols-2">
                   <PlotlyChart

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -55,6 +59,38 @@ class SessionStoreTests(unittest.TestCase):
             self.assertTrue(store.delete_session(session_id))
             self.assertFalse(root.exists())
             self.assertFalse(store.delete_session(session_id))
+
+    def test_create_session_prefers_source_folder_session_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_root = Path(temp_dir) / "workbooks"
+            source_root.mkdir(parents=True, exist_ok=True)
+            workbook_path = source_root / "source.xlsx"
+            workbook_bytes = b"dummy workbook bytes for source matching"
+            workbook_path.write_bytes(workbook_bytes)
+            source_spec = {
+                "name": workbook_path.name,
+                "size": len(workbook_bytes),
+                "md5": hashlib.md5(workbook_bytes).hexdigest().lower(),
+            }
+            with patch.dict(os.environ, {"IRMS_SOURCE_SEARCH_ROOTS": str(source_root)}):
+                store = FileSessionStore(Path(temp_dir) / "store")
+                session_id = store.create_session({"source_files": [source_spec]})
+
+            paths = store._paths(session_id)
+            expected_root = (source_root / "Session record" / session_id).resolve()
+            self.assertEqual(paths.root, expected_root)
+            self.assertTrue(paths.metadata_path.exists())
+
+            index_path = Path(temp_dir) / "store" / "_session_index.json"
+            self.assertTrue(index_path.exists())
+            index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+            self.assertEqual(index_payload.get(session_id), str(expected_root))
+
+    def test_source_search_roots_require_explicit_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {"IRMS_SOURCE_SEARCH_ROOTS": ""}):
+                store = FileSessionStore(temp_dir)
+                self.assertEqual(store._iter_source_search_roots(), [])
 
 
 if __name__ == "__main__":

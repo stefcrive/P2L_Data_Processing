@@ -60,6 +60,20 @@ def _resolve_species_labels(df: pd.DataFrame) -> pd.Series:
     return labels
 
 
+def _effective_calibrated_column(df: pd.DataFrame, isotope_key: str) -> str | None:
+    if df is None or df.empty:
+        return None
+    candidates = (
+        ["d13C_calibrated_linearity_corrected", "d13C_calibrated"]
+        if isotope_key == "d13C"
+        else ["d18O_calibrated_linearity_corrected", "d18O_calibrated"]
+    )
+    for col in candidates:
+        if col in df.columns and pd.to_numeric(df[col], errors="coerce").notna().any():
+            return col
+    return None
+
+
 def _color_series_for_plot(df: pd.DataFrame, color_col: str) -> tuple[pd.Series, tuple[list[Any], list[str]] | None, bool, float, float]:
     color_values, category_ticks = _prepare_color_values(df.get(color_col))
     if color_values is not None and len(color_values) == len(df):
@@ -79,6 +93,46 @@ def _color_series_for_plot(df: pd.DataFrame, color_col: str) -> tuple[pd.Series,
     return numeric_colors, category_ticks, has_numeric_colors, cmin, cmax
 
 
+def _restored_row_labels(edit_state: dict[str, Any] | None, isotope_key: str | None = None) -> set[str]:
+    raw_tokens = (edit_state or {}).get("restored_delta_tokens", [])
+    raw_missing_tokens = (edit_state or {}).get("original_missing_delta_tokens", [])
+    missing_by_isotope: dict[str, set[str]] = {"d13C": set(), "d18O": set()}
+    for token in raw_missing_tokens if isinstance(raw_missing_tokens, list) else []:
+        token_str = str(token).strip()
+        if not token_str or "|" not in token_str:
+            continue
+        iso, row_label = token_str.split("|", 1)
+        row_key = row_label.strip()
+        if iso in missing_by_isotope and row_key:
+            missing_by_isotope[iso].add(row_key)
+    restored: set[str] = set()
+    for token in raw_tokens if isinstance(raw_tokens, list) else []:
+        token_str = str(token).strip()
+        if not token_str:
+            continue
+        if "|" not in token_str:
+            continue
+        iso, row_label = token_str.split("|", 1)
+        row_key = row_label.strip()
+        if not row_key:
+            continue
+        if iso not in missing_by_isotope:
+            continue
+        # Only treat as restored when the isotope was originally missing.
+        if row_key not in missing_by_isotope[iso]:
+            continue
+        if isotope_key is None or iso == isotope_key:
+            restored.add(row_key)
+    return restored
+
+
+def _restored_crossplot_rows(edit_state: dict[str, Any] | None) -> set[str]:
+    # Cross/3D restored markers should only show points restored for both isotopes.
+    restored_d13 = _restored_row_labels(edit_state, isotope_key="d13C")
+    restored_d18 = _restored_row_labels(edit_state, isotope_key="d18O")
+    return restored_d13 & restored_d18
+
+
 def _build_summary_figure(
     df: pd.DataFrame,
     isotope_key: str,
@@ -89,7 +143,7 @@ def _build_summary_figure(
     if go is None or df is None or df.empty:
         return {}
     y_col = "d 13C/12C  Mean" if isotope_key == "d13C" else "d 18O/16O  Mean"
-    cal_col = "d13C_calibrated" if isotope_key == "d13C" else "d18O_calibrated"
+    cal_col = _effective_calibrated_column(df, isotope_key)
     fig = go.Figure()
     work = df.copy()
     work["_species_label"] = _resolve_species_labels(work)
@@ -119,7 +173,7 @@ def _build_summary_figure(
                 customdata=_build_delta_point_customdata(plot_df, isotope_key),
             )
         )
-        if show_calibrated and cal_col in plot_df.columns and pd.to_numeric(plot_df[cal_col], errors="coerce").notna().any():
+        if show_calibrated and cal_col and cal_col in plot_df.columns and pd.to_numeric(plot_df[cal_col], errors="coerce").notna().any():
             fig.add_trace(
                 go.Scatter(
                     x=plot_df["x_axis"],
@@ -242,6 +296,7 @@ def _add_processing_crossplot_overlays(
     summary_masks: dict[str, pd.Series],
     sat_masks: dict[str, pd.Series],
     config: Any,
+    edit_state: dict[str, Any] | None = None,
 ) -> None:
     if fig is None or overlay_df is None or overlay_df.empty:
         return
@@ -252,10 +307,14 @@ def _add_processing_crossplot_overlays(
     if not valid_xy.any():
         return
 
-    def _rows(mask: pd.Series | None) -> pd.DataFrame:
+    restored_rows_all = _restored_crossplot_rows(edit_state)
+
+    def _rows(mask: pd.Series | None, include_restored: bool = False) -> pd.DataFrame:
         if mask is None:
             return pd.DataFrame(columns=overlay_df.columns)
         m = mask.reindex(overlay_df.index, fill_value=False).astype(bool) & valid_xy
+        if not include_restored and restored_rows_all:
+            m = m & ~pd.Series([str(idx) in restored_rows_all for idx in overlay_df.index], index=overlay_df.index, dtype=bool)
         return overlay_df.loc[m].copy()
 
     if getattr(config.overlays, "show_statistical_outliers", False):
@@ -345,6 +404,26 @@ def _add_processing_crossplot_overlays(
                 )
             )
 
+    restored_rows = _rows(
+        pd.Series(
+            [str(idx) in _restored_crossplot_rows(edit_state) for idx in overlay_df.index],
+            index=overlay_df.index,
+            dtype=bool,
+        ),
+        include_restored=True,
+    )
+    if not restored_rows.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=pd.to_numeric(restored_rows.get("d 18O/16O  Mean"), errors="coerce"),
+                y=pd.to_numeric(restored_rows.get("d 13C/12C  Mean"), errors="coerce"),
+                mode="markers",
+                name="Restored Samples",
+                marker=dict(size=13, symbol="star", color="#22c55e", line=dict(width=1.5, color="#166534")),
+                customdata=_build_delta_point_customdata(restored_rows, "cross"),
+            )
+        )
+
 
 def _add_processing_3d_overlays(
     fig: go.Figure,
@@ -354,6 +433,7 @@ def _add_processing_3d_overlays(
     z_col: str,
     z_label: str,
     config: Any,
+    edit_state: dict[str, Any] | None = None,
 ) -> None:
     if fig is None or overlay_df is None or overlay_df.empty:
         return
@@ -365,18 +445,22 @@ def _add_processing_3d_overlays(
     if not valid_xyz.any():
         return
 
-    def _rows(mask: pd.Series | None) -> pd.DataFrame:
+    restored_rows_all = _restored_crossplot_rows(edit_state)
+
+    def _rows(mask: pd.Series | None, include_restored: bool = False) -> pd.DataFrame:
         if mask is None:
             return pd.DataFrame(columns=overlay_df.columns)
         m = mask.reindex(overlay_df.index, fill_value=False).astype(bool) & valid_xyz
+        if not include_restored and restored_rows_all:
+            m = m & ~pd.Series([str(idx) in restored_rows_all for idx in overlay_df.index], index=overlay_df.index, dtype=bool)
         return overlay_df.loc[m].copy()
 
     hover_template = (
         "Identifier 1: %{customdata[2]}<br>"
         "Identifier 2: %{customdata[3]}<br>"
-        "d18O: %{x:.4f}<br>"
-        "d13C: %{y:.4f}<br>"
-        f"{z_label}: %{{z:.4f}}<extra></extra>"
+        "d18O: %{x:.3f}<br>"
+        "d13C: %{y:.3f}<br>"
+        f"{z_label}: %{{z:.3f}}<extra></extra>"
     )
 
     if getattr(config.overlays, "show_statistical_outliers", False):
@@ -476,6 +560,28 @@ def _add_processing_3d_overlays(
                 )
             )
 
+    restored_rows = _rows(
+        pd.Series(
+            [str(idx) in _restored_crossplot_rows(edit_state) for idx in overlay_df.index],
+            index=overlay_df.index,
+            dtype=bool,
+        ),
+        include_restored=True,
+    )
+    if not restored_rows.empty:
+        fig.add_trace(
+            go.Scatter3d(
+                x=pd.to_numeric(restored_rows.get("d 18O/16O  Mean"), errors="coerce"),
+                y=pd.to_numeric(restored_rows.get("d 13C/12C  Mean"), errors="coerce"),
+                z=pd.to_numeric(restored_rows.get(z_col), errors="coerce"),
+                mode="markers",
+                name="Restored Samples",
+                marker=dict(size=9, symbol="x", color="#22c55e", line=dict(width=2, color="#166534"), opacity=0.95),
+                customdata=_build_delta_point_customdata(restored_rows, "cross"),
+                hovertemplate=hover_template,
+            )
+        )
+
 
 def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
     """Tune processing 3D figure spacing so the chart fills the card and colorbar stays right-aligned."""
@@ -506,41 +612,6 @@ def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
     fig.update_layout(**layout_updates)
 
 
-def _materialize_color_param_z_axis(
-    filtered_df: pd.DataFrame,
-    overlay_df: pd.DataFrame,
-    color_param: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, str, str]:
-    filtered = filtered_df.copy() if filtered_df is not None else pd.DataFrame()
-    overlay = overlay_df.copy() if overlay_df is not None else pd.DataFrame()
-    color_col = str(color_param or "").strip()
-    if not color_col:
-        return filtered, overlay, color_col, color_col
-    if color_col not in filtered.columns and color_col not in overlay.columns:
-        return filtered, overlay, color_col, color_col
-
-    filtered_source = filtered.get(color_col, pd.Series(np.nan, index=filtered.index))
-    overlay_source = overlay.get(color_col, pd.Series(np.nan, index=overlay.index))
-    combined = pd.concat(
-        [
-            pd.Series(filtered_source, index=filtered.index, dtype=object).reset_index(drop=True),
-            pd.Series(overlay_source, index=overlay.index, dtype=object).reset_index(drop=True),
-        ],
-        axis=0,
-        ignore_index=True,
-    )
-    z_values, _ = _prepare_color_values(combined)
-    z_numeric = pd.to_numeric(z_values, errors="coerce") if z_values is not None else pd.Series(dtype=float)
-    if z_numeric.empty or not bool(z_numeric.notna().any()):
-        return filtered, overlay, color_col, color_col
-
-    z_axis_col = "__z_axis_from_color_param__"
-    split_index = len(filtered_source)
-    filtered[z_axis_col] = pd.Series(z_numeric.iloc[:split_index].to_numpy(), index=filtered.index, dtype=float)
-    overlay[z_axis_col] = pd.Series(z_numeric.iloc[split_index:].to_numpy(), index=overlay.index, dtype=float)
-    return filtered, overlay, z_axis_col, color_col
-
-
 def build_overview_figures(
     filtered_df: pd.DataFrame,
     scoped_df: pd.DataFrame,
@@ -564,15 +635,10 @@ def build_overview_figures(
         filtered_base_df = filtered_base_df.loc[
             ~stat_mask_combined.reindex(filtered_base_df.index, fill_value=False).astype(bool)
         ].copy()
-    filtered_base_df, overlays_df, z_axis_col, z_axis_label = _materialize_color_param_z_axis(
-        filtered_base_df,
-        overlays_df,
-        str(config.color_param),
-    )
     fig_3d, _ = _build_isotope_3d_scatter(
         filtered_base_df,
-        z_col=z_axis_col,
-        z_label=z_axis_label,
+        z_col=config.z_axis,
+        z_label=config.z_axis,
         color_col=config.color_param,
         color_label=config.color_param,
         title="Processing 3D Chart",
@@ -583,11 +649,12 @@ def build_overview_figures(
             overlays_df,
             summary_masks,
             sat_masks,
-            z_col=z_axis_col,
-            z_label=z_axis_label,
+            z_col=config.z_axis,
+            z_label=config.z_axis,
             config=config,
+            edit_state=edit_state,
         )
-        axis_cols = ["d 18O/16O  Mean", "d 13C/12C  Mean", str(z_axis_col)]
+        axis_cols = ["d 18O/16O  Mean", "d 13C/12C  Mean", str(config.z_axis)]
         axis_df = pd.concat(
             [
                 _numeric_axis_rows(filtered_base_df, axis_cols),
@@ -599,7 +666,7 @@ def build_overview_figures(
         if not axis_df.empty:
             x_range = _axis_range(axis_df["d 18O/16O  Mean"])
             y_range = _axis_range(axis_df["d 13C/12C  Mean"])
-            z_range = _axis_range(axis_df[str(z_axis_col)])
+            z_range = _axis_range(axis_df[str(config.z_axis)])
             scene_update: dict[str, Any] = {}
             if x_range is not None:
                 scene_update["xaxis"] = {"range": x_range}
@@ -683,7 +750,7 @@ def build_overview_figures(
                 ),
             )
         )
-    _add_processing_crossplot_overlays(fig_cross, overlays_df, summary_masks, sat_masks, config)
+    _add_processing_crossplot_overlays(fig_cross, overlays_df, summary_masks, sat_masks, config, edit_state=edit_state)
     axis_cols = ["d 18O/16O  Mean", "d 13C/12C  Mean"]
     axis_df = pd.concat(
         [
@@ -735,10 +802,10 @@ def _build_identifier_figure(
     if go is None:
         return {}, False
     y_col = "d 13C/12C  Mean" if isotope_key == "d13C" else "d 18O/16O  Mean"
-    cal_col = "d13C_calibrated" if isotope_key == "d13C" else "d18O_calibrated"
     species_col = "Species" if "Species" in species_unfiltered.columns else "Identifier 1"
     filtered_identifier = species_df[species_df["Identifier 1"].astype(str) == str(identifier)].copy()
     unfiltered_identifier = species_unfiltered[species_unfiltered["Identifier 1"].astype(str) == str(identifier)].copy()
+    cal_col = _effective_calibrated_column(unfiltered_identifier, isotope_key)
     if filtered_identifier.empty and unfiltered_identifier.empty:
         return {}, False
 
@@ -796,17 +863,25 @@ def _build_identifier_figure(
     ].copy()
     color_series, _, has_numeric_colors, color_min, color_max = _color_series_for_plot(filtered_identifier, config.color_param)
     filtered_identifier["_color_value"] = color_series
+    restored_rows_for_isotope = _restored_row_labels(edit_state, isotope_key=isotope_key)
+    edited_row_tokens = {str(row) for row in (edit_state or {}).get("edited_rows", [])}
     edited_mask = pd.Series(
-        [str(idx) in {str(row) for row in (edit_state or {}).get("edited_rows", [])} for idx in filtered_identifier.index],
+        [str(idx) in edited_row_tokens and str(idx) not in restored_rows_for_isotope for idx in filtered_identifier.index],
         index=filtered_identifier.index,
         dtype=bool,
     )
     sat_masks = _partial_saturation_isotope_masks(unfiltered_identifier)
     d13_std_lookup, d18_std_lookup = _build_cycle_std_lookups(unfiltered_identifier)
 
+    def _exclude_restored(rows: pd.DataFrame) -> pd.DataFrame:
+        if rows.empty or not restored_rows_for_isotope:
+            return rows
+        return rows.loc[[str(idx) not in restored_rows_for_isotope for idx in rows.index]]
+
     fig = go.Figure()
     if getattr(config.overlays, "show_statistical_outliers", False):
         statistical_outliers = unfiltered_identifier.loc[statistical_mask.reindex(unfiltered_identifier.index, fill_value=False)]
+        statistical_outliers = _exclude_restored(statistical_outliers)
         if not statistical_outliers.empty:
             fig.add_trace(
                 go.Scatter(
@@ -841,6 +916,7 @@ def _build_identifier_figure(
         }
         for key, mask in range_masks.items():
             rows = unfiltered_identifier.loc[mask]
+            rows = _exclude_restored(rows)
             if rows.empty:
                 continue
             fig.add_trace(
@@ -856,6 +932,7 @@ def _build_identifier_figure(
     if getattr(config.overlays, "show_manual_outliers", False):
         manual_mask = summary_masks.get("Manual Override", pd.Series(False, index=unfiltered_identifier.index))
         manual_rows = unfiltered_identifier.loc[manual_mask.reindex(unfiltered_identifier.index, fill_value=False).astype(bool)]
+        manual_rows = _exclude_restored(manual_rows)
         if not manual_rows.empty:
             fig.add_trace(
                 go.Scatter(
@@ -869,6 +946,7 @@ def _build_identifier_figure(
             )
     if getattr(config.overlays, "show_saturated_collectors", True):
         status_rows = unfiltered_identifier.loc[sat_masks[isotope_key]]
+        status_rows = _exclude_restored(status_rows)
         if not status_rows.empty:
             fig.add_trace(
                 go.Scatter(
@@ -882,6 +960,7 @@ def _build_identifier_figure(
             )
     if getattr(config.overlays, "show_saturated_samples", True):
         full_rows = unfiltered_identifier.loc[summary_masks["Fully Saturated Collectors"]]
+        full_rows = _exclude_restored(full_rows)
         if not full_rows.empty:
             y_vals = pd.to_numeric(filtered_identifier.get(y_col), errors="coerce")
             y_min = y_vals.min() if y_vals.notna().any() else -1.0
@@ -900,6 +979,7 @@ def _build_identifier_figure(
             )
     if getattr(config.overlays, "show_failed_samples", True):
         failed_rows = unfiltered_identifier.loc[summary_masks["Failed Sample"]]
+        failed_rows = _exclude_restored(failed_rows)
         if not failed_rows.empty:
             failed_values = pd.to_numeric(failed_rows.get(y_col), errors="coerce")
             failed_interp = failed_rows.loc[failed_values.notna()]
@@ -931,18 +1011,40 @@ def _build_identifier_figure(
                         customdata=_build_delta_point_customdata(failed_missing, isotope_key),
                     )
                 )
+    restored_rows = unfiltered_identifier.loc[
+        pd.Series([str(idx) in restored_rows_for_isotope for idx in unfiltered_identifier.index], index=unfiltered_identifier.index, dtype=bool)
+    ]
+    if not restored_rows.empty:
+        restored_values = pd.to_numeric(restored_rows.get(y_col), errors="coerce")
+        restored_interp = restored_rows.loc[restored_values.notna()]
+        show_legend = True
+        if not restored_interp.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=restored_interp["x_axis"],
+                    y=pd.to_numeric(restored_interp.get(y_col), errors="coerce"),
+                    mode="markers",
+                    marker=dict(color="#22c55e", symbol="star", size=13, line=dict(width=1.5, color="#166534")),
+                    name="Restored Samples",
+                    showlegend=show_legend,
+                    customdata=_build_delta_point_customdata(restored_interp, isotope_key),
+                )
+            )
     if not filtered_identifier.empty:
         error_y = _build_plotly_error_bar_for_df(filtered_identifier, isotope_key, d13_std_lookup, d18_std_lookup)
+        raw_marker_sizes = [0 if str(idx) in restored_rows_for_isotope else 8 for idx in filtered_identifier.index]
         marker: dict[str, Any] = dict(size=8, color="#2563eb")
         if has_numeric_colors:
             marker = dict(
-                size=8,
+                size=raw_marker_sizes,
                 color=filtered_identifier["_color_value"],
                 colorscale="Viridis",
                 cmin=color_min,
                 cmax=color_max,
                 showscale=False,
             )
+        else:
+            marker = dict(size=raw_marker_sizes, color="#2563eb")
         fig.add_trace(
             go.Scatter(
                 x=filtered_identifier["x_axis"],
@@ -967,12 +1069,16 @@ def _build_identifier_figure(
                     customdata=_build_delta_point_customdata(edited_rows, isotope_key),
                 )
             )
-        has_calibrated = cal_col in filtered_identifier.columns and pd.to_numeric(filtered_identifier[cal_col], errors="coerce").notna().any()
+        has_calibrated = bool(
+            cal_col
+            and cal_col in filtered_identifier.columns
+            and pd.to_numeric(filtered_identifier[cal_col], errors="coerce").notna().any()
+        )
         if has_calibrated:
             fig.add_trace(
                 go.Scatter(
                     x=filtered_identifier["x_axis"],
-                    y=pd.to_numeric(filtered_identifier.get(cal_col), errors="coerce"),
+                    y=pd.to_numeric(filtered_identifier.get(str(cal_col)), errors="coerce"),
                     mode="lines",
                     line=dict(color="#f97316", width=2),
                     name=f"Calibrated {isotope_key} - {identifier}",

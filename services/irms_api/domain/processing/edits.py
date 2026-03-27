@@ -5,7 +5,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..calibration.core import _resolve_linearity_intensity_column_for_fits
+from ..calibration.core import (
+    _apply_linearity_line_offsets,
+    _linearity_correction_delta,
+    _resolve_linearity_intensity_column_for_fits,
+)
 from ..contracts import EditAction
 from ..shared.dataframe import _parse_numeric_token
 
@@ -17,6 +21,15 @@ def _get_isotope_columns(isotope_key: str) -> tuple[str | None, str | None, str 
     if key == "d18O":
         return ("d 18O/16O  Mean", "d18O_calibrated", "d18O_calibrated_linearity_corrected")
     return (None, None, None)
+
+
+def _get_isotope_std_column(isotope_key: str) -> str | None:
+    key = str(isotope_key).strip()
+    if key == "d13C":
+        return "d 13C/12C  Std Dev"
+    if key == "d18O":
+        return "d 18O/16O  Std Dev"
+    return None
 
 
 def _estimate_calibration_affine(
@@ -74,11 +87,13 @@ def _refresh_calibrated_after_delta_edit(
     isotope_key: str,
     calibration_coefficients: dict[str, Any] | None = None,
     linearity_fits: dict[str, Any] | None = None,
+    linearity_config: dict[str, Any] | None = None,
     previous_raw: float | None = None,
     previous_calibrated: float | None = None,
 ) -> pd.DataFrame:
     work = df.copy()
     raw_col, cal_col, corrected_col = _get_isotope_columns(isotope_key)
+    raw_corrected_col = "d13C_linearity_corrected" if isotope_key == "d13C" else "d18O_linearity_corrected" if isotope_key == "d18O" else None
     if row_label not in work.index or raw_col is None or cal_col is None:
         return work
     if raw_col not in work.columns or cal_col not in work.columns:
@@ -91,6 +106,40 @@ def _refresh_calibrated_after_delta_edit(
         return work
     slope = None
     intercept = None
+    linearity_cfg = linearity_config or {}
+    fits = linearity_fits or {}
+    fit = fits.get(str(isotope_key).strip(), {}) if isinstance(fits, dict) else {}
+    apply_linearity_before_calibration = bool(linearity_cfg.get("apply")) and isinstance(fits, dict) and bool(fits)
+    delta = np.nan
+    if apply_linearity_before_calibration:
+        context = _apply_linearity_line_offsets(
+            work,
+            _resolve_linearity_intensity_column_for_fits(
+                fits=fits,
+                df=work,
+                use_diff_intensity=bool(linearity_cfg.get("use_diff_intensity", False)),
+                selected_intensity_col=linearity_cfg.get("intensity_col"),
+            ),
+            line_1_offset=float(linearity_cfg.get("line_1_offset", 0.0) or 0.0),
+            line_2_offset=float(linearity_cfg.get("line_2_offset", 0.0) or 0.0),
+        )
+        intensity_col = _resolve_linearity_intensity_column_for_fits(
+            fits=fits,
+            df=context,
+            use_diff_intensity=bool(linearity_cfg.get("use_diff_intensity", False)),
+            selected_intensity_col=linearity_cfg.get("intensity_col"),
+        )
+        intensity = (
+            pd.to_numeric(pd.Series([context.at[row_label, intensity_col]]), errors="coerce").iloc[0]
+            if intensity_col in context.columns
+            else np.nan
+        )
+        if np.isfinite(intensity):
+            intensity_series = pd.Series([float(intensity)], index=[row_label], dtype=float)
+            delta = pd.to_numeric(_linearity_correction_delta(intensity_series, fit), errors="coerce").iloc[0]
+    effective_raw = float(new_raw - delta) if np.isfinite(new_raw) and np.isfinite(delta) else float(new_raw)
+    if raw_corrected_col and raw_corrected_col in work.columns:
+        work.at[row_label, raw_corrected_col] = effective_raw if np.isfinite(effective_raw) else np.nan
     coeffs = calibration_coefficients or {}
     iso_coeff = coeffs.get(str(isotope_key).strip(), {}) if isinstance(coeffs, dict) else {}
     slope_candidate = pd.to_numeric(pd.Series([iso_coeff.get("slope")]), errors="coerce").iloc[0]
@@ -101,30 +150,20 @@ def _refresh_calibrated_after_delta_edit(
     if slope is None or intercept is None:
         slope, intercept = _estimate_calibration_affine(work, raw_col, cal_col, exclude_row_label=row_label)
     if slope is not None and intercept is not None:
-        new_cal = slope * float(new_raw) + intercept
+        new_cal = slope * effective_raw + intercept
     else:
         prev_raw_num = pd.to_numeric(pd.Series([previous_raw]), errors="coerce").iloc[0]
         prev_cal_num = pd.to_numeric(pd.Series([previous_calibrated]), errors="coerce").iloc[0]
+        if np.isfinite(prev_raw_num) and np.isfinite(delta):
+            prev_raw_num = float(prev_raw_num) - float(delta)
         if np.isfinite(prev_raw_num) and np.isfinite(prev_cal_num):
-            new_cal = float(prev_cal_num) + (float(new_raw) - float(prev_raw_num))
+            new_cal = float(prev_cal_num) + (effective_raw - float(prev_raw_num))
         else:
-            return work
+            # Keep calibrated curves synchronized with edits even when no calibration model is available.
+            new_cal = effective_raw
     work.at[row_label, cal_col] = float(new_cal) if np.isfinite(new_cal) else np.nan
     if corrected_col in work.columns:
-        fits = linearity_fits or {}
-        fit = fits.get(str(isotope_key).strip(), {}) if isinstance(fits, dict) else {}
-        slope_lin = pd.to_numeric(pd.Series([fit.get("slope")]), errors="coerce").iloc[0]
-        x_ref = pd.to_numeric(pd.Series([fit.get("x_ref")]), errors="coerce").iloc[0]
-        intensity_col = _resolve_linearity_intensity_column_for_fits(fits=fits, df=work)
-        intensity = (
-            pd.to_numeric(pd.Series([work.at[row_label, intensity_col]]), errors="coerce").iloc[0]
-            if intensity_col in work.columns
-            else np.nan
-        )
-        if np.isfinite(slope_lin) and np.isfinite(x_ref) and np.isfinite(intensity):
-            work.at[row_label, corrected_col] = float(new_cal - float(slope_lin) * (float(intensity) - float(x_ref)))
-        else:
-            work.at[row_label, corrected_col] = float(new_cal)
+        work.at[row_label, corrected_col] = float(new_cal) if np.isfinite(new_cal) else np.nan
     return work
 
 
@@ -226,20 +265,80 @@ def _interpolate_single_target_within_identifier_group(
     if row_label not in subset.index:
         return None
 
-    target_mask = pd.Series(False, index=subset.index, dtype=bool)
-    target_mask.loc[row_label] = True
-    interpolated_subset = _interpolate_outliers_by_identifier2(subset, target_mask, [col], id2_col=id2_col)
-    interpolated_value = pd.to_numeric(pd.Series([interpolated_subset.at[row_label, col]]), errors="coerce").iloc[0]
-    if not np.isfinite(interpolated_value):
+    work = subset.copy()
+    if id2_col in work.columns:
+        order = pd.to_numeric(work[id2_col], errors="coerce")
+        if order.isna().all():
+            order = pd.to_numeric(work[id2_col].map(_parse_numeric_token), errors="coerce")
+    else:
+        order = pd.Series(np.arange(len(work)), index=work.index, dtype=float)
+    work["_order_irms"] = order
+    work["_orig_pos_irms"] = np.arange(len(work), dtype=float)
+    work_sorted = work.sort_values(["_order_irms", "_orig_pos_irms"], na_position="last")
+    if row_label not in work_sorted.index:
         return None
-    return float(interpolated_value)
+
+    y_values = pd.to_numeric(work_sorted[col], errors="coerce")
+    x_order = pd.to_numeric(work_sorted["_order_irms"], errors="coerce")
+    x_pos = pd.Series(np.arange(len(work_sorted), dtype=float), index=work_sorted.index)
+    x_axis = x_order.where(x_order.notna(), x_pos)
+    row_positions = np.flatnonzero(work_sorted.index.to_numpy() == row_label)
+    if row_positions.size == 0:
+        return None
+    pos = int(row_positions[0])
+
+    prev_value: float | None = None
+    prev_pos: int | None = None
+    for i in range(pos - 1, -1, -1):
+        value = y_values.iloc[i]
+        if np.isfinite(value):
+            prev_value = float(value)
+            prev_pos = int(i)
+            break
+
+    next_value: float | None = None
+    next_pos: int | None = None
+    for i in range(pos + 1, len(work_sorted)):
+        value = y_values.iloc[i]
+        if np.isfinite(value):
+            next_value = float(value)
+            next_pos = int(i)
+            break
+
+    if prev_value is not None and next_value is not None and prev_pos is not None and next_pos is not None:
+        x0 = pd.to_numeric(pd.Series([x_axis.iloc[prev_pos]]), errors="coerce").iloc[0]
+        x1 = pd.to_numeric(pd.Series([x_axis.iloc[next_pos]]), errors="coerce").iloc[0]
+        xt = pd.to_numeric(pd.Series([x_axis.iloc[pos]]), errors="coerce").iloc[0]
+        if (
+            np.isfinite(x0)
+            and np.isfinite(x1)
+            and np.isfinite(xt)
+            and not np.isclose(float(x1), float(x0))
+        ):
+            ratio = (float(xt) - float(x0)) / (float(x1) - float(x0))
+        else:
+            denom = float(next_pos - prev_pos)
+            ratio = (float(pos) - float(prev_pos)) / denom if denom != 0 else 0.5
+        if not np.isfinite(ratio):
+            ratio = 0.5
+        ratio = float(np.clip(ratio, 0.0, 1.0))
+        return float(prev_value + ratio * (next_value - prev_value))
+    if prev_value is not None:
+        return prev_value
+    if next_value is not None:
+        return next_value
+    return None
 
 
 def _ensure_edit_state(edit_state: dict[str, Any] | None) -> dict[str, Any]:
     payload = dict(edit_state or {})
     payload.setdefault("edited_rows", [])
     payload.setdefault("original_delta_values", {})
+    payload.setdefault("original_missing_delta_tokens", [])
+    payload.setdefault("original_std_values", {})
+    payload.setdefault("original_missing_std_tokens", [])
     payload.setdefault("manual_outlier_overrides", {})
+    payload.setdefault("restored_delta_tokens", [])
     return payload
 
 
@@ -249,6 +348,8 @@ def apply_edit_action(
     edit: EditAction,
     calibration_coefficients: dict[str, Any] | None = None,
     linearity_fits: dict[str, Any] | None = None,
+    linearity_config: dict[str, Any] | None = None,
+    interpolation_source_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     work = df.copy()
     state = _ensure_edit_state(edit_state)
@@ -257,10 +358,30 @@ def apply_edit_action(
         for key, value in state.get("original_delta_values", {}).items()
         if pd.notna(pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0])
     }
+    original_missing_tokens = {
+        str(token)
+        for token in state.get("original_missing_delta_tokens", [])
+        if str(token).strip() != ""
+    }
+    original_std_map = {
+        str(key): float(value)
+        for key, value in state.get("original_std_values", {}).items()
+        if pd.notna(pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0])
+    }
+    original_missing_std_tokens = {
+        str(token)
+        for token in state.get("original_missing_std_tokens", [])
+        if str(token).strip() != ""
+    }
     edited_rows = {str(row) for row in state.get("edited_rows", [])}
     manual_outlier_overrides = {
         str(key): bool(value)
         for key, value in state.get("manual_outlier_overrides", {}).items()
+    }
+    restored_tokens = {
+        str(token)
+        for token in state.get("restored_delta_tokens", [])
+        if str(token).strip() != ""
     }
     coeffs = calibration_coefficients or {}
     fits = linearity_fits or {}
@@ -277,7 +398,8 @@ def apply_edit_action(
         raise KeyError(f"Unknown row label {target_row_label}")
 
     if edit.action == "reset_all":
-        for token, original_value in list(original_map.items()):
+        reset_tokens = sorted(set(original_map.keys()) | original_missing_tokens)
+        for token in reset_tokens:
             if "|" not in token:
                 continue
             isotope_key, row_label_raw = token.split("|", 1)
@@ -291,7 +413,10 @@ def apply_edit_action(
                 if cal_col in work.columns
                 else None
             )
-            work.at[row_label, raw_col] = float(original_value)
+            if token in original_map:
+                work.at[row_label, raw_col] = float(original_map[token])
+            else:
+                work.at[row_label, raw_col] = np.nan
             work = _refresh_collector_status_after_delta_edit(work, row_label)
             work = _refresh_calibrated_after_delta_edit(
                 work,
@@ -299,11 +424,29 @@ def apply_edit_action(
                 isotope_key,
                 coeffs,
                 fits,
+                linearity_config,
                 previous_raw=prev_raw,
                 previous_calibrated=prev_cal,
             )
+        std_reset_tokens = sorted(set(original_std_map.keys()) | original_missing_std_tokens)
+        for token in std_reset_tokens:
+            if "|" not in token:
+                continue
+            isotope_key, row_label_raw = token.split("|", 1)
+            std_col = _get_isotope_std_column(isotope_key)
+            if std_col is None or std_col not in work.columns:
+                continue
+            row_label = _resolve_target_row(row_label_raw)
+            if token in original_std_map:
+                work.at[row_label, std_col] = float(original_std_map[token])
+            else:
+                work.at[row_label, std_col] = np.nan
         edited_rows.clear()
         original_map = {}
+        original_missing_tokens = set()
+        original_std_map = {}
+        original_missing_std_tokens = set()
+        restored_tokens = set()
     elif edit.action == "set_outlier_override":
         for target in edit.targets:
             manual_outlier_overrides[str(target.row_label)] = bool(edit.is_outlier)
@@ -311,15 +454,19 @@ def apply_edit_action(
         for target in edit.targets:
             row_label = _resolve_target_row(target.row_label)
             raw_col, cal_col, _ = _get_isotope_columns(target.isotope_key)
+            std_col = _get_isotope_std_column(target.isotope_key)
             key = f"{target.isotope_key}|{target.row_label}"
-            if raw_col and key in original_map:
+            if raw_col and (key in original_map or key in original_missing_tokens):
                 prev_raw = pd.to_numeric(pd.Series([work.at[row_label, raw_col]]), errors="coerce").iloc[0]
                 prev_cal = (
                     pd.to_numeric(pd.Series([work.at[row_label, cal_col]]), errors="coerce").iloc[0]
                     if cal_col in work.columns
                     else None
                 )
-                work.at[row_label, raw_col] = original_map[key]
+                if key in original_map:
+                    work.at[row_label, raw_col] = original_map[key]
+                else:
+                    work.at[row_label, raw_col] = np.nan
                 work = _refresh_collector_status_after_delta_edit(work, row_label)
                 work = _refresh_calibrated_after_delta_edit(
                     work,
@@ -327,11 +474,21 @@ def apply_edit_action(
                     target.isotope_key,
                     coeffs,
                     fits,
+                    linearity_config,
                     previous_raw=prev_raw,
                     previous_calibrated=prev_cal,
                 )
                 original_map.pop(key, None)
+                original_missing_tokens.discard(key)
+                restored_tokens.discard(key)
                 edited_rows.discard(str(target.row_label))
+            if std_col and std_col in work.columns and (key in original_std_map or key in original_missing_std_tokens):
+                if key in original_std_map:
+                    work.at[row_label, std_col] = float(original_std_map[key])
+                else:
+                    work.at[row_label, std_col] = np.nan
+                original_std_map.pop(key, None)
+                original_missing_std_tokens.discard(key)
     elif edit.action in {"set_value", "offset"}:
         delta = edit.offset if edit.action == "offset" else edit.value
         if delta is None:
@@ -343,8 +500,11 @@ def apply_edit_action(
                 continue
             key = f"{target.isotope_key}|{target.row_label}"
             current_value = pd.to_numeric(pd.Series([work.at[row_label, raw_col]]), errors="coerce").iloc[0]
-            if key not in original_map and pd.notna(current_value):
-                original_map[key] = float(current_value)
+            if key not in original_map and key not in original_missing_tokens:
+                if pd.notna(current_value):
+                    original_map[key] = float(current_value)
+                else:
+                    original_missing_tokens.add(key)
             new_value = float(delta) if edit.action == "set_value" else float(current_value) + float(delta)
             prev_cal = (
                 pd.to_numeric(pd.Series([work.at[row_label, cal_col]]), errors="coerce").iloc[0]
@@ -359,36 +519,88 @@ def apply_edit_action(
                 target.isotope_key,
                 coeffs,
                 fits,
+                linearity_config,
                 previous_raw=current_value,
                 previous_calibrated=prev_cal,
             )
             edited_rows.add(str(target.row_label))
+            restored_tokens.discard(key)
     elif edit.action == "interpolate":
-        for isotope_key in {"d13C", "d18O"}:
+        failed_rows_before_interpolation: set[str] = set()
+        if "Collector Status" in work.columns:
+            status_series = work["Collector Status"].fillna("").astype(str).str.strip()
+            failed_rows_before_interpolation = {str(idx) for idx in work.index[status_series.eq("Failed Sample")]}
+        interpolation_offset = 0.0
+        if edit.offset is not None:
+            parsed_offset = pd.to_numeric(pd.Series([edit.offset]), errors="coerce").iloc[0]
+            if not np.isfinite(parsed_offset):
+                raise ValueError("Invalid interpolate offset")
+            interpolation_offset = float(parsed_offset)
+        interpolation_stdev: float | None = None
+        if edit.stdev is not None:
+            parsed_stdev = pd.to_numeric(pd.Series([edit.stdev]), errors="coerce").iloc[0]
+            if not np.isfinite(parsed_stdev):
+                raise ValueError("Invalid interpolate stdev")
+            if float(parsed_stdev) < 0:
+                raise ValueError("Interpolate stdev must be non-negative")
+            interpolation_stdev = float(parsed_stdev)
+        targets_by_row: dict[str, set[str]] = {}
+        for target in edit.targets:
+            row_key = str(target.row_label)
+            targets_by_row.setdefault(row_key, set()).add(str(target.isotope_key).strip())
+        preserved_non_target_values: dict[tuple[str, str], dict[str, Any]] = {}
+        for row_key, iso_targets in targets_by_row.items():
+            row_label = _resolve_target_row(row_key)
+            for iso_key in ("d13C", "d18O"):
+                if iso_key in iso_targets:
+                    continue
+                raw_col, cal_col, corrected_col = _get_isotope_columns(iso_key)
+                std_col = _get_isotope_std_column(iso_key)
+                cols = [col for col in (raw_col, cal_col, corrected_col, std_col) if col is not None and col in work.columns]
+                if not cols:
+                    continue
+                preserved_non_target_values[(str(row_label), iso_key)] = {
+                    col: work.at[row_label, col] for col in cols
+                }
+        for isotope_key in ("d13C", "d18O"):
             targets = [target for target in edit.targets if target.isotope_key == isotope_key]
             if not targets:
                 continue
             raw_col, cal_col, _ = _get_isotope_columns(isotope_key)
+            std_col = _get_isotope_std_column(isotope_key)
             if raw_col is None:
                 continue
             interpolation_base = work.copy()
+            interpolation_neighbor_base = interpolation_base.copy()
+            if interpolation_source_df is not None and raw_col in interpolation_source_df.columns:
+                available_for_interpolation = pd.to_numeric(interpolation_source_df[raw_col], errors="coerce").reindex(
+                    interpolation_neighbor_base.index
+                )
+                unavailable_mask = available_for_interpolation.isna()
+                if bool(unavailable_mask.any()):
+                    interpolation_neighbor_base.loc[unavailable_mask, raw_col] = np.nan
             prev_cal_map: dict[str, float | None] = {}
             prev_raw_map: dict[str, float | None] = {}
             interpolated_map: dict[str, float] = {}
+            previously_failed_map: dict[str, bool] = {}
             for target in targets:
                 row_label = _resolve_target_row(target.row_label)
                 key = f"{target.isotope_key}|{target.row_label}"
                 current_value = pd.to_numeric(pd.Series([interpolation_base.at[row_label, raw_col]]), errors="coerce").iloc[0]
-                if key not in original_map and pd.notna(current_value):
-                    original_map[key] = float(current_value)
+                if key not in original_map and key not in original_missing_tokens:
+                    if pd.notna(current_value):
+                        original_map[key] = float(current_value)
+                    else:
+                        original_missing_tokens.add(key)
                 prev_raw_map[str(target.row_label)] = float(current_value) if pd.notna(current_value) else None
                 prev_cal_map[str(target.row_label)] = (
                     pd.to_numeric(pd.Series([interpolation_base.at[row_label, cal_col]]), errors="coerce").iloc[0]
                     if cal_col in work.columns
                     else None
                 )
+                previously_failed_map[str(target.row_label)] = str(row_label) in failed_rows_before_interpolation
                 interpolated_value = _interpolate_single_target_within_identifier_group(
-                    interpolation_base,
+                    interpolation_neighbor_base,
                     row_label,
                     raw_col,
                 )
@@ -396,9 +608,22 @@ def apply_edit_action(
                     interpolated_map[str(target.row_label)] = float(interpolated_value)
             for target in targets:
                 row_label = _resolve_target_row(target.row_label)
+                key = f"{target.isotope_key}|{target.row_label}"
                 next_raw = interpolated_map.get(str(target.row_label))
                 if next_raw is not None:
-                    work.at[row_label, raw_col] = float(next_raw)
+                    work.at[row_label, raw_col] = float(next_raw) + interpolation_offset
+                    if interpolation_stdev is not None and std_col and std_col in work.columns:
+                        if key not in original_std_map and key not in original_missing_std_tokens:
+                            current_std = pd.to_numeric(pd.Series([work.at[row_label, std_col]]), errors="coerce").iloc[0]
+                            if pd.notna(current_std):
+                                original_std_map[key] = float(current_std)
+                            else:
+                                original_missing_std_tokens.add(key)
+                        work.at[row_label, std_col] = float(interpolation_stdev)
+                    # Mark as restored only when this interpolation actually recovers
+                    # a previously missing failed-sample isotope value.
+                    if previously_failed_map.get(str(target.row_label), False) and key in original_missing_tokens:
+                        restored_tokens.add(key)
                 work = _refresh_collector_status_after_delta_edit(work, row_label)
                 work = _refresh_calibrated_after_delta_edit(
                     work,
@@ -406,14 +631,23 @@ def apply_edit_action(
                     isotope_key,
                     coeffs,
                     fits,
+                    linearity_config,
                     previous_raw=prev_raw_map.get(str(target.row_label)),
                     previous_calibrated=prev_cal_map.get(str(target.row_label)),
                 )
                 edited_rows.add(str(target.row_label))
+        for row_key, col_values in preserved_non_target_values.items():
+            row_label = _resolve_target_row(row_key[0])
+            for col, value in col_values.items():
+                work.at[row_label, col] = value
     else:
         raise ValueError(f"Unsupported edit action {edit.action}")
 
     state["original_delta_values"] = original_map
+    state["original_missing_delta_tokens"] = sorted(original_missing_tokens)
+    state["original_std_values"] = original_std_map
+    state["original_missing_std_tokens"] = sorted(original_missing_std_tokens)
     state["edited_rows"] = sorted(edited_rows)
     state["manual_outlier_overrides"] = manual_outlier_overrides
+    state["restored_delta_tokens"] = sorted(restored_tokens)
     return work, state

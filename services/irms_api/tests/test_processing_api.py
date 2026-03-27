@@ -136,6 +136,58 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertEqual(float(updated_df.loc[0, "d 13C/12C  Mean"]), 8.0)
         self.assertEqual(float(updated_df.loc[0, "d13C_calibrated"]), 9.0)
 
+    def test_remove_processing_calibration_drops_applied_columns_only(self) -> None:
+        workspace = api_main.remove_processing_calibration(self.session_id)
+        self.assertEqual(workspace.session_id, self.session_id)
+
+        updated_df = api_main.store.load_frame(self.session_id)
+        self.assertNotIn("d13C_calibrated", updated_df.columns)
+        self.assertNotIn("d18O_calibrated", updated_df.columns)
+        self.assertNotIn("d13C_calibrated_linearity_corrected", updated_df.columns)
+        self.assertNotIn("d18O_calibrated_linearity_corrected", updated_df.columns)
+
+        metadata = api_main.store.load_metadata(self.session_id)
+        self.assertIn("coefficients", metadata.get("calibration", {}))
+        self.assertFalse(bool(metadata.get("processing", {}).get("apply_calibration", True)))
+
+        has_any_calibrated = any(
+            figure_set.has_calibrated_d13c or figure_set.has_calibrated_d18o
+            for section in workspace.species_sections
+            for figure_set in section.identifier_figures
+        )
+        self.assertFalse(has_any_calibrated)
+
+    def test_interpolate_uses_raw_domain_values(self) -> None:
+        df = sample_processing_df().copy()
+        df.loc[0, "d 13C/12C  Mean"] = 1.0
+        df.loc[1, "d 13C/12C  Mean"] = 99.0
+        df.loc[2, "d 13C/12C  Mean"] = 5.0
+        df.loc[0, "1  Cycle Int  Samp  44"] = 15.0
+        df.loc[1, "1  Cycle Int  Samp  44"] = 15.1
+        df.loc[2, "1  Cycle Int  Samp  44"] = 18.0
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        metadata = api_main.store.load_metadata(self.session_id)
+        metadata["calibration"] = {
+            **metadata.get("calibration", {}),
+            "config": {"linearity": {"apply": True, "use_diff_intensity": False}},
+            "linearity_fits": {
+                "d13C": {"slope": 3.0, "x_ref": 15.0, "intercept": 0.0, "n": 3},
+                "d18O": {"slope": 0.0, "x_ref": 15.0, "intercept": 0.0, "n": 3},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+        }
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        api_main.edit_processing(
+            self.session_id,
+            EditAction(action="interpolate", targets=[{"row_label": "1", "isotope_key": "d13C"}]),
+        )
+
+        updated_df = api_main.store.load_frame(self.session_id)
+        # Interpolation remains in raw-domain values.
+        self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 3.0, places=6)
+
     def test_cycle_diagnostics_and_export_endpoints(self) -> None:
         diagnostics = api_main.processing_cycle_diagnostics(
             self.session_id,
@@ -178,11 +230,18 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertEqual(client_workbook.sheet_names, ["Client Output"])
         client_sheet = pd.read_excel(io.BytesIO(export_client_output.body), sheet_name="Client Output")
         self.assertIn("Species", client_sheet.columns)
+        self.assertIn("Sequence", client_sheet.columns)
         self.assertIn("Porites", set(client_sheet["Species"].astype(str)))
-        self.assertEqual(client_sheet["Identifier"].notna().sum(), len(sample_processing_df()))
+        self.assertEqual(client_sheet["Identifier"].notna().sum(), 3)
+        sample_values = set(client_sheet["Sample #"].dropna().astype(str))
+        self.assertNotIn("range", sample_values)
+        self.assertEqual(sample_values, {"ok", "partial", "failed"})
+        self.assertEqual(client_sheet["Corrected d13C (‰, VPDB)"].notna().sum(), 3)
+        self.assertEqual(client_sheet["Corrected d18O (‰, VPDB)"].notna().sum(), 3)
         disposition_headers = {key.lower(): value for key, value in export_client_output.headers.items()}
         self.assertIn("content-disposition", disposition_headers)
-        self.assertIn("Client A BTS Stable C&O isosopes results P2L", disposition_headers["content-disposition"])
+        self.assertIn("Client A", disposition_headers["content-disposition"])
+        self.assertIn("Stable C&O isotopes P2L", disposition_headers["content-disposition"])
 
         export_with_interpolation = api_main.export_dataset(
             self.session_id,
@@ -200,6 +259,37 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertIn("Outlier Types", data_sheet.columns)
         self.assertIn("Original d 13C/12C  Mean", data_sheet.columns)
         self.assertIn("Statistics", workbook_with.sheet_names)
+
+    def test_client_output_precision_uses_full_working_frame(self) -> None:
+        df = sample_processing_df()
+        shp_rows = df.iloc[[0, 0]].copy()
+        shp_rows["Identifier 1"] = ["SHP2L", "SHP2L"]
+        shp_rows["Identifier 2"] = ["900", "901"]
+        shp_rows["Comment"] = ["SHP2L-900", "SHP2L-901"]
+        shp_rows["d 13C/12C  Mean"] = [0.10, 0.40]
+        shp_rows["d 18O/16O  Mean"] = [1.10, 1.70]
+        shp_rows["d 13C/12C  Std Dev"] = [0.05, 0.05]
+        shp_rows["d 18O/16O  Std Dev"] = [0.05, 0.05]
+        merged = pd.concat([df, shp_rows], ignore_index=True)
+        api_main.store.save_frames(self.session_id, merged, sample_cycles_df())
+
+        export_client_output = api_main.export_dataset(
+            self.session_id,
+            ExportRequest(
+                include_outliers=False,
+                selected_ids=["SampleA"],
+                interpolate_outliers=False,
+                client_name="Client A",
+                comment_map={"Coral": "Porites"},
+                output_type="client_output",
+            ),
+        )
+
+        sheet = pd.read_excel(io.BytesIO(export_client_output.body), sheet_name="Client Output", header=None)
+        text_cells = {str(value) for value in sheet.to_numpy().ravel() if isinstance(value, str) and value.strip()}
+        self.assertIn("d13C n=2, d18O n=2", text_cells)
+        self.assertNotIn("0.00 ‰ for d13C", text_cells)
+        self.assertNotIn("0.00 ‰ for d18O", text_cells)
 
 
 if __name__ == "__main__":

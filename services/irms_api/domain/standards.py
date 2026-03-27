@@ -168,12 +168,13 @@ def ensure_standards_database(
     target_csv = Path(standards_csv_path) if standards_csv_path is not None else default_standards_path()
     target_db = target_db.resolve()
     target_csv = target_csv.resolve()
-    with _connect_db(target_db) as conn:
+    conn = _connect_db(target_db)
+    try:
         _ensure_schema(conn)
         if _table_row_count(conn) == 0 and target_csv.exists():
             _seed_database_from_csv(conn, target_csv)
-        elif target_csv.exists():
-            _insert_missing_rows_from_csv(conn, target_csv)
+    finally:
+        conn.close()
     return target_db
 
 
@@ -186,7 +187,8 @@ def load_standards(
         db_path=db_path,
         standards_csv_path=standards_csv_path,
     )
-    with _connect_db(standards_db_path) as conn:
+    conn = _connect_db(standards_db_path)
+    try:
         frame = pd.read_sql_query(
             f"""
             SELECT
@@ -199,6 +201,8 @@ def load_standards(
             """,
             conn,
         )
+    finally:
+        conn.close()
     return normalize_standards_frame(frame)
 
 
@@ -295,7 +299,8 @@ class StandardsRepository:
         if numeric_value is None:
             raise ValueError("Value must be numeric.")
         source_value = str(source or "manual").strip() or "manual"
-        with _connect_db(self.database_path) as conn:
+        conn = _connect_db(self.database_path)
+        try:
             _ensure_schema(conn)
             conn.execute(
                 f"""
@@ -316,6 +321,8 @@ class StandardsRepository:
                 (normalized_standard, normalized_isotopic_type, numeric_value, source_value),
             )
             conn.commit()
+        finally:
+            conn.close()
         self.frame = load_standards(path=self.source_path, db_path=self.database_path)
         return {
             "standard": normalized_standard,
@@ -330,13 +337,16 @@ class StandardsRepository:
         normalized_standard = _normalize_standard_name(standard)
         if not normalized_standard:
             return 0
-        with _connect_db(self.database_path) as conn:
+        conn = _connect_db(self.database_path)
+        try:
             cursor = conn.execute(
                 f"DELETE FROM {_STANDARDS_TABLE} WHERE standard = ?",
                 (normalized_standard,),
             )
             conn.commit()
             deleted_rows = int(cursor.rowcount or 0)
+        finally:
+            conn.close()
         self.frame = load_standards(path=self.source_path, db_path=self.database_path)
         return deleted_rows
 
@@ -347,7 +357,8 @@ class StandardsRepository:
         normalized_isotopic_type = _normalize_isotopic_type(isotopic_value_type)
         if not normalized_standard or not normalized_isotopic_type:
             return 0
-        with _connect_db(self.database_path) as conn:
+        conn = _connect_db(self.database_path)
+        try:
             cursor = conn.execute(
                 f"""
                 DELETE FROM {_STANDARDS_TABLE}
@@ -357,6 +368,8 @@ class StandardsRepository:
             )
             conn.commit()
             deleted_rows = int(cursor.rowcount or 0)
+        finally:
+            conn.close()
         self.frame = load_standards(path=self.source_path, db_path=self.database_path)
         return deleted_rows
 

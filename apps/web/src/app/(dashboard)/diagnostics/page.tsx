@@ -127,7 +127,6 @@ function RangeSliderControl({
 export default function DiagnosticsPage() {
   const sessionId = useSessionStore((state) => state.sessionId);
   const [colorParam, setColorParam] = useState("Date_ordinal");
-  const [zAxis, setZAxis] = useState("1  Cycle Int  Diff Samp-Ref  44");
   const [identifierFilter, setIdentifierFilter] = useState<string[]>([]);
   const [d13Range, setD13Range] = useState<[number, number] | null>(null);
   const [d18Range, setD18Range] = useState<[number, number] | null>(null);
@@ -139,7 +138,6 @@ export default function DiagnosticsPage() {
       "diagnostics",
       sessionId,
       colorParam,
-      zAxis,
       identifierFilter.join("|"),
       appliedD13Range ? `${appliedD13Range[0]}:${appliedD13Range[1]}` : "",
       appliedD18Range ? `${appliedD18Range[0]}:${appliedD18Range[1]}` : "",
@@ -147,7 +145,6 @@ export default function DiagnosticsPage() {
     queryFn: () =>
       api.getDiagnostics(sessionId!, {
         color_param: colorParam,
-        z_axis: zAxis,
         identifier_filter: identifierFilter,
         d13_range: appliedD13Range,
         d18_range: appliedD18Range,
@@ -157,24 +154,16 @@ export default function DiagnosticsPage() {
 
   const summary = useMemo(() => (data?.summary ?? {}) as Record<string, unknown>, [data?.summary]);
   const availableColorParams = useMemo(() => asStringArray(summary.available_color_params), [summary.available_color_params]);
-  const availableZAxisOptions = useMemo(() => asStringArray(summary.available_z_axis_options), [summary.available_z_axis_options]);
   const availableIdentifiers = useMemo(() => asStringArray(summary.available_identifiers), [summary.available_identifiers]);
   const d13Bounds = useMemo(() => asRange(summary.d13_bounds), [summary.d13_bounds]);
   const d18Bounds = useMemo(() => asRange(summary.d18_bounds), [summary.d18_bounds]);
   const diagnosticsMatrixHeight = useMemo(() => resolveFigureHeight(data?.figures?.diagnostics, 2600), [data?.figures?.diagnostics]);
-  const diagnostics3dHeight = useMemo(() => resolveFigureHeight(data?.figures?.diagnostics_3d, 850), [data?.figures?.diagnostics_3d]);
 
   useEffect(() => {
     if (availableColorParams.length && !availableColorParams.includes(colorParam)) {
       setColorParam(availableColorParams[0]);
     }
   }, [availableColorParams, colorParam]);
-
-  useEffect(() => {
-    if (availableZAxisOptions.length && !availableZAxisOptions.includes(zAxis)) {
-      setZAxis(availableZAxisOptions[0]);
-    }
-  }, [availableZAxisOptions, zAxis]);
 
   useEffect(() => {
     if (!d13Range && d13Bounds) {
@@ -265,16 +254,6 @@ export default function DiagnosticsPage() {
                     ))}
                   </select>
                 </label>
-                <label className="form-field">
-                  <span className="form-label">3D chart Z-axis</span>
-                  <select value={zAxis} onChange={(event) => setZAxis(event.target.value)} className="form-control">
-                    {(availableZAxisOptions.length ? availableZAxisOptions : [zAxis]).map((option) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
-                </label>
                 <MultiSelectDropdown
                   label="Filter by Identifier 1"
                   options={availableIdentifiers}
@@ -320,16 +299,6 @@ export default function DiagnosticsPage() {
             <CardContent>
               <div className="w-full" style={{ height: diagnosticsMatrixHeight }}>
                 <PlotlyChart figure={data?.figures?.diagnostics} className="h-full w-full" />
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
-              <CardTitle>Diagnostics 3D Chart</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="w-full" style={{ height: diagnostics3dHeight }}>
-                <PlotlyChart figure={data?.figures?.diagnostics_3d} className="h-full w-full" />
               </div>
             </CardContent>
           </Card>

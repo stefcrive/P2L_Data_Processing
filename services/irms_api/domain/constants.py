@@ -5,6 +5,7 @@ ISOTYPE_D18O = "VSMOW(18O)"
 CYCLE1_SIGNAL_SAMP44_COL = "1  Cycle Int  Samp  44"
 CYCLE1_SIGNAL_REF44_COL = "1  Cycle Int  Ref  44"
 CYCLE1_SIGNAL_DIFF44_COL = "1  Cycle Int  Diff Samp-Ref  44"
+CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44"
 
 AUTOSAVE_LOG_PATH_KEY = "autosave_log_path"
 AUTOSAVE_SNAPSHOT_PATH_KEY = "autosave_snapshot_path"
@@ -30,3 +31,4 @@ LINEARITY_USE_DIFF_INTENSITY_TAB3_UI_KEY = "linearity_use_diff_intensity_44_tab3
 DEFAULT_SIGNAL_RANGE = (0.0, 50.0)
 DEFAULT_SESSION_DATA_DIR = ".data/irms_api_sessions"
 DEFAULT_STANDARDS_DB_PATH = ".data/irms_standards.db"
+SESSION_RECORD_DIRNAME = "Session record"

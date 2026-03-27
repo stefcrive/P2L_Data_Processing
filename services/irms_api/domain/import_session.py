@@ -33,6 +33,40 @@ def _safe_filename_fragment(value):
     text = text.strip("._")
     return text if text else "session"
 
+
+def _file_stem(value):
+    """Return filename stem from any slash style path."""
+    text = str(value or "").replace("\\", "/").strip()
+    if text == "":
+        return ""
+    basename = text.split("/")[-1]
+    dot = basename.rfind(".")
+    if dot > 0:
+        return basename[:dot]
+    return basename
+
+
+def _build_session_name_from_source_files(source_files):
+    """Build a stable human-readable session name from uploaded workbook names."""
+    names = []
+    for item in source_files or []:
+        spec = _normalize_upload_spec(item)
+        if spec is None:
+            continue
+        name = str(spec.get("name", "")).strip()
+        if name:
+            names.append(name)
+
+    if len(names) == 0:
+        return "irms_data"
+    if len(names) == 1:
+        return _safe_filename_fragment(_file_stem(names[0]))
+
+    stems = [_safe_filename_fragment(_file_stem(name)) for name in names]
+    ordered = sorted(stems, key=lambda value: value.lower())
+    candidate = f"{ordered[0]}_plus_{len(stems) - 1}"
+    return candidate[:96].strip("._-") or "irms_data"
+
 def _numeric_or_none(value):
     """Convert numeric-like values to float; return None for NaN/invalid."""
     num = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]

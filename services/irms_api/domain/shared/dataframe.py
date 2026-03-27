@@ -8,6 +8,7 @@ import pandas as pd
 
 from ..constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
 )
@@ -792,6 +793,47 @@ def _ensure_cycle1_signal_difference_columns(df):
     else:
         df[CYCLE1_SIGNAL_DIFF44_COL] = diff_vals
 
+    _ensure_cycle1_pressure_weighted_mismatch_column(df)
+    return df
+
+
+def _ensure_cycle1_pressure_weighted_mismatch_column(df):
+    """Ensure pressure-weighted mismatch column exists for cycle-1 m/z44.
+
+    Formula:
+    10 * (Samp-Ref) / Ref * (Samp / median(Samp))
+    Fallback (when sample median is unavailable): 10 * (Samp-Ref) / Ref
+    """
+    if df is None:
+        return df
+
+    samp_vals = pd.to_numeric(df.get(CYCLE1_SIGNAL_SAMP44_COL), errors='coerce')
+    ref_vals = pd.to_numeric(df.get(CYCLE1_SIGNAL_REF44_COL), errors='coerce')
+    diff_vals = pd.to_numeric(df.get(CYCLE1_SIGNAL_DIFF44_COL), errors='coerce')
+    if diff_vals.isna().all():
+        valid_samp_ref = np.isfinite(samp_vals) & np.isfinite(ref_vals)
+        diff_vals = (samp_vals - ref_vals).where(valid_samp_ref)
+
+    valid_ref = np.isfinite(ref_vals) & (np.abs(ref_vals) > 1e-12)
+    valid_diff = np.isfinite(diff_vals)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mismatch_10v = (diff_vals / ref_vals) * 10.0
+    mismatch_10v = mismatch_10v.where(valid_ref & valid_diff)
+
+    weighted = mismatch_10v
+    finite_sample = samp_vals[np.isfinite(samp_vals)]
+    if not finite_sample.empty:
+        sample_ref = float(finite_sample.median())
+        if np.isfinite(sample_ref) and abs(sample_ref) > 1e-12:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                sample_scale = samp_vals / sample_ref
+            weighted = (mismatch_10v * sample_scale).where(np.isfinite(mismatch_10v) & np.isfinite(sample_scale))
+
+    if CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL in df.columns:
+        existing = pd.to_numeric(df[CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL], errors='coerce')
+        df[CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL] = weighted.where(np.isfinite(weighted), existing)
+    else:
+        df[CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL] = weighted
     return df
 
 def _split_label_species(label):

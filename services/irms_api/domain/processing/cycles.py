@@ -81,8 +81,16 @@ def build_target_info(
     has_value = pd.notna(current_value_raw)
     current_value = float(current_value_raw) if has_value else 0.0
     original_map = (edit_state or {}).get("original_delta_values", {})
+    original_missing_tokens = {
+        str(token)
+        for token in (edit_state or {}).get("original_missing_delta_tokens", [])
+        if str(token).strip() != ""
+    }
     original_key = f"{str(isotope_key).strip()}|{str(row_label)}"
-    original_value_raw = original_map.get(original_key, current_value_raw if has_value else np.nan)
+    if original_key in original_missing_tokens:
+        original_value_raw = np.nan
+    else:
+        original_value_raw = original_map.get(original_key, current_value_raw if has_value else np.nan)
     original_value_num = pd.to_numeric(pd.Series([original_value_raw]), errors="coerce").iloc[0]
     original_value = float(original_value_num) if pd.notna(original_value_num) else None
     return {
@@ -328,6 +336,27 @@ def _pick_mass_role_columns(
         else:
             unknown_candidates.append(col)
 
+    col_order = {col: idx for idx, col in enumerate(mass_cols)}
+
+    def _ordered(cols: list[str]) -> list[str]:
+        return sorted(cols, key=lambda col: col_order.get(col, len(col_order)))
+
+    def _is_duplicate_col(col: str) -> bool:
+        return bool(re.search(r"__dup\d+$", _normalize_column_key(col)))
+
+    if not sample_candidates and not ref_candidates and unknown_candidates:
+        # Flattened dual-header cycle exports often produce unlabeled duplicate pairs
+        # (e.g. 45.00 m/z and 45.00 m/z__dup2) where the first column is sample and
+        # the duplicate is reference gas.
+        ordered_unknown = _ordered(unknown_candidates)
+        non_duplicate = [col for col in ordered_unknown if not _is_duplicate_col(col)]
+        duplicate = [col for col in ordered_unknown if _is_duplicate_col(col)]
+        if non_duplicate and duplicate:
+            return non_duplicate[0], duplicate[0]
+        if len(ordered_unknown) >= 2:
+            return ordered_unknown[0], ordered_unknown[1]
+        return ordered_unknown[0], None
+
     def _rank(cols: list[str]) -> list[tuple[str, float]]:
         ranked: list[tuple[str, float]] = []
         for col in cols:
@@ -534,6 +563,8 @@ def build_selected_point_diagnostics_inline(
         if isinstance(value, (float, np.floating)) and np.isfinite(value):
             if label == "Line" and float(value).is_integer():
                 return str(int(value))
+            if label in {"Leak Rate", "Total CO2", "P gasses", "P no acid"}:
+                return f"{float(value):.0f}"
             precision = 3 if label in {"d18O values", "d13C values"} else 4
             return f"{float(value):.{precision}f}"
         if isinstance(value, (int, np.integer)):

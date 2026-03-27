@@ -550,6 +550,8 @@ def _table_rows_from_mask(
     ]
     present = [col for col in preferred if col in rows_df.columns]
     table = rows_df[present].replace({pd.NA: None}).where(pd.notnull(rows_df[present]), None)
+    # Keep internal row labels so UI actions can target exact rows for edit operations.
+    table.insert(0, "__row_label", table.index.astype(str))
     if species_col in table.columns and species_col != "Species":
         table = table.rename(columns={species_col: "Species"})
     return table.to_dict(orient="records")

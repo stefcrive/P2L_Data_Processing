@@ -5,9 +5,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from .constants import CYCLE1_SIGNAL_SAMP44_COL
+
 
 class SessionSnapshot(BaseModel):
     session_id: str
+    session_name: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     source_files: list[dict[str, Any]] = Field(default_factory=list)
@@ -33,10 +36,16 @@ class FilterConfig(BaseModel):
 
 class LinearityConfig(BaseModel):
     apply: bool = False
+    intensity_col: str = CYCLE1_SIGNAL_SAMP44_COL
     use_diff_intensity: bool = False
+    quadratic: bool = False
     manual_override_enabled: bool = False
+    line_1_offset: float = 0.0
+    line_2_offset: float = 0.0
     manual_d13_per_10v: float = 0.0
     manual_d18_per_10v: float = 0.0
+    manual_d13_per_10v2: float = 0.0
+    manual_d18_per_10v2: float = 0.0
 
 
 class CalibrationConfig(BaseModel):
@@ -126,8 +135,12 @@ class ProcessingOverlayConfig(BaseModel):
 
 class ProcessingLinearityOverrideConfig(BaseModel):
     enabled: bool = False
+    use_diff_intensity: bool = False
+    quadratic: bool = False
     d13_per_10v: float = 0.0
     d18_per_10v: float = 0.0
+    d13_per_10v2: float = 0.0
+    d18_per_10v2: float = 0.0
 
 
 class ProcessingExportConfig(BaseModel):
@@ -178,6 +191,7 @@ class EditAction(BaseModel):
     targets: list[EditTarget] = Field(default_factory=list)
     value: float | None = None
     offset: float | None = None
+    stdev: float | None = None
     is_outlier: bool | None = None
 
 
@@ -257,7 +271,11 @@ class ProcessingExportState(BaseModel):
 class ProcessingEditState(BaseModel):
     edited_rows: list[str] = Field(default_factory=list)
     original_delta_values: dict[str, float] = Field(default_factory=dict)
+    original_missing_delta_tokens: list[str] = Field(default_factory=list)
+    original_std_values: dict[str, float] = Field(default_factory=dict)
+    original_missing_std_tokens: list[str] = Field(default_factory=list)
     manual_outlier_overrides: dict[str, bool] = Field(default_factory=dict)
+    restored_delta_tokens: list[str] = Field(default_factory=list)
 
 
 class CycleDiagnosticsPayload(BaseModel):

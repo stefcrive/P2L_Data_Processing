@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 
 import { PlotlyChart, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,11 @@ type SelectedTarget = {
   chartKey: string;
 };
 
+type IsotopeKey = "d13C" | "d18O";
+const ISOTOPE_KEYS: IsotopeKey[] = ["d13C", "d18O"];
+type IsotopeNumericMap = Record<IsotopeKey, number>;
+const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
+
 type DisplayStateMap = Record<string, { rawOnly: boolean; hideCalibrated: boolean }>;
 type FigureShape = Record<string, unknown> & {
   data: Array<Record<string, unknown>>;
@@ -36,9 +41,11 @@ type FigureShape = Record<string, unknown> & {
 type SelectionSourceChart = {
   title: string;
   description: string;
+  chartKey?: string;
   figure?: Record<string, unknown>;
   stackedFigures?: Array<{
     key: string;
+    chartKey: string;
     title: string;
     figure?: Record<string, unknown>;
   }>;
@@ -534,6 +541,36 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
   return targets;
 }
 
+function isPartiallySaturatedCollectorStatus(value: unknown): boolean {
+  return String(value ?? "").trim().toLowerCase() === "partially saturated collectors";
+}
+
+function targetNumberValue(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "null";
+}
+
+function targetSignature(target: SelectedTarget): string {
+  return [
+    target.chartKey,
+    target.rowLabel,
+    target.isotopeKey,
+    target.identifier1,
+    target.identifier2,
+    targetNumberValue(target.currentValue),
+    targetNumberValue(target.currentD13),
+    targetNumberValue(target.currentD18),
+  ].join("|");
+}
+
+function areSameSelectionTargets(current: SelectedTarget[], next: SelectedTarget[]): boolean {
+  if (current.length !== next.length) {
+    return false;
+  }
+  const currentSignatures = current.map(targetSignature).sort();
+  const nextSignatures = next.map(targetSignature).sort();
+  return currentSignatures.every((value, index) => value === nextSignatures[index]);
+}
+
 function coerceStoredSelectedTarget(value: unknown): SelectedTarget | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -581,6 +618,31 @@ function parseCommentMap(raw: string) {
       }
     });
   return map;
+}
+
+function fallbackTargetValue(target: SelectedTarget, isotopeKey: IsotopeKey): number {
+  if (target.isotopeKey === "cross") {
+    const crossValue = isotopeKey === "d13C" ? target.currentD13 : target.currentD18;
+    return typeof crossValue === "number" && Number.isFinite(crossValue) ? crossValue : 0;
+  }
+  if (target.isotopeKey === isotopeKey && typeof target.currentValue === "number" && Number.isFinite(target.currentValue)) {
+    return target.currentValue;
+  }
+  return 0;
+}
+
+function selectedTargetPointValue(target: SelectedTarget | null, isotopeKey: IsotopeKey): number | null {
+  if (!target) {
+    return null;
+  }
+  if (target.isotopeKey === "cross") {
+    const value = isotopeKey === "d13C" ? target.currentD13 : target.currentD18;
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+  }
+  if (target.isotopeKey === isotopeKey && typeof target.currentValue === "number" && Number.isFinite(target.currentValue)) {
+    return target.currentValue;
+  }
+  return null;
 }
 
 function configEquals(left: ProcessingConfig | null | undefined, right: ProcessingConfig | null | undefined) {
@@ -685,7 +747,7 @@ function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>;
   if (!rows.length) {
     return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{emptyLabel}</div>;
   }
-  const columns = Object.keys(rows[0] ?? {});
+  const columns = Object.keys(rows[0] ?? {}).filter((column) => !column.startsWith("__"));
 
   function formatValue(value: unknown, column: string): string {
     if (value == null || value === "") {
@@ -739,6 +801,38 @@ function clampNumber(value: number, min: number, max: number) {
 function parseFinite(value: string, fallback: number) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function extractOutlierRowLabel(row: Record<string, unknown>): string | null {
+  const direct = row["__row_label"];
+  if (typeof direct === "string" && direct.trim()) {
+    return direct.trim();
+  }
+  if (typeof direct === "number" && Number.isFinite(direct)) {
+    return String(direct);
+  }
+  const fallback = row["Row Label"] ?? row["row_label"];
+  if (typeof fallback === "string" && fallback.trim()) {
+    return fallback.trim();
+  }
+  if (typeof fallback === "number" && Number.isFinite(fallback)) {
+    return String(fallback);
+  }
+  return null;
+}
+
+function pickRandomSubset(values: string[], count: number): string[] {
+  if (count <= 0) {
+    return [];
+  }
+  const pool = [...values];
+  for (let i = pool.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = pool[i];
+    pool[i] = pool[j];
+    pool[j] = tmp;
+  }
+  return pool.slice(0, Math.min(count, pool.length));
 }
 
 function RangeSliderField({
@@ -922,7 +1016,15 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   );
 }
 
-function OutlierTablesPanel({ title, tables }: { title: string; tables: OutlierTable[] }) {
+function OutlierTablesPanel({
+  title,
+  tables,
+  renderTableControls,
+}: {
+  title: string;
+  tables: OutlierTable[];
+  renderTableControls?: (table: OutlierTable) => ReactNode;
+}) {
   return (
     <Card>
       <CardHeader>
@@ -938,6 +1040,7 @@ function OutlierTablesPanel({ title, tables }: { title: string; tables: OutlierT
               </summary>
               <div className="mt-3">
                 <DataTable rows={table.rows} emptyLabel="No rows in this outlier category." />
+                {renderTableControls ? <div className="mt-3">{renderTableControls(table)}</div> : null}
               </div>
             </details>
           ))
@@ -1039,6 +1142,7 @@ function DiagnosticsPanel({
   onLinearityEnabledChange,
   linearityTargetIntensity,
   onLinearityTargetIntensityChange,
+  displayDelta = 0,
   onPickDeltaValue,
 }: {
   title: string;
@@ -1049,13 +1153,17 @@ function DiagnosticsPanel({
   onLinearityEnabledChange?: (value: boolean) => void;
   linearityTargetIntensity?: number;
   onLinearityTargetIntensityChange?: (value: number) => void;
+  displayDelta?: number;
   onPickDeltaValue?: (value: number) => void;
 }) {
   const cycleMean = diagnostics?.cycle_mean ?? {};
   const validMean = asNumber(cycleMean.valid_mean);
   const finalMean = asNumber(cycleMean.mean);
+  const validMeanDisplay = validMean == null ? null : validMean + displayDelta;
+  const finalMeanDisplay = finalMean == null ? null : finalMean + displayDelta;
   const targetIntensity = asNumber(cycleMean.linearity_target_intensity);
   const prediction = asNumber(cycleMean.linearity_prediction);
+  const predictionDisplay = prediction == null ? null : prediction + displayDelta;
   const prevNeighbor = cycleMean.prev_neighbor as Record<string, unknown> | undefined;
   const nextNeighbor = cycleMean.next_neighbor as Record<string, unknown> | undefined;
   const reason = asString(cycleMean.reason);
@@ -1068,8 +1176,8 @@ function DiagnosticsPanel({
     typeof linearityTargetIntensity === "number" &&
     typeof onLinearityTargetIntensityChange === "function";
   const shouldRenderLinearityPreview = showLinearityChart || Boolean(linearityEnabled);
-  const canPickValidMean = typeof onPickDeltaValue === "function" && validMean != null;
-  const canPickFinalMean = typeof onPickDeltaValue === "function" && finalMean != null;
+  const canPickValidMean = typeof onPickDeltaValue === "function" && validMeanDisplay != null;
+  const canPickFinalMean = typeof onPickDeltaValue === "function" && finalMeanDisplay != null;
 
   return (
     <Card className="border-stone-300">
@@ -1087,7 +1195,7 @@ function DiagnosticsPanel({
                 type="button"
                 onClick={() => {
                   if (canPickValidMean) {
-                    onPickDeltaValue(validMean);
+                    onPickDeltaValue(validMeanDisplay);
                   }
                 }}
                 disabled={!canPickValidMean}
@@ -1097,13 +1205,13 @@ function DiagnosticsPanel({
                 )}
               >
                 <div className="text-xs uppercase tracking-wide text-stone-500">Valid Cycle Mean</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMean)}</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMeanDisplay)}</div>
               </button>
               <button
                 type="button"
                 onClick={() => {
                   if (canPickFinalMean) {
-                    onPickDeltaValue(finalMean);
+                    onPickDeltaValue(finalMeanDisplay);
                   }
                 }}
                 disabled={!canPickFinalMean}
@@ -1113,7 +1221,7 @@ function DiagnosticsPanel({
                 )}
               >
                 <div className="text-xs uppercase tracking-wide text-stone-500">Final Mean</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(finalMean)}</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(finalMeanDisplay)}</div>
               </button>
               <div className="rounded-lg border border-stone-200 p-3">
                 <div className="text-xs uppercase tracking-wide text-stone-500">Method</div>
@@ -1161,7 +1269,7 @@ function DiagnosticsPanel({
                 </div>
                 <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
                   <div className="font-medium text-stone-800">Linearity Prediction</div>
-                  <div>{formatDeltaValue(prediction)}</div>
+                  <div>{formatDeltaValue(predictionDisplay)}</div>
                 </div>
               </div>
             ) : null}
@@ -1170,11 +1278,19 @@ function DiagnosticsPanel({
               <div className="grid gap-3 md:grid-cols-2">
                 <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
                   <div className="font-medium text-stone-800">Previous interpolation neighbor</div>
-                  <div>{prevNeighbor ? `${asString(prevNeighbor.identifier_2)} -> ${asString(prevNeighbor.value)}` : "Not available"}</div>
+                  <div>
+                    {prevNeighbor
+                      ? `${asString(prevNeighbor.identifier_2)} -> ${formatDeltaValue(asNumber(prevNeighbor.value) == null ? null : asNumber(prevNeighbor.value)! + displayDelta)}`
+                      : "Not available"}
+                  </div>
                 </div>
                 <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
                   <div className="font-medium text-stone-800">Next interpolation neighbor</div>
-                  <div>{nextNeighbor ? `${asString(nextNeighbor.identifier_2)} -> ${asString(nextNeighbor.value)}` : "Not available"}</div>
+                  <div>
+                    {nextNeighbor
+                      ? `${asString(nextNeighbor.identifier_2)} -> ${formatDeltaValue(asNumber(nextNeighbor.value) == null ? null : asNumber(nextNeighbor.value)! + displayDelta)}`
+                      : "Not available"}
+                  </div>
                 </div>
               </div>
             ) : null}
@@ -1234,19 +1350,25 @@ export default function ProcessingPage() {
   const [selectedTargets, setSelectedTargets] = useState<SelectedTarget[]>([]);
   const [activeTargetIndex, setActiveTargetIndex] = useState(0);
   const [displayState, setDisplayState] = useState<DisplayStateMap>({});
-  const [singleValue, setSingleValue] = useState(0);
-  const [singleOffset, setSingleOffset] = useState(0);
-  const [crossD13Value, setCrossD13Value] = useState(0);
-  const [crossD18Value, setCrossD18Value] = useState(0);
+  const [selectionEditorTab, setSelectionEditorTab] = useState<IsotopeKey>("d13C");
+  const [singleValues, setSingleValues] = useState<IsotopeNumericMap>({ d13C: 0, d18O: 0 });
+  const [singleOffsets, setSingleOffsets] = useState<IsotopeNumericMap>({
+    d13C: SELECTION_EDITOR_DEFAULT_OFFSET,
+    d18O: SELECTION_EDITOR_DEFAULT_OFFSET,
+  });
   const [multiOffsetD13, setMultiOffsetD13] = useState(0);
   const [multiOffsetD18, setMultiOffsetD18] = useState(0);
   const [linearityEnabled, setLinearityEnabled] = useState(false);
+  const [linearityManuallySet, setLinearityManuallySet] = useState(false);
   const [linearityTargetIntensity, setLinearityTargetIntensity] = useState(15);
   const [setValueHighlightNonce, setSetValueHighlightNonce] = useState(0);
   const [isSetValueInputHighlighted, setIsSetValueInputHighlighted] = useState(false);
   const [isSelectionEditorOpen, setSelectionEditorOpen] = useState(false);
   const [isExportModalOpen, setExportModalOpen] = useState(false);
   const [exportOutputType, setExportOutputType] = useState<"dataset" | "client_output">("dataset");
+  const [failedRestoreRate, setFailedRestoreRate] = useState(100);
+  const [failedRestoreOffset, setFailedRestoreOffset] = useState(0);
+  const [failedRestoreStdev, setFailedRestoreStdev] = useState(0);
 
   const workspaceQuery = useQuery({
     queryKey: ["processing-workspace", sessionId],
@@ -1318,6 +1440,17 @@ export default function ProcessingPage() {
     },
   });
 
+  const removeCalibrationMutation = useMutation({
+    mutationFn: () => api.removeProcessingCalibration(sessionId!),
+    onSuccess: (workspace) => {
+      queryClient.setQueryData(["processing-workspace", sessionId], workspace);
+      setConfig(workspace.config);
+      setSelectedTargets([]);
+      setActiveTargetIndex(0);
+      setSelectionEditorOpen(false);
+    },
+  });
+
   useEffect(() => {
     if ((!isSelectionEditorOpen && !isExportModalOpen) || typeof window === "undefined") {
       return;
@@ -1346,8 +1479,7 @@ export default function ProcessingPage() {
   }, [config, saveConfigMutation, saveConfigMutation.isPending, sessionId, workspaceQuery.data]);
 
   const activeTarget = selectedTargets.length ? selectedTargets[Math.min(activeTargetIndex, selectedTargets.length - 1)] : null;
-  const activeIsotopeTarget = activeTarget && activeTarget.isotopeKey !== "cross" ? activeTarget : null;
-  const activeCrossTarget = activeTarget && activeTarget.isotopeKey === "cross" ? activeTarget : null;
+  const activeSampleTarget = activeTarget;
 
   useEffect(() => {
     if (!setValueHighlightNonce) {
@@ -1360,69 +1492,126 @@ export default function ProcessingPage() {
     return () => window.clearTimeout(timer);
   }, [setValueHighlightNonce]);
 
-  const singleDiagnosticsQuery = useQuery({
+  const sampleD13DiagnosticsQuery = useQuery({
     queryKey: [
       "processing-diagnostics",
       sessionId,
-      activeIsotopeTarget?.rowLabel,
+      activeSampleTarget?.rowLabel,
+      "d13C",
+      linearityEnabled,
+      linearityTargetIntensity,
+    ],
+    queryFn: () =>
+      api.getProcessingCycleDiagnostics(sessionId!, {
+        ...diagnosticsTargetPayload(activeSampleTarget!, "d13C"),
+        correct_linearity: linearityEnabled,
+        target_intensity: linearityEnabled ? linearityTargetIntensity : null,
+      }),
+    enabled: Boolean(sessionId && activeSampleTarget),
+  });
+
+  const sampleD18DiagnosticsQuery = useQuery({
+    queryKey: [
+      "processing-diagnostics",
+      sessionId,
+      activeSampleTarget?.rowLabel,
       "d18O",
       linearityEnabled,
       linearityTargetIntensity,
     ],
     queryFn: () =>
       api.getProcessingCycleDiagnostics(sessionId!, {
-        ...diagnosticsTargetPayload(activeIsotopeTarget!, "d18O"),
+        ...diagnosticsTargetPayload(activeSampleTarget!, "d18O"),
         correct_linearity: linearityEnabled,
         target_intensity: linearityEnabled ? linearityTargetIntensity : null,
       }),
-    enabled: Boolean(sessionId && activeIsotopeTarget),
-  });
-
-  const crossD13DiagnosticsQuery = useQuery({
-    queryKey: ["processing-diagnostics-cross-d13", sessionId, activeCrossTarget?.rowLabel],
-    queryFn: () => api.getProcessingCycleDiagnostics(sessionId!, diagnosticsTargetPayload(activeCrossTarget!, "d13C")),
-    enabled: Boolean(sessionId && activeCrossTarget),
-  });
-
-  const crossD18DiagnosticsQuery = useQuery({
-    queryKey: ["processing-diagnostics-cross-d18", sessionId, activeCrossTarget?.rowLabel],
-    queryFn: () => api.getProcessingCycleDiagnostics(sessionId!, diagnosticsTargetPayload(activeCrossTarget!, "d18O")),
-    enabled: Boolean(sessionId && activeCrossTarget),
+    enabled: Boolean(sessionId && activeSampleTarget),
   });
 
   useEffect(() => {
-    if (!activeIsotopeTarget) {
+    if (!activeSampleTarget) {
       return;
     }
-    setSingleOffset(0);
+    setSelectionEditorTab(activeSampleTarget.isotopeKey === "d18O" ? "d18O" : "d13C");
+    setSingleOffsets({ d13C: SELECTION_EDITOR_DEFAULT_OFFSET, d18O: SELECTION_EDITOR_DEFAULT_OFFSET });
+    setLinearityManuallySet(false);
     setLinearityEnabled(false);
-  }, [activeIsotopeTarget?.rowLabel, activeIsotopeTarget?.isotopeKey]);
+  }, [activeSampleTarget?.rowLabel, activeSampleTarget?.isotopeKey]);
 
   useEffect(() => {
-    if (!activeIsotopeTarget) {
+    if (!activeSampleTarget || linearityManuallySet) {
       return;
     }
-    setSingleValue(
-      activeIsotopeTarget.isotopeKey === "d18O" && typeof singleDiagnosticsQuery.data?.target?.current_value === "number"
-        ? roundDeltaValue(singleDiagnosticsQuery.data.target.current_value as number)
-        : roundDeltaValue(activeIsotopeTarget.currentValue ?? 0),
-    );
-  }, [activeIsotopeTarget, singleDiagnosticsQuery.data?.target]);
+    const d13Target = sampleD13DiagnosticsQuery.data?.target ?? {};
+    const d18Target = sampleD18DiagnosticsQuery.data?.target ?? {};
+    const activeRowLabel = String(activeSampleTarget.rowLabel).trim();
+    const d13Status =
+      asString(d13Target["row_label"]).trim() === activeRowLabel
+        ? asString(d13Target["collector_status"]).trim()
+        : "";
+    const d18Status =
+      asString(d18Target["row_label"]).trim() === activeRowLabel
+        ? asString(d18Target["collector_status"]).trim()
+        : "";
+    if (!d13Status && !d18Status) {
+      return;
+    }
+    const shouldEnableLinearity =
+      isPartiallySaturatedCollectorStatus(d13Status) || isPartiallySaturatedCollectorStatus(d18Status);
+    setLinearityEnabled(shouldEnableLinearity);
+  }, [
+    activeSampleTarget,
+    linearityManuallySet,
+    sampleD13DiagnosticsQuery.data?.target,
+    sampleD18DiagnosticsQuery.data?.target,
+  ]);
 
   useEffect(() => {
-    if (activeCrossTarget) {
-      const nextD13 =
-        typeof crossD13DiagnosticsQuery.data?.target?.current_value === "number"
-          ? roundDeltaValue(crossD13DiagnosticsQuery.data.target.current_value as number)
-          : roundDeltaValue(activeCrossTarget.currentD13 ?? 0);
-      const nextD18 =
-        typeof crossD18DiagnosticsQuery.data?.target?.current_value === "number"
-          ? roundDeltaValue(crossD18DiagnosticsQuery.data.target.current_value as number)
-          : roundDeltaValue(activeCrossTarget.currentD18 ?? 0);
-      setCrossD13Value(nextD13);
-      setCrossD18Value(nextD18);
+    if (!activeSampleTarget) {
+      return;
     }
-  }, [activeCrossTarget, crossD13DiagnosticsQuery.data?.target, crossD18DiagnosticsQuery.data?.target]);
+    const activeRowLabel = String(activeSampleTarget.rowLabel).trim();
+    const selectedD13 = selectedTargetPointValue(activeSampleTarget, "d13C");
+    const selectedD18 = selectedTargetPointValue(activeSampleTarget, "d18O");
+    const d13Target = sampleD13DiagnosticsQuery.data?.target ?? {};
+    const d18Target = sampleD18DiagnosticsQuery.data?.target ?? {};
+    const d13MatchesActiveRow = asString(d13Target["row_label"]).trim() === activeRowLabel;
+    const d18MatchesActiveRow = asString(d18Target["row_label"]).trim() === activeRowLabel;
+    const d13Status = d13MatchesActiveRow ? asString(d13Target["collector_status"]).trim() : "";
+    const d18Status = d18MatchesActiveRow ? asString(d18Target["collector_status"]).trim() : "";
+    const d13Current = d13MatchesActiveRow ? asNumber(d13Target["current_value"]) : null;
+    const d18Current = d18MatchesActiveRow ? asNumber(d18Target["current_value"]) : null;
+    const d13CycleMean = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
+    const d18CycleMean = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
+    const useD13LinearityDefault =
+      linearityEnabled && isPartiallySaturatedCollectorStatus(d13Status) && d13CycleMean != null;
+    const useD18LinearityDefault =
+      linearityEnabled && isPartiallySaturatedCollectorStatus(d18Status) && d18CycleMean != null;
+    const d13DisplayToRawDelta = selectedD13 != null && d13Current != null ? selectedD13 - d13Current : 0;
+    const d18DisplayToRawDelta = selectedD18 != null && d18Current != null ? selectedD18 - d18Current : 0;
+    const d13SeedRawValue = useD13LinearityDefault ? d13CycleMean : d13Current;
+    const d18SeedRawValue = useD18LinearityDefault ? d18CycleMean : d18Current;
+    const nextValues: IsotopeNumericMap = {
+      d13C: roundDeltaValue(
+        d13SeedRawValue != null
+          ? d13SeedRawValue + d13DisplayToRawDelta
+          : selectedD13 ?? fallbackTargetValue(activeSampleTarget, "d13C"),
+      ),
+      d18O: roundDeltaValue(
+        d18SeedRawValue != null
+          ? d18SeedRawValue + d18DisplayToRawDelta
+          : selectedD18 ?? fallbackTargetValue(activeSampleTarget, "d18O"),
+      ),
+    };
+    setSingleValues(nextValues);
+  }, [
+    activeSampleTarget,
+    linearityEnabled,
+    sampleD13DiagnosticsQuery.data?.target,
+    sampleD13DiagnosticsQuery.data?.cycle_mean,
+    sampleD18DiagnosticsQuery.data?.target,
+    sampleD18DiagnosticsQuery.data?.cycle_mean,
+  ]);
 
   const workspace = workspaceQuery.data;
   const activeConfig = config ?? workspace?.config ?? null;
@@ -1450,9 +1639,10 @@ export default function ProcessingPage() {
   }, [sessionId, workspaceQuery.data]);
 
   function setTargets(nextTargets: SelectedTarget[]) {
-    setSelectedTargets(nextTargets);
-    setActiveTargetIndex(0);
-    setSelectionEditorOpen(nextTargets.length > 0);
+    const shouldOpen = nextTargets.length > 0;
+    setSelectedTargets((current) => (areSameSelectionTargets(current, nextTargets) ? current : nextTargets));
+    setActiveTargetIndex((current) => (current === 0 ? current : 0));
+    setSelectionEditorOpen((current) => (current === shouldOpen ? current : shouldOpen));
   }
 
   function updateConfig<T extends keyof ProcessingConfig>(key: T, value: ProcessingConfig[T]) {
@@ -1515,9 +1705,39 @@ export default function ProcessingPage() {
     }));
   }
 
-  function setSingleValueFromSuggestion(value: number) {
-    setSingleValue(roundDeltaValue(value));
+  function rawToDisplayDelta(isotopeKey: IsotopeKey): number {
+    const selectedDisplayValue = selectedTargetPointValue(activeSampleTarget, isotopeKey);
+    const diagnosticsCurrentValue =
+      isotopeKey === "d13C"
+        ? asNumber((sampleD13DiagnosticsQuery.data?.target ?? {})["current_value"])
+        : asNumber((sampleD18DiagnosticsQuery.data?.target ?? {})["current_value"]);
+    if (selectedDisplayValue == null || diagnosticsCurrentValue == null) {
+      return 0;
+    }
+    return selectedDisplayValue - diagnosticsCurrentValue;
+  }
+
+  function setSingleValueFromSuggestion(
+    isotopeKey: IsotopeKey,
+    value: number,
+    valueSpace: "raw" | "display" = "raw",
+  ) {
+    const resolvedDisplayValue = valueSpace === "raw" ? value + rawToDisplayDelta(isotopeKey) : value;
+    setSelectionEditorTab(isotopeKey);
+    setSingleValues((current) => ({ ...current, [isotopeKey]: roundDeltaValue(resolvedDisplayValue) }));
     setSetValueHighlightNonce((current) => current + 1);
+  }
+
+  function resolveSetValuePayload(isotopeKey: IsotopeKey, requestedDisplayValue: number): number {
+    const selectedDisplayValue = selectedTargetPointValue(activeSampleTarget, isotopeKey);
+    const diagnosticsCurrentValue =
+      isotopeKey === "d13C"
+        ? asNumber((sampleD13DiagnosticsQuery.data?.target ?? {})["current_value"])
+        : asNumber((sampleD18DiagnosticsQuery.data?.target ?? {})["current_value"]);
+    if (selectedDisplayValue == null || diagnosticsCurrentValue == null) {
+      return requestedDisplayValue;
+    }
+    return requestedDisplayValue - rawToDisplayDelta(isotopeKey);
   }
 
   function handleChartClick(chartKey: string, points: PlotlyPoint[]) {
@@ -1528,6 +1748,20 @@ export default function ProcessingPage() {
   }
 
   function handleChartSelection(chartKey: string, points: PlotlyPoint[]) {
+    const targets = parseSelectedTargets(points, chartKey);
+    if (targets.length) {
+      setTargets(targets);
+    }
+  }
+
+  function handleSelectionSourceChartClick(chartKey: string, points: PlotlyPoint[]) {
+    const targets = parseSelectedTargets(points, chartKey);
+    if (targets.length) {
+      setTargets(targets.slice(0, 1));
+    }
+  }
+
+  function handleSelectionSourceChartSelection(chartKey: string, points: PlotlyPoint[]) {
     const targets = parseSelectedTargets(points, chartKey);
     if (targets.length) {
       setTargets(targets);
@@ -1592,55 +1826,37 @@ export default function ProcessingPage() {
     setExportModalOpen(false);
   }
 
-  async function applySingleValue() {
-    if (!sessionId || !activeIsotopeTarget) {
+  async function applySingleValue(isotopeKey: IsotopeKey) {
+    if (!sessionId || !activeSampleTarget) {
       return;
     }
-    const isotopeKey = activeIsotopeTarget.isotopeKey as "d13C" | "d18O";
+    const payloadValue = resolveSetValuePayload(isotopeKey, singleValues[isotopeKey]);
     await editMutation.mutateAsync({
       action: "set_value",
-      targets: [{ row_label: activeIsotopeTarget.rowLabel, isotope_key: isotopeKey }],
-      value: singleValue,
+      targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
+      value: payloadValue,
     });
   }
 
-  async function applySingleOffset() {
-    if (!sessionId || !activeIsotopeTarget) {
+  async function applySingleOffset(isotopeKey: IsotopeKey) {
+    if (!sessionId || !activeSampleTarget) {
       return;
     }
-    const isotopeKey = activeIsotopeTarget.isotopeKey as "d13C" | "d18O";
     await editMutation.mutateAsync({
       action: "offset",
-      targets: [{ row_label: activeIsotopeTarget.rowLabel, isotope_key: isotopeKey }],
-      offset: singleOffset,
+      targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
+      offset: singleOffsets[isotopeKey],
     });
   }
 
-  async function applySingleInterpolate() {
-    if (!sessionId || !activeIsotopeTarget) {
+  async function applySingleInterpolate(isotopeKey: IsotopeKey) {
+    if (!sessionId || !activeSampleTarget) {
       return;
     }
-    const isotopeKey = activeIsotopeTarget.isotopeKey as "d13C" | "d18O";
     await editMutation.mutateAsync({
       action: "interpolate",
-      targets: [{ row_label: activeIsotopeTarget.rowLabel, isotope_key: isotopeKey }],
-    });
-  }
-
-  async function applyCrossValues() {
-    if (!sessionId || !activeCrossTarget) {
-      return;
-    }
-    const rowLabel = activeCrossTarget.rowLabel;
-    await editMutation.mutateAsync({
-      action: "set_value",
-      targets: [{ row_label: rowLabel, isotope_key: "d13C" }],
-      value: crossD13Value,
-    });
-    await editMutation.mutateAsync({
-      action: "set_value",
-      targets: [{ row_label: rowLabel, isotope_key: "d18O" }],
-      value: crossD18Value,
+      targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
+      offset: singleOffsets[isotopeKey],
     });
   }
 
@@ -1666,6 +1882,41 @@ export default function ProcessingPage() {
     await editMutation.mutateAsync({
       action: "interpolate",
       targets: buildTargetsForAction(selectedTargets),
+    });
+  }
+
+  function buildRandomFailedSampleTargets(rows: Array<Record<string, unknown>>, ratePercent: number) {
+    const uniqueRowLabels = Array.from(
+      new Set(rows.map((row) => extractOutlierRowLabel(row)).filter((rowLabel): rowLabel is string => rowLabel != null && rowLabel !== "")),
+    );
+    if (!uniqueRowLabels.length) {
+      return [];
+    }
+    const clampedRate = clampNumber(ratePercent, 0, 100);
+    if (clampedRate <= 0) {
+      return [];
+    }
+    const selectedCount = Math.min(uniqueRowLabels.length, Math.max(1, Math.ceil((uniqueRowLabels.length * clampedRate) / 100)));
+    const sampledRows = pickRandomSubset(uniqueRowLabels, selectedCount);
+    return sampledRows.flatMap((rowLabel) => [
+      { row_label: rowLabel, isotope_key: "d13C" as const },
+      { row_label: rowLabel, isotope_key: "d18O" as const },
+    ]);
+  }
+
+  async function restoreFailedSamples(table: OutlierTable) {
+    if (!sessionId) {
+      return;
+    }
+    const targets = buildRandomFailedSampleTargets(table.rows, failedRestoreRate);
+    if (!targets.length) {
+      return;
+    }
+    await editMutation.mutateAsync({
+      action: "interpolate",
+      targets,
+      offset: Number.isFinite(failedRestoreOffset) ? failedRestoreOffset : 0,
+      stdev: Number.isFinite(failedRestoreStdev) ? failedRestoreStdev : 0,
     });
   }
 
@@ -1728,36 +1979,68 @@ export default function ProcessingPage() {
     return null;
   }
 
-  const busy = saveConfigMutation.isPending || editMutation.isPending || resetAllMutation.isPending;
+  const busy =
+    saveConfigMutation.isPending ||
+    editMutation.isPending ||
+    resetAllMutation.isPending ||
+    removeCalibrationMutation.isPending;
   const manualOverrideCount = Object.keys(workspace.edit_state.manual_outlier_overrides ?? {}).length;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
-  const crossSharedDiagnostics = crossD18DiagnosticsQuery.data ?? crossD13DiagnosticsQuery.data;
-  const crossSharedDiagnosticsLoading =
-    (crossD18DiagnosticsQuery.isLoading && !crossD18DiagnosticsQuery.data) ||
-    (!crossD18DiagnosticsQuery.data && crossD13DiagnosticsQuery.isLoading && !crossD13DiagnosticsQuery.data);
-  const activeTargetInlineSummary =
-    activeIsotopeTarget?.rowLabel === activeTarget?.rowLabel
-      ? singleDiagnosticsQuery.data?.inline_summary
-      : crossSharedDiagnostics?.inline_summary;
-  const activeTargetInlineItems = parseInlineDiagnosticsSummary(activeTargetInlineSummary);
+  const diagnosticsByIsotope: Record<IsotopeKey, CycleDiagnosticsPayload | undefined> = {
+    d13C: sampleD13DiagnosticsQuery.data,
+    d18O: sampleD18DiagnosticsQuery.data,
+  };
+  const activeDiagnostics = diagnosticsByIsotope[selectionEditorTab];
+  const activeDiagnosticsLoading =
+    selectionEditorTab === "d13C" ? sampleD13DiagnosticsQuery.isLoading : sampleD18DiagnosticsQuery.isLoading;
+  const selectedPointD13 = selectedTargetPointValue(activeSampleTarget, "d13C");
+  const selectedPointD18 = selectedTargetPointValue(activeSampleTarget, "d18O");
+  const activeTargetDiagnostics = (sampleD18DiagnosticsQuery.data ?? sampleD13DiagnosticsQuery.data) ?? null;
+  const activeTargetInlineSummary = activeTargetDiagnostics?.inline_summary;
+  const activeTargetSourceExcel = asString(activeTargetDiagnostics?.target?.source_excel).trim() || "Unknown";
+  const parsedActiveTargetInlineItems = parseInlineDiagnosticsSummary(activeTargetInlineSummary);
+  const hasInlineExcelProvenance = parsedActiveTargetInlineItems.some((item) => {
+    const normalized = normalizeInlineLabel(item.label);
+    return normalized === "excel file" || normalized === "original excel file" || normalized === "source excel";
+  });
+  const activeTargetInlineItems = hasInlineExcelProvenance
+    ? parsedActiveTargetInlineItems
+    : [...parsedActiveTargetInlineItems, { label: "Original Excel File", value: activeTargetSourceExcel }];
   const activeTargetInlineDisplayItems = activeTargetInlineItems.map((item) => {
     const numericValue = parseStrictNumber(item.value);
     const isDelta = isDeltaInlineLabel(item.label);
     const normalizedLabel = normalizeInlineLabel(item.label);
-    const canSetSingleValue = Boolean(activeIsotopeTarget) && normalizedLabel === "d18o values" && numericValue != null;
+    const settableIsotope: IsotopeKey | null =
+      normalizedLabel === "d13c values" ? "d13C" : normalizedLabel === "d18o values" ? "d18O" : null;
+    const selectedPointValue =
+      normalizedLabel === "d13c values" ? selectedPointD13 : normalizedLabel === "d18o values" ? selectedPointD18 : null;
+    const convertedNumericValue = numericValue == null || settableIsotope == null ? numericValue : numericValue + rawToDisplayDelta(settableIsotope);
+    const resolvedNumericValue = selectedPointValue ?? convertedNumericValue;
+    const canSetSingleValue = Boolean(activeSampleTarget) && settableIsotope != null && resolvedNumericValue != null;
     return {
       ...item,
       unit: unitForInlineLabel(item.label),
-      value: isDelta && numericValue != null ? formatDeltaValue(numericValue) : item.value,
+      value: isDelta && resolvedNumericValue != null ? formatDeltaValue(resolvedNumericValue) : item.value,
       canSetSingleValue,
-      setValue: canSetSingleValue && numericValue != null ? roundDeltaValue(numericValue) : null,
+      setValue: canSetSingleValue && resolvedNumericValue != null ? roundDeltaValue(resolvedNumericValue) : null,
+      settableIsotope,
     };
   });
+  const d13CycleMeanDisplayValue = (() => {
+    const raw = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
+    return raw == null ? null : raw + rawToDisplayDelta("d13C");
+  })();
+  const d18CycleMeanDisplayValue = (() => {
+    const raw = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
+    return raw == null ? null : raw + rawToDisplayDelta("d18O");
+  })();
+  const d13CurrentDisplayValue = selectedPointD13 ?? asNumber((sampleD13DiagnosticsQuery.data?.target ?? {})["current_value"]);
+  const d18CurrentDisplayValue = selectedPointD18 ?? asNumber((sampleD18DiagnosticsQuery.data?.target ?? {})["current_value"]);
   const effectiveOutlier =
-    typeof singleDiagnosticsQuery.data?.target?.effective_outlier === "boolean"
-      ? (singleDiagnosticsQuery.data.target.effective_outlier as boolean)
-      : typeof crossD13DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
-        ? (crossD13DiagnosticsQuery.data.target.effective_outlier as boolean)
+    typeof sampleD18DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
+      ? (sampleD18DiagnosticsQuery.data.target.effective_outlier as boolean)
+      : typeof sampleD13DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
+        ? (sampleD13DiagnosticsQuery.data.target.effective_outlier as boolean)
         : false;
   const overviewCards = {
     processing3d: {
@@ -1785,7 +2068,7 @@ export default function ProcessingPage() {
       figure: workspace.overview_figures.crossplot,
     },
   };
-  const activeSelectionChartKey = activeTarget?.chartKey ?? selectedTargets[0]?.chartKey ?? null;
+  const activeSelectionChartKey = isSelectionEditorOpen ? (activeTarget?.chartKey ?? selectedTargets[0]?.chartKey ?? null) : null;
   const selectionSourceChart: SelectionSourceChart | null = (() => {
     if (!activeSelectionChartKey) {
       return null;
@@ -1810,15 +2093,18 @@ export default function ProcessingPage() {
           return {
             title: "Crossplot selection source",
             description: `${section.species} | ${figureSet.identifier} isotope series for the selected sample.`,
+            chartKey: overviewCards.crossplot.key,
             figure: undefined,
             stackedFigures: [
               {
                 key: `${d13Key}:selection-source`,
+                chartKey: d13Key,
                 title: "d13C series",
                 figure: highlightSelectionSourceFigure(d13FigureBase, activeTarget),
               },
               {
                 key: `${d18Key}:selection-source`,
+                chartKey: d18Key,
                 title: "d18O series",
                 figure: highlightSelectionSourceFigure(d18FigureBase, activeTarget),
               },
@@ -1833,22 +2119,26 @@ export default function ProcessingPage() {
       [overviewCards.processing3d.key]: {
         title: overviewCards.processing3d.title,
         description: overviewCards.processing3d.description,
+        chartKey: overviewCards.processing3d.key,
         figure: highlightSelectionSourceFigure(overviewCards.processing3d.figure, activeTarget),
       },
       [overviewCards.crossplot.key]: {
         title: crossplotStackedSource?.title ?? overviewCards.crossplot.title,
         description: crossplotStackedSource?.description ?? overviewCards.crossplot.description,
+        chartKey: overviewCards.crossplot.key,
         figure: crossplotStackedSource?.figure ?? highlightSelectionSourceFigure(overviewCards.crossplot.figure, activeTarget),
         stackedFigures: crossplotStackedSource?.stackedFigures,
       },
       [overviewCards.d13Summary.key]: {
         title: overviewCards.d13Summary.title,
         description: overviewCards.d13Summary.description,
+        chartKey: overviewCards.d13Summary.key,
         figure: highlightSelectionSourceFigure(overviewCards.d13Summary.figure, activeTarget),
       },
       [overviewCards.d18Summary.key]: {
         title: overviewCards.d18Summary.title,
         description: overviewCards.d18Summary.description,
+        chartKey: overviewCards.d18Summary.key,
         figure: highlightSelectionSourceFigure(overviewCards.d18Summary.figure, activeTarget),
       },
     };
@@ -1874,6 +2164,7 @@ export default function ProcessingPage() {
     return {
       title: `${species} | ${identifier} | ${isotopeKey}`,
       description: "Source chart used for the current selection.",
+      chartKey: activeSelectionChartKey,
       figure: highlightSelectionSourceFigure(
         isotopeKey === "d13C"
           ? applyDisplayState(figureSet.d13c, state.rawOnly, state.hideCalibrated)
@@ -1944,21 +2235,24 @@ export default function ProcessingPage() {
                   <span className="mb-1 block font-medium text-stone-700">Color parameter</span>
                   <select
                     value={activeConfig.color_param}
-                    onChange={(event) => {
-                      const nextColorParam = event.target.value;
-                      setConfig((current) =>
-                        current
-                          ? {
-                              ...current,
-                              color_param: nextColorParam,
-                              z_axis: nextColorParam,
-                            }
-                          : current,
-                      );
-                    }}
+                    onChange={(event) => updateConfig("color_param", event.target.value)}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
                     {workspace.available_values.color_params.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-sm">
+                  <span className="mb-1 block font-medium text-stone-700">3D Z axis</span>
+                  <select
+                    value={activeConfig.z_axis}
+                    onChange={(event) => updateConfig("z_axis", event.target.value)}
+                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                  >
+                    {workspace.available_values.z_axis_options.map((option) => (
                       <option key={option} value={option}>
                         {option}
                       </option>
@@ -2070,27 +2364,75 @@ export default function ProcessingPage() {
                 <CheckboxField
                   checked={activeConfig.manual_linearity_override.enabled}
                   label="Enable manual linearity transform"
-                  description="This is a derived workspace/export transform only. Raw stored values are not overwritten."
+                  description="Applied to all workspace samples before outlier filtering; raw stored values are not overwritten."
                   onChange={(checked) => updateManualLinearity("enabled", checked)}
+                />
+                <CheckboxField
+                  checked={activeConfig.manual_linearity_override.use_diff_intensity}
+                  label="Use Samp-Ref intensity difference"
+                  description="Switches manual override to pressure-weighted mismatch: 10 x (Samp-Ref)/Ref x (Samp/Samp median)."
+                  disabled={!activeConfig.manual_linearity_override.enabled}
+                  onChange={(checked) => updateManualLinearity("use_diff_intensity", checked)}
+                />
+                <CheckboxField
+                  checked={Boolean(activeConfig.manual_linearity_override.quadratic)}
+                  label="Use quadratic relationship"
+                  description="Applies c*(I^2 - Iref^2) instead of b*(I - Iref) for manual override in both intensity modes."
+                  disabled={!activeConfig.manual_linearity_override.enabled}
+                  onChange={(checked) => updateManualLinearity("quadratic", checked)}
                 />
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-2">
                   <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">d13 per 10V</span>
+                    <span className="mb-1 block text-stone-700">
+                      {activeConfig.manual_linearity_override.use_diff_intensity
+                        ? activeConfig.manual_linearity_override.quadratic
+                          ? "d13 pressure-weighted mismatch coefficient per (10V)^2"
+                          : "d13 pressure-weighted mismatch coefficient"
+                        : activeConfig.manual_linearity_override.quadratic
+                          ? "d13 per (10V)^2"
+                          : "d13 per 10V"}
+                    </span>
                     <input
                       type="number"
                       step="0.01"
-                      value={activeConfig.manual_linearity_override.d13_per_10v}
-                      onChange={(event) => updateManualLinearity("d13_per_10v", Number(event.target.value))}
+                      value={
+                        activeConfig.manual_linearity_override.quadratic
+                          ? (activeConfig.manual_linearity_override.d13_per_10v2 ?? 0)
+                          : (activeConfig.manual_linearity_override.d13_per_10v ?? 0)
+                      }
+                      onChange={(event) =>
+                        updateManualLinearity(
+                          activeConfig.manual_linearity_override.quadratic ? "d13_per_10v2" : "d13_per_10v",
+                          Number(event.target.value),
+                        )
+                      }
                       className="w-full rounded-lg border border-stone-300 px-3 py-2"
                     />
                   </label>
                   <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">d18 per 10V</span>
+                    <span className="mb-1 block text-stone-700">
+                      {activeConfig.manual_linearity_override.use_diff_intensity
+                        ? activeConfig.manual_linearity_override.quadratic
+                          ? "d18 pressure-weighted mismatch coefficient per (10V)^2"
+                          : "d18 pressure-weighted mismatch coefficient"
+                        : activeConfig.manual_linearity_override.quadratic
+                          ? "d18 per (10V)^2"
+                          : "d18 per 10V"}
+                    </span>
                     <input
                       type="number"
                       step="0.01"
-                      value={activeConfig.manual_linearity_override.d18_per_10v}
-                      onChange={(event) => updateManualLinearity("d18_per_10v", Number(event.target.value))}
+                      value={
+                        activeConfig.manual_linearity_override.quadratic
+                          ? (activeConfig.manual_linearity_override.d18_per_10v2 ?? 0)
+                          : (activeConfig.manual_linearity_override.d18_per_10v ?? 0)
+                      }
+                      onChange={(event) =>
+                        updateManualLinearity(
+                          activeConfig.manual_linearity_override.quadratic ? "d18_per_10v2" : "d18_per_10v",
+                          Number(event.target.value),
+                        )
+                      }
                       className="w-full rounded-lg border border-stone-300 px-3 py-2"
                     />
                   </label>
@@ -2103,6 +2445,9 @@ export default function ProcessingPage() {
                 </Button>
                 <Button variant="outline" onClick={() => setConfig(workspace.config)} disabled={busy}>
                   Restore saved
+                </Button>
+                <Button variant="outline" onClick={() => removeCalibrationMutation.mutate()} disabled={busy}>
+                  {removeCalibrationMutation.isPending ? "Removing calibration..." : "Remove calibration"}
                 </Button>
                 <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>
                   Reset all edits
@@ -2247,7 +2592,7 @@ export default function ProcessingPage() {
                       <div className="font-medium text-stone-900">Export summary</div>
                       <div>Filename (dataset): generated from client name and current date.</div>
                       <div>
-                        Filename (client output): generated from client name and current date.
+                        Filename (client output): generated from client name, exported series/species, and current date.
                       </div>
                       <div>Rows in workspace scope: {workspace.summary.total_measurements}</div>
                       <div>Final analyses: {workspace.summary.final_analyses}</div>
@@ -2296,12 +2641,26 @@ export default function ProcessingPage() {
                             {selectionSourceChart.stackedFigures.map((item) => (
                               <div key={item.key} className="rounded-lg border border-stone-200 p-2">
                                 <div className="px-1 pb-2 text-sm font-medium text-stone-700">{item.title}</div>
-                                <PlotlyChart figure={item.figure} className="h-[280px] w-full" />
+                                <PlotlyChart
+                                  figure={item.figure}
+                                  className="h-[280px] w-full"
+                                  onPointClick={(points) => handleSelectionSourceChartClick(item.chartKey, points)}
+                                  onSelection={(points) => handleSelectionSourceChartSelection(item.chartKey, points)}
+                                />
                               </div>
                             ))}
                           </div>
                         ) : selectionSourceChart.figure ? (
-                          <PlotlyChart figure={selectionSourceChart.figure} className="h-[360px] w-full" />
+                          <PlotlyChart
+                            figure={selectionSourceChart.figure}
+                            className="h-[360px] w-full"
+                            onPointClick={(points) =>
+                              handleSelectionSourceChartClick(selectionSourceChart.chartKey ?? activeSelectionChartKey ?? "", points)
+                            }
+                            onSelection={(points) =>
+                              handleSelectionSourceChartSelection(selectionSourceChart.chartKey ?? activeSelectionChartKey ?? "", points)
+                            }
+                          />
                         ) : (
                           <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
                             Source chart preview unavailable for this selection.
@@ -2344,8 +2703,8 @@ export default function ProcessingPage() {
                               <div
                                 key={`${item.label}:${item.value}:${index}`}
                                 onClick={() => {
-                                  if (item.canSetSingleValue && item.setValue != null) {
-                                    setSingleValueFromSuggestion(item.setValue);
+                                  if (item.canSetSingleValue && item.setValue != null && item.settableIsotope) {
+                                    setSingleValueFromSuggestion(item.settableIsotope, item.setValue, "display");
                                   }
                                 }}
                                 className={cn(
@@ -2392,16 +2751,32 @@ export default function ProcessingPage() {
                         </Button>
                       </div>
 
-                      {activeIsotopeTarget ? (
+                      {activeTarget ? (
                         <div className="space-y-4">
+                          <div className="flex flex-wrap gap-2">
+                            {ISOTOPE_KEYS.map((isotopeKey) => (
+                              <Button
+                                key={isotopeKey}
+                                variant={selectionEditorTab === isotopeKey ? "secondary" : "outline"}
+                                size="sm"
+                                onClick={() => setSelectionEditorTab(isotopeKey)}
+                                disabled={busy}
+                              >
+                                {isotopeKey}
+                              </Button>
+                            ))}
+                          </div>
+
                           <div className="grid gap-3 sm:grid-cols-2">
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Set value</span>
+                              <span className="mb-1 block text-stone-700">Set value ({selectionEditorTab})</span>
                               <input
                                 type="number"
                                 step="0.001"
-                                value={singleValue}
-                                onChange={(event) => setSingleValue(Number(event.target.value))}
+                                value={singleValues[selectionEditorTab]}
+                                onChange={(event) =>
+                                  setSingleValues((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }))
+                                }
                                 className={cn(
                                   "w-full rounded-lg border px-3 py-2 transition-all duration-200",
                                   isSetValueInputHighlighted
@@ -2411,115 +2786,76 @@ export default function ProcessingPage() {
                               />
                             </label>
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Offset</span>
+                              <span className="mb-1 block text-stone-700">Offset ({selectionEditorTab})</span>
                               <input
                                 type="number"
                                 step="0.001"
-                                value={singleOffset}
-                                onChange={(event) => setSingleOffset(Number(event.target.value))}
+                                value={singleOffsets[selectionEditorTab]}
+                                onChange={(event) =>
+                                  setSingleOffsets((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }))
+                                }
                                 className="w-full rounded-lg border border-stone-300 px-3 py-2"
                               />
                             </label>
                           </div>
-                          <div className="flex flex-wrap gap-2">
-                            <Button onClick={applySingleValue} disabled={busy}>
-                              Set {activeIsotopeTarget.isotopeKey}
-                            </Button>
-                            <Button variant="outline" onClick={applySingleOffset} disabled={busy}>
-                              Offset {activeIsotopeTarget.isotopeKey}
-                            </Button>
-                            <Button variant="outline" onClick={applySingleInterpolate} disabled={busy}>
-                              Interpolate {activeIsotopeTarget.isotopeKey}
-                            </Button>
-                          </div>
-                          <DiagnosticsPanel
-                            title="d18O cycle diagnostics"
-                            diagnostics={singleDiagnosticsQuery.data}
-                            loading={singleDiagnosticsQuery.isLoading}
-                            showLinearityChart={linearityEnabled}
-                            linearityEnabled={linearityEnabled}
-                            onLinearityEnabledChange={setLinearityEnabled}
-                            linearityTargetIntensity={linearityTargetIntensity}
-                            onLinearityTargetIntensityChange={setLinearityTargetIntensity}
-                            onPickDeltaValue={setSingleValueFromSuggestion}
-                          />
-                        </div>
-                      ) : null}
 
-                      {activeCrossTarget ? (
-                        <div className="space-y-4">
-                          <div className="grid gap-3 sm:grid-cols-2">
-                            <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Set d13C</span>
-                              <input
-                                type="number"
-                                step="0.001"
-                                value={crossD13Value}
-                                onChange={(event) => setCrossD13Value(Number(event.target.value))}
-                                className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                              />
-                            </label>
-                            <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Set d18O</span>
-                              <input
-                                type="number"
-                                step="0.001"
-                                value={crossD18Value}
-                                onChange={(event) => setCrossD18Value(Number(event.target.value))}
-                                className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                              />
-                            </label>
-                          </div>
                           <div className="flex flex-wrap gap-2">
-                            <Button onClick={applyCrossValues} disabled={busy}>
-                              Apply crossplot values
+                            <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>
+                              Set {selectionEditorTab}
                             </Button>
-                            <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>
-                              Interpolate both isotopes
+                            <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>
+                              Offset {selectionEditorTab}
+                            </Button>
+                            <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
+                              Interpolate {selectionEditorTab}
                             </Button>
                           </div>
+
                           <div className="grid gap-3 md:grid-cols-2">
                             <div className="rounded-lg border border-stone-200 p-3">
                               <div className="text-xs uppercase tracking-wide text-stone-500">d13C details</div>
                               <div className="mt-1 text-sm text-stone-800">
                                 Current:{" "}
-                                {asNumber((crossD13DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
-                                  ? "N/A"
-                                  : formatDeltaValue(asNumber((crossD13DiagnosticsQuery.data?.target ?? {})["current_value"]))}
+                                {d13CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d13CurrentDisplayValue)}
                               </div>
                               <div className="text-sm text-stone-700">
                                 Cycle mean:{" "}
-                                {asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]) == null
-                                  ? "N/A"
-                                  : formatDeltaValue(asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]))}
+                                {d13CycleMeanDisplayValue == null ? "N/A" : formatDeltaValue(d13CycleMeanDisplayValue)}
                               </div>
                               <div className="text-xs text-stone-500">
-                                Method: {asString((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
+                                Method: {asString((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
                               </div>
                             </div>
                             <div className="rounded-lg border border-stone-200 p-3">
                               <div className="text-xs uppercase tracking-wide text-stone-500">d18O details</div>
                               <div className="mt-1 text-sm text-stone-800">
                                 Current:{" "}
-                                {asNumber((crossD18DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
-                                  ? "N/A"
-                                  : formatDeltaValue(asNumber((crossD18DiagnosticsQuery.data?.target ?? {})["current_value"]))}
+                                {d18CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d18CurrentDisplayValue)}
                               </div>
                               <div className="text-sm text-stone-700">
                                 Cycle mean:{" "}
-                                {asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]) == null
-                                  ? "N/A"
-                                  : formatDeltaValue(asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]))}
+                                {d18CycleMeanDisplayValue == null ? "N/A" : formatDeltaValue(d18CycleMeanDisplayValue)}
                               </div>
                               <div className="text-xs text-stone-500">
-                                Method: {asString((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
+                                Method: {asString((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
                               </div>
                             </div>
                           </div>
+
                           <DiagnosticsPanel
-                            title="Crossplot cycle diagnostics (shared intensity chart/table, d18O)"
-                            diagnostics={crossSharedDiagnostics}
-                            loading={crossSharedDiagnosticsLoading}
+                            title={`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`}
+                            diagnostics={activeDiagnostics}
+                            loading={activeDiagnosticsLoading}
+                            showLinearityChart={linearityEnabled}
+                            linearityEnabled={linearityEnabled}
+                            onLinearityEnabledChange={(value) => {
+                              setLinearityManuallySet(true);
+                              setLinearityEnabled(value);
+                            }}
+                            linearityTargetIntensity={linearityTargetIntensity}
+                            onLinearityTargetIntensityChange={setLinearityTargetIntensity}
+                            displayDelta={rawToDisplayDelta(selectionEditorTab)}
+                            onPickDeltaValue={(value) => setSingleValueFromSuggestion(selectionEditorTab, value, "display")}
                           />
                         </div>
                       ) : null}
@@ -2592,7 +2928,63 @@ export default function ProcessingPage() {
             />
           </div>
 
-          <OutlierTablesPanel title="Selected data outlier tables" tables={workspace.outlier_tables} />
+          <OutlierTablesPanel
+            title="Data outlier tables"
+            tables={workspace.outlier_tables}
+            renderTableControls={(table) => {
+              const normalizedName = String(table.name || table.title || "").toLowerCase();
+              const isFailedSampleTable = normalizedName.includes("failed sample");
+              if (!isFailedSampleTable) {
+                return null;
+              }
+              return (
+                <div className="flex flex-wrap items-end gap-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">Rate (%)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={failedRestoreRate}
+                      onChange={(event) => setFailedRestoreRate(clampNumber(parseFinite(event.target.value, 0), 0, 100))}
+                      className="w-28 rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">Offset</span>
+                    <input
+                      type="number"
+                      step="0.001"
+                      value={failedRestoreOffset}
+                      onChange={(event) => setFailedRestoreOffset(parseFinite(event.target.value, 0))}
+                      className="w-28 rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">Stdev</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.001"
+                      value={failedRestoreStdev}
+                      onChange={(event) => setFailedRestoreStdev(Math.max(0, parseFinite(event.target.value, 0)))}
+                      className="w-28 rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                  <Button
+                    onClick={() => restoreFailedSamples(table)}
+                    disabled={busy || !table.rows.length || clampNumber(failedRestoreRate, 0, 100) <= 0}
+                  >
+                    Restore
+                  </Button>
+                  <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>
+                    Reset
+                  </Button>
+                </div>
+              );
+            }}
+          />
 
           <div className="space-y-6">
             {workspace.species_sections.map((section) => (

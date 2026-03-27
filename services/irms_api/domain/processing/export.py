@@ -5,6 +5,8 @@ import re
 
 import pandas as pd
 
+from ..shared.dataframe import _parse_numeric_token
+
 MATERIALS_METHODS_TEXT = (
     'When results produced at P2L are being published, we suggest using the following text in the "Material and Methods" section of the publication:\n\n'
     '"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology '
@@ -30,11 +32,20 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _build_client_filename(client_name: str, client_df: pd.DataFrame) -> str:
-    del client_df  # filename is based on requested client name and export date
+    identifier_values = (
+        client_df.get("Identifier", pd.Series(dtype=object))
+        .dropna()
+        .astype(str)
+        .map(str.strip)
+    )
+    identifier_tokens = [_sanitize_filename(value) for value in pd.unique(identifier_values) if value]
+
     client_part = _sanitize_filename(client_name) if client_name else "Client"
+    series_part = " ".join(identifier_tokens)
     date_str = pd.Timestamp.today().strftime("%d%m%Y")
-    title = "BTS Stable C&O isosopes results P2L"
-    return f"{client_part} {title} {date_str}.xlsx"
+    title = "Stable C&O isotopes P2L"
+    parts = [part for part in [client_part, series_part, "series", title, date_str] if part]
+    return f"{' '.join(parts)}.xlsx"
 
 
 def _build_dataset_filename(client_name: str | None) -> str:
@@ -54,6 +65,12 @@ def _build_data_sheet(df: pd.DataFrame, selected_standards: list[str]) -> pd.Dat
 
 
 def _build_client_output_frame(data_sheet: pd.DataFrame, comment_map: dict[str, str] | None = None) -> pd.DataFrame:
+    sample_series = (
+        data_sheet.get("Comment", data_sheet.get("Identifier 2", pd.Series(index=data_sheet.index, dtype=object)))
+        .fillna("")
+        .astype(str)
+    )
+    sequence_series = sample_series.map(_parse_numeric_token)
     species_series = (
         data_sheet.get("Species", pd.Series(index=data_sheet.index, dtype=object))
         .fillna("")
@@ -64,7 +81,8 @@ def _build_client_output_frame(data_sheet: pd.DataFrame, comment_map: dict[str, 
     return pd.DataFrame(
         {
             "Identifier": data_sheet.get("Identifier 1", pd.Series(index=data_sheet.index, dtype=object)),
-            "Sample #": data_sheet.get("Identifier 2", pd.Series(index=data_sheet.index, dtype=object)),
+            "Sample #": sample_series,
+            "Sequence": sequence_series,
             "Species": species_series,
             "d13C (\u2030, VPDB)  Mean": pd.to_numeric(data_sheet.get("d 13C/12C  Mean"), errors="coerce"),
             "d13C (\u2030, VPDB)  Std Dev": pd.to_numeric(data_sheet.get("d 13C/12C  Std Dev"), errors="coerce"),
@@ -116,6 +134,7 @@ def _format_client_output_worksheet(
     sheet_name: str,
     client_df: pd.DataFrame,
     source_df: pd.DataFrame,
+    precision_override: tuple[float, float, int, int] | None = None,
 ) -> None:
     workbook = writer.book
     worksheet = writer.sheets[sheet_name]
@@ -138,19 +157,35 @@ def _format_client_output_worksheet(
         elif "Corrected" in col_name:
             width = 22
         worksheet.set_column(col_idx, col_idx, width, num_fmt if col_name in numeric_cols else None)
+
+    # Keep one blank separator column between data columns and equipment/method text.
+    equip_title_col = len(client_df.columns) + 1
+    equip_value_col = equip_title_col + 1
+
+    def _excel_col_name(col_idx: int) -> str:
+        name = ""
+        index = int(col_idx)
+        while index >= 0:
+            index, rem = divmod(index, 26)
+            name = chr(65 + rem) + name
+            index -= 1
+        return name
+
     equip_title_fmt = workbook.add_format({"bold": True})
-    d13_std, d18_std, n13, n18 = _compute_shp2l_precision(source_df)
-    worksheet.write(1, 10, "Equiment:", equip_title_fmt)
-    worksheet.write(1, 11, "ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer")
-    worksheet.write(2, 11, "Kiel IV automated carbonate preparation device")
-    worksheet.write(4, 10, "Standard deviation of SHP2L over measurement period:", equip_title_fmt)
-    worksheet.write(5, 11, f"{d13_std:.2f} \u2030 for d13C")
-    worksheet.write(6, 11, f"{d18_std:.2f} \u2030 for d18O")
-    worksheet.write(7, 11, f"d13C n={n13}, d18O n={n18}")
+    equip_text_fmt = workbook.add_format({"bold": True})
+    d13_std, d18_std, n13, n18 = precision_override if precision_override is not None else _compute_shp2l_precision(source_df)
+    worksheet.write(1, equip_title_col, "Equiment:", equip_title_fmt)
+    worksheet.write(1, equip_value_col, "ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer", equip_text_fmt)
+    worksheet.write(2, equip_value_col, "Kiel IV automated carbonate preparation device", equip_text_fmt)
+    worksheet.write(4, equip_title_col, "Standard deviation of SHP2L over measurement period:", equip_title_fmt)
+    worksheet.write(5, equip_value_col, f"{d13_std:.2f} \u2030 for d13C")
+    worksheet.write(6, equip_value_col, f"{d18_std:.2f} \u2030 for d18O")
+    worksheet.write(7, equip_value_col, f"d13C n={n13}, d18O n={n18}")
+    textbox_anchor = f"{_excel_col_name(equip_value_col)}10"
     worksheet.insert_textbox(
-        "L10",
+        textbox_anchor,
         MATERIALS_METHODS_TEXT,
-        {"width": 820, "height": 580, "line": {"color": "#4F81BD"}},
+        {"width": 620, "height": 580, "line": {"color": "#4F81BD"}},
     )
 
 
@@ -190,14 +225,30 @@ def build_client_output_workbook_bytes(
     selected_standards: list[str] | None = None,
     client_name: str | None = None,
     comment_map: dict[str, str] | None = None,
+    precision_source_df: pd.DataFrame | None = None,
+    precision_override: tuple[float, float, int, int] | None = None,
 ) -> tuple[bytes, str]:
     towrite = io.BytesIO()
     selected_standards = selected_standards or []
     data_sheet = _build_data_sheet(df, selected_standards)
     client_df = _round_client_output_columns(_build_client_output_frame(data_sheet, comment_map=comment_map))
+    if "Sequence" in client_df.columns:
+        client_df = client_df.sort_values(
+            by=["Sequence", "Identifier", "Sample #"],
+            ascending=[True, True, True],
+            na_position="last",
+            kind="mergesort",
+        ).reset_index(drop=True)
+    precision_df = precision_source_df if precision_source_df is not None else df
     with pd.ExcelWriter(towrite, engine="xlsxwriter") as writer:
         sheet_name = "Client Output"
         client_df.to_excel(writer, index=False, sheet_name=sheet_name)
-        _format_client_output_worksheet(writer, sheet_name, client_df, source_df=df)
+        _format_client_output_worksheet(
+            writer,
+            sheet_name,
+            client_df,
+            source_df=precision_df,
+            precision_override=precision_override,
+        )
     towrite.seek(0)
     return towrite.getvalue(), _build_client_filename(client_name or "", client_df)
