@@ -211,6 +211,23 @@ def _compute_linearity_fit(
     return result
 
 
+def _filter_linearity_fit_input_by_max_intensity(
+    df: pd.DataFrame,
+    intensity_col: str,
+    max_intensity: float | None = None,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if intensity_col not in df.columns:
+        return df
+    max_value = pd.to_numeric(pd.Series([max_intensity]), errors="coerce").iloc[0]
+    if not np.isfinite(max_value):
+        return df
+    intensity = pd.to_numeric(df[intensity_col], errors="coerce")
+    mask = np.isfinite(intensity) & (intensity <= float(max_value))
+    return df.loc[mask].copy()
+
+
 def _resolve_linearity_fit_degree(fit: dict[str, Any] | None) -> int:
     if not isinstance(fit, dict):
         return 1
@@ -238,19 +255,210 @@ def _linearity_correction_delta(intensity: pd.Series, fit: dict[str, Any]) -> pd
     return pd.to_numeric(delta, errors="coerce")
 
 
+def _offset_number(value: Any, fallback: float = 0.0) -> float:
+    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if np.isfinite(parsed):
+        return float(parsed)
+    fallback_num = pd.to_numeric(pd.Series([fallback]), errors="coerce").iloc[0]
+    return float(fallback_num) if np.isfinite(fallback_num) else 0.0
+
+
+def _has_effective_line_offsets(line_1_offset: float, line_2_offset: float) -> bool:
+    line1 = _offset_number(line_1_offset, 0.0)
+    line2 = _offset_number(line_2_offset, 0.0)
+    return abs(float(line1)) > 1e-15 or abs(float(line2)) > 1e-15
+
+
+def _resolve_isotope_line_offsets(
+    line_1_offset: float = 0.0,
+    line_2_offset: float = 0.0,
+    line_1_offset_d13: float | None = None,
+    line_1_offset_d18: float | None = None,
+    line_2_offset_d13: float | None = None,
+    line_2_offset_d18: float | None = None,
+) -> dict[str, tuple[float, float]]:
+    base_line_1 = _offset_number(line_1_offset, 0.0)
+    base_line_2 = _offset_number(line_2_offset, 0.0)
+    return {
+        "d13C": (
+            _offset_number(line_1_offset_d13, base_line_1),
+            _offset_number(line_2_offset_d13, base_line_2),
+        ),
+        "d18O": (
+            _offset_number(line_1_offset_d18, base_line_1),
+            _offset_number(line_2_offset_d18, base_line_2),
+        ),
+    }
+
+
+def _resolve_isotope_specific_line_offsets(
+    line_1_offset_d13: float | None = None,
+    line_1_offset_d18: float | None = None,
+    line_2_offset_d13: float | None = None,
+    line_2_offset_d18: float | None = None,
+) -> dict[str, tuple[float, float]]:
+    return {
+        "d13C": (
+            _offset_number(line_1_offset_d13, 0.0),
+            _offset_number(line_2_offset_d13, 0.0),
+        ),
+        "d18O": (
+            _offset_number(line_1_offset_d18, 0.0),
+            _offset_number(line_2_offset_d18, 0.0),
+        ),
+    }
+
+
+def _apply_isotope_line_offsets(
+    df: pd.DataFrame,
+    line_1_offset_d13: float | None = None,
+    line_1_offset_d18: float | None = None,
+    line_2_offset_d13: float | None = None,
+    line_2_offset_d18: float | None = None,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    line_col = _find_column(df, "Line")
+    if not line_col:
+        return df
+    offsets = _resolve_isotope_specific_line_offsets(
+        line_1_offset_d13=line_1_offset_d13,
+        line_1_offset_d18=line_1_offset_d18,
+        line_2_offset_d13=line_2_offset_d13,
+        line_2_offset_d18=line_2_offset_d18,
+    )
+    has_any_offset = any(_has_effective_line_offsets(pair[0], pair[1]) for pair in offsets.values())
+    if not has_any_offset:
+        return df
+
+    work = df.copy()
+    line_values = pd.to_numeric(work[line_col], errors="coerce")
+    col_map = {"d13C": "d 13C/12C  Mean", "d18O": "d 18O/16O  Mean"}
+    for isotope_key, value_col in col_map.items():
+        if value_col not in work.columns:
+            continue
+        line1, line2 = offsets[isotope_key]
+        if not _has_effective_line_offsets(line1, line2):
+            continue
+        values = pd.to_numeric(work[value_col], errors="coerce")
+        adjustment = pd.Series(0.0, index=work.index, dtype=float)
+        if abs(float(line1)) > 1e-15:
+            adjustment = adjustment + float(line1) * line_values.eq(1)
+        if abs(float(line2)) > 1e-15:
+            adjustment = adjustment + float(line2) * line_values.eq(2)
+        adjusted = values + adjustment
+        work[value_col] = adjusted.where(np.isfinite(values), values)
+    return work
+
+
+def _linearity_adjusted_intensity_series(
+    df: pd.DataFrame,
+    intensity_col: str,
+    line_1_offset: float = 0.0,
+    line_2_offset: float = 0.0,
+) -> pd.Series:
+    if intensity_col not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    intensity = pd.to_numeric(df[intensity_col], errors="coerce")
+    line1 = _offset_number(line_1_offset, 0.0)
+    line2 = _offset_number(line_2_offset, 0.0)
+    if not _has_effective_line_offsets(line1, line2):
+        return intensity
+    line_col = _find_column(df, "Line")
+    if not line_col:
+        return intensity
+    line_values = pd.to_numeric(df[line_col], errors="coerce")
+    adjustment = pd.Series(0.0, index=df.index, dtype=float)
+    if abs(float(line1)) > 1e-15:
+        adjustment = adjustment + float(line1) * line_values.eq(1)
+    if abs(float(line2)) > 1e-15:
+        adjustment = adjustment + float(line2) * line_values.eq(2)
+    adjusted = intensity + adjustment
+    return adjusted.where(np.isfinite(intensity), intensity)
+
+
+def _with_isotope_linearity_intensity_columns(
+    df: pd.DataFrame,
+    intensity_col: str,
+    line_1_offset: float = 0.0,
+    line_2_offset: float = 0.0,
+    line_1_offset_d13: float | None = None,
+    line_1_offset_d18: float | None = None,
+    line_2_offset_d13: float | None = None,
+    line_2_offset_d18: float | None = None,
+) -> tuple[pd.DataFrame, str, str]:
+    if df is None or df.empty or intensity_col not in df.columns:
+        return df, intensity_col, intensity_col
+    offsets = _resolve_isotope_line_offsets(
+        line_1_offset=line_1_offset,
+        line_2_offset=line_2_offset,
+        line_1_offset_d13=line_1_offset_d13,
+        line_1_offset_d18=line_1_offset_d18,
+        line_2_offset_d13=line_2_offset_d13,
+        line_2_offset_d18=line_2_offset_d18,
+    )
+    d13_offsets = offsets["d13C"]
+    d18_offsets = offsets["d18O"]
+    d13_has_offsets = _has_effective_line_offsets(*d13_offsets)
+    d18_has_offsets = _has_effective_line_offsets(*d18_offsets)
+    if not d13_has_offsets and not d18_has_offsets:
+        return df, intensity_col, intensity_col
+
+    work = df.copy()
+    d13_intensity_col = intensity_col
+    d18_intensity_col = intensity_col
+    if d13_has_offsets and d18_has_offsets and d13_offsets == d18_offsets:
+        shared_col = f"{intensity_col}__linearity_line_offset"
+        work[shared_col] = _linearity_adjusted_intensity_series(work, intensity_col, d13_offsets[0], d13_offsets[1])
+        return work, shared_col, shared_col
+    if d13_has_offsets:
+        d13_intensity_col = f"{intensity_col}__linearity_d13"
+        work[d13_intensity_col] = _linearity_adjusted_intensity_series(work, intensity_col, d13_offsets[0], d13_offsets[1])
+    if d18_has_offsets:
+        d18_intensity_col = f"{intensity_col}__linearity_d18"
+        work[d18_intensity_col] = _linearity_adjusted_intensity_series(work, intensity_col, d18_offsets[0], d18_offsets[1])
+    return work, d13_intensity_col, d18_intensity_col
+
+
 def _apply_linearity_correction(
     df: pd.DataFrame,
     intensity_col: str,
     fits: dict[str, Any],
 ) -> pd.DataFrame:
     work = df.copy()
-    if intensity_col not in work.columns:
-        return work
-    intensity = pd.to_numeric(work[intensity_col], errors="coerce")
+    fallback_intensity = (
+        pd.to_numeric(work[intensity_col], errors="coerce")
+        if intensity_col in work.columns
+        else pd.Series(np.nan, index=work.index, dtype=float)
+    )
+    d13_intensity_col = (
+        str(fits.get("d13_intensity_col", "")).strip()
+        if isinstance(fits, dict)
+        else ""
+    )
+    d18_intensity_col = (
+        str(fits.get("d18_intensity_col", "")).strip()
+        if isinstance(fits, dict)
+        else ""
+    )
+    if d13_intensity_col == "" or d13_intensity_col not in work.columns:
+        d13_intensity_col = intensity_col
+    if d18_intensity_col == "" or d18_intensity_col not in work.columns:
+        d18_intensity_col = intensity_col
+    d13_intensity = (
+        pd.to_numeric(work[d13_intensity_col], errors="coerce")
+        if d13_intensity_col in work.columns
+        else fallback_intensity
+    )
+    d18_intensity = (
+        pd.to_numeric(work[d18_intensity_col], errors="coerce")
+        if d18_intensity_col in work.columns
+        else fallback_intensity
+    )
     d13_fit = fits.get("d13C", {}) if isinstance(fits, dict) else {}
     d18_fit = fits.get("d18O", {}) if isinstance(fits, dict) else {}
-    d13_delta = _linearity_correction_delta(intensity, d13_fit)
-    d18_delta = _linearity_correction_delta(intensity, d18_fit)
+    d13_delta = _linearity_correction_delta(d13_intensity, d13_fit)
+    d18_delta = _linearity_correction_delta(d18_intensity, d18_fit)
     if "d 13C/12C  Mean" in work.columns and d13_delta.notna().any():
         values = pd.to_numeric(work["d 13C/12C  Mean"], errors="coerce")
         work["d13C_linearity_corrected"] = (values - d13_delta).where(np.isfinite(values) & np.isfinite(d13_delta))
@@ -278,25 +486,14 @@ def _apply_linearity_line_offsets(
 ) -> pd.DataFrame:
     if df is None or df.empty or intensity_col not in df.columns:
         return df
-    line_col = _find_column(df, "Line")
-    if not line_col:
+    line1 = _offset_number(line_1_offset, 0.0)
+    line2 = _offset_number(line_2_offset, 0.0)
+    if not _has_effective_line_offsets(line1, line2):
         return df
-    line1 = pd.to_numeric(pd.Series([line_1_offset]), errors="coerce").iloc[0]
-    line2 = pd.to_numeric(pd.Series([line_2_offset]), errors="coerce").iloc[0]
-    if (not np.isfinite(line1) or abs(float(line1)) <= 1e-15) and (
-        not np.isfinite(line2) or abs(float(line2)) <= 1e-15
-    ):
+    if _find_column(df, "Line") is None:
         return df
     work = df.copy()
-    intensity = pd.to_numeric(work[intensity_col], errors="coerce")
-    line_values = pd.to_numeric(work[line_col], errors="coerce")
-    adjustment = pd.Series(0.0, index=work.index, dtype=float)
-    if np.isfinite(line1) and abs(float(line1)) > 1e-15:
-        adjustment = adjustment + float(line1) * line_values.eq(1)
-    if np.isfinite(line2) and abs(float(line2)) > 1e-15:
-        adjustment = adjustment + float(line2) * line_values.eq(2)
-    adjusted = intensity + adjustment
-    work[intensity_col] = adjusted.where(np.isfinite(intensity), intensity)
+    work[intensity_col] = _linearity_adjusted_intensity_series(work, intensity_col, line1, line2)
     return work
 
 

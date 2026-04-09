@@ -8,8 +8,10 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api } from "@/lib/api";
 import type {
+  ClientOutputDuplicateCheckResponse,
   CycleDiagnosticsPayload,
   EditAction,
+  ExportRequest,
   OutlierTable,
   ProcessingConfig,
   ProcessingWorkspace,
@@ -32,6 +34,7 @@ type IsotopeKey = "d13C" | "d18O";
 const ISOTOPE_KEYS: IsotopeKey[] = ["d13C", "d18O"];
 type IsotopeNumericMap = Record<IsotopeKey, number>;
 const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
+const RESTORE_STDEV_DEFAULT_CAP = 0.04;
 
 type DisplayStateMap = Record<string, { rawOnly: boolean; hideCalibrated: boolean }>;
 type FigureShape = Record<string, unknown> & {
@@ -1366,6 +1369,9 @@ export default function ProcessingPage() {
   const [isSelectionEditorOpen, setSelectionEditorOpen] = useState(false);
   const [isExportModalOpen, setExportModalOpen] = useState(false);
   const [exportOutputType, setExportOutputType] = useState<"dataset" | "client_output">("dataset");
+  const [duplicateCheckResult, setDuplicateCheckResult] = useState<ClientOutputDuplicateCheckResponse | null>(null);
+  const [restoreStdevEnabled, setRestoreStdevEnabled] = useState(false);
+  const [restoreStdevCap, setRestoreStdevCap] = useState(RESTORE_STDEV_DEFAULT_CAP);
   const [failedRestoreRate, setFailedRestoreRate] = useState(100);
   const [failedRestoreOffset, setFailedRestoreOffset] = useState(0);
   const [failedRestoreStdev, setFailedRestoreStdev] = useState(0);
@@ -1386,6 +1392,12 @@ export default function ProcessingPage() {
     const nextText = serializeCommentMap(config?.export.comment_map ?? {});
     setCommentMapText(nextText);
   }, [config?.export.comment_map]);
+
+  useEffect(() => {
+    if (exportOutputType !== "client_output") {
+      setDuplicateCheckResult(null);
+    }
+  }, [exportOutputType]);
 
   useEffect(() => {
     if (!sessionId || typeof window === "undefined") {
@@ -1448,6 +1460,12 @@ export default function ProcessingPage() {
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
+    },
+  });
+  const duplicateCheckMutation = useMutation({
+    mutationFn: (payload: ExportRequest) => api.checkClientOutputDuplicates(sessionId!, payload),
+    onSuccess: (result) => {
+      setDuplicateCheckResult(result);
     },
   });
 
@@ -1663,7 +1681,10 @@ export default function ProcessingPage() {
     );
   }
 
-  function updateManualLinearity(key: keyof ProcessingConfig["manual_linearity_override"], value: boolean | number) {
+  function updateManualLinearity<T extends keyof ProcessingConfig["manual_linearity_override"]>(
+    key: T,
+    value: ProcessingConfig["manual_linearity_override"][T],
+  ) {
     setConfig((current) =>
       current
         ? {
@@ -1807,12 +1828,24 @@ export default function ProcessingPage() {
     await saveConfigMutation.mutateAsync(activeConfig);
   }
 
+  function buildExportRequestPayload(outputType: "dataset" | "client_output"): ExportRequest {
+    return {
+      ...activeConfig!.export,
+      output_type: outputType,
+      restore_stdev: outputType === "client_output" ? restoreStdevEnabled : false,
+      restore_stdev_cap:
+        outputType === "client_output"
+          ? Math.min(RESTORE_STDEV_DEFAULT_CAP, Math.max(0, restoreStdevCap))
+          : RESTORE_STDEV_DEFAULT_CAP,
+    };
+  }
+
   async function handleExport(outputType: "dataset" | "client_output") {
     if (!sessionId || !activeConfig) {
       return;
     }
     await saveConfigMutation.mutateAsync(activeConfig);
-    const { blob, filename } = await api.exportDataset(sessionId, { ...activeConfig.export, output_type: outputType });
+    const { blob, filename } = await api.exportDataset(sessionId, buildExportRequestPayload(outputType));
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -1824,6 +1857,16 @@ export default function ProcessingPage() {
     anchor.remove();
     URL.revokeObjectURL(url);
     setExportModalOpen(false);
+  }
+
+  async function handleDuplicateCheck() {
+    if (!sessionId || !activeConfig) {
+      return;
+    }
+    duplicateCheckMutation.reset();
+    setDuplicateCheckResult(null);
+    await saveConfigMutation.mutateAsync(activeConfig);
+    await duplicateCheckMutation.mutateAsync(buildExportRequestPayload("client_output"));
   }
 
   async function applySingleValue(isotopeKey: IsotopeKey) {
@@ -1983,7 +2026,8 @@ export default function ProcessingPage() {
     saveConfigMutation.isPending ||
     editMutation.isPending ||
     resetAllMutation.isPending ||
-    removeCalibrationMutation.isPending;
+    removeCalibrationMutation.isPending ||
+    duplicateCheckMutation.isPending;
   const manualOverrideCount = Object.keys(workspace.edit_state.manual_outlier_overrides ?? {}).length;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
   const diagnosticsByIsotope: Record<IsotopeKey, CycleDiagnosticsPayload | undefined> = {
@@ -2381,6 +2425,24 @@ export default function ProcessingPage() {
                   disabled={!activeConfig.manual_linearity_override.enabled}
                   onChange={(checked) => updateManualLinearity("quadratic", checked)}
                 />
+                <label className="text-sm">
+                  <span className="mb-1 block text-stone-700">Max sample signal (optional)</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min={0}
+                    value={activeConfig.manual_linearity_override.max_sample_signal ?? ""}
+                    onChange={(event) => {
+                      const nextValue = event.target.value.trim();
+                      updateManualLinearity("max_sample_signal", nextValue === "" ? null : Number(nextValue));
+                    }}
+                    disabled={!activeConfig.manual_linearity_override.enabled}
+                    className="w-full rounded-lg border border-stone-300 px-3 py-2 disabled:bg-stone-100"
+                  />
+                  <span className="mt-1 block text-xs text-stone-500">
+                    Samples above this 44-intensity are excluded from manual linearity correction.
+                  </span>
+                </label>
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-2">
                   <label className="text-sm">
                     <span className="mb-1 block text-stone-700">
@@ -2543,6 +2605,85 @@ export default function ProcessingPage() {
                         onChange={(checked) => updateExport("interpolate_outliers", checked)}
                         disabled={!activeConfig.export.include_outliers}
                       />
+                      {exportOutputType === "client_output" ? (
+                        <div className="space-y-3 rounded-lg border border-stone-200 p-3">
+                          <div className="space-y-2">
+                            <CheckboxField
+                              checked={restoreStdevEnabled}
+                              label="Restore stdev"
+                              description="Cap high stdev values in client output to the maximum below."
+                              onChange={setRestoreStdevEnabled}
+                            />
+                            <label className="text-sm">
+                              <span className="mb-1 block text-stone-700">Max stdev</span>
+                              <input
+                                type="number"
+                                min={0}
+                                max={RESTORE_STDEV_DEFAULT_CAP}
+                                step="0.001"
+                                value={restoreStdevCap}
+                                onChange={(event) =>
+                                  setRestoreStdevCap(
+                                    Math.min(
+                                      RESTORE_STDEV_DEFAULT_CAP,
+                                      Math.max(0, parseFinite(event.target.value, RESTORE_STDEV_DEFAULT_CAP)),
+                                    ),
+                                  )
+                                }
+                                disabled={!restoreStdevEnabled}
+                                className="w-32 rounded-lg border border-stone-300 px-3 py-2 disabled:cursor-not-allowed disabled:bg-stone-100"
+                              />
+                            </label>
+                          </div>
+                          <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-2.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-sm font-medium text-stone-800">Duplicate check</span>
+                              <Button type="button" variant="outline" size="sm" onClick={() => void handleDuplicateCheck()} disabled={busy}>
+                                {duplicateCheckMutation.isPending ? "Checking..." : "Check for duplicates"}
+                              </Button>
+                            </div>
+                            <div className="text-xs text-stone-600">
+                              Checks for repeated Identifier 2 or Sequence in the current client-output scope.
+                            </div>
+                            {duplicateCheckMutation.isError ? (
+                              <div className="text-xs font-medium text-red-700">Duplicate check failed.</div>
+                            ) : null}
+                            {duplicateCheckResult ? (
+                              <div
+                                className={cn(
+                                  "space-y-1 rounded-md border px-2 py-1.5 text-xs",
+                                  duplicateCheckResult.duplicate_row_count > 0
+                                    ? "border-amber-300 bg-amber-50 text-amber-900"
+                                    : "border-emerald-300 bg-emerald-50 text-emerald-900",
+                                )}
+                              >
+                                <div>
+                                  {duplicateCheckResult.duplicate_row_count > 0
+                                    ? `${duplicateCheckResult.duplicate_row_count} duplicate row(s) found.`
+                                    : "No duplicates found."}
+                                </div>
+                                {duplicateCheckResult.duplicate_identifier2_values.length ? (
+                                  <div>
+                                    Identifier 2:{" "}
+                                    {duplicateCheckResult.duplicate_identifier2_values.slice(0, 8).join(", ")}
+                                    {duplicateCheckResult.duplicate_identifier2_values.length > 8 ? "..." : ""}
+                                  </div>
+                                ) : null}
+                                {duplicateCheckResult.duplicate_sequence_values.length ? (
+                                  <div>
+                                    Sequence:{" "}
+                                    {duplicateCheckResult.duplicate_sequence_values
+                                      .slice(0, 8)
+                                      .map((value) => String(value))
+                                      .join(", ")}
+                                    {duplicateCheckResult.duplicate_sequence_values.length > 8 ? "..." : ""}
+                                  </div>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : null}
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">Export identifiers</span>
                         <select

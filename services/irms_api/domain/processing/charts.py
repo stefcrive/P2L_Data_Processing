@@ -169,6 +169,7 @@ def _build_summary_figure(
                 y=pd.to_numeric(plot_df.get(y_col), errors="coerce"),
                 mode="lines+markers",
                 name=f"Raw {isotope_key} - {species}",
+                yhoverformat=".3f",
                 marker=marker,
                 customdata=_build_delta_point_customdata(plot_df, isotope_key),
             )
@@ -181,6 +182,7 @@ def _build_summary_figure(
                     mode="lines",
                     line=dict(color="#f97316", width=2),
                     name=f"Calibrated {isotope_key} - {species}",
+                    customdata=_build_delta_point_customdata(plot_df, isotope_key),
                 )
             )
     fig.update_layout(
@@ -1053,6 +1055,7 @@ def _build_identifier_figure(
                 line=dict(color="#2563eb", width=1.5),
                 marker=marker,
                 name=f"Raw {isotope_key} - {identifier}",
+                yhoverformat=".3f",
                 error_y=error_y,
                 customdata=_build_delta_point_customdata(filtered_identifier, isotope_key),
             )
@@ -1082,6 +1085,7 @@ def _build_identifier_figure(
                     mode="lines",
                     line=dict(color="#f97316", width=2),
                     name=f"Calibrated {isotope_key} - {identifier}",
+                    customdata=_build_delta_point_customdata(filtered_identifier, isotope_key),
                 )
             )
         fig.update_layout(

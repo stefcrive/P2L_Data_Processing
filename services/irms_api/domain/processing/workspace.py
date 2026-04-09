@@ -7,12 +7,13 @@ import numpy as np
 import pandas as pd
 
 from ..calibration.core import (
-    _apply_linearity_line_offsets,
+    _apply_isotope_line_offsets,
     _apply_linearity_correction,
     _resolve_linearity_intensity_column_for_fits,
     _resolve_manual_linearity_override_intensity,
     _resolve_linearity_reference_intensity,
     _resolve_selected_linearity_intensity_column,
+    _with_isotope_linearity_intensity_columns,
 )
 from ..constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, CYCLE1_SIGNAL_SAMP44_COL
 from ..contracts import (
@@ -59,6 +60,7 @@ def normalize_processing_config(raw: dict[str, Any] | None) -> ProcessingWorkspa
             "enabled": bool(payload.pop("manual_linearity_override_enabled", False)),
             "use_diff_intensity": bool(payload.pop("manual_linearity_use_diff_intensity", False)),
             "quadratic": bool(payload.pop("manual_linearity_quadratic", False)),
+            "max_sample_signal": payload.pop("manual_linearity_max_sample_signal", None),
             "d13_per_10v": float(payload.pop("manual_linearity_d13_per_10v", 0.0) or 0.0),
             "d18_per_10v": float(payload.pop("manual_linearity_d18_per_10v", 0.0) or 0.0),
             "d13_per_10v2": float(payload.pop("manual_linearity_d13_per_10v2", 0.0) or 0.0),
@@ -70,6 +72,8 @@ def normalize_processing_config(raw: dict[str, Any] | None) -> ProcessingWorkspa
             override_payload["use_diff_intensity"] = bool(payload.pop("manual_linearity_use_diff_intensity", False))
         if isinstance(override_payload, dict) and "quadratic" not in override_payload:
             override_payload["quadratic"] = bool(payload.pop("manual_linearity_quadratic", False))
+        if isinstance(override_payload, dict) and "max_sample_signal" not in override_payload:
+            override_payload["max_sample_signal"] = payload.pop("manual_linearity_max_sample_signal", None)
         if isinstance(override_payload, dict) and "d13_per_10v2" not in override_payload:
             override_payload["d13_per_10v2"] = float(payload.pop("manual_linearity_d13_per_10v2", 0.0) or 0.0)
         if isinstance(override_payload, dict) and "d18_per_10v2" not in override_payload:
@@ -159,7 +163,13 @@ def _apply_manual_linearity_override(
         intensity_col,
         use_diff_intensity=bool(override.use_diff_intensity),
     )
-    valid_intensity = np.isfinite(intensity)
+    intensity_series = pd.to_numeric(pd.Series(intensity, index=work.index), errors="coerce")
+    max_sample_signal_raw = pd.to_numeric(pd.Series([override.max_sample_signal]), errors="coerce").iloc[0]
+    within_max_sample_signal = pd.Series(True, index=work.index, dtype=bool)
+    if np.isfinite(max_sample_signal_raw) and CYCLE1_SIGNAL_SAMP44_COL in work.columns:
+        sample_signal = pd.to_numeric(work[CYCLE1_SIGNAL_SAMP44_COL], errors="coerce")
+        within_max_sample_signal = np.isfinite(sample_signal) & (sample_signal <= float(max_sample_signal_raw))
+    valid_intensity = intensity_series.notna() & within_max_sample_signal
 
     def _apply_single_column(
         column_name: str,
@@ -174,7 +184,7 @@ def _apply_manual_linearity_override(
         if not np.isfinite(slope_num) and not np.isfinite(quad_num):
             return
         if normalized_intensity:
-            finite_scope = intensity[np.isfinite(intensity)]
+            finite_scope = intensity_series[valid_intensity]
             x_ref = float(finite_scope.median()) if not finite_scope.empty else 0.0
         else:
             x_ref = _resolve_linearity_reference_intensity(
@@ -191,11 +201,14 @@ def _apply_manual_linearity_override(
             else:
                 quad_coeff_num = slope_num
             quad_per_v2 = float(quad_coeff_num) / 100.0
-            delta = quad_per_v2 * (np.square(intensity) - float(x_ref) ** 2)
+            delta = quad_per_v2 * (np.square(intensity_series) - float(x_ref) ** 2)
         else:
             slope_per_v = float(slope_num) / 10.0
-            delta = slope_per_v * (intensity - float(x_ref))
-        work[column_name] = (values - delta).where(np.isfinite(values) & valid_intensity & np.isfinite(delta))
+            delta = slope_per_v * (intensity_series - float(x_ref))
+        apply_mask = np.isfinite(values) & valid_intensity & np.isfinite(delta)
+        corrected = values.copy()
+        corrected.loc[apply_mask] = values.loc[apply_mask] - delta.loc[apply_mask]
+        work[column_name] = corrected
 
     _apply_single_column("d 13C/12C  Mean", "d13C", override.d13_per_10v, override.d13_per_10v2)
     _apply_single_column("d13C_calibrated", "d13C", override.d13_per_10v, override.d13_per_10v2)
@@ -243,12 +256,12 @@ def _recompute_calibration_after_modifications(
     edit_state: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     work = df.copy()
+    del config
+    del edit_state
     calibration = calibration_meta or {}
     coeffs = calibration.get("coefficients", {})
     if not isinstance(coeffs, dict) or not coeffs:
         return work
-
-    outlier_mask = _effective_outlier_mask(work, config, edit_state=edit_state)
     standards_repo = StandardsRepository.default()
     standards = {str(item).strip().upper() for item in standards_repo.standards_list() if str(item).strip() != ""}
     standards.update(
@@ -261,7 +274,7 @@ def _recompute_calibration_after_modifications(
         standards_mask = identifier_labels.isin(standards)
     else:
         standards_mask = pd.Series(False, index=work.index, dtype=bool)
-    eligible_mask = ~outlier_mask.reindex(work.index, fill_value=False).astype(bool) & ~standards_mask
+    eligible_mask = ~standards_mask
 
     isotopes: dict[str, tuple[str, str, str]] = {
         "d13C": ("d 13C/12C  Mean", "d13C_calibrated", "d13C_calibrated_linearity_corrected"),
@@ -297,6 +310,13 @@ def _derive_working_frame(
     calibration = calibration_meta or {}
     fits = calibration.get("linearity_fits", {})
     linearity_cfg = calibration.get("config", {}).get("linearity", {}) if isinstance(calibration.get("config"), dict) else {}
+    work = _apply_isotope_line_offsets(
+        work,
+        line_1_offset_d13=linearity_cfg.get("line_1_offset_d13"),
+        line_1_offset_d18=linearity_cfg.get("line_1_offset_d18"),
+        line_2_offset_d13=linearity_cfg.get("line_2_offset_d13"),
+        line_2_offset_d18=linearity_cfg.get("line_2_offset_d18"),
+    )
     if bool(linearity_cfg.get("apply")) and isinstance(fits, dict) and fits:
         intensity_col = _resolve_linearity_intensity_column_for_fits(
             fits=fits,
@@ -304,13 +324,16 @@ def _derive_working_frame(
             use_diff_intensity=bool(linearity_cfg.get("use_diff_intensity", False)),
             selected_intensity_col=linearity_cfg.get("intensity_col"),
         )
-        work = _apply_linearity_line_offsets(
+        work, d13_offset_intensity_col, d18_offset_intensity_col = _with_isotope_linearity_intensity_columns(
             work,
             intensity_col,
             line_1_offset=float(linearity_cfg.get("line_1_offset", 0.0) or 0.0),
             line_2_offset=float(linearity_cfg.get("line_2_offset", 0.0) or 0.0),
         )
-        corrected = _apply_linearity_correction(work, intensity_col, fits)
+        fit_payload = dict(fits)
+        fit_payload.setdefault("d13_intensity_col", d13_offset_intensity_col)
+        fit_payload.setdefault("d18_intensity_col", d18_offset_intensity_col)
+        corrected = _apply_linearity_correction(work, intensity_col, fit_payload)
         if "d13C_linearity_corrected" in corrected.columns:
             corrected_values = pd.to_numeric(corrected["d13C_linearity_corrected"], errors="coerce")
             if corrected_values.notna().any():

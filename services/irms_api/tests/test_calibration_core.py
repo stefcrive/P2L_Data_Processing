@@ -5,10 +5,12 @@ import unittest
 import pandas as pd
 
 from services.irms_api.domain.calibration.core import (
+    _apply_isotope_line_offsets,
     _apply_linearity_line_offsets,
     _apply_linearity_correction,
     _apply_manual_linearity_override_to_standards,
     _compute_linearity_fit,
+    _filter_linearity_fit_input_by_max_intensity,
     create_calibration_plots,
     identify_outliers_iqr,
     single_point_calibration,
@@ -49,6 +51,17 @@ class CalibrationCoreTests(unittest.TestCase):
         self.assertTrue(pd.isna(pd.to_numeric(pd.Series([result["slope"]]), errors="coerce").iloc[0]))
         self.assertAlmostEqual(float(result["intercept"]), 2.0, places=6)
 
+    def test_filter_linearity_fit_input_by_max_intensity(self) -> None:
+        df = pd.DataFrame(
+            {
+                "intensity": [13.5, 15.0, 15.4, 16.1],
+                "value": [1.0, 2.0, 3.0, 4.0],
+            }
+        )
+        filtered = _filter_linearity_fit_input_by_max_intensity(df, "intensity", max_intensity=15.0)
+        self.assertEqual(len(filtered), 2)
+        self.assertListEqual(filtered["intensity"].tolist(), [13.5, 15.0])
+
     def test_apply_linearity_correction_quadratic(self) -> None:
         df = pd.DataFrame(
             {
@@ -86,6 +99,60 @@ class CalibrationCoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(values.iloc[0]), 11.5, places=6)
         self.assertAlmostEqual(float(values.iloc[1]), 9.5, places=6)
         self.assertAlmostEqual(float(values.iloc[2]), 14.0, places=6)
+
+    def test_apply_isotope_line_offsets_adjusts_d13_and_d18_values_by_line(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Line": [1, 2, 1, 2],
+                "d 13C/12C  Mean": [1.0, 1.0, 2.0, 2.0],
+                "d 18O/16O  Mean": [3.0, 3.0, 4.0, 4.0],
+            }
+        )
+
+        adjusted = _apply_isotope_line_offsets(
+            df,
+            line_1_offset_d13=0.5,
+            line_2_offset_d13=-1.0,
+            line_1_offset_d18=2.0,
+            line_2_offset_d18=-0.5,
+        )
+
+        d13 = pd.to_numeric(adjusted["d 13C/12C  Mean"], errors="coerce")
+        d18 = pd.to_numeric(adjusted["d 18O/16O  Mean"], errors="coerce")
+        self.assertAlmostEqual(float(d13.iloc[0]), 1.5, places=6)
+        self.assertAlmostEqual(float(d13.iloc[1]), 0.0, places=6)
+        self.assertAlmostEqual(float(d13.iloc[2]), 2.5, places=6)
+        self.assertAlmostEqual(float(d13.iloc[3]), 1.0, places=6)
+        self.assertAlmostEqual(float(d18.iloc[0]), 5.0, places=6)
+        self.assertAlmostEqual(float(d18.iloc[1]), 2.5, places=6)
+        self.assertAlmostEqual(float(d18.iloc[2]), 6.0, places=6)
+        self.assertAlmostEqual(float(d18.iloc[3]), 3.5, places=6)
+
+    def test_apply_linearity_correction_honors_isotope_specific_intensity_columns(self) -> None:
+        df = pd.DataFrame(
+            {
+                "1  Cycle Int  Samp  44": [10.0, 10.0],
+                "1  Cycle Int  Samp  44__linearity_d13": [10.0, 11.0],
+                "1  Cycle Int  Samp  44__linearity_d18": [10.0, 20.0],
+                "d 13C/12C  Mean": [100.0, 102.0],
+                "d 18O/16O  Mean": [200.0, 210.0],
+            }
+        )
+        fits = {
+            "d13C": {"slope": 1.0, "x_ref": 10.0, "n": 2},
+            "d18O": {"slope": 1.0, "x_ref": 10.0, "n": 2},
+            "intensity_col": "1  Cycle Int  Samp  44",
+            "d13_intensity_col": "1  Cycle Int  Samp  44__linearity_d13",
+            "d18_intensity_col": "1  Cycle Int  Samp  44__linearity_d18",
+        }
+
+        corrected = _apply_linearity_correction(df, "1  Cycle Int  Samp  44", fits)
+        d13 = pd.to_numeric(corrected["d13C_linearity_corrected"], errors="coerce")
+        d18 = pd.to_numeric(corrected["d18O_linearity_corrected"], errors="coerce")
+        self.assertAlmostEqual(float(d13.iloc[0]), 100.0, places=6)
+        self.assertAlmostEqual(float(d13.iloc[1]), 101.0, places=6)
+        self.assertAlmostEqual(float(d18.iloc[0]), 200.0, places=6)
+        self.assertAlmostEqual(float(d18.iloc[1]), 200.0, places=6)
 
     def test_identify_outliers_iqr(self) -> None:
         df = pd.DataFrame({"value": [1, 1, 1, 1, 25]})

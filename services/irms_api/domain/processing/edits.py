@@ -6,9 +6,10 @@ import numpy as np
 import pandas as pd
 
 from ..calibration.core import (
-    _apply_linearity_line_offsets,
+    _apply_isotope_line_offsets,
     _linearity_correction_delta,
     _resolve_linearity_intensity_column_for_fits,
+    _with_isotope_linearity_intensity_columns,
 )
 from ..contracts import EditAction
 from ..shared.dataframe import _parse_numeric_token
@@ -110,25 +111,42 @@ def _refresh_calibrated_after_delta_edit(
     fits = linearity_fits or {}
     fit = fits.get(str(isotope_key).strip(), {}) if isinstance(fits, dict) else {}
     apply_linearity_before_calibration = bool(linearity_cfg.get("apply")) and isinstance(fits, dict) and bool(fits)
+    context = _apply_isotope_line_offsets(
+        work,
+        line_1_offset_d13=linearity_cfg.get("line_1_offset_d13"),
+        line_1_offset_d18=linearity_cfg.get("line_1_offset_d18"),
+        line_2_offset_d13=linearity_cfg.get("line_2_offset_d13"),
+        line_2_offset_d18=linearity_cfg.get("line_2_offset_d18"),
+    )
+    line_adjusted_raw = (
+        pd.to_numeric(pd.Series([context.at[row_label, raw_col]]), errors="coerce").iloc[0]
+        if row_label in context.index and raw_col in context.columns
+        else new_raw
+    )
     delta = np.nan
     if apply_linearity_before_calibration:
-        context = _apply_linearity_line_offsets(
-            work,
-            _resolve_linearity_intensity_column_for_fits(
-                fits=fits,
-                df=work,
-                use_diff_intensity=bool(linearity_cfg.get("use_diff_intensity", False)),
-                selected_intensity_col=linearity_cfg.get("intensity_col"),
-            ),
-            line_1_offset=float(linearity_cfg.get("line_1_offset", 0.0) or 0.0),
-            line_2_offset=float(linearity_cfg.get("line_2_offset", 0.0) or 0.0),
-        )
-        intensity_col = _resolve_linearity_intensity_column_for_fits(
+        resolved_intensity_col = _resolve_linearity_intensity_column_for_fits(
             fits=fits,
             df=context,
             use_diff_intensity=bool(linearity_cfg.get("use_diff_intensity", False)),
             selected_intensity_col=linearity_cfg.get("intensity_col"),
         )
+        context, d13_offset_intensity_col, d18_offset_intensity_col = _with_isotope_linearity_intensity_columns(
+            context,
+            resolved_intensity_col,
+            line_1_offset=float(linearity_cfg.get("line_1_offset", 0.0) or 0.0),
+            line_2_offset=float(linearity_cfg.get("line_2_offset", 0.0) or 0.0),
+        )
+        iso_key = str(isotope_key).strip()
+        if iso_key == "d13C":
+            fallback_intensity_col = d13_offset_intensity_col
+            configured_intensity_col = str(fits.get("d13_intensity_col", "")).strip()
+        else:
+            fallback_intensity_col = d18_offset_intensity_col
+            configured_intensity_col = str(fits.get("d18_intensity_col", "")).strip()
+        intensity_col = configured_intensity_col if configured_intensity_col in context.columns else fallback_intensity_col
+        if intensity_col not in context.columns:
+            intensity_col = resolved_intensity_col
         intensity = (
             pd.to_numeric(pd.Series([context.at[row_label, intensity_col]]), errors="coerce").iloc[0]
             if intensity_col in context.columns
@@ -137,7 +155,12 @@ def _refresh_calibrated_after_delta_edit(
         if np.isfinite(intensity):
             intensity_series = pd.Series([float(intensity)], index=[row_label], dtype=float)
             delta = pd.to_numeric(_linearity_correction_delta(intensity_series, fit), errors="coerce").iloc[0]
-    effective_raw = float(new_raw - delta) if np.isfinite(new_raw) and np.isfinite(delta) else float(new_raw)
+    effective_raw_source = line_adjusted_raw if np.isfinite(line_adjusted_raw) else new_raw
+    effective_raw = (
+        float(effective_raw_source - delta)
+        if np.isfinite(effective_raw_source) and np.isfinite(delta)
+        else float(effective_raw_source)
+    )
     if raw_corrected_col and raw_corrected_col in work.columns:
         work.at[row_label, raw_corrected_col] = effective_raw if np.isfinite(effective_raw) else np.nan
     coeffs = calibration_coefficients or {}
@@ -571,14 +594,23 @@ def apply_edit_action(
             if raw_col is None:
                 continue
             interpolation_base = work.copy()
-            interpolation_neighbor_base = interpolation_base.copy()
-            if interpolation_source_df is not None and raw_col in interpolation_source_df.columns:
-                available_for_interpolation = pd.to_numeric(interpolation_source_df[raw_col], errors="coerce").reindex(
-                    interpolation_neighbor_base.index
+            interpolation_value_base = interpolation_base.copy()
+            source_to_raw_offset_by_row = pd.Series(0.0, index=interpolation_base.index, dtype=float)
+            use_interpolation_source_values = interpolation_source_df is not None and raw_col in interpolation_source_df.columns
+            if use_interpolation_source_values:
+                source_values = pd.to_numeric(interpolation_source_df[raw_col], errors="coerce").reindex(
+                    interpolation_value_base.index
                 )
-                unavailable_mask = available_for_interpolation.isna()
-                if bool(unavailable_mask.any()):
-                    interpolation_neighbor_base.loc[unavailable_mask, raw_col] = np.nan
+                interpolation_value_base[raw_col] = source_values
+                raw_values = pd.to_numeric(interpolation_base[raw_col], errors="coerce").reindex(source_values.index)
+                source_to_raw_offset_by_row = pd.to_numeric(source_values - raw_values, errors="coerce")
+            interpolation_neighbor_base = interpolation_value_base.copy()
+            # When interpolating multiple selected points, exclude all current
+            # targets from the neighbor pool so they do not contaminate each
+            # other's interpolation values.
+            target_row_labels_for_iso = [_resolve_target_row(target.row_label) for target in targets]
+            if target_row_labels_for_iso:
+                interpolation_neighbor_base.loc[target_row_labels_for_iso, raw_col] = np.nan
             prev_cal_map: dict[str, float | None] = {}
             prev_raw_map: dict[str, float | None] = {}
             interpolated_map: dict[str, float] = {}
@@ -611,7 +643,15 @@ def apply_edit_action(
                 key = f"{target.isotope_key}|{target.row_label}"
                 next_raw = interpolated_map.get(str(target.row_label))
                 if next_raw is not None:
-                    work.at[row_label, raw_col] = float(next_raw) + interpolation_offset
+                    raw_value_to_persist = float(next_raw)
+                    if use_interpolation_source_values:
+                        source_to_raw_offset = pd.to_numeric(
+                            pd.Series([source_to_raw_offset_by_row.get(row_label)]),
+                            errors="coerce",
+                        ).iloc[0]
+                        if np.isfinite(source_to_raw_offset):
+                            raw_value_to_persist = float(next_raw) - float(source_to_raw_offset)
+                    work.at[row_label, raw_col] = raw_value_to_persist + interpolation_offset
                     if interpolation_stdev is not None and std_col and std_col in work.columns:
                         if key not in original_std_map and key not in original_missing_std_tokens:
                             current_std = pd.to_numeric(pd.Series([work.at[row_label, std_col]]), errors="coerce").iloc[0]

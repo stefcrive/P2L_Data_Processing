@@ -253,7 +253,7 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertTrue(pd.isna(reset_df.loc[1, "d 13C/12C  Std Dev"]))
         self.assertTrue(pd.isna(reset_df.loc[1, "d 18O/16O  Std Dev"]))
 
-    def test_apply_edit_action_interpolate_uses_raw_domain_values(self) -> None:
+    def test_apply_edit_action_interpolate_uses_interpolation_source_domain(self) -> None:
         df = pd.DataFrame(
             {
                 "Identifier 1": ["A", "A", "A"],
@@ -273,8 +273,8 @@ class ProcessingCoreTests(unittest.TestCase):
             interpolation_source_df=display_source,
         )
 
-        # Neighbors are selected by the interpolation source frame, but interpolation value remains raw-domain.
-        self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 3.0, places=6)
+        # Interpolation is computed from the source-domain values and mapped back to persisted raw.
+        self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 2.0, places=6)
 
     def test_apply_edit_action_interpolate_does_not_change_other_isotope(self) -> None:
         df = pd.DataFrame(
@@ -471,6 +471,35 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertIn("1", updated_state["edited_rows"])
         self.assertEqual(updated_state["original_delta_values"]["d13C|1"], 99.0)
 
+    def test_apply_edit_action_interpolate_multi_target_excludes_selected_neighbors(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["A", "A", "A", "A"],
+                "Identifier 2": [1, 2, 3, 4],
+                "d 13C/12C  Mean": [1.0, 100.0, 200.0, 4.0],
+            }
+        )
+        edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        updated_df, updated_state = apply_edit_action(
+            df,
+            edit_state,
+            EditAction(
+                action="interpolate",
+                targets=[
+                    {"row_label": "1", "isotope_key": "d13C"},
+                    {"row_label": "2", "isotope_key": "d13C"},
+                ],
+            ),
+        )
+
+        # Both selected rows should be interpolated from non-selected neighbors
+        # (Identifier 2 == 1 and 4), not from each other's original outlier values.
+        self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 2.0, places=6)
+        self.assertAlmostEqual(float(updated_df.loc[2, "d 13C/12C  Mean"]), 3.0, places=6)
+        self.assertIn("1", updated_state["edited_rows"])
+        self.assertIn("2", updated_state["edited_rows"])
+
     def test_build_processing_workspace_returns_expected_sections(self) -> None:
         df = sample_processing_df()
         metadata = {
@@ -611,6 +640,28 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(quadratic_work.loc[0, "d 13C/12C  Mean"]), 1.075625, places=6)
         self.assertNotEqual(float(linear_work.loc[0, "d 13C/12C  Mean"]), float(quadratic_work.loc[0, "d 13C/12C  Mean"]))
 
+    def test_manual_linearity_override_max_sample_signal_excludes_high_signal_samples(self) -> None:
+        df = sample_processing_df().copy()
+
+        config = normalize_processing_config(
+            {
+                "manual_linearity_override": {
+                    "enabled": True,
+                    "use_diff_intensity": False,
+                    "max_sample_signal": 15.0,
+                    "d13_per_10v": 1.0,
+                    "d18_per_10v": 0.0,
+                }
+            }
+        )
+        calibration_meta = {"config": {"linearity": {"use_diff_intensity": False}}, "linearity_fits": {}}
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
+
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.025, places=6)
+        self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 50.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 2.0, places=6)
+
     def test_saved_linearity_fits_are_applied_before_processing_outlier_filtering(self) -> None:
         df = sample_processing_df().copy()
         config = normalize_processing_config(
@@ -636,7 +687,79 @@ class ProcessingCoreTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 2.0, places=6)
 
-    def test_derive_working_frame_recalibrates_after_modifications_for_non_outliers_only(self) -> None:
+    def test_saved_linearity_fits_honor_isotope_specific_line_offsets(self) -> None:
+        df = sample_processing_df().copy()
+        config = normalize_processing_config(
+            {
+                "manual_linearity_override": {
+                    "enabled": False,
+                    "use_diff_intensity": False,
+                    "d13_per_10v": 0.0,
+                    "d18_per_10v": 0.0,
+                }
+            }
+        )
+        base_fits = {
+            "d13C": {"slope": 1.0, "intercept": 0.0, "r2": 1.0, "x_ref": 15.0, "n": 3},
+            "d18O": {"slope": 0.0, "intercept": 0.0, "r2": 1.0, "x_ref": 15.0, "n": 3},
+            "intensity_col": "1  Cycle Int  Samp  44",
+        }
+        baseline_meta = {
+            "config": {"linearity": {"apply": True, "use_diff_intensity": False, "line_1_offset": 0.0, "line_2_offset": 0.0}},
+            "linearity_fits": base_fits,
+        }
+        offset_meta = {
+            "config": {
+                "linearity": {
+                    "apply": True,
+                    "use_diff_intensity": False,
+                    "line_1_offset": 0.0,
+                    "line_2_offset": 0.0,
+                    "line_1_offset_d13": 2.0,
+                }
+            },
+            "linearity_fits": base_fits,
+        }
+
+        baseline_work = _derive_working_frame(df, config, calibration_meta=baseline_meta)
+        offset_work = _derive_working_frame(df, config, calibration_meta=offset_meta)
+
+        self.assertNotAlmostEqual(
+            float(baseline_work.loc[0, "d 13C/12C  Mean"]),
+            float(offset_work.loc[0, "d 13C/12C  Mean"]),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(baseline_work.loc[0, "d 18O/16O  Mean"]),
+            float(offset_work.loc[0, "d 18O/16O  Mean"]),
+            places=6,
+        )
+
+    def test_derive_working_frame_applies_isotope_line_offsets_without_linearity_fit(self) -> None:
+        df = sample_processing_df().copy()
+        config = normalize_processing_config(
+            {
+                "manual_linearity_override": {
+                    "enabled": False,
+                    "use_diff_intensity": False,
+                    "d13_per_10v": 0.0,
+                    "d18_per_10v": 0.0,
+                }
+            }
+        )
+        calibration_meta = {
+            "config": {"linearity": {"apply": False, "line_1_offset_d13": 1.0, "line_1_offset_d18": -2.0}},
+            "linearity_fits": {},
+            "selected_standards": [],
+            "coefficients": {},
+        }
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
+
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 2.0, places=6)
+        self.assertAlmostEqual(float(work.loc[0, "d 18O/16O  Mean"]), 0.0, places=6)
+
+    def test_derive_working_frame_recalibrates_after_modifications_before_outlier_masking(self) -> None:
         df = pd.DataFrame(
             {
                 "Identifier 1": ["SampleA", "SampleB", "SHP2L"],
@@ -686,8 +809,8 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 1.0, places=6)
         self.assertAlmostEqual(float(work.loc[0, "d13C_calibrated"]), 2.0, places=6)
         self.assertAlmostEqual(float(work.loc[0, "d13C_calibrated_linearity_corrected"]), 2.0, places=6)
-        self.assertTrue(pd.isna(work.loc[1, "d13C_calibrated"]))
-        self.assertTrue(pd.isna(work.loc[1, "d13C_calibrated_linearity_corrected"]))
+        self.assertAlmostEqual(float(work.loc[1, "d13C_calibrated"]), 2.0, places=6)
+        self.assertAlmostEqual(float(work.loc[1, "d13C_calibrated_linearity_corrected"]), 2.0, places=6)
         self.assertTrue(pd.isna(work.loc[2, "d13C_calibrated"]))
         self.assertTrue(pd.isna(work.loc[2, "d13C_calibrated_linearity_corrected"]))
 

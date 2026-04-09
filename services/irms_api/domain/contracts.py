@@ -39,9 +39,14 @@ class LinearityConfig(BaseModel):
     intensity_col: str = CYCLE1_SIGNAL_SAMP44_COL
     use_diff_intensity: bool = False
     quadratic: bool = False
+    max_sample_intensity: float | None = None
     manual_override_enabled: bool = False
     line_1_offset: float = 0.0
     line_2_offset: float = 0.0
+    line_1_offset_d13: float | None = None
+    line_1_offset_d18: float | None = None
+    line_2_offset_d13: float | None = None
+    line_2_offset_d18: float | None = None
     manual_d13_per_10v: float = 0.0
     manual_d18_per_10v: float = 0.0
     manual_d13_per_10v2: float = 0.0
@@ -137,6 +142,7 @@ class ProcessingLinearityOverrideConfig(BaseModel):
     enabled: bool = False
     use_diff_intensity: bool = False
     quadratic: bool = False
+    max_sample_signal: float | None = Field(default=None, ge=0.0)
     d13_per_10v: float = 0.0
     d18_per_10v: float = 0.0
     d13_per_10v2: float = 0.0
@@ -214,7 +220,16 @@ class ExportRequest(BaseModel):
     interpolate_outliers: bool = False
     client_name: str | None = None
     comment_map: dict[str, str] = Field(default_factory=dict)
+    restore_stdev: bool = False
+    restore_stdev_cap: float = Field(default=0.2, ge=0.0)
     output_type: Literal["dataset", "client_output"] = "dataset"
+
+
+class ClientOutputDuplicateCheckResponse(BaseModel):
+    duplicate_row_count: int = 0
+    duplicate_identifier2_values: list[str] = Field(default_factory=list)
+    duplicate_sequence_values: list[int | float] = Field(default_factory=list)
+    duplicate_rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ProcessingSummaryMetric(BaseModel):

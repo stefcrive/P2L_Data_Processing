@@ -10,10 +10,21 @@ import pandas as pd
 def to_json_compatible(value: Any) -> Any:
     if value is None:
         return None
-    if isinstance(value, (str, int, float, bool)):
+    if isinstance(value, bool):
         return value
+    if isinstance(value, (str, int)):
+        return value
+    if isinstance(value, float):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, np.floating):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
     if isinstance(value, np.generic):
-        return value.item()
+        return to_json_compatible(value.item())
     if isinstance(value, np.ndarray):
         return [to_json_compatible(item) for item in value.tolist()]
     if isinstance(value, (pd.Timestamp, datetime, date)):

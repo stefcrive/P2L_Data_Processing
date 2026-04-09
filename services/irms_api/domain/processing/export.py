@@ -2,6 +2,7 @@
 
 import io
 import re
+from typing import Any
 
 import pandas as pd
 
@@ -43,7 +44,7 @@ def _build_client_filename(client_name: str, client_df: pd.DataFrame) -> str:
     client_part = _sanitize_filename(client_name) if client_name else "Client"
     series_part = " ".join(identifier_tokens)
     date_str = pd.Timestamp.today().strftime("%d%m%Y")
-    title = "Stable C&O isotopes P2L"
+    title = "stable C&O isotopes P2L"
     parts = [part for part in [client_part, series_part, "series", title, date_str] if part]
     return f"{' '.join(parts)}.xlsx"
 
@@ -51,7 +52,7 @@ def _build_client_filename(client_name: str, client_df: pd.DataFrame) -> str:
 def _build_dataset_filename(client_name: str | None) -> str:
     client_part = _sanitize_filename(client_name) if client_name else "Client"
     date_str = pd.Timestamp.today().strftime("%d%m%Y")
-    title = "all data BTS Stable C&O isosopes results P2L"
+    title = "all data BTS stable C&O isosopes results P2L"
     return f"{client_part} {title} {date_str}.xlsx"
 
 
@@ -116,6 +117,66 @@ def _round_client_output_columns(client_df: pd.DataFrame) -> pd.DataFrame:
     return rounded
 
 
+def _normalize_duplicate_key_series(values: pd.Series) -> pd.Series:
+    return values.fillna("").astype(str).map(str.strip)
+
+
+def _serialize_sequence_token(value: Any) -> int | float | None:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return None
+    as_float = float(numeric)
+    if as_float.is_integer():
+        return int(as_float)
+    return as_float
+
+
+def summarize_client_output_duplicates(client_df: pd.DataFrame) -> dict[str, Any]:
+    if client_df.empty:
+        return {
+            "duplicate_row_mask": pd.Series(dtype=bool),
+            "duplicate_rows": [],
+            "duplicate_identifier2_values": [],
+            "duplicate_sequence_values": [],
+            "duplicate_row_count": 0,
+        }
+
+    identifier2_series = _normalize_duplicate_key_series(
+        client_df.get("__identifier_2_key", pd.Series("", index=client_df.index, dtype=object))
+    )
+    sequence_series = pd.to_numeric(
+        client_df.get("Sequence", pd.Series(index=client_df.index, dtype=object)),
+        errors="coerce",
+    )
+    duplicate_identifier2_mask = identifier2_series.ne("") & identifier2_series.duplicated(keep=False)
+    duplicate_sequence_mask = sequence_series.notna() & sequence_series.duplicated(keep=False)
+    duplicate_row_mask = (duplicate_identifier2_mask | duplicate_sequence_mask).astype(bool)
+
+    duplicate_rows_df = client_df.loc[duplicate_row_mask, ["Identifier", "Sample #", "Sequence"]].copy()
+    duplicate_rows_df["Duplicate Identifier 2"] = duplicate_identifier2_mask.loc[duplicate_rows_df.index].astype(bool)
+    duplicate_rows_df["Duplicate Sequence"] = duplicate_sequence_mask.loc[duplicate_rows_df.index].astype(bool)
+    duplicate_rows_df = duplicate_rows_df.fillna("")
+
+    duplicate_identifier2_values = sorted(
+        {token for token in identifier2_series.loc[duplicate_identifier2_mask].tolist() if str(token).strip()}
+    )
+    duplicate_sequence_values = sorted(
+        {
+            serialized
+            for serialized in (_serialize_sequence_token(value) for value in sequence_series.loc[duplicate_sequence_mask].tolist())
+            if serialized is not None
+        },
+        key=float,
+    )
+    return {
+        "duplicate_row_mask": duplicate_row_mask,
+        "duplicate_rows": duplicate_rows_df.to_dict(orient="records"),
+        "duplicate_identifier2_values": duplicate_identifier2_values,
+        "duplicate_sequence_values": duplicate_sequence_values,
+        "duplicate_row_count": int(duplicate_row_mask.sum()),
+    }
+
+
 def _compute_shp2l_precision(df: pd.DataFrame) -> tuple[float, float, int, int]:
     if "Identifier 1" not in df.columns:
         return (0.0, 0.0, 0, 0)
@@ -135,6 +196,7 @@ def _format_client_output_worksheet(
     client_df: pd.DataFrame,
     source_df: pd.DataFrame,
     precision_override: tuple[float, float, int, int] | None = None,
+    duplicate_row_mask: pd.Series | None = None,
 ) -> None:
     workbook = writer.book
     worksheet = writer.sheets[sheet_name]
@@ -157,6 +219,24 @@ def _format_client_output_worksheet(
         elif "Corrected" in col_name:
             width = 22
         worksheet.set_column(col_idx, col_idx, width, num_fmt if col_name in numeric_cols else None)
+    if duplicate_row_mask is not None and not client_df.empty:
+        duplicate_row_fmt = workbook.add_format({"bg_color": "#FDE68A"})
+        last_col = len(client_df.columns) - 1
+        for row_idx, is_duplicate in duplicate_row_mask.fillna(False).astype(bool).items():
+            if not bool(is_duplicate):
+                continue
+            excel_row = int(row_idx) + 1
+            worksheet.conditional_format(
+                excel_row,
+                0,
+                excel_row,
+                last_col,
+                {
+                    "type": "formula",
+                    "criteria": "=TRUE",
+                    "format": duplicate_row_fmt,
+                },
+            )
 
     # Keep one blank separator column between data columns and equipment/method text.
     equip_title_col = len(client_df.columns) + 1
@@ -181,6 +261,7 @@ def _format_client_output_worksheet(
     worksheet.write(5, equip_value_col, f"{d13_std:.2f} \u2030 for d13C")
     worksheet.write(6, equip_value_col, f"{d18_std:.2f} \u2030 for d18O")
     worksheet.write(7, equip_value_col, f"d13C n={n13}, d18O n={n18}")
+    worksheet.write(8, equip_value_col, "Yellow rows indicate duplicate Identifier 2 and/or Sequence values.")
     textbox_anchor = f"{_excel_col_name(equip_value_col)}10"
     worksheet.insert_textbox(
         textbox_anchor,
@@ -232,6 +313,10 @@ def build_client_output_workbook_bytes(
     selected_standards = selected_standards or []
     data_sheet = _build_data_sheet(df, selected_standards)
     client_df = _round_client_output_columns(_build_client_output_frame(data_sheet, comment_map=comment_map))
+    client_df["__identifier_2_key"] = data_sheet.get(
+        "Identifier 2",
+        pd.Series(index=data_sheet.index, dtype=object),
+    )
     if "Sequence" in client_df.columns:
         client_df = client_df.sort_values(
             by=["Sequence", "Identifier", "Sample #"],
@@ -239,16 +324,19 @@ def build_client_output_workbook_bytes(
             na_position="last",
             kind="mergesort",
         ).reset_index(drop=True)
+    duplicate_summary = summarize_client_output_duplicates(client_df)
+    export_df = client_df.drop(columns=["__identifier_2_key"], errors="ignore")
     precision_df = precision_source_df if precision_source_df is not None else df
     with pd.ExcelWriter(towrite, engine="xlsxwriter") as writer:
         sheet_name = "Client Output"
-        client_df.to_excel(writer, index=False, sheet_name=sheet_name)
+        export_df.to_excel(writer, index=False, sheet_name=sheet_name)
         _format_client_output_worksheet(
             writer,
             sheet_name,
-            client_df,
+            export_df,
             source_df=precision_df,
             precision_override=precision_override,
+            duplicate_row_mask=duplicate_summary.get("duplicate_row_mask"),
         )
     towrite.seek(0)
-    return towrite.getvalue(), _build_client_filename(client_name or "", client_df)
+    return towrite.getvalue(), _build_client_filename(client_name or "", export_df)

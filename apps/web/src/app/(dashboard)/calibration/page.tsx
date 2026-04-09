@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useDeferredValue, useEffect, useState } from "react";
+import { useDeferredValue, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { PlotlyChart, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { Button } from "@/components/ui/button";
@@ -38,6 +38,8 @@ type SelectionSourceChart = {
   chartKey?: string;
   figure?: Record<string, unknown>;
 };
+type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
+type LinearityOffsetDraftState = Record<LinearityOffsetField, string>;
 
 const PRECISION_PASS_THRESHOLD = 0.07;
 const INCLUSION_PASS_THRESHOLD = 80;
@@ -671,6 +673,40 @@ function parseStrictNumber(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function parseDecimalInput(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  const normalized = trimmed.replace(",", ".");
+  if (!/^[-+]?(\d+(\.\d*)?|\.\d+)$/.test(normalized)) {
+    return null;
+  }
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatDecimalInput(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "0";
+}
+
+function readLinearityOffsetValue(linearity: CalibrationConfig["linearity"], field: LinearityOffsetField): number {
+  if (field === "line_1_offset_d13") {
+    return linearityOffsetWithFallback(linearity.line_1_offset_d13, linearityOffsetWithFallback(linearity.line_1_offset, 0));
+  }
+  if (field === "line_1_offset_d18") {
+    return linearityOffsetWithFallback(linearity.line_1_offset_d18, linearityOffsetWithFallback(linearity.line_1_offset, 0));
+  }
+  if (field === "line_2_offset_d13") {
+    return linearityOffsetWithFallback(linearity.line_2_offset_d13, linearityOffsetWithFallback(linearity.line_2_offset, 0));
+  }
+  return linearityOffsetWithFallback(linearity.line_2_offset_d18, linearityOffsetWithFallback(linearity.line_2_offset, 0));
+}
+
+function linearityOffsetWithFallback(value: number | null | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
 function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ label: string; value: string }> {
   if (!summary || !summary.trim()) {
     return [];
@@ -1266,6 +1302,13 @@ export default function CalibrationPage() {
   const [linearityTargetIntensity, setLinearityTargetIntensity] = useState(15);
   const [setValueHighlightNonce, setSetValueHighlightNonce] = useState(0);
   const [isSetValueInputHighlighted, setIsSetValueInputHighlighted] = useState(false);
+  const [linearityOffsetDrafts, setLinearityOffsetDrafts] = useState<LinearityOffsetDraftState>({
+    line_1_offset_d13: "0",
+    line_1_offset_d18: "0",
+    line_2_offset_d13: "0",
+    line_2_offset_d18: "0",
+  });
+  const [linearityOffsetEditing, setLinearityOffsetEditing] = useState<LinearityOffsetField | null>(null);
   const draftStorageKey = sessionId ? `calibration-config:${sessionId}` : null;
   const activeTarget = selectedTargets.length ? selectedTargets[Math.min(activeTargetIndex, selectedTargets.length - 1)] : null;
   const activeIsotopeTarget = activeTarget && activeTarget.isotopeKey !== "cross" ? activeTarget : null;
@@ -1422,6 +1465,30 @@ export default function CalibrationPage() {
   }, [hasLoadedDraft, workspaceQuery.data]);
 
   useEffect(() => {
+    const sourceConfig = config ?? workspaceQuery.data?.config;
+    if (!sourceConfig || linearityOffsetEditing) {
+      return;
+    }
+    const nextDrafts: LinearityOffsetDraftState = {
+      line_1_offset_d13: formatDecimalInput(readLinearityOffsetValue(sourceConfig.linearity, "line_1_offset_d13")),
+      line_1_offset_d18: formatDecimalInput(readLinearityOffsetValue(sourceConfig.linearity, "line_1_offset_d18")),
+      line_2_offset_d13: formatDecimalInput(readLinearityOffsetValue(sourceConfig.linearity, "line_2_offset_d13")),
+      line_2_offset_d18: formatDecimalInput(readLinearityOffsetValue(sourceConfig.linearity, "line_2_offset_d18")),
+    };
+    setLinearityOffsetDrafts((current) => {
+      if (
+        current.line_1_offset_d13 === nextDrafts.line_1_offset_d13 &&
+        current.line_1_offset_d18 === nextDrafts.line_1_offset_d18 &&
+        current.line_2_offset_d13 === nextDrafts.line_2_offset_d13 &&
+        current.line_2_offset_d18 === nextDrafts.line_2_offset_d18
+      ) {
+        return current;
+      }
+      return nextDrafts;
+    });
+  }, [config, workspaceQuery.data, linearityOffsetEditing]);
+
+  useEffect(() => {
     if (!draftStorageKey || typeof window === "undefined" || !config) {
       return;
     }
@@ -1526,7 +1593,7 @@ export default function CalibrationPage() {
     setConfig((current) => (current ? { ...current, [key]: value } : current));
   }
 
-  function updateLinearity(key: keyof CalibrationConfig["linearity"], value: boolean | number | string) {
+  function updateLinearity(key: keyof CalibrationConfig["linearity"], value: boolean | number | string | null) {
     setConfig((current) =>
       current
         ? {
@@ -1553,6 +1620,52 @@ export default function CalibrationPage() {
           }
         : current,
     );
+  }
+
+  function handleLinearityOffsetDraftChange(field: LinearityOffsetField, rawValue: string) {
+    setLinearityOffsetEditing(field);
+    setLinearityOffsetDrafts((current) => ({ ...current, [field]: rawValue }));
+    const parsed = parseDecimalInput(rawValue);
+    if (parsed == null) {
+      return;
+    }
+    updateLinearity(field, parsed);
+  }
+
+  function resetLinearityOffsetDraft(field: LinearityOffsetField) {
+    const sourceConfig = config ?? workspaceQuery.data?.config;
+    if (!sourceConfig) {
+      return;
+    }
+    const value = readLinearityOffsetValue(sourceConfig.linearity, field);
+    setLinearityOffsetDrafts((current) => ({ ...current, [field]: formatDecimalInput(value) }));
+  }
+
+  function commitLinearityOffsetDraft(field: LinearityOffsetField) {
+    const parsed = parseDecimalInput(linearityOffsetDrafts[field]);
+    if (parsed == null) {
+      resetLinearityOffsetDraft(field);
+      setLinearityOffsetEditing((current) => (current === field ? null : current));
+      return;
+    }
+    updateLinearity(field, parsed);
+    setLinearityOffsetDrafts((current) => ({ ...current, [field]: formatDecimalInput(parsed) }));
+    setLinearityOffsetEditing((current) => (current === field ? null : current));
+  }
+
+  function handleLinearityOffsetKeyDown(event: ReactKeyboardEvent<HTMLInputElement>, field: LinearityOffsetField) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitLinearityOffsetDraft(field);
+      event.currentTarget.blur();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      resetLinearityOffsetDraft(field);
+      setLinearityOffsetEditing((current) => (current === field ? null : current));
+      event.currentTarget.blur();
+    }
   }
 
   function setTargets(nextTargets: SelectedTarget[]) {
@@ -1868,10 +1981,6 @@ export default function CalibrationPage() {
       ? LINEARITY_INTENSITY_DIFF44
       : LINEARITY_INTENSITY_SAMP44;
   const linearityControlsEnabled = activeConfig.linearity.apply || activeConfig.linearity.manual_override_enabled;
-  const line1OffsetD13 = activeConfig.linearity.line_1_offset_d13 ?? activeConfig.linearity.line_1_offset ?? 0;
-  const line1OffsetD18 = activeConfig.linearity.line_1_offset_d18 ?? activeConfig.linearity.line_1_offset ?? 0;
-  const line2OffsetD13 = activeConfig.linearity.line_2_offset_d13 ?? activeConfig.linearity.line_2_offset ?? 0;
-  const line2OffsetD18 = activeConfig.linearity.line_2_offset_d18 ?? activeConfig.linearity.line_2_offset ?? 0;
   const selectedLinearityBasisLabel = getLinearityIntensityOptionLabel(selectedLinearityIntensityCol);
   const lineIntensityBasis = String(displayedWorkspace.linearity_fits?.intensity_col ?? selectedLinearityIntensityCol ?? "N/A");
   const previewError = previewQuery.error instanceof Error ? previewQuery.error.message : null;
@@ -2552,58 +2661,6 @@ export default function CalibrationPage() {
                 <label className="flex items-start gap-3">
                   <input
                     type="checkbox"
-                    checked={activeConfig.linearity.apply}
-                    onChange={(event) => updateLinearity("apply", event.target.checked)}
-                    className="mt-1 h-4 w-4 accent-stone-900"
-                  />
-                  <span>
-                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Enable linearity correction</span>
-                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
-                      Corrects selected-standard fits and sample raw measurements with the same linearity relationship before calibration is applied.
-                    </span>
-                  </span>
-                </label>
-
-                {linearityControlsEnabled ? (
-                  <>
-                    <label className="flex items-start gap-3">
-                      <input
-                        type="checkbox"
-                        checked={Boolean(activeConfig.linearity.quadratic)}
-                        onChange={(event) => updateLinearity("quadratic", event.target.checked)}
-                        className="mt-1 h-4 w-4 accent-stone-900"
-                      />
-                      <span>
-                        <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Use quadratic linearity relationship</span>
-                        <span className="mt-1 block text-xs leading-relaxed text-stone-500">
-                          Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I for the selected linearity basis.
-                        </span>
-                      </span>
-                    </label>
-
-                    <label className="form-field">
-                      <span className="form-label">Linearity basis</span>
-                      <select
-                        value={selectedLinearityIntensityCol}
-                        onChange={(event) => updateLinearityIntensityCol(event.target.value)}
-                        className="form-control"
-                      >
-                        {LINEARITY_INTENSITY_OPTIONS.map((option) => (
-                          <option key={option} value={option}>
-                            {getLinearityIntensityOptionLabel(option)}
-                          </option>
-                        ))}
-                      </select>
-                      <span className="mt-2 block text-xs leading-relaxed text-stone-500">
-                        Used for standards-side linearity fits, sample-side linearity correction, and manual override coefficients.
-                      </span>
-                    </label>
-                  </>
-                ) : null}
-
-                <label className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
                     checked={activeConfig.linearity.manual_override_enabled}
                     onChange={(event) => updateLinearity("manual_override_enabled", event.target.checked)}
                     className="mt-1 h-4 w-4 accent-stone-900"
@@ -2663,17 +2720,97 @@ export default function CalibrationPage() {
                   </div>
                 ) : null}
 
+                <label className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={activeConfig.linearity.apply}
+                    onChange={(event) => updateLinearity("apply", event.target.checked)}
+                    className="mt-1 h-4 w-4 accent-stone-900"
+                  />
+                  <span>
+                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Enable linearity correction</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
+                      Corrects selected-standard fits and sample raw measurements with the same linearity relationship before calibration is applied.
+                    </span>
+                  </span>
+                </label>
+
+                {linearityControlsEnabled ? (
+                  <>
+                    <label className="flex items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(activeConfig.linearity.quadratic)}
+                        onChange={(event) => updateLinearity("quadratic", event.target.checked)}
+                        className="mt-1 h-4 w-4 accent-stone-900"
+                      />
+                      <span>
+                        <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Use quadratic linearity relationship</span>
+                        <span className="mt-1 block text-xs leading-relaxed text-stone-500">
+                          Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I for the selected linearity basis.
+                        </span>
+                      </span>
+                    </label>
+
+                    <label className="form-field">
+                      <span className="form-label">Linearity basis</span>
+                      <select
+                        value={selectedLinearityIntensityCol}
+                        onChange={(event) => updateLinearityIntensityCol(event.target.value)}
+                        className="form-control"
+                      >
+                        {LINEARITY_INTENSITY_OPTIONS.map((option) => (
+                          <option key={option} value={option}>
+                            {getLinearityIntensityOptionLabel(option)}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="mt-2 block text-xs leading-relaxed text-stone-500">
+                        Used for standards-side linearity fits, sample-side linearity correction, and manual override coefficients.
+                      </span>
+                    </label>
+
+                    {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
+                      <label className="form-field">
+                        <span className="form-label">Max sample intensity</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.1"
+                          value={activeConfig.linearity.max_sample_intensity ?? ""}
+                          onChange={(event) => {
+                            const rawValue = event.target.value.trim();
+                            if (rawValue === "") {
+                              updateLinearity("max_sample_intensity", null);
+                              return;
+                            }
+                            const parsed = Number(rawValue);
+                            updateLinearity("max_sample_intensity", Number.isFinite(parsed) ? parsed : null);
+                          }}
+                          className="form-control"
+                        />
+                        <span className="mt-2 block text-xs leading-relaxed text-stone-500">
+                          Excludes standards above this sample intensity from linearity-fit calculations.
+                        </span>
+                      </label>
+                    ) : null}
+                  </>
+                ) : null}
+
                 <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
                   <div className="space-y-3">
-                    <span className="form-label">Line 1 offset</span>
+                    <span className="text-sm font-semibold tracking-[0.01em] text-stone-800">Line 1 offset</span>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="form-field">
                         <span className="form-label">d13C</span>
                         <input
-                          type="number"
-                          step="0.01"
-                          value={line1OffsetD13}
-                          onChange={(event) => updateLinearity("line_1_offset_d13", Number(event.target.value))}
+                          type="text"
+                          inputMode="decimal"
+                          value={linearityOffsetDrafts.line_1_offset_d13}
+                          onFocus={() => setLinearityOffsetEditing("line_1_offset_d13")}
+                          onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d13", event.target.value)}
+                          onBlur={() => commitLinearityOffsetDraft("line_1_offset_d13")}
+                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d13")}
                           className="form-control"
                           disabled={!linearityControlsEnabled}
                         />
@@ -2681,10 +2818,13 @@ export default function CalibrationPage() {
                       <label className="form-field">
                         <span className="form-label">d18O</span>
                         <input
-                          type="number"
-                          step="0.01"
-                          value={line1OffsetD18}
-                          onChange={(event) => updateLinearity("line_1_offset_d18", Number(event.target.value))}
+                          type="text"
+                          inputMode="decimal"
+                          value={linearityOffsetDrafts.line_1_offset_d18}
+                          onFocus={() => setLinearityOffsetEditing("line_1_offset_d18")}
+                          onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d18", event.target.value)}
+                          onBlur={() => commitLinearityOffsetDraft("line_1_offset_d18")}
+                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d18")}
                           className="form-control"
                           disabled={!linearityControlsEnabled}
                         />
@@ -2692,15 +2832,18 @@ export default function CalibrationPage() {
                     </div>
                   </div>
                   <div className="space-y-3">
-                    <span className="form-label">Line 2 offset</span>
+                    <span className="text-sm font-semibold tracking-[0.01em] text-stone-800">Line 2 offset</span>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="form-field">
                         <span className="form-label">d13C</span>
                         <input
-                          type="number"
-                          step="0.01"
-                          value={line2OffsetD13}
-                          onChange={(event) => updateLinearity("line_2_offset_d13", Number(event.target.value))}
+                          type="text"
+                          inputMode="decimal"
+                          value={linearityOffsetDrafts.line_2_offset_d13}
+                          onFocus={() => setLinearityOffsetEditing("line_2_offset_d13")}
+                          onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d13", event.target.value)}
+                          onBlur={() => commitLinearityOffsetDraft("line_2_offset_d13")}
+                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d13")}
                           className="form-control"
                           disabled={!linearityControlsEnabled}
                         />
@@ -2708,10 +2851,13 @@ export default function CalibrationPage() {
                       <label className="form-field">
                         <span className="form-label">d18O</span>
                         <input
-                          type="number"
-                          step="0.01"
-                          value={line2OffsetD18}
-                          onChange={(event) => updateLinearity("line_2_offset_d18", Number(event.target.value))}
+                          type="text"
+                          inputMode="decimal"
+                          value={linearityOffsetDrafts.line_2_offset_d18}
+                          onFocus={() => setLinearityOffsetEditing("line_2_offset_d18")}
+                          onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d18", event.target.value)}
+                          onBlur={() => commitLinearityOffsetDraft("line_2_offset_d18")}
+                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d18")}
                           className="form-control"
                           disabled={!linearityControlsEnabled}
                         />
@@ -2720,7 +2866,7 @@ export default function CalibrationPage() {
                   </div>
                 </div>
                 <div className="text-xs leading-relaxed text-stone-500">
-                  Line offsets shift the selected linearity basis by sample line before fits and corrections are applied.
+                  Line offsets are applied directly to d13C/d18O values for each line before outlier filtering, fitting, and calibration.
                 </div>
               </div>
 

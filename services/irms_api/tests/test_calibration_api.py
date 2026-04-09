@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import base64
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from fastapi import HTTPException
 
@@ -213,6 +215,95 @@ class CalibrationApiTests(unittest.TestCase):
         self.assertEqual(base_summary.d13_average, apply_summary.d13_average)
         self.assertEqual(base_summary.d18_average, apply_summary.d18_average)
 
+    def test_preview_workspace_linearity_apply_uses_corrected_standard_values_in_calibration_charts(self) -> None:
+        base_config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+            precision_date_range=("2025-01-01", "2025-01-03"),
+            linearity={
+                "apply": False,
+                "use_diff_intensity": False,
+                "manual_override_enabled": False,
+                "manual_d13_per_10v": 0.0,
+                "manual_d18_per_10v": 0.0,
+            },
+        )
+        apply_config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+            precision_date_range=("2025-01-01", "2025-01-03"),
+            linearity={
+                "apply": True,
+                "use_diff_intensity": False,
+                "manual_override_enabled": False,
+                "manual_d13_per_10v": 0.0,
+                "manual_d18_per_10v": 0.0,
+            },
+        )
+
+        baseline = api_main.calibration_workspace_preview(self.session_id, base_config)
+        applied = api_main.calibration_workspace_preview(self.session_id, apply_config)
+
+        def parse_numeric_vector(payload: object) -> list[float]:
+            if isinstance(payload, list):
+                values: list[float] = []
+                for item in payload:
+                    try:
+                        values.append(float(item))
+                    except (TypeError, ValueError):
+                        continue
+                return values
+            if isinstance(payload, dict) and "bdata" in payload:
+                dtype_name = str(payload.get("dtype", "f8"))
+                encoded = str(payload.get("bdata", ""))
+                if not encoded:
+                    return []
+                try:
+                    decoded = base64.b64decode(encoded)
+                    return np.frombuffer(decoded, dtype=np.dtype(dtype_name)).astype(float).tolist()
+                except Exception:
+                    return []
+            return []
+
+        def extract_row_to_y(figure: dict) -> dict[str, float]:
+            rows: dict[str, float] = {}
+            for trace in figure.get("data", []):
+                y_values = parse_numeric_vector(trace.get("y"))
+                customdata = trace.get("customdata")
+                if not y_values or not isinstance(customdata, list):
+                    continue
+                for idx, payload in enumerate(customdata):
+                    if not isinstance(payload, list) or not payload or idx >= len(y_values):
+                        continue
+                    row_label = str(payload[0]).strip()
+                    if not row_label:
+                        continue
+                    try:
+                        rows[row_label] = float(y_values[idx])
+                    except (TypeError, ValueError):
+                        continue
+            return rows
+
+        for isotope_key in ("VPDB(13C)", "VSMOW(18O)"):
+            baseline_rows = extract_row_to_y(baseline.figures.get(isotope_key, {}))
+            applied_rows = extract_row_to_y(applied.figures.get(isotope_key, {}))
+            shared_labels = sorted(set(baseline_rows).intersection(applied_rows))
+            self.assertTrue(shared_labels, f"Expected shared plotted rows for {isotope_key}")
+            self.assertTrue(
+                any(abs(applied_rows[label] - baseline_rows[label]) > 1e-9 for label in shared_labels),
+                f"Expected at least one corrected plotted value change for {isotope_key}",
+            )
+
     def test_preview_workspace_applies_linearity_before_outlier_detection(self) -> None:
         trend_df = pd.DataFrame(
             {
@@ -308,6 +399,60 @@ class CalibrationApiTests(unittest.TestCase):
             "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44",
             str(((d13_layout.get("xaxis") or {}).get("title") or {}).get("text", "")),
         )
+
+    def test_preview_workspace_linearity_max_sample_intensity_filters_sample_basis_fits(self) -> None:
+        baseline = api_main.calibration_workspace_preview(
+            self.session_id,
+            CalibrationConfig(
+                selected_standards=["SHP2L", "NBS19"],
+                calibration_type="IQR",
+                sigma_level=1.0,
+                iqr_multiplier=1.5,
+                independent_isotope_outliers=True,
+                color_param="Date_ordinal",
+                z_axis="1  Cycle Int  Samp  44",
+                precision_date_range=("2025-01-01", "2025-01-03"),
+                linearity={
+                    "apply": True,
+                    "intensity_col": "1  Cycle Int  Samp  44",
+                    "use_diff_intensity": False,
+                    "manual_override_enabled": False,
+                    "manual_d13_per_10v": 0.0,
+                    "manual_d18_per_10v": 0.0,
+                },
+            ),
+        )
+        filtered = api_main.calibration_workspace_preview(
+            self.session_id,
+            CalibrationConfig(
+                selected_standards=["SHP2L", "NBS19"],
+                calibration_type="IQR",
+                sigma_level=1.0,
+                iqr_multiplier=1.5,
+                independent_isotope_outliers=True,
+                color_param="Date_ordinal",
+                z_axis="1  Cycle Int  Samp  44",
+                precision_date_range=("2025-01-01", "2025-01-03"),
+                linearity={
+                    "apply": True,
+                    "intensity_col": "1  Cycle Int  Samp  44",
+                    "use_diff_intensity": False,
+                    "max_sample_intensity": 15.2,
+                    "manual_override_enabled": False,
+                    "manual_d13_per_10v": 0.0,
+                    "manual_d18_per_10v": 0.0,
+                },
+            ),
+        )
+
+        baseline_d13_n = int((baseline.linearity_fits.get("d13C", {}) or {}).get("n", 0))
+        baseline_d18_n = int((baseline.linearity_fits.get("d18O", {}) or {}).get("n", 0))
+        filtered_d13_n = int((filtered.linearity_fits.get("d13C", {}) or {}).get("n", 0))
+        filtered_d18_n = int((filtered.linearity_fits.get("d18O", {}) or {}).get("n", 0))
+        self.assertEqual(baseline_d13_n, 6)
+        self.assertEqual(baseline_d18_n, 6)
+        self.assertEqual(filtered_d13_n, 4)
+        self.assertEqual(filtered_d18_n, 4)
 
     def test_run_calibration_persists_results_and_workspace_reflects_saved_state(self) -> None:
         snapshot = api_main.run_calibration(
@@ -416,6 +561,60 @@ class CalibrationApiTests(unittest.TestCase):
             )
         )
 
+    def test_run_calibration_linearity_max_sample_intensity_filters_sample_basis_fits(self) -> None:
+        baseline_session = api_main.store.create_session()
+        filtered_session = api_main.store.create_session()
+        api_main.store.save_frames(baseline_session, sample_calibration_df(), pd.DataFrame())
+        api_main.store.save_frames(filtered_session, sample_calibration_df(), pd.DataFrame())
+
+        baseline_config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+            precision_date_range=("2025-01-01", "2025-01-03"),
+            linearity={
+                "apply": True,
+                "intensity_col": "1  Cycle Int  Samp  44",
+                "use_diff_intensity": False,
+                "manual_override_enabled": False,
+                "manual_d13_per_10v": 0.0,
+                "manual_d18_per_10v": 0.0,
+            },
+        )
+        filtered_config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+            precision_date_range=("2025-01-01", "2025-01-03"),
+            linearity={
+                "apply": True,
+                "intensity_col": "1  Cycle Int  Samp  44",
+                "use_diff_intensity": False,
+                "max_sample_intensity": 15.2,
+                "manual_override_enabled": False,
+                "manual_d13_per_10v": 0.0,
+                "manual_d18_per_10v": 0.0,
+            },
+        )
+
+        api_main.run_calibration(baseline_session, baseline_config)
+        api_main.run_calibration(filtered_session, filtered_config)
+
+        baseline_fits = api_main.store.load_metadata(baseline_session).get("calibration", {}).get("linearity_fits", {})
+        filtered_fits = api_main.store.load_metadata(filtered_session).get("calibration", {}).get("linearity_fits", {})
+        self.assertEqual(int((baseline_fits.get("d13C", {}) or {}).get("n", 0)), 6)
+        self.assertEqual(int((baseline_fits.get("d18O", {}) or {}).get("n", 0)), 6)
+        self.assertEqual(int((filtered_fits.get("d13C", {}) or {}).get("n", 0)), 4)
+        self.assertEqual(int((filtered_fits.get("d18O", {}) or {}).get("n", 0)), 4)
+
     def test_reset_calibration_clears_metadata_and_derived_columns(self) -> None:
         api_main.run_calibration(
             self.session_id,
@@ -501,6 +700,40 @@ class CalibrationApiTests(unittest.TestCase):
 
         self.assertTrue(pd.to_numeric(stored_df.loc[samples_mask, "d13C_calibrated"], errors="coerce").notna().any())
         self.assertTrue(pd.to_numeric(stored_df.loc[samples_mask, "d18O_calibrated"], errors="coerce").notna().any())
+
+    def test_run_calibration_with_isotope_line_offsets_keeps_raw_measurements_unchanged(self) -> None:
+        baseline_df = api_main.store.load_frame(self.session_id).copy()
+        api_main.run_calibration(
+            self.session_id,
+            CalibrationConfig(
+                selected_standards=["SHP2L", "NBS19"],
+                calibration_type="IQR",
+                sigma_level=1.0,
+                iqr_multiplier=1.5,
+                independent_isotope_outliers=True,
+                color_param="Date_ordinal",
+                z_axis="1  Cycle Int  Samp  44",
+                precision_date_range=("2025-01-01", "2025-01-03"),
+                linearity={
+                    "apply": True,
+                    "use_diff_intensity": True,
+                    "manual_override_enabled": False,
+                    "line_1_offset": 0.0,
+                    "line_2_offset": 0.0,
+                    "line_1_offset_d13": 2.5,
+                    "line_2_offset_d13": -1.5,
+                    "line_1_offset_d18": -0.8,
+                    "line_2_offset_d18": 1.2,
+                    "manual_d13_per_10v": 0.0,
+                    "manual_d18_per_10v": 0.0,
+                },
+            ),
+        )
+        stored_df = api_main.store.load_frame(self.session_id)
+        for raw_col in ("d 13C/12C  Mean", "d 18O/16O  Mean"):
+            baseline_raw = pd.to_numeric(baseline_df[raw_col], errors="coerce").reset_index(drop=True)
+            stored_raw = pd.to_numeric(stored_df[raw_col], errors="coerce").reset_index(drop=True)
+            pd.testing.assert_series_equal(stored_raw, baseline_raw, check_names=False)
 
     def test_run_calibration_manual_linearity_override_changes_coefficients(self) -> None:
         baseline_session = api_main.store.create_session()
@@ -660,6 +893,69 @@ class CalibrationApiTests(unittest.TestCase):
                 "manual_override_enabled": False,
                 "line_1_offset": 1.5,
                 "line_2_offset": -0.5,
+                "manual_d13_per_10v": 0.0,
+                "manual_d18_per_10v": 0.0,
+            },
+        )
+
+        api_main.run_calibration(baseline_session, baseline_config)
+        api_main.run_calibration(offset_session, offset_config)
+
+        baseline_df = api_main.store.load_frame(baseline_session)
+        offset_df = api_main.store.load_frame(offset_session)
+        sample_mask = (
+            baseline_df["Identifier 1"].astype(str).eq("SampleA")
+            & baseline_df["Identifier 2"].astype(str).eq("1")
+        )
+        self.assertTrue(bool(sample_mask.any()))
+        baseline_value = float(pd.to_numeric(baseline_df.loc[sample_mask, "d13C_calibrated"], errors="coerce").iloc[0])
+        offset_value = float(pd.to_numeric(offset_df.loc[sample_mask, "d13C_calibrated"], errors="coerce").iloc[0])
+        self.assertNotAlmostEqual(baseline_value, offset_value, places=6)
+
+    def test_run_calibration_isotope_specific_line_offsets_are_applied(self) -> None:
+        baseline_session = api_main.store.create_session()
+        offset_session = api_main.store.create_session()
+        api_main.store.save_frames(baseline_session, sample_calibration_df(), pd.DataFrame())
+        api_main.store.save_frames(offset_session, sample_calibration_df(), pd.DataFrame())
+
+        baseline_config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+            precision_date_range=("2025-01-01", "2025-01-03"),
+            linearity={
+                "apply": True,
+                "intensity_col": "1  Cycle Int  Samp  44",
+                "use_diff_intensity": False,
+                "manual_override_enabled": False,
+                "line_1_offset": 0.0,
+                "line_2_offset": 0.0,
+                "manual_d13_per_10v": 0.0,
+                "manual_d18_per_10v": 0.0,
+            },
+        )
+        offset_config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+            precision_date_range=("2025-01-01", "2025-01-03"),
+            linearity={
+                "apply": True,
+                "intensity_col": "1  Cycle Int  Samp  44",
+                "use_diff_intensity": False,
+                "manual_override_enabled": False,
+                "line_1_offset": 0.0,
+                "line_2_offset": 0.0,
+                "line_1_offset_d13": 1.5,
+                "line_2_offset_d13": -0.5,
                 "manual_d13_per_10v": 0.0,
                 "manual_d18_per_10v": 0.0,
             },

@@ -115,7 +115,8 @@ def _build_plotly_error_bar(row_tokens, std_lookup):
     for row_token in row_tokens:
         sd_val = std_lookup.get(str(row_token), np.nan)
         if pd.notna(sd_val) and np.isfinite(sd_val):
-            error_vals.append(float(sd_val))
+            # Keep hover uncertainty display concise and consistent.
+            error_vals.append(round(float(sd_val), 3))
             has_value = True
         else:
             error_vals.append(np.nan)
@@ -177,6 +178,9 @@ def _apply_cycle_std_error_bars(fig, d13_std_lookup, d18_std_lookup):
         return np.asarray([row], dtype=object)
 
     for trace in fig.data:
+        trace_name = str(getattr(trace, "name", "")).strip()
+        if trace_name.startswith("Calibrated "):
+            continue
         customdata = getattr(trace, 'customdata', None)
         custom_arr = _coerce_customdata_2d(customdata)
         if custom_arr is None:

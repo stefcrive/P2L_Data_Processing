@@ -13,14 +13,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from ..domain.calibration.core import (
-    _apply_linearity_line_offsets,
+    _apply_isotope_line_offsets,
     _apply_linearity_correction,
     _apply_manual_linearity_override_to_standards,
     _compute_calibration_coefficients,
     _compute_linearity_fit,
+    _filter_linearity_fit_input_by_max_intensity,
     _filter_standards_remove_outliers,
     _promote_linearity_corrected_raw_columns,
     _resolve_selected_linearity_intensity_column,
+    _with_isotope_linearity_intensity_columns,
     calibrate_results,
     create_calibration_plots,
     identify_outliers,
@@ -32,6 +34,7 @@ from ..domain.contracts import (
     CalibrationOfficialValueDeleteResult,
     CalibrationOfficialValueUpsertRequest,
     CalibrationWorkspace,
+    ClientOutputDuplicateCheckResponse,
     ChartBundle,
     CycleDiagnosticsPayload,
     CycleDiagnosticsRequest,
@@ -43,6 +46,7 @@ from ..domain.contracts import (
     ProcessingWorkspace,
     SessionSnapshot,
 )
+from ..domain.constants import CYCLE1_SIGNAL_SAMP44_COL
 from ..domain.diagnostics.core import create_diagnostic_plots
 from ..domain.calibration.workspace import build_calibration_workspace, normalize_calibration_config
 from ..domain.import_session import (
@@ -54,15 +58,25 @@ from ..domain.import_session import (
 from ..domain.processing.core import RangeConfig, _interpolate_outliers_by_identifier2
 from ..domain.processing.cycles import build_cycle_diagnostics_payload, build_target_info
 from ..domain.processing.edits import apply_edit_action
-from ..domain.processing.export import build_client_output_workbook_bytes, build_dataset_workbook_bytes
+from ..domain.processing.export import (
+    _build_client_output_frame,
+    _round_client_output_columns,
+    build_client_output_workbook_bytes,
+    build_dataset_workbook_bytes,
+    summarize_client_output_duplicates,
+)
 from ..domain.processing.outliers import (
+    _partial_saturation_isotope_masks,
+    _signal_in_range_mask,
     build_category_masks,
     build_outlier_type_labels,
     build_processing_summary,
     compute_statistical_outlier_masks,
 )
 from ..domain.processing.workspace import (
+    _build_plot_frames,
     _derive_working_frame,
+    _exclude_outliers_from_plot_base,
     _selected_processing_rows,
     build_processing_workspace,
     normalize_processing_config,
@@ -396,12 +410,57 @@ def _session_exists_or_404(session_id: str) -> None:
 
 
 def _compute_export_shp2l_precision(
-    working_df: pd.DataFrame,
+    source_df: pd.DataFrame,
+    metadata: dict[str, Any] | None = None,
     calibration_meta: dict[str, Any] | None = None,
+    working_df: pd.DataFrame | None = None,
 ) -> tuple[float, float, int, int]:
-    if working_df is None or working_df.empty or "Identifier 1" not in working_df.columns:
+    # Prefer calibration workspace precision summaries so client export mirrors
+    # the exact values shown on the calibration page (including date-window and
+    # linearity-corrected precision when enabled).
+    try:
+        if source_df is not None and not source_df.empty:
+            calibration_only_meta: dict[str, Any] = {"calibration": calibration_meta or {}}
+            workspace_meta = metadata if isinstance(metadata, dict) else calibration_only_meta
+            calibration_workspace = build_calibration_workspace(
+                "__export_precision__",
+                source_df,
+                workspace_meta,
+            )
+            shp_summary = next(
+                (
+                    summary
+                    for summary in calibration_workspace.precision_summaries
+                    if str(summary.standard).strip().upper() == "SHP2L"
+                ),
+                None,
+            )
+            if shp_summary is not None:
+                use_corrected = bool(getattr(calibration_workspace.config.linearity, "apply", False))
+                d13_value = shp_summary.d13_linearity_corrected_precision if use_corrected else shp_summary.d13_precision
+                d18_value = shp_summary.d18_linearity_corrected_precision if use_corrected else shp_summary.d18_precision
+                if use_corrected and d13_value is None:
+                    d13_value = shp_summary.d13_precision
+                if use_corrected and d18_value is None:
+                    d18_value = shp_summary.d18_precision
+                d13_num = pd.to_numeric(pd.Series([d13_value]), errors="coerce").iloc[0]
+                d18_num = pd.to_numeric(pd.Series([d18_value]), errors="coerce").iloc[0]
+                return (
+                    float(d13_num) if np.isfinite(d13_num) else 0.0,
+                    float(d18_num) if np.isfinite(d18_num) else 0.0,
+                    int(shp_summary.included_d13),
+                    int(shp_summary.included_d18),
+                )
+    except Exception:
+        # Fallback to legacy direct computation below.
+        pass
+
+    work = working_df if working_df is not None else source_df
+    if work is None:
         return (0.0, 0.0, 0, 0)
-    shp = working_df[working_df["Identifier 1"].astype(str).str.strip().str.upper() == "SHP2L"].copy()
+    if work.empty or "Identifier 1" not in work.columns:
+        return (0.0, 0.0, 0, 0)
+    shp = work[work["Identifier 1"].astype(str).str.strip().str.upper() == "SHP2L"].copy()
     if shp.empty:
         return (0.0, 0.0, 0, 0)
 
@@ -451,6 +510,77 @@ def _compute_export_shp2l_precision(
     d13_std = float(d13_values.std()) if not d13_values.empty and pd.notna(d13_values.std()) else 0.0
     d18_std = float(d18_values.std()) if not d18_values.empty and pd.notna(d18_values.std()) else 0.0
     return (d13_std, d18_std, int(d13_values.shape[0]), int(d18_values.shape[0]))
+
+
+def _cap_stdev_columns_for_client_output(df: pd.DataFrame, cap_value: float) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    capped = df.copy()
+    max_stdev = float(cap_value)
+    for column in ("d 13C/12C  Std Dev", "d 18O/16O  Std Dev"):
+        if column in capped.columns:
+            numeric_values = pd.to_numeric(capped[column], errors="coerce")
+            capped[column] = numeric_values.clip(upper=max_stdev)
+    return capped
+
+
+def _chart_visible_client_output_frame(
+    working_df: pd.DataFrame,
+    config: ProcessingConfig,
+    selected_ids: list[str],
+    selected_standards: list[str],
+    edit_state: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    filtered_df, unfiltered_df = _build_plot_frames(working_df, config, standards_to_exclude=selected_standards)
+    range_config = RangeConfig(
+        signal_range=config.signal_range,
+        leak_range=config.leak_range,
+        d13c_range=config.d13c_range,
+        d18o_range=config.d18o_range,
+        partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+    )
+    filtered_df = _exclude_outliers_from_plot_base(
+        filtered_df,
+        unfiltered_df,
+        range_config,
+        edit_state=edit_state,
+        sigma_level=float(config.sigma_level_data),
+        statistical_outlier_method=str(getattr(config, "statistical_outlier_method", "Z-Score")),
+        iqr_multiplier=float(getattr(config, "iqr_multiplier_data", 1.5)),
+    )
+    scoped_filtered = _selected_processing_rows(filtered_df, selected_ids)
+    scoped_unfiltered = _selected_processing_rows(unfiltered_df, selected_ids)
+    if scoped_filtered.empty or scoped_unfiltered.empty:
+        return scoped_filtered
+
+    # Mirror identifier-chart statistical context: compute statistical outliers from
+    # rows that are within range and leak/signal constraints (plus optional partial keep).
+    signal_ok = _signal_in_range_mask(scoped_unfiltered.get("1  Cycle Int  Samp  44"), config.signal_range)
+    leak_ok = pd.to_numeric(scoped_unfiltered.get("leak_rate"), errors="coerce").between(*config.leak_range, inclusive="both")
+    d13_ok = pd.to_numeric(scoped_unfiltered.get("d 13C/12C  Mean"), errors="coerce").between(*config.d13c_range, inclusive="both")
+    d18_ok = pd.to_numeric(scoped_unfiltered.get("d 18O/16O  Mean"), errors="coerce").between(*config.d18o_range, inclusive="both")
+    sat_masks_for_stats = _partial_saturation_isotope_masks(scoped_unfiltered)
+    partial_keep = pd.Series(False, index=scoped_unfiltered.index, dtype=bool)
+    if bool(config.overlays.show_saturated_collectors):
+        partial_keep = signal_ok & leak_ok & (
+            (sat_masks_for_stats["d13C"] & d13_ok) | (sat_masks_for_stats["d18O"] & d18_ok)
+        )
+    stat_source_mask = (signal_ok & leak_ok & d13_ok & d18_ok) | partial_keep
+    stat_source = scoped_unfiltered.loc[stat_source_mask].copy()
+    if stat_source.empty:
+        return scoped_filtered
+    stat_mask_d13, stat_mask_d18, _ = compute_statistical_outlier_masks(
+        stat_source,
+        sigma_level=float(config.sigma_level_data),
+        edit_state=edit_state,
+        method=str(getattr(config, "statistical_outlier_method", "Z-Score")),
+        iqr_multiplier=float(getattr(config, "iqr_multiplier_data", 1.5)),
+    )
+    stat_mask_combined = (
+        stat_mask_d13.reindex(scoped_filtered.index, fill_value=False).astype(bool)
+        | stat_mask_d18.reindex(scoped_filtered.index, fill_value=False).astype(bool)
+    )
+    return scoped_filtered.loc[~stat_mask_combined].copy()
 
 
 def _autosave_paths_payload(session_id: str) -> dict[str, Any]:
@@ -746,6 +876,13 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
     working_df = _ensure_cycle1_signal_difference_columns(df.copy())
+    working_df = _apply_isotope_line_offsets(
+        working_df,
+        line_1_offset_d13=getattr(config.linearity, "line_1_offset_d13", None),
+        line_1_offset_d18=getattr(config.linearity, "line_1_offset_d18", None),
+        line_2_offset_d13=getattr(config.linearity, "line_2_offset_d13", None),
+        line_2_offset_d18=getattr(config.linearity, "line_2_offset_d18", None),
+    )
     standards_repo = StandardsRepository.default()
     if len(config.selected_standards) not in (1, 2):
         raise HTTPException(status_code=400, detail="Please select either one or two standards for calibration.")
@@ -765,11 +902,21 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         use_diff_intensity=config.linearity.use_diff_intensity,
         selected_intensity_col=getattr(config.linearity, "intensity_col", None),
     )
-    line_adjusted_df = _apply_linearity_line_offsets(
+    max_sample_intensity = (
+        getattr(config.linearity, "max_sample_intensity", None)
+        if selected_linearity_intensity_col == CYCLE1_SIGNAL_SAMP44_COL
+        else None
+    )
+    line_adjusted_df, d13_offset_intensity_col, d18_offset_intensity_col = _with_isotope_linearity_intensity_columns(
         working_df,
         selected_linearity_intensity_col,
-        config.linearity.line_1_offset,
-        config.linearity.line_2_offset,
+        line_1_offset=config.linearity.line_1_offset,
+        line_2_offset=config.linearity.line_2_offset,
+    )
+    manual_override_intensity_col = (
+        d13_offset_intensity_col
+        if d13_offset_intensity_col == d18_offset_intensity_col
+        else selected_linearity_intensity_col
     )
     standards_adjusted_df = _apply_manual_linearity_override_to_standards(
         line_adjusted_df,
@@ -781,7 +928,7 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         d18_per_10v2=config.linearity.manual_d18_per_10v2,
         quadratic=bool(config.linearity.quadratic),
         use_diff_intensity=config.linearity.use_diff_intensity,
-        selected_intensity_col=selected_linearity_intensity_col,
+        selected_intensity_col=manual_override_intensity_col,
     )
     outlier_input_df = standards_adjusted_df
     selected_mask = (
@@ -799,11 +946,17 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
             use_diff_intensity=config.linearity.use_diff_intensity,
             selected_intensity_col=selected_linearity_intensity_col,
         )
+        fit13_intensity_col = d13_offset_intensity_col if d13_offset_intensity_col in fit_input.columns else intensity_col
+        fit18_intensity_col = d18_offset_intensity_col if d18_offset_intensity_col in fit_input.columns else intensity_col
         fit13 = (
             _compute_linearity_fit(
-                fit_input,
+                _filter_linearity_fit_input_by_max_intensity(
+                    fit_input,
+                    fit13_intensity_col,
+                    max_sample_intensity,
+                ),
                 "d 13C/12C  Mean",
-                intensity_col,
+                fit13_intensity_col,
                 quadratic=bool(config.linearity.quadratic),
             )
             if fit_input is not None and not fit_input.empty
@@ -811,15 +964,25 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         )
         fit18 = (
             _compute_linearity_fit(
-                fit_input,
+                _filter_linearity_fit_input_by_max_intensity(
+                    fit_input,
+                    fit18_intensity_col,
+                    max_sample_intensity,
+                ),
                 "d 18O/16O  Mean",
-                intensity_col,
+                fit18_intensity_col,
                 quadratic=bool(config.linearity.quadratic),
             )
             if fit_input is not None and not fit_input.empty
             else {}
         )
-        fits = {"d13C": fit13, "d18O": fit18, "intensity_col": intensity_col}
+        fits = {
+            "d13C": fit13,
+            "d18O": fit18,
+            "intensity_col": intensity_col,
+            "d13_intensity_col": d13_offset_intensity_col,
+            "d18_intensity_col": d18_offset_intensity_col,
+        }
         outlier_reference_df = _promote_linearity_corrected_raw_columns(
             _apply_linearity_correction(outlier_input_df, intensity_col, fits)
         )
@@ -858,8 +1021,8 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
     # Keep stored imported isotope measurements untouched; calibration writes derived columns only.
     calibrated_for_storage = calibrated.copy()
     for raw_col in ("d 13C/12C  Mean", "d 18O/16O  Mean"):
-        if raw_col in working_df.columns and raw_col in calibrated_for_storage.columns:
-            calibrated_for_storage[raw_col] = working_df[raw_col]
+        if raw_col in df.columns and raw_col in calibrated_for_storage.columns:
+            calibrated_for_storage[raw_col] = df[raw_col]
 
     def _normalize_identifier(value: Any) -> str:
         return str(value).strip().upper()
@@ -1131,6 +1294,98 @@ def processing_charts(session_id: str) -> ChartBundle:
     return _workspace_to_chart_bundle(_build_processing_workspace_response(session_id))
 
 
+@app.post("/sessions/{session_id}/exports/client-output/duplicates", response_model=ClientOutputDuplicateCheckResponse)
+def check_client_output_duplicates(session_id: str, request: ExportRequest) -> ClientOutputDuplicateCheckResponse:
+    _session_exists_or_404(session_id)
+    metadata = store.load_metadata(session_id)
+    df = store.load_frame(session_id)
+    config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
+    config.export = ProcessingExportConfig.model_validate(
+        request.model_dump(exclude={"output_type", "restore_stdev", "restore_stdev_cap"})
+    )
+
+    calibration = _processing_calibration_meta(metadata)
+    working_df = _derive_working_frame(df, config, calibration_meta=calibration, edit_state=metadata.get("edit_state", {}))
+    data_to_process = _selected_processing_rows(working_df, list(config.export.selected_ids))
+    range_config = RangeConfig(
+        signal_range=config.signal_range,
+        leak_range=config.leak_range,
+        d13c_range=config.d13c_range,
+        d18o_range=config.d18o_range,
+        partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+    )
+    category_masks = build_category_masks(
+        data_to_process,
+        range_config,
+        edit_state=metadata.get("edit_state", {}),
+        sigma_level=float(config.sigma_level_data),
+        statistical_outlier_method=str(getattr(config, "statistical_outlier_method", "Z-Score")),
+        iqr_multiplier=float(getattr(config, "iqr_multiplier_data", 1.5)),
+    )
+    outlier_types = build_outlier_type_labels(data_to_process, category_masks)
+    effective_outlier_mask = outlier_types.astype(str).str.strip().replace({"": np.nan}).notna()
+    selected_standards = metadata.get("calibration", {}).get("selected_standards", [])
+
+    if bool(config.export.include_outliers):
+        client_source = data_to_process.copy()
+        if bool(config.export.interpolate_outliers):
+            columns_to_interp = [
+                "1  Cycle Int  Samp  44",
+                "d 13C/12C  Mean",
+                "d 13C/12C  Std Dev",
+                "d 18O/16O  Mean",
+                "d 18O/16O  Std Dev",
+                "d13C_calibrated",
+                "d18O_calibrated",
+            ]
+            present_cols = [col for col in columns_to_interp if col in client_source.columns]
+            if present_cols:
+                client_source = _interpolate_outliers_by_identifier2(client_source, effective_outlier_mask, present_cols)
+    else:
+        client_source = _chart_visible_client_output_frame(
+            working_df,
+            config,
+            list(config.export.selected_ids),
+            list(selected_standards),
+            edit_state=metadata.get("edit_state", {}),
+        )
+
+    if selected_standards and "Identifier 1" in client_source.columns:
+        standards_mask = client_source["Identifier 1"].isin(selected_standards)
+        client_source = client_source.loc[~standards_mask].copy()
+    else:
+        client_source = client_source.copy()
+
+    client_df = _round_client_output_columns(_build_client_output_frame(client_source, comment_map=config.export.comment_map))
+    client_df["__identifier_2_key"] = client_source.get(
+        "Identifier 2",
+        pd.Series(index=client_source.index, dtype=object),
+    )
+    if "Sequence" in client_df.columns:
+        client_df = client_df.sort_values(
+            by=["Sequence", "Identifier", "Sample #"],
+            ascending=[True, True, True],
+            na_position="last",
+            kind="mergesort",
+        ).reset_index(drop=True)
+    duplicate_summary = summarize_client_output_duplicates(client_df)
+    return ClientOutputDuplicateCheckResponse(
+        duplicate_row_count=int(duplicate_summary["duplicate_row_count"]),
+        duplicate_identifier2_values=[
+            str(value)
+            for value in duplicate_summary["duplicate_identifier2_values"]
+        ],
+        duplicate_sequence_values=[
+            float(value) if isinstance(value, float) else int(value)
+            for value in duplicate_summary["duplicate_sequence_values"]
+        ],
+        duplicate_rows=[
+            dict(row)
+            for row in duplicate_summary["duplicate_rows"]
+        ],
+    )
+
+
 @app.post("/sessions/{session_id}/exports/dataset")
 def export_dataset(session_id: str, request: ExportRequest) -> Response:
     _session_exists_or_404(session_id)
@@ -1215,8 +1470,26 @@ def export_dataset(session_id: str, request: ExportRequest) -> Response:
     ]
     output_type = request.output_type
     if output_type == "client_output":
+        restore_stdev_cap = float(request.restore_stdev_cap)
+        if request.restore_stdev and not np.isfinite(restore_stdev_cap):
+            raise HTTPException(status_code=400, detail="restore_stdev_cap must be a finite number")
         client_source = main_data.copy()
-        precision_override = _compute_export_shp2l_precision(working_df, calibration_meta=calibration)
+        if not bool(config.export.include_outliers):
+            client_source = _chart_visible_client_output_frame(
+                working_df,
+                config,
+                list(config.export.selected_ids),
+                list(selected_standards),
+                edit_state=metadata.get("edit_state", {}),
+            )
+        if request.restore_stdev:
+            client_source = _cap_stdev_columns_for_client_output(client_source, restore_stdev_cap)
+        precision_override = _compute_export_shp2l_precision(
+            df,
+            metadata=metadata,
+            calibration_meta=calibration,
+            working_df=working_df,
+        )
         workbook, filename = build_client_output_workbook_bytes(
             client_source,
             selected_standards=selected_standards,
