@@ -95,6 +95,14 @@ function applyDisplayState(
   return { ...cloned, data: traces };
 }
 
+function figureHasTracePrefix(figure: Record<string, unknown> | undefined, prefix: string): boolean {
+  const dataCandidate = (figure as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(dataCandidate)) {
+    return false;
+  }
+  return dataCandidate.some((trace) => String((trace as Record<string, unknown>)?.name ?? "").startsWith(prefix));
+}
+
 function pointMatchesSelectedTarget(pointCustomData: unknown, target: SelectedTarget): boolean {
   if (Array.isArray(pointCustomData)) {
     const rowLabel = String(pointCustomData[0] ?? "").trim();
@@ -1319,6 +1327,7 @@ function FigureCard({
   title,
   description,
   figure,
+  headerActions,
   cardClassName,
   chartClassName,
   onPointClick,
@@ -1327,6 +1336,7 @@ function FigureCard({
   title: string;
   description: string;
   figure?: Record<string, unknown>;
+  headerActions?: ReactNode;
   cardClassName?: string;
   chartClassName?: string;
   onPointClick?: (points: PlotlyPoint[]) => void;
@@ -1337,6 +1347,7 @@ function FigureCard({
       <CardHeader>
         <CardTitle className="text-base">{title}</CardTitle>
         <CardDescription>{description}</CardDescription>
+        {headerActions ? <div>{headerActions}</div> : null}
       </CardHeader>
       <CardContent>
         <PlotlyChart figure={figure} className={chartClassName ?? "min-h-[340px]"} onPointClick={onPointClick} onSelection={onSelection} />
@@ -2028,6 +2039,59 @@ export default function ProcessingPage() {
     resetAllMutation.isPending ||
     removeCalibrationMutation.isPending ||
     duplicateCheckMutation.isPending;
+  const renderFailedSampleTableControls = (table: OutlierTable) => {
+    const normalizedName = String(table.name || table.title || "").toLowerCase();
+    const isFailedSampleTable = normalizedName.includes("failed sample");
+    if (!isFailedSampleTable) {
+      return null;
+    }
+    return (
+      <div className="flex flex-wrap items-end gap-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
+        <label className="text-sm">
+          <span className="mb-1 block text-stone-700">Rate (%)</span>
+          <input
+            type="number"
+            min={0}
+            max={100}
+            step={1}
+            value={failedRestoreRate}
+            onChange={(event) => setFailedRestoreRate(clampNumber(parseFinite(event.target.value, 0), 0, 100))}
+            className="w-28 rounded-lg border border-stone-300 px-3 py-2"
+          />
+        </label>
+        <label className="text-sm">
+          <span className="mb-1 block text-stone-700">Offset</span>
+          <input
+            type="number"
+            step="0.001"
+            value={failedRestoreOffset}
+            onChange={(event) => setFailedRestoreOffset(parseFinite(event.target.value, 0))}
+            className="w-28 rounded-lg border border-stone-300 px-3 py-2"
+          />
+        </label>
+        <label className="text-sm">
+          <span className="mb-1 block text-stone-700">Stdev</span>
+          <input
+            type="number"
+            min={0}
+            step="0.001"
+            value={failedRestoreStdev}
+            onChange={(event) => setFailedRestoreStdev(Math.max(0, parseFinite(event.target.value, 0)))}
+            className="w-28 rounded-lg border border-stone-300 px-3 py-2"
+          />
+        </label>
+        <Button
+          onClick={() => restoreFailedSamples(table)}
+          disabled={busy || !table.rows.length || clampNumber(failedRestoreRate, 0, 100) <= 0}
+        >
+          Restore
+        </Button>
+        <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>
+          Reset
+        </Button>
+      </div>
+    );
+  };
   const manualOverrideCount = Object.keys(workspace.edit_state.manual_outlier_overrides ?? {}).length;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
   const diagnosticsByIsotope: Record<IsotopeKey, CycleDiagnosticsPayload | undefined> = {
@@ -2112,6 +2176,12 @@ export default function ProcessingPage() {
       figure: workspace.overview_figures.crossplot,
     },
   };
+  const d13SummaryState = displayState[overviewCards.d13Summary.key] ?? { rawOnly: false, hideCalibrated: false };
+  const d18SummaryState = displayState[overviewCards.d18Summary.key] ?? { rawOnly: false, hideCalibrated: false };
+  const d13SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d13Summary.figure, "Calibrated ");
+  const d18SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d18Summary.figure, "Calibrated ");
+  const d13SummaryFigure = applyDisplayState(overviewCards.d13Summary.figure, d13SummaryState.rawOnly, d13SummaryState.hideCalibrated);
+  const d18SummaryFigure = applyDisplayState(overviewCards.d18Summary.figure, d18SummaryState.rawOnly, d18SummaryState.hideCalibrated);
   const activeSelectionChartKey = isSelectionEditorOpen ? (activeTarget?.chartKey ?? selectedTargets[0]?.chartKey ?? null) : null;
   const selectionSourceChart: SelectionSourceChart | null = (() => {
     if (!activeSelectionChartKey) {
@@ -2177,13 +2247,13 @@ export default function ProcessingPage() {
         title: overviewCards.d13Summary.title,
         description: overviewCards.d13Summary.description,
         chartKey: overviewCards.d13Summary.key,
-        figure: highlightSelectionSourceFigure(overviewCards.d13Summary.figure, activeTarget),
+        figure: highlightSelectionSourceFigure(d13SummaryFigure, activeTarget),
       },
       [overviewCards.d18Summary.key]: {
         title: overviewCards.d18Summary.title,
         description: overviewCards.d18Summary.description,
         chartKey: overviewCards.d18Summary.key,
-        figure: highlightSelectionSourceFigure(overviewCards.d18Summary.figure, activeTarget),
+        figure: highlightSelectionSourceFigure(d18SummaryFigure, activeTarget),
       },
     };
     if (overviewChartMap[activeSelectionChartKey]) {
@@ -3050,12 +3120,31 @@ export default function ProcessingPage() {
             </div>
           ) : null}
 
-          <div className="grid gap-6 xl:grid-cols-2">
+          <div className="space-y-6">
             <FigureCard
               key={overviewCards.d13Summary.key}
               title={overviewCards.d13Summary.title}
               description={overviewCards.d13Summary.description}
-              figure={overviewCards.d13Summary.figure}
+              figure={d13SummaryFigure}
+              headerActions={
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    variant={d13SummaryState.rawOnly ? "secondary" : "outline"}
+                    size="sm"
+                    onClick={() => toggleDisplayState(overviewCards.d13Summary.key, "rawOnly")}
+                  >
+                    Raw only
+                  </Button>
+                  <Button
+                    variant={d13SummaryState.hideCalibrated ? "secondary" : "outline"}
+                    size="sm"
+                    onClick={() => toggleDisplayState(overviewCards.d13Summary.key, "hideCalibrated")}
+                    disabled={!d13SummaryHasCalibrated}
+                  >
+                    Hide calibrated
+                  </Button>
+                </div>
+              }
               chartClassName="h-[460px] w-full"
               onPointClick={(points) => handleChartClick(overviewCards.d13Summary.key, points)}
               onSelection={(points) => handleChartSelection(overviewCards.d13Summary.key, points)}
@@ -3064,7 +3153,26 @@ export default function ProcessingPage() {
               key={overviewCards.d18Summary.key}
               title={overviewCards.d18Summary.title}
               description={overviewCards.d18Summary.description}
-              figure={overviewCards.d18Summary.figure}
+              figure={d18SummaryFigure}
+              headerActions={
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    variant={d18SummaryState.rawOnly ? "secondary" : "outline"}
+                    size="sm"
+                    onClick={() => toggleDisplayState(overviewCards.d18Summary.key, "rawOnly")}
+                  >
+                    Raw only
+                  </Button>
+                  <Button
+                    variant={d18SummaryState.hideCalibrated ? "secondary" : "outline"}
+                    size="sm"
+                    onClick={() => toggleDisplayState(overviewCards.d18Summary.key, "hideCalibrated")}
+                    disabled={!d18SummaryHasCalibrated}
+                  >
+                    Hide calibrated
+                  </Button>
+                </div>
+              }
               chartClassName="h-[460px] w-full"
               onPointClick={(points) => handleChartClick(overviewCards.d18Summary.key, points)}
               onSelection={(points) => handleChartSelection(overviewCards.d18Summary.key, points)}
@@ -3074,59 +3182,7 @@ export default function ProcessingPage() {
           <OutlierTablesPanel
             title="Data outlier tables"
             tables={workspace.outlier_tables}
-            renderTableControls={(table) => {
-              const normalizedName = String(table.name || table.title || "").toLowerCase();
-              const isFailedSampleTable = normalizedName.includes("failed sample");
-              if (!isFailedSampleTable) {
-                return null;
-              }
-              return (
-                <div className="flex flex-wrap items-end gap-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">Rate (%)</span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={failedRestoreRate}
-                      onChange={(event) => setFailedRestoreRate(clampNumber(parseFinite(event.target.value, 0), 0, 100))}
-                      className="w-28 rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">Offset</span>
-                    <input
-                      type="number"
-                      step="0.001"
-                      value={failedRestoreOffset}
-                      onChange={(event) => setFailedRestoreOffset(parseFinite(event.target.value, 0))}
-                      className="w-28 rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">Stdev</span>
-                    <input
-                      type="number"
-                      min={0}
-                      step="0.001"
-                      value={failedRestoreStdev}
-                      onChange={(event) => setFailedRestoreStdev(Math.max(0, parseFinite(event.target.value, 0)))}
-                      className="w-28 rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
-                  <Button
-                    onClick={() => restoreFailedSamples(table)}
-                    disabled={busy || !table.rows.length || clampNumber(failedRestoreRate, 0, 100) <= 0}
-                  >
-                    Restore
-                  </Button>
-                  <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>
-                    Reset
-                  </Button>
-                </div>
-              );
-            }}
+            renderTableControls={renderFailedSampleTableControls}
           />
 
           <div className="space-y-6">
@@ -3216,7 +3272,11 @@ export default function ProcessingPage() {
                     );
                   })}
 
-                  <OutlierTablesPanel title={`${section.species} outlier tables`} tables={section.outlier_tables} />
+                  <OutlierTablesPanel
+                    title={`${section.species} outlier tables`}
+                    tables={section.outlier_tables}
+                    renderTableControls={renderFailedSampleTableControls}
+                  />
                 </div>
               </details>
             ))}
