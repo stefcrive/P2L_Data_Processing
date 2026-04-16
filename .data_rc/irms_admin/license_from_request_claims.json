@@ -1,0 +1,12 @@
+{
+  "license_id": "DEMO-CLIENT-LABS-WORKSTATION-20260410",
+  "client_name": "Demo Client Labs",
+  "site_name": "Primary Lab Workstation",
+  "issued_at": "2026-04-10T22:03:34Z",
+  "expires_at": "2027-12-31T23:59:59Z",
+  "support_until": "2027-12-31T23:59:59Z",
+  "allowed_version": "0.1",
+  "host_bindings": [
+    "WORKSTATION"
+  ]
+}

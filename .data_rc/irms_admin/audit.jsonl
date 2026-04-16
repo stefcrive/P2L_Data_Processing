@@ -1,0 +1,4 @@
+{"timestamp": "2026-04-10T21:05:20.917585+00:00", "action": "bootstrap_admin", "payload": {"username": "stefcrive"}}
+{"timestamp": "2026-04-10T21:05:20.919607+00:00", "action": "user_login", "payload": {"user_id": "6bb95ee5fa5b40478edf37c912c51f82", "username": "stefcrive"}}
+{"timestamp": "2026-04-10T21:18:21.401305+00:00", "action": "user_logout", "payload": {"token_hash": "ddbfb75c21dd5d674d617f04cba218dfd82eb1219fc94de5a24c2b01082652d8"}}
+{"timestamp": "2026-04-10T21:18:25.426901+00:00", "action": "user_login", "payload": {"user_id": "6bb95ee5fa5b40478edf37c912c51f82", "username": "stefcrive"}}

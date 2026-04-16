@@ -1,0 +1,20 @@
+Backend port 8000 is busy. Using 8001 instead.
+Starting IRMS backend and Next.js application in dev mode...
+Backend:  http://127.0.0.1:8001
+Frontend: http://127.0.0.1:3000
+
+
+> irms-dashboard@0.1.0 dev
+> next dev --port 3000
+
+ ⨯ Failed to start server
+Error: listen EADDRINUSE: address already in use :::3000
+    at <unknown> (Error: listen EADDRINUSE: address already in use :::3000)
+    at new Promise (<anonymous>) {
+  code: 'EADDRINUSE',
+  errno: -4091,
+  syscall: 'listen',
+  address: '::',
+  port: 3000
+}
+[?25h

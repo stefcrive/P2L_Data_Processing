@@ -1,0 +1,13 @@
+[
+  {
+    "user_id": "6bb95ee5fa5b40478edf37c912c51f82",
+    "username": "stefcrive",
+    "display_name": "Stefano",
+    "role": "admin",
+    "is_active": true,
+    "created_at": "2026-04-10T21:05:20.917585+00:00",
+    "last_login_at": "2026-04-10T21:18:25.426901+00:00",
+    "password_salt": "PNZ1F4IgZSgfWoEFMmyUXw==",
+    "password_hash": "vVyfbWQkam/nhCuBt+4zNtojZRZ+Wbg/w9gID0jbkPWCbfDDYvqXB7sxsqjr6EJZZKCXR3pkOGx1jaW71seZGg=="
+  }
+]

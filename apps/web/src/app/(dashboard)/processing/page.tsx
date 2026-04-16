@@ -3056,6 +3056,7 @@ export default function ProcessingPage() {
               title={overviewCards.d13Summary.title}
               description={overviewCards.d13Summary.description}
               figure={overviewCards.d13Summary.figure}
+              chartClassName="h-[460px] w-full"
               onPointClick={(points) => handleChartClick(overviewCards.d13Summary.key, points)}
               onSelection={(points) => handleChartSelection(overviewCards.d13Summary.key, points)}
             />
@@ -3064,6 +3065,7 @@ export default function ProcessingPage() {
               title={overviewCards.d18Summary.title}
               description={overviewCards.d18Summary.description}
               figure={overviewCards.d18Summary.figure}
+              chartClassName="h-[460px] w-full"
               onPointClick={(points) => handleChartClick(overviewCards.d18Summary.key, points)}
               onSelection={(points) => handleChartSelection(overviewCards.d18Summary.key, points)}
             />

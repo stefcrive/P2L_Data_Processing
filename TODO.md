@@ -5,3 +5,6 @@ Add progress bar animation when importing
 fix excel output, file renaming, 
 
 if i interpolate 
+
+add sample and session file link to timelapse recording for diagnostic
+

@@ -1,0 +1,177 @@
+{
+  "session_id": "17eab8cd05014ea7bae7f31600965529",
+  "session_name": "Natan_Pereira_BTS_coral_series_1_plus_17",
+  "created_at": "2026-04-10T21:45:35.270647+00:00",
+  "updated_at": "2026-04-11T16:36:21.193993+00:00",
+  "source_files": [
+    {
+      "name": "Natan Pereira BTS coral series 1.xlsx",
+      "size": 76676,
+      "md5": "280df434d060837c21f7c7b9ea09685b"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 2.xlsx",
+      "size": 94702,
+      "md5": "77f54b43d54afa94d298cbea8b050ad6"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 3.xlsx",
+      "size": 115893,
+      "md5": "46c0f77f88d5245b0dcf368d9ad04813"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 4.1.xlsx",
+      "size": 115934,
+      "md5": "56cbef8625beeb0c42eed8a37e8d2f98"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 5.xlsx",
+      "size": 109433,
+      "md5": "7b36fe5d8b2c068314a43bf63a2d9022"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 6.3.xlsx",
+      "size": 34078,
+      "md5": "c264ff8922b453fe41b18963a604d02d"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 6.xlsx",
+      "size": 90650,
+      "md5": "a5d0734e89daa4bad04073dff2db02ec"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 7.xlsx",
+      "size": 116230,
+      "md5": "5d1def4f8270e134b70dcc67077e877c"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 8.1.xlsx",
+      "size": 115962,
+      "md5": "6e4dda9dab895925c17aca8d91131a9b"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 9.xlsx",
+      "size": 116100,
+      "md5": "727b3e7e1752ece065090b25b4ca5f3e"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 10.xlsx",
+      "size": 115909,
+      "md5": "ddf2511a31bfbe9723611dbf4882caba"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 11.xlsx",
+      "size": 89631,
+      "md5": "4a0c73db3ab87af4441b46deea4c80a7"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 12.xlsx",
+      "size": 113488,
+      "md5": "364229222373fdae9f57faadbe56b72f"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 13.xlsx",
+      "size": 106572,
+      "md5": "5e6e228fa1d171ce371e95b77d1cbe54"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 14.1.xlsx",
+      "size": 115544,
+      "md5": "95f51c9f12f40c3620252d8ebacb899c"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 15.xlsx",
+      "size": 110597,
+      "md5": "5f2cb71184d4fd9db63dc3e3496e43f4"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 16.xlsx",
+      "size": 104051,
+      "md5": "7d5c31c42c9e5270ed7e33b7e80146dd"
+    },
+    {
+      "name": "Natan Pereira BTS coral series 17.4.xlsx",
+      "size": 111066,
+      "md5": "da762132c6feea07b989f87ddeb44027"
+    }
+  ],
+  "errors": [],
+  "calibration": {},
+  "processing": {
+    "config": {
+      "selected_identifier": "All",
+      "x_axis_option": "By Identifier 2",
+      "color_param": "Date_ordinal",
+      "z_axis": "1  Cycle Int  Samp  44",
+      "signal_range": [
+        0.0,
+        50.0
+      ],
+      "leak_range": [
+        0.0,
+        1000.0
+      ],
+      "d13c_range": [
+        -10.0,
+        10.0
+      ],
+      "d18o_range": [
+        -10.0,
+        10.0
+      ],
+      "statistical_outlier_method": "Z-Score",
+      "sigma_level_data": 4.0,
+      "iqr_multiplier_data": 1.5,
+      "overlays": {
+        "show_statistical_outliers": false,
+        "show_range_outliers": false,
+        "show_manual_outliers": false,
+        "show_saturated_collectors": true,
+        "show_saturated_samples": true,
+        "show_failed_samples": true
+      },
+      "manual_linearity_override": {
+        "enabled": true,
+        "use_diff_intensity": true,
+        "quadratic": false,
+        "max_sample_signal": null,
+        "d13_per_10v": 0.0,
+        "d18_per_10v": 0.0,
+        "d13_per_10v2": 0.0,
+        "d18_per_10v2": 0.0
+      },
+      "export": {
+        "include_outliers": false,
+        "selected_ids": [
+          "All"
+        ],
+        "interpolate_outliers": false,
+        "client_name": null,
+        "comment_map": {}
+      }
+    }
+  },
+  "autosave": {
+    "save_dir": "C:\\Users\\stefa\\Documents\\VSCprojects\\IRMSdataprocessing\\.data_rc\\irms_api_sessions\\17eab8cd05014ea7bae7f31600965529",
+    "log_path": "C:\\Users\\stefa\\Documents\\VSCprojects\\IRMSdataprocessing\\.data_rc\\irms_api_sessions\\17eab8cd05014ea7bae7f31600965529\\events.jsonl",
+    "snapshot_path": "C:\\Users\\stefa\\Documents\\VSCprojects\\IRMSdataprocessing\\.data_rc\\irms_api_sessions\\17eab8cd05014ea7bae7f31600965529\\snapshot.csv",
+    "meta_path": "C:\\Users\\stefa\\Documents\\VSCprojects\\IRMSdataprocessing\\.data_rc\\irms_api_sessions\\17eab8cd05014ea7bae7f31600965529\\metadata.json",
+    "session_token": "17eab8cd05014ea7bae7f31600965529",
+    "initialized_at": "2026-04-10T21:45:35.303695+00:00",
+    "resumed": true,
+    "last_action": "session_opened",
+    "last_saved_at": "2026-04-11T16:36:21.191995+00:00",
+    "event_count": 16
+  },
+  "edit_state": {
+    "edited_rows": [],
+    "original_delta_values": {},
+    "original_missing_delta_tokens": [],
+    "original_std_values": {},
+    "original_missing_std_tokens": [],
+    "manual_outlier_overrides": {},
+    "restored_delta_tokens": []
+  },
+  "row_count": 771,
+  "cycles_row_count": 12281
+}

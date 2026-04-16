@@ -1,0 +1,14 @@
+﻿{
+    "schema_version":  "1.0",
+    "request_id":  "22b81b96-5901-46bd-a57a-19cc84c50e46",
+    "generated_at_utc":  "2026-04-10T22:03:56.9937108+00:00",
+    "computer_name":  "WORKSTATION",
+    "hostname":  "Workstation",
+    "suggested_host_binding":  "WORKSTATION",
+    "machine_guid":  "6dad5b01-ffac-446f-a9c4-c669e7c55bcd",
+    "bios_serial":  "System Serial Number",
+    "os":  {
+               "platform":  "Win32NT",
+               "version":  "Microsoft Windows NT 10.0.26200.0"
+           }
+}

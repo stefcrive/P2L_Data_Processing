@@ -3,7 +3,11 @@ setlocal
 
 for %%I in ("%~dp0.") do set "ROOT_DIR=%%~fI"
 set "WEB_DIR=%ROOT_DIR%\apps\web"
-set "VENV_ACTIVATE=%ROOT_DIR%\ven\Scripts\activate.bat"
+set "BACKEND_LAUNCHER=%ROOT_DIR%\scripts\launch_backend.bat"
+set "VENV_ACTIVATE=%ROOT_DIR%\.venv\Scripts\activate.bat"
+set "LEGACY_VENV_ACTIVATE=%ROOT_DIR%\ven\Scripts\activate.bat"
+set "VENV_PYTHON=%ROOT_DIR%\.venv\Scripts\python.exe"
+set "LEGACY_VENV_PYTHON=%ROOT_DIR%\ven\Scripts\python.exe"
 set "RUN_MODE=dev"
 set "BACKEND_PORT="
 set "FRONTEND_PORT="
@@ -64,13 +68,7 @@ if not exist "%WEB_DIR%" (
   exit /b 1
 )
 
-rem Ensure Python, Node.js and npm are available.
-where python >nul 2>&1
-if errorlevel 1 (
-  echo Python was not found in PATH. Install Python and try again.
-  exit /b 1
-)
-
+rem Ensure Node.js and npm are available.
 where node >nul 2>&1
 if errorlevel 1 (
   echo Node.js was not found in PATH. Install Node.js and try again.
@@ -85,12 +83,41 @@ if errorlevel 1 (
 
 rem Ensure Python environment exists for backend.
 if not exist "%VENV_ACTIVATE%" (
+  if exist "%LEGACY_VENV_ACTIVATE%" (
+    set "VENV_ACTIVATE=%LEGACY_VENV_ACTIVATE%"
+    set "VENV_PYTHON=%LEGACY_VENV_PYTHON%"
+  )
+)
+
+if not exist "%VENV_PYTHON%" (
+  if exist "%LEGACY_VENV_PYTHON%" (
+    set "VENV_ACTIVATE=%LEGACY_VENV_ACTIVATE%"
+    set "VENV_PYTHON=%LEGACY_VENV_PYTHON%"
+  )
+)
+
+if not exist "%VENV_ACTIVATE%" if not exist "%VENV_PYTHON%" (
   echo Python virtual environment not found. Running setup...
   call "%ROOT_DIR%\setup.bat"
   if errorlevel 1 (
     echo setup.bat failed.
     exit /b 1
   )
+  if not exist "%VENV_ACTIVATE%" if not exist "%VENV_PYTHON%" (
+    if exist "%LEGACY_VENV_ACTIVATE%" if exist "%LEGACY_VENV_PYTHON%" (
+      set "VENV_ACTIVATE=%LEGACY_VENV_ACTIVATE%"
+      set "VENV_PYTHON=%LEGACY_VENV_PYTHON%"
+    )
+  )
+  if not exist "%VENV_PYTHON%" (
+    echo Python virtual environment still not found after setup.
+    exit /b 1
+  )
+)
+
+if not exist "%VENV_PYTHON%" (
+  echo Python executable was not found in virtual environment: %VENV_PYTHON%
+  exit /b 1
 )
 
 rem Install frontend dependencies if node_modules is missing.
@@ -110,12 +137,17 @@ if not exist "node_modules" (
 )
 
 rem Launch backend in a separate terminal window.
-if /I "%RUN_MODE%"=="prod" (
-  set "BACKEND_CMD=cd /d ""%ROOT_DIR%"" && call ""%VENV_ACTIVATE%"" && python -m uvicorn services.irms_api.api.main:app --host 127.0.0.1 --port %BACKEND_PORT%"
-) else (
-  set "BACKEND_CMD=cd /d ""%ROOT_DIR%"" && call ""%VENV_ACTIVATE%"" && python -m uvicorn services.irms_api.api.main:app --host 127.0.0.1 --port %BACKEND_PORT% --reload"
+if not exist "%BACKEND_LAUNCHER%" (
+  echo Could not find backend launcher script: %BACKEND_LAUNCHER%
+  popd
+  exit /b 1
 )
-start "IRMS Backend :%BACKEND_PORT%" cmd /k "%BACKEND_CMD%"
+
+if /I "%RUN_MODE%"=="prod" (
+  start "IRMS Backend :%BACKEND_PORT%" cmd /k ""%BACKEND_LAUNCHER%" "%ROOT_DIR%" "%VENV_PYTHON%" "%BACKEND_PORT%" "prod""
+) else (
+  start "IRMS Backend :%BACKEND_PORT%" cmd /k ""%BACKEND_LAUNCHER%" "%ROOT_DIR%" "%VENV_PYTHON%" "%BACKEND_PORT%" "dev""
+)
 
 set "NEXT_PUBLIC_IRMS_API_URL=http://127.0.0.1:%BACKEND_PORT%"
 
