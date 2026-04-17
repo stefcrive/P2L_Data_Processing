@@ -13,7 +13,38 @@ except ModuleNotFoundError:  # pragma: no cover - optional for logic-only tests
     make_subplots = None
     go = None
 
-from ..shared.plotting import _build_date_colorbar_ticks, _prepare_color_values
+from ..shared.plotting import (
+    _build_date_colorbar_ticks,
+    _is_date_color_column,
+    _prefer_datetime_color_values,
+    _prepare_color_values,
+)
+
+
+def _color_param_label(color_param: str) -> str:
+    return "Date" if _is_date_color_column(color_param) else str(color_param)
+
+
+def _format_hover_color_value(value) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except Exception:
+        pass
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.notna(numeric) and np.isfinite(float(numeric)):
+        return f"{float(numeric):.2f}"
+    return str(value)
+
+
+def _resolve_species_labels(df: pd.DataFrame) -> pd.Series:
+    source = df.get("Species", df.get("Identifier 1", pd.Series(index=df.index, dtype=object)))
+    labels = pd.Series(source, index=df.index).fillna("").astype(str).str.strip()
+    labels = labels.where(~labels.str.lower().eq("nan"), "")
+    labels = labels.where(labels != "", "Unknown")
+    return labels
 
 def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     """
@@ -62,14 +93,34 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         if col not in df.columns:
             raise ValueError(f"Missing required column: {col}")
 
+    identifier1_series = df.get("Identifier 1", pd.Series("", index=df.index)).fillna("").astype(str)
+    identifier2_series = df.get("Identifier 2", pd.Series("", index=df.index)).fillna("").astype(str)
+    species_series = _resolve_species_labels(df)
+    hover_color_label = _color_param_label(color_param)
+    hover_color_series = df.get(color_param, pd.Series(index=df.index, dtype=object)).map(_format_hover_color_value)
+
+    def _build_customdata_for_index(index: pd.Index) -> np.ndarray:
+        return np.column_stack(
+            (
+                index.astype(str).to_numpy(),
+                identifier1_series.reindex(index).fillna("").astype(str).to_numpy(),
+                identifier2_series.reindex(index).fillna("").astype(str).to_numpy(),
+                species_series.reindex(index).fillna("Unknown").astype(str).to_numpy(),
+                hover_color_series.reindex(index).fillna("N/A").astype(str).to_numpy(),
+            )
+        )
+
+    base_customdata = _build_customdata_for_index(df.index)
+
     # Set marker styles based on whether Identifier 1 is in the standards list
     marker_symbols = ['circle-open' if id in standards_list else 'circle' for id in df['Identifier 1']]
     hover_text = df['Identifier 2']
 
     # Build colorbar configuration for the first trace (readable dates if needed)
+    is_date_color = _is_date_color_column(color_param)
     colorbar_cfg = dict(
         title=dict(
-            text='Date' if color_param == 'Date_ordinal' else color_param,
+            text='Date' if is_date_color else color_param,
             side='right',
         ),
         thickness=20,
@@ -79,9 +130,12 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         x=1.15,    # Move further right
         xanchor='right'
     )
-    color_values, colorbar_category_ticks = _prepare_color_values(df[color_param])
-    if color_param == 'Date_ordinal' and color_param in df.columns:
-        tickvals, ticktext = _build_date_colorbar_ticks(df[color_param])
+    color_values, colorbar_category_ticks = _prepare_color_values(
+        df[color_param],
+        prefer_dates=_prefer_datetime_color_values(color_param),
+    )
+    if is_date_color:
+        tickvals, ticktext = _build_date_colorbar_ticks(color_values if color_values is not None else df[color_param])
         if tickvals and ticktext:
             colorbar_cfg.update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
     elif colorbar_category_ticks is not None:
@@ -212,9 +266,11 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     loadings = pca.components_.T * np.sqrt(pca.explained_variance_)
 
     # Scatter plot for PCA components
+    pca_customdata = None
     if n_components == 2:
         pca_color = color_values.loc[X.index] if color_values is not None else df.loc[X.index, color_param]
         pca_hover = df.loc[X.index, 'Identifier 2']
+        pca_customdata = _build_customdata_for_index(X.index)
         fig.add_trace(go.Scatter(
             x=components[:, 0], y=components[:, 1], mode='markers',
             marker=dict(color=pca_color, colorscale='Viridis', symbol=marker_symbols, showscale=False),
@@ -272,6 +328,34 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     for (row, col), (x_title, y_title) in axis_titles.items():
         fig.update_xaxes(title_text=x_title, row=row, col=col)
         fig.update_yaxes(title_text=y_title, row=row, col=col)
+
+    unified_hover_template = (
+        "Identifier 1: %{customdata[1]}<br>"
+        "Identifier 2: %{customdata[2]}<br>"
+        "Species: %{customdata[3]}<br>"
+        "Row: %{customdata[0]}<br>"
+        f"{hover_color_label}: %{{customdata[4]}}<br>"
+        "X: %{x}<br>"
+        "Y: %{y}<extra></extra>"
+    )
+    base_count = len(df.index)
+    pca_count = len(X.index)
+    for trace in fig.data:
+        if not isinstance(trace, go.Scatter):
+            continue
+        mode = str(getattr(trace, "mode", ""))
+        if "markers" not in mode:
+            continue
+        x_values = getattr(trace, "x", None)
+        point_count = len(x_values) if x_values is not None else 0
+        if point_count == base_count:
+            trace.customdata = base_customdata
+        elif pca_customdata is not None and point_count == pca_count:
+            trace.customdata = pca_customdata
+        else:
+            continue
+        trace.hovertemplate = unified_hover_template
+        trace.hoverlabel = dict(namelength=-1)
 
     # Update layout with right margin for colorbar
     fig.update_layout(

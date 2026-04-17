@@ -34,7 +34,12 @@ from ..constants import (
     ISOTYPE_D18O,
 )
 from ..shared.dataframe import _find_column
-from ..shared.plotting import _build_date_colorbar_ticks, _prepare_color_values
+from ..shared.plotting import (
+    _build_date_colorbar_ticks,
+    _is_date_color_column,
+    _prefer_datetime_color_values,
+    _prepare_color_values,
+)
 from ..standards import StandardsRepository
 
 
@@ -834,6 +839,22 @@ def create_calibration_plots(
     selected_standards: list[str],
     color_param: str,
 ) -> dict[str, go.Figure]:
+    def _color_param_label(param: str) -> str:
+        return "Date" if _is_date_color_column(param) else str(param)
+
+    def _format_hover_color_value(value: Any) -> str:
+        if value is None:
+            return "N/A"
+        try:
+            if pd.isna(value):
+                return "N/A"
+        except Exception:
+            pass
+        numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.notna(numeric) and np.isfinite(float(numeric)):
+            return f"{float(numeric):.2f}"
+        return str(value)
+
     figs: dict[str, go.Figure] = {}
     isotopes = {
         ISOTYPE_D13C: {"y_label": "d13C", "measurement_col": "d 13C/12C  Mean"},
@@ -841,14 +862,16 @@ def create_calibration_plots(
     }
     for isotope_type, isotope_data in isotopes.items():
         isotope_key = "d13C" if isotope_type == ISOTYPE_D13C else "d18O"
+        is_date_color = _is_date_color_column(color_param)
         fig = go.Figure()
+        hover_color_label = _color_param_label(color_param)
         true_values: list[float] = []
         measured_values: list[float] = []
         coloraxis_cfg: dict[str, Any] = {
             "colorscale": "Viridis",
             "colorbar": {
                 "title": {
-                    "text": "Date" if color_param == "Date_ordinal" else color_param,
+                    "text": "Date" if is_date_color else color_param,
                     "side": "right",
                 },
                 "thickness": 20,
@@ -860,15 +883,18 @@ def create_calibration_plots(
             },
         }
         color_values_all, colorbar_category_ticks = _prepare_color_values(
-            measurement_df[color_param] if color_param in measurement_df.columns else None
+            measurement_df[color_param] if color_param in measurement_df.columns else None,
+            prefer_dates=_prefer_datetime_color_values(color_param),
         )
         if color_values_all is not None:
             cdata = pd.to_numeric(color_values_all, errors="coerce")
             if cdata.notna().any():
                 coloraxis_cfg["cmin"] = float(np.nanmin(cdata))
                 coloraxis_cfg["cmax"] = float(np.nanmax(cdata))
-        if color_param == "Date_ordinal" and color_param in measurement_df.columns:
-            tickvals, ticktext = _build_date_colorbar_ticks(measurement_df[color_param])
+        if is_date_color:
+            tickvals, ticktext = _build_date_colorbar_ticks(
+                color_values_all if color_values_all is not None else measurement_df.get(color_param)
+            )
             if tickvals and ticktext:
                 coloraxis_cfg["colorbar"].update(
                     tickmode="array",
@@ -906,12 +932,26 @@ def create_calibration_plots(
             valid_rows = standard_rows.loc[valid_mask]
             id1_values = valid_rows.get("Identifier 1", pd.Series("", index=valid_rows.index)).fillna("").astype(str).to_numpy()
             id2_values = valid_rows.get("Identifier 2", pd.Series("", index=valid_rows.index)).fillna("").astype(str).to_numpy()
+            species_values = (
+                valid_rows.get("Species", valid_rows.get("Identifier 1", pd.Series("", index=valid_rows.index)))
+                .fillna("")
+                .astype(str)
+                .replace("", "Unknown")
+                .to_numpy()
+            )
+            color_hover_values = (
+                valid_rows.get(color_param, pd.Series(index=valid_rows.index, dtype=object))
+                .map(_format_hover_color_value)
+                .to_numpy()
+            )
             customdata = np.column_stack(
                 (
                     valid_rows.index.astype(str).to_numpy(),
                     np.full(len(valid_rows), isotope_key, dtype=object),
                     id1_values,
                     id2_values,
+                    species_values,
+                    color_hover_values,
                 )
             )
             true_values.extend([true_value] * len(measured_values_for_standard))
@@ -932,7 +972,9 @@ def create_calibration_plots(
                     hovertemplate=(
                         "Identifier 1: %{customdata[2]}<br>"
                         "Identifier 2: %{customdata[3]}<br>"
+                        "Species: %{customdata[4]}<br>"
                         "Row: %{customdata[0]}<br>"
+                        f"{hover_color_label}: %{{customdata[5]}}<br>"
                         f"True {isotope_data['y_label']}: %{{x:.3f}}<br>"
                         f"Measured {isotope_data['y_label']}: %{{y:.3f}}<extra></extra>"
                     ),

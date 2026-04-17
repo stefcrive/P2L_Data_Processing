@@ -94,6 +94,9 @@ export function PlotlyChart({ figure, className, onPointClick, onSelection }: Pl
     const safeFigure = deepClone(figure);
     const layout = typeof safeFigure.layout === "object" && safeFigure.layout ? { ...(safeFigure.layout as Record<string, unknown>) } : {};
     applyD18AxisInversion(layout);
+    const hoverLabel = layout.hoverlabel && typeof layout.hoverlabel === "object" ? { ...(layout.hoverlabel as Record<string, unknown>) } : {};
+    hoverLabel.namelength = -1;
+    layout.hoverlabel = hoverLabel;
     layout.autosize = true;
     delete (layout as { width?: unknown }).width;
     delete (layout as { height?: unknown }).height;

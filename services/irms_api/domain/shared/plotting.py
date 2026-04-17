@@ -9,6 +9,15 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - optional for logic-only tests
     go = None
 
+def _normalize_color_key(value):
+    return ''.join(ch.lower() for ch in str(value or '') if ch.isalnum())
+
+def _is_date_color_column(color_col):
+    return _normalize_color_key(color_col) in {'date', 'dateordinal'}
+
+def _prefer_datetime_color_values(color_col):
+    return _normalize_color_key(color_col) == 'date'
+
 def _build_date_colorbar_ticks(values, n=6, date_format='%Y-%m-%d'):
     try:
         s = pd.to_numeric(pd.Series(values), errors='coerce').dropna()
@@ -32,11 +41,16 @@ def _build_date_colorbar_ticks(values, n=6, date_format='%Y-%m-%d'):
             ticktext.append(str(v))
     return tickvals.tolist(), ticktext
 
-def _prepare_color_values(values):
+def _prepare_color_values(values, prefer_dates=False):
     """Coerce color values to numeric, with categorical fallback + ticks."""
     if values is None:
         return None, None
     series = pd.Series(values)
+    if prefer_dates:
+        parsed = pd.to_datetime(series, errors='coerce')
+        if parsed.notna().any():
+            date_ordinals = parsed.map(lambda x: x.toordinal() if pd.notna(x) else np.nan)
+            return pd.to_numeric(date_ordinals, errors='coerce'), None
     numeric = pd.to_numeric(series, errors='coerce')
     if numeric.notna().any():
         return numeric, None
@@ -77,7 +91,28 @@ def _build_delta_point_customdata(df, isotope_key):
     id1_vals = df.get('Identifier 1', pd.Series(index=df.index, dtype=object)).fillna('').astype(str).to_numpy()
     id2_vals = df.get('Identifier 2', pd.Series(index=df.index, dtype=object)).fillna('').astype(str).to_numpy()
     iso_vals = np.full(len(df), str(isotope_key), dtype=object)
-    return np.column_stack((idx_vals, iso_vals, id1_vals, id2_vals))
+    columns = [idx_vals, iso_vals, id1_vals, id2_vals]
+    if "__hover_species" in df.columns:
+        species_vals = df.get("__hover_species", pd.Series(index=df.index, dtype=object)).fillna("Unknown").astype(str).to_numpy()
+        columns.append(species_vals)
+    if "__hover_color_value" in df.columns:
+        color_vals = df.get("__hover_color_value", pd.Series(index=df.index, dtype=object)).fillna("N/A").astype(str).to_numpy()
+        columns.append(color_vals)
+    return np.column_stack(columns)
+
+
+def _format_hover_color_value(value):
+    if value is None:
+        return "N/A"
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except Exception:
+        pass
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.notna(numeric) and np.isfinite(float(numeric)):
+        return f"{float(numeric):.2f}"
+    return str(value)
 
 def _build_cycle_std_lookups(df):
     """Build per-row lookups for cycle-derived d13C/d18O standard deviations."""
@@ -253,12 +288,16 @@ def _build_isotope_3d_scatter(
     color_max = None
     solid_color = 'rgba(70, 130, 180, 0.85)'
     if color_col and color_col in plot_df.columns:
-        color_values, colorbar_category_ticks = _prepare_color_values(plot_df[color_col])
+        is_date_color = _is_date_color_column(color_col)
+        color_values, colorbar_category_ticks = _prepare_color_values(
+            plot_df[color_col],
+            prefer_dates=_prefer_datetime_color_values(color_col),
+        )
         numeric_colors = pd.to_numeric(color_values, errors='coerce') if color_values is not None else pd.Series(dtype=float)
         if color_values is not None and numeric_colors.notna().any():
             colorbar_cfg = dict(
                 title=dict(
-                    text='Date' if color_col == 'Date_ordinal' else (color_label or color_col),
+                    text='Date' if is_date_color else (color_label or color_col),
                     side='right',
                 ),
                 thickness=18,
@@ -266,8 +305,8 @@ def _build_isotope_3d_scatter(
                 y=0.5,
                 yanchor='middle'
             )
-            if color_col == 'Date_ordinal':
-                tickvals, ticktext = _build_date_colorbar_ticks(plot_df[color_col])
+            if is_date_color:
+                tickvals, ticktext = _build_date_colorbar_ticks(color_values if color_values is not None else plot_df[color_col])
                 if tickvals and ticktext:
                     colorbar_cfg.update(tickmode='array', tickvals=tickvals, ticktext=ticktext)
             elif colorbar_category_ticks is not None:
@@ -282,6 +321,15 @@ def _build_isotope_3d_scatter(
 
     id1_series = plot_df.get('Identifier 1', pd.Series(plot_df.index, index=plot_df.index)).fillna('').astype(str)
     id2_series = plot_df.get('Identifier 2', pd.Series(plot_df.index, index=plot_df.index)).fillna('').astype(str)
+    species_source = (
+        plot_df.get('__hover_species', plot_df.get('Species', plot_df.get('Identifier 1', pd.Series(index=plot_df.index, dtype=object))))
+        .fillna('')
+        .astype(str)
+    )
+    species_series = species_source.where(species_source.str.strip() != "", "Unknown")
+    color_hover_series = plot_df.get('__hover_color_value', plot_df.get(color_col, pd.Series(index=plot_df.index, dtype=object)))
+    color_hover_series = color_hover_series.map(_format_hover_color_value)
+    color_hover_label = 'Date' if _is_date_color_column(color_col) else str(color_label or color_col or 'Color')
     standard_mask = (
         id1_series.str.strip().str.upper().eq(str(open_circle_identifier).strip().upper()).to_numpy(dtype=bool)
         if open_circle_identifier is not None
@@ -294,6 +342,8 @@ def _build_isotope_3d_scatter(
     row_array = plot_df.index.astype(str).to_numpy()
     id1_array = id1_series.to_numpy()
     id2_array = id2_series.to_numpy()
+    species_array = species_series.to_numpy()
+    color_hover_array = color_hover_series.to_numpy()
     color_array = numeric_colors.to_numpy() if has_numeric_color else None
     z_axis_title = z_label or z_col
 
@@ -322,21 +372,27 @@ def _build_isotope_3d_scatter(
                     np.full(int(np.sum(mask)), str(isotope_key), dtype=object),
                     id1_array[mask],
                     id2_array[mask],
+                    species_array[mask],
+                    color_hover_array[mask],
                 ]
             )
             hovertemplate = (
                 "Identifier 1: %{customdata[2]}<br>"
                 "Identifier 2: %{customdata[3]}<br>"
+                "Species: %{customdata[4]}<br>"
                 "Row: %{customdata[0]}<br>"
+                f"{color_hover_label}: %{{customdata[5]}}<br>"
                 "d18O: %{x:.3f}<br>"
                 "d13C: %{y:.3f}<br>"
                 f"{z_axis_title}: %{{z:.3f}}<extra></extra>"
             )
         else:
-            customdata = np.column_stack([id1_array[mask], id2_array[mask]])
+            customdata = np.column_stack([id1_array[mask], id2_array[mask], species_array[mask], color_hover_array[mask]])
             hovertemplate = (
                 "Identifier 1: %{customdata[0]}<br>"
                 "Identifier 2: %{customdata[1]}<br>"
+                "Species: %{customdata[2]}<br>"
+                f"{color_hover_label}: %{{customdata[3]}}<br>"
                 "d18O: %{x:.3f}<br>"
                 "d13C: %{y:.3f}<br>"
                 f"{z_axis_title}: %{{z:.3f}}<extra></extra>"
@@ -350,7 +406,8 @@ def _build_isotope_3d_scatter(
             marker=marker,
             showlegend=bool(np.any(standard_mask)),
             customdata=customdata,
-            hovertemplate=hovertemplate
+            hovertemplate=hovertemplate,
+            hoverlabel=dict(namelength=-1),
         ))
 
     if has_numeric_color and np.any(non_standard_mask):

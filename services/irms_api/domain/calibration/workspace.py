@@ -27,7 +27,13 @@ from ..contracts import (
 )
 from ..shared.dataframe import _ensure_cycle1_signal_difference_columns, _find_column, _parse_numeric_token
 from ..shared.json_compat import to_json_compatible
-from ..shared.plotting import _build_date_colorbar_ticks, _build_isotope_3d_scatter, _prepare_color_values
+from ..shared.plotting import (
+    _build_date_colorbar_ticks,
+    _build_isotope_3d_scatter,
+    _is_date_color_column,
+    _prefer_datetime_color_values,
+    _prepare_color_values,
+)
 from ..standards import StandardsRepository
 from .core import (
     _apply_isotope_line_offsets,
@@ -64,7 +70,6 @@ def _figure_json(fig: go.Figure | None) -> dict[str, Any]:
 
 def _candidate_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
-        "Date_ordinal",
         "Date",
         "Identifier 1",
         "Identifier 2",
@@ -167,11 +172,60 @@ def _outlier_rows(std_df: pd.DataFrame, mask: pd.Series, value_col: str) -> list
     return to_json_compatible(table.to_dict(orient="records"))
 
 
+def _color_param_label(color_param: str) -> str:
+    return "Date" if _is_date_color_column(color_param) else str(color_param)
+
+
+def _format_hover_color_value(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except Exception:
+        pass
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.notna(numeric) and np.isfinite(float(numeric)):
+        return f"{float(numeric):.2f}"
+    return str(value)
+
+
+def _resolve_species_labels(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=object)
+    species = df.get("Species", df.get("Identifier 1", pd.Series(index=df.index, dtype=object)))
+    labels = pd.Series(species, index=df.index).fillna("").astype(str).str.strip()
+    labels = labels.where(~labels.str.lower().eq("nan"), "")
+    labels = labels.where(labels != "", "Unknown")
+    return labels
+
+
+def _attach_hover_context(df: pd.DataFrame, color_param: str) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    work = df.copy()
+    if work.empty:
+        work["__hover_species"] = pd.Series(index=work.index, dtype=object)
+        work["__hover_color_value"] = pd.Series(index=work.index, dtype=object)
+        return work
+    work["__hover_species"] = _resolve_species_labels(work)
+    source = work.get(color_param, pd.Series(index=work.index, dtype=object))
+    work["__hover_color_value"] = source.reindex(work.index).map(_format_hover_color_value)
+    return work
+
+
 def _build_point_customdata(df: pd.DataFrame, isotope_key: str) -> np.ndarray:
     row_labels = df.index.astype(str).to_numpy()
     id1_values = df.get("Identifier 1", pd.Series("", index=df.index)).fillna("").astype(str).to_numpy()
     id2_values = df.get("Identifier 2", pd.Series("", index=df.index)).fillna("").astype(str).to_numpy()
-    return np.column_stack((row_labels, np.full(len(df), isotope_key, dtype=object), id1_values, id2_values))
+    species_values = (
+        df.get("__hover_species", df.get("Species", df.get("Identifier 1", pd.Series(index=df.index, dtype=object))))
+        .fillna("Unknown")
+        .astype(str)
+        .to_numpy()
+    )
+    color_values = df.get("__hover_color_value", pd.Series("N/A", index=df.index)).fillna("N/A").astype(str).to_numpy()
+    return np.column_stack((row_labels, np.full(len(df), isotope_key, dtype=object), id1_values, id2_values, species_values, color_values))
 
 
 def _build_standard_outlier_figure(
@@ -185,20 +239,25 @@ def _build_standard_outlier_figure(
 ) -> dict[str, Any]:
     if go is None or std_df is None or std_df.empty or value_col not in std_df.columns:
         return {}
-    work = std_df.copy()
+    work = _attach_hover_context(std_df, color_param)
     work["x_axis"] = _sequence_axis(work)
     values = pd.to_numeric(work[value_col], errors="coerce")
     inlier_mask = ~outlier_mask.reindex(work.index, fill_value=False)
     isotope_key = "d13C" if "13" in str(value_col) else "d18O"
+    color_label = _color_param_label(color_param)
     fig = go.Figure()
-    color_values, colorbar_category_ticks = _prepare_color_values(work[color_param] if color_param in work.columns else None)
+    is_date_color = _is_date_color_column(color_param)
+    color_values, colorbar_category_ticks = _prepare_color_values(
+        work[color_param] if color_param in work.columns else None,
+        prefer_dates=_prefer_datetime_color_values(color_param),
+    )
     color_numeric = pd.to_numeric(color_values, errors="coerce") if color_values is not None else pd.Series(np.nan, index=work.index)
     has_color = bool(color_numeric.notna().any())
     coloraxis_cfg: dict[str, Any] = {
         "colorscale": "Viridis",
         "colorbar": {
             "title": {
-                "text": "Date" if color_param == "Date_ordinal" else color_param,
+                "text": "Date" if is_date_color else color_param,
                 "side": "right",
             },
             "thickness": 16,
@@ -220,8 +279,8 @@ def _build_standard_outlier_figure(
                     cmax = cmax + 0.5
                 coloraxis_cfg["cmin"] = cmin
                 coloraxis_cfg["cmax"] = cmax
-        if color_param == "Date_ordinal" and color_param in work.columns:
-            tickvals, ticktext = _build_date_colorbar_ticks(work[color_param])
+        if is_date_color:
+            tickvals, ticktext = _build_date_colorbar_ticks(color_values if color_values is not None else work.get(color_param))
             if tickvals and ticktext:
                 coloraxis_cfg["colorbar"].update(tickmode="array", tickvals=tickvals, ticktext=ticktext)
         elif colorbar_category_ticks is not None:
@@ -247,7 +306,9 @@ def _build_standard_outlier_figure(
                 hovertemplate=(
                     "Identifier 1: %{customdata[2]}<br>"
                     "Identifier 2: %{customdata[3]}<br>"
+                    "Species: %{customdata[4]}<br>"
                     "Row: %{customdata[0]}<br>"
+                    f"{color_label}: %{{customdata[5]}}<br>"
                     f"{y_label}: %{{y:.3f}}<extra></extra>"
                 ),
             )
@@ -269,7 +330,9 @@ def _build_standard_outlier_figure(
                 hovertemplate=(
                     "Identifier 1: %{customdata[2]}<br>"
                     "Identifier 2: %{customdata[3]}<br>"
+                    "Species: %{customdata[4]}<br>"
                     "Row: %{customdata[0]}<br>"
+                    f"{color_label}: %{{customdata[5]}}<br>"
                     f"{y_label}: %{{y:.3f}}<extra></extra>"
                 ),
             )
@@ -344,7 +407,7 @@ def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str
     if not valid.any():
         return {}
 
-    plot_df = df.loc[valid].copy()
+    plot_df = _attach_hover_context(df.loc[valid].copy(), color_param)
     plot_df["_group"] = (
         plot_df.get("Identifier 1", pd.Series("Standards", index=plot_df.index))
         .fillna("Unknown")
@@ -353,7 +416,11 @@ def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str
         .replace("", "Unknown")
     )
 
-    color_values, colorbar_category_ticks = _prepare_color_values(plot_df[color_param] if color_param in plot_df.columns else None)
+    is_date_color = _is_date_color_column(color_param)
+    color_values, colorbar_category_ticks = _prepare_color_values(
+        plot_df[color_param] if color_param in plot_df.columns else None,
+        prefer_dates=_prefer_datetime_color_values(color_param),
+    )
     color_numeric = pd.to_numeric(color_values, errors="coerce") if color_values is not None else pd.Series(np.nan, index=plot_df.index)
     has_color = bool(color_numeric.notna().any())
     color_min: float | None = None
@@ -370,6 +437,7 @@ def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str
                 color_max += 0.5
 
     fig = go.Figure()
+    color_label = _color_param_label(color_param)
     show_colorbar = has_color
     for group, group_df in plot_df.groupby("_group", dropna=False):
         marker: dict[str, Any] = {"size": 9, "opacity": 0.85}
@@ -384,7 +452,7 @@ def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str
             if show_colorbar:
                 colorbar_cfg: dict[str, Any] = {
                     "title": {
-                        "text": "Date" if color_param == "Date_ordinal" else str(color_param),
+                        "text": "Date" if is_date_color else str(color_param),
                         "side": "right",
                     },
                     "thickness": 16,
@@ -394,8 +462,8 @@ def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str
                     "x": 1.04,
                     "xanchor": "left",
                 }
-                if color_param == "Date_ordinal":
-                    tickvals, ticktext = _build_date_colorbar_ticks(plot_df.get(color_param))
+                if is_date_color:
+                    tickvals, ticktext = _build_date_colorbar_ticks(color_values if color_values is not None else plot_df.get(color_param))
                     if tickvals and ticktext:
                         colorbar_cfg.update(tickmode="array", tickvals=tickvals, ticktext=ticktext)
                 elif colorbar_category_ticks is not None:
@@ -419,7 +487,9 @@ def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str
                 hovertemplate=(
                     "Identifier 1: %{customdata[2]}<br>"
                     "Identifier 2: %{customdata[3]}<br>"
+                    "Species: %{customdata[4]}<br>"
                     "Row: %{customdata[0]}<br>"
+                    f"{color_label}: %{{customdata[5]}}<br>"
                     "d18O: %{x:.3f}<br>"
                     "d13C: %{y:.3f}<extra></extra>"
                 ),
@@ -450,7 +520,10 @@ def _build_linearity_figure(
         return {}
     intensity = pd.to_numeric(df_src[intensity_col], errors="coerce")
     y = pd.to_numeric(df_src[y_col], errors="coerce")
-    color_values, _ = _prepare_color_values(df_src[color_param] if color_param in df_src.columns else None)
+    color_values, _ = _prepare_color_values(
+        df_src[color_param] if color_param in df_src.columns else None,
+        prefer_dates=_prefer_datetime_color_values(color_param),
+    )
     work = pd.DataFrame({"intensity": intensity, "y": y}, index=df_src.index)
     work["identifier_1"] = df_src.get("Identifier 1", pd.Series("", index=df_src.index)).fillna("").astype(str)
     work["identifier_2"] = df_src.get("Identifier 2", pd.Series("", index=df_src.index)).fillna("").astype(str)
@@ -458,6 +531,8 @@ def _build_linearity_figure(
         work["color"] = pd.to_numeric(color_values, errors="coerce")
     else:
         work["color"] = np.nan
+    work["__hover_species"] = _resolve_species_labels(df_src).reindex(work.index)
+    work["__hover_color_value"] = df_src.get(color_param, pd.Series(index=df_src.index, dtype=object)).reindex(work.index).map(_format_hover_color_value)
     slope = pd.to_numeric(pd.Series([fit.get("slope")]), errors="coerce").iloc[0]
     intercept = pd.to_numeric(pd.Series([fit.get("intercept")]), errors="coerce").iloc[0]
     quad = pd.to_numeric(pd.Series([fit.get("quad")]), errors="coerce").iloc[0]
@@ -482,12 +557,15 @@ def _build_linearity_figure(
         else:
             marker_kwargs.update(color="#2563eb")
         isotope_key = "d13C" if "13" in str(y_col) else "d18O"
+        color_label = _color_param_label(color_param)
         customdata = np.column_stack(
             (
                 work.index.astype(str).to_numpy(),
                 np.full(len(work), isotope_key, dtype=object),
                 work["identifier_1"].to_numpy(),
                 work["identifier_2"].to_numpy(),
+                work["__hover_species"].fillna("Unknown").astype(str).to_numpy(),
+                work["__hover_color_value"].fillna("N/A").astype(str).to_numpy(),
                 work["intensity"].to_numpy(),
             )
         )
@@ -502,9 +580,11 @@ def _build_linearity_figure(
                 hovertemplate=(
                     "Identifier 1: %{customdata[2]}<br>"
                     "Identifier 2: %{customdata[3]}<br>"
+                    "Species: %{customdata[4]}<br>"
                     "Row: %{customdata[0]}<br>"
+                    f"{color_label}: %{{customdata[5]}}<br>"
                     "Axis value: %{x:.3f}<br>"
-                    "Intensity: %{customdata[4]:.3f}<br>"
+                    "Intensity: %{customdata[6]:.3f}<br>"
                     "Value: %{y:.3f}<extra></extra>"
                 ),
             )
@@ -786,10 +866,13 @@ def build_calibration_workspace(
                 pre_outlier_fits,
             )
             outlier_reference_df = _promote_linearity_corrected_raw_columns(corrected_for_outliers)
+    available_color_params = _candidate_color_columns(work_df)
+    if available_color_params and config.color_param not in available_color_params:
+        config.color_param = "Date" if "Date" in available_color_params else available_color_params[0]
     min_date, max_date, _ = _date_bounds(work_df)
     available_values = CalibrationAvailableValues(
         standards=standards_repo.standards_list(),
-        color_params=_candidate_color_columns(work_df),
+        color_params=available_color_params,
         z_axis_options=_candidate_z_columns(work_df),
         min_date=min_date,
         max_date=max_date,

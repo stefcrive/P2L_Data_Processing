@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useDeferredValue, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useDeferredValue, useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { PlotlyChart, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { Button } from "@/components/ui/button";
@@ -37,6 +37,10 @@ type SelectionSourceChart = {
   description: string;
   chartKey?: string;
   figure?: Record<string, unknown>;
+};
+type ColorScaleBounds = {
+  min: number;
+  max: number;
 };
 type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
 type LinearityOffsetDraftState = Record<LinearityOffsetField, string>;
@@ -124,6 +128,15 @@ function coerceVector(values: unknown): unknown[] | null {
     return values;
   }
   if (values && typeof values === "object") {
+    const encoded = values as { dtype?: unknown; bdata?: unknown };
+    if (typeof encoded.dtype === "string" && typeof encoded.bdata === "string") {
+      const decoded = decodeBinaryVector(encoded.dtype, encoded.bdata);
+      if (decoded) {
+        return decoded;
+      }
+    }
+  }
+  if (values && typeof values === "object") {
     const arrayLike = values as unknown as { [index: number]: unknown; length: number };
     if (ArrayBuffer.isView(values)) {
       return Array.from(arrayLike);
@@ -140,17 +153,114 @@ function coerceVector(values: unknown): unknown[] | null {
   return null;
 }
 
+function decodeBinaryVector(dtype: string, bdata: string): number[] | null {
+  if (typeof window === "undefined" || typeof window.atob !== "function") {
+    return null;
+  }
+  let binary: string;
+  try {
+    binary = window.atob(bdata);
+  } catch {
+    return null;
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const view = new DataView(bytes.buffer);
+  const littleEndian = true;
+  const values: number[] = [];
+  const pushNumbers = (size: number, reader: (offset: number) => number) => {
+    for (let offset = 0; offset + size <= view.byteLength; offset += size) {
+      values.push(reader(offset));
+    }
+  };
+  if (dtype === "f8") {
+    pushNumbers(8, (offset) => view.getFloat64(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "f4") {
+    pushNumbers(4, (offset) => view.getFloat32(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "i4") {
+    pushNumbers(4, (offset) => view.getInt32(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "u4") {
+    pushNumbers(4, (offset) => view.getUint32(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "i2") {
+    pushNumbers(2, (offset) => view.getInt16(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "u2") {
+    pushNumbers(2, (offset) => view.getUint16(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "i1") {
+    pushNumbers(1, (offset) => view.getInt8(offset));
+    return values;
+  }
+  if (dtype === "u1") {
+    pushNumbers(1, (offset) => view.getUint8(offset));
+    return values;
+  }
+  return null;
+}
+
+function coerceIndexedObjectToArray(value: unknown): unknown[] | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const numericKeys = Object.keys(record)
+    .filter((key) => /^\d+$/.test(key))
+    .map((key) => Number(key))
+    .sort((left, right) => left - right);
+  if (!numericKeys.length || !numericKeys.every((key, index) => key === index)) {
+    return null;
+  }
+  return numericKeys.map((key) => record[String(key)]);
+}
+
+function coercePointCustomDataArray(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  return coerceVector(value) ?? coerceIndexedObjectToArray(value);
+}
+
+function hasPointCustomDataPayload(value: unknown): boolean {
+  const customArray = coercePointCustomDataArray(value);
+  if (customArray && customArray.length > 0) {
+    return true;
+  }
+  if (value && typeof value === "object") {
+    const payload = value as Record<string, unknown>;
+    return "row_label" in payload || "rowLabel" in payload || "0" in payload;
+  }
+  return false;
+}
+
 function extractPointCustomData(point: PlotlyPoint): unknown {
-  if (point.customdata != null) {
+  if (point.customdata != null && hasPointCustomDataPayload(point.customdata)) {
     return point.customdata;
   }
   const payload = point as unknown as Record<string, unknown>;
-  const pointNumber = typeof payload.pointNumber === "number" ? payload.pointNumber : typeof payload.pointIndex === "number" ? payload.pointIndex : null;
+  const pointNumberRaw = payload.pointNumber ?? payload.pointIndex;
+  const pointNumber =
+    typeof pointNumberRaw === "number"
+      ? pointNumberRaw
+      : Array.isArray(pointNumberRaw) && typeof pointNumberRaw[0] === "number"
+        ? pointNumberRaw[0]
+        : null;
   if (pointNumber == null) {
     return null;
   }
   const dataCandidate = (payload.data ?? payload.fullData) as Record<string, unknown> | undefined;
-  const traceCustomdata = coerceVector(dataCandidate?.customdata);
+  const traceCustomdata = coercePointCustomDataArray(dataCandidate?.customdata);
   if (!traceCustomdata || pointNumber < 0 || pointNumber >= traceCustomdata.length) {
     return null;
   }
@@ -163,14 +273,24 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
   const inferredIsotope = inferIsotopeKeyFromChartKey(chartKey);
   for (const point of points) {
     const rawCustomdata = extractPointCustomData(point);
-    const customdata = Array.isArray(rawCustomdata) ? rawCustomdata : null;
+    const customdata = coercePointCustomDataArray(rawCustomdata);
     const customObj = rawCustomdata && typeof rawCustomdata === "object" ? (rawCustomdata as Record<string, unknown>) : null;
-    const hasArrayRowPayload = Boolean(customdata && customdata.length >= 4);
-    const hasObjectRowPayload = Boolean(customObj && ("row_label" in customObj || "rowLabel" in customObj));
-    if (!hasArrayRowPayload && !hasObjectRowPayload) {
+    const scalarRowLabel =
+      typeof rawCustomdata === "string" || typeof rawCustomdata === "number" ? String(rawCustomdata).trim() : "";
+    const hasArrayRowPayload = Boolean(customdata && customdata.length >= 1);
+    const hasObjectRowPayload = Boolean(customObj && ("row_label" in customObj || "rowLabel" in customObj || "0" in customObj));
+    if (!hasArrayRowPayload && !hasObjectRowPayload && !scalarRowLabel) {
       continue;
     }
-    const rowLabel = String(customdata?.[0] ?? customObj?.row_label ?? customObj?.rowLabel ?? "").trim();
+    const pointPayload = point as unknown as Record<string, unknown>;
+    const rowLabel = String(
+      customdata?.[0] ??
+        customObj?.row_label ??
+        customObj?.rowLabel ??
+        scalarRowLabel ??
+        pointPayload.id ??
+        "",
+    ).trim();
     const isotopeKey = normalizeIsotopeKey(customdata?.[1] ?? customObj?.isotope_key ?? customObj?.isotopeKey) ?? inferredIsotope;
     const identifier1 = String(customdata?.[2] ?? customObj?.identifier_1 ?? customObj?.identifier1 ?? "").trim();
     const identifier2 = String(customdata?.[3] ?? customObj?.identifier_2 ?? customObj?.identifier2 ?? "").trim();
@@ -728,6 +848,266 @@ function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ lab
       return null;
     })
     .filter((item): item is { label: string; value: string } => item != null);
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function parseFinite(value: string, fallback: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function RangeSliderField({
+  label,
+  value,
+  min,
+  max,
+  step = 0.1,
+  precision = 2,
+  onChange,
+}: {
+  label: string;
+  value: [number, number];
+  min: number;
+  max: number;
+  step?: number;
+  precision?: number;
+  onChange: (next: [number, number]) => void;
+}) {
+  const resolvedMin = Math.min(min, max);
+  const resolvedMax = Math.max(min, max);
+  const low = clampNumber(Math.min(value[0], value[1]), resolvedMin, resolvedMax);
+  const high = clampNumber(Math.max(value[0], value[1]), resolvedMin, resolvedMax);
+
+  return (
+    <div className="rounded-lg border border-stone-200 bg-white p-3 text-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-medium text-stone-700">{label}</span>
+        <span className="text-xs text-stone-500">
+          {low.toFixed(precision)} to {high.toFixed(precision)}
+        </span>
+      </div>
+      <div className="mt-3 space-y-2">
+        <label className="block text-xs text-stone-600">
+          Min
+          <input
+            type="range"
+            min={resolvedMin}
+            max={resolvedMax}
+            step={step}
+            value={low}
+            onInput={(event) => {
+              const nextLow = parseFinite(event.currentTarget.value, low);
+              onChange([Math.min(nextLow, high), high]);
+            }}
+            className="mt-1 w-full accent-stone-700"
+          />
+        </label>
+        <label className="block text-xs text-stone-600">
+          Max
+          <input
+            type="range"
+            min={resolvedMin}
+            max={resolvedMax}
+            step={step}
+            value={high}
+            onInput={(event) => {
+              const nextHigh = parseFinite(event.currentTarget.value, high);
+              onChange([low, Math.max(nextHigh, low)]);
+            }}
+            className="mt-1 w-full accent-stone-700"
+          />
+        </label>
+      </div>
+      <div className="mt-2 flex items-center justify-between text-[11px] text-stone-400">
+        <span>{resolvedMin.toFixed(precision)}</span>
+        <span>{resolvedMax.toFixed(precision)}</span>
+      </div>
+    </div>
+  );
+}
+
+function collectNumericColorValues(figure?: Record<string, unknown>): number[] {
+  if (!figure) {
+    return [];
+  }
+  const traces = Array.isArray((figure as FigureShape).data) ? ((figure as FigureShape).data as Array<Record<string, unknown>>) : [];
+  const values: number[] = [];
+  for (const trace of traces) {
+    const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : null;
+    if (!marker) {
+      continue;
+    }
+    const colorVector = coerceVector(marker.color);
+    if (!colorVector) {
+      continue;
+    }
+    for (const item of colorVector) {
+      const numericValue = toFiniteNumber(item);
+      if (numericValue != null) {
+        values.push(numericValue);
+      }
+    }
+  }
+  return values;
+}
+
+function deriveColorScaleBounds(figures: Array<Record<string, unknown> | undefined>): ColorScaleBounds | null {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const figure of figures) {
+    if (!figure) {
+      continue;
+    }
+    for (const value of collectNumericColorValues(figure)) {
+      if (value < min) {
+        min = value;
+      }
+      if (value > max) {
+        max = value;
+      }
+    }
+    const traces = Array.isArray((figure as FigureShape).data) ? ((figure as FigureShape).data as Array<Record<string, unknown>>) : [];
+    for (const trace of traces) {
+      const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : null;
+      const markerMin = marker ? toFiniteNumber(marker.cmin) : null;
+      const markerMax = marker ? toFiniteNumber(marker.cmax) : null;
+      if (markerMin != null) {
+        min = Math.min(min, markerMin);
+      }
+      if (markerMax != null) {
+        max = Math.max(max, markerMax);
+      }
+    }
+    const layout = (figure as FigureShape).layout ?? {};
+    for (const key of Object.keys(layout)) {
+      if (!key.toLowerCase().startsWith("coloraxis")) {
+        continue;
+      }
+      const axis = layout[key];
+      if (!axis || typeof axis !== "object") {
+        continue;
+      }
+      const axisMin = toFiniteNumber((axis as Record<string, unknown>).cmin);
+      const axisMax = toFiniteNumber((axis as Record<string, unknown>).cmax);
+      if (axisMin != null) {
+        min = Math.min(min, axisMin);
+      }
+      if (axisMax != null) {
+        max = Math.max(max, axisMax);
+      }
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    return null;
+  }
+  if (min === max) {
+    const pad = Math.max(Math.abs(min) * 0.01, 0.001);
+    return { min: min - pad, max: max + pad };
+  }
+  return { min, max };
+}
+
+function normalizeColorScaleRange(range: [number, number], bounds: ColorScaleBounds): [number, number] {
+  const low = clampNumber(Math.min(range[0], range[1]), bounds.min, bounds.max);
+  const high = clampNumber(Math.max(range[0], range[1]), bounds.min, bounds.max);
+  return [Math.min(low, high), Math.max(low, high)];
+}
+
+function sliderPrecision(bounds: ColorScaleBounds): number {
+  const span = Math.abs(bounds.max - bounds.min);
+  if (span >= 1000) {
+    return 0;
+  }
+  if (span >= 100) {
+    return 1;
+  }
+  if (span >= 10) {
+    return 2;
+  }
+  return 3;
+}
+
+function sliderStep(bounds: ColorScaleBounds): number {
+  const span = Math.abs(bounds.max - bounds.min);
+  if (!Number.isFinite(span) || span <= 0) {
+    return 0.001;
+  }
+  const step = span / 400;
+  if (step >= 1) {
+    return Math.round(step);
+  }
+  if (step >= 0.1) {
+    return Number(step.toFixed(2));
+  }
+  if (step >= 0.01) {
+    return Number(step.toFixed(3));
+  }
+  return Number(step.toFixed(4));
+}
+
+function applyColorScaleRangeToFigure(
+  figure: Record<string, unknown> | undefined,
+  range: [number, number] | null,
+): Record<string, unknown> | undefined {
+  if (!figure || !range) {
+    return figure;
+  }
+  const [cmin, cmax] = [Math.min(range[0], range[1]), Math.max(range[0], range[1])];
+  const cloned = cloneFigure(figure);
+  let hasColorMapping = false;
+  const nextData = cloned.data.map((trace) => {
+    const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : null;
+    if (!marker) {
+      return trace;
+    }
+    const colorVector = coerceVector(marker.color);
+    const hasNumericVector = Boolean(colorVector && colorVector.some((value) => toFiniteNumber(value) != null));
+    const hasNumericBounds = toFiniteNumber(marker.cmin) != null || toFiniteNumber(marker.cmax) != null;
+    if (!hasNumericVector && !hasNumericBounds) {
+      return trace;
+    }
+    hasColorMapping = true;
+    return {
+      ...trace,
+      marker: {
+        ...marker,
+        cauto: false,
+        cmin,
+        cmax,
+      },
+    };
+  });
+  let nextLayout: Record<string, unknown> = cloned.layout;
+  for (const key of Object.keys(cloned.layout)) {
+    if (!key.toLowerCase().startsWith("coloraxis")) {
+      continue;
+    }
+    const axis = cloned.layout[key];
+    if (!axis || typeof axis !== "object") {
+      continue;
+    }
+    hasColorMapping = true;
+    nextLayout = {
+      ...nextLayout,
+      [key]: {
+        ...(axis as Record<string, unknown>),
+        cauto: false,
+        cmin,
+        cmax,
+      },
+    };
+  }
+  if (!hasColorMapping) {
+    return figure;
+  }
+  return {
+    ...cloned,
+    data: nextData,
+    layout: nextLayout,
+  };
 }
 
 function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> }) {
@@ -1302,6 +1682,8 @@ export default function CalibrationPage() {
   const [linearityTargetIntensity, setLinearityTargetIntensity] = useState(15);
   const [setValueHighlightNonce, setSetValueHighlightNonce] = useState(0);
   const [isSetValueInputHighlighted, setIsSetValueInputHighlighted] = useState(false);
+  const [colorScaleRange, setColorScaleRange] = useState<[number, number] | null>(null);
+  const [colorScaleRangeParam, setColorScaleRangeParam] = useState<string | null>(null);
   const [linearityOffsetDrafts, setLinearityOffsetDrafts] = useState<LinearityOffsetDraftState>({
     line_1_offset_d13: "0",
     line_1_offset_d18: "0",
@@ -1517,6 +1899,51 @@ export default function CalibrationPage() {
     queryFn: () => api.previewCalibrationWorkspace(sessionId!, deferredConfig!),
     enabled: Boolean(sessionId && deferredConfig),
   });
+  const previewWorkspace = previewQuery.data as CalibrationWorkspace | undefined;
+  const persistedWorkspace = workspaceQuery.data as CalibrationWorkspace | undefined;
+  const workspaceForColorScale = previewWorkspace ?? persistedWorkspace;
+  const activeColorParam = config?.color_param ?? workspaceForColorScale?.config.color_param ?? null;
+  const colorScaleBounds = useMemo(() => {
+    if (!workspaceForColorScale) {
+      return null;
+    }
+    const figures: Array<Record<string, unknown> | undefined> = [
+      workspaceForColorScale.figures["VPDB(13C)"],
+      workspaceForColorScale.figures["VSMOW(18O)"],
+      workspaceForColorScale.figures.calibration_3d,
+      workspaceForColorScale.figures.crossplot,
+      workspaceForColorScale.linearity_figures.d13_raw,
+      workspaceForColorScale.linearity_figures.d13_corrected,
+      workspaceForColorScale.linearity_figures.d18_raw,
+      workspaceForColorScale.linearity_figures.d18_corrected,
+    ];
+    for (const section of workspaceForColorScale.standard_sections) {
+      figures.push(section.d13_figure, section.d18_figure);
+    }
+    return deriveColorScaleBounds(figures);
+  }, [workspaceForColorScale]);
+
+  useEffect(() => {
+    if (!activeColorParam) {
+      return;
+    }
+    const bounds = colorScaleBounds ?? { min: 0, max: 1 };
+    const fullRange: [number, number] = [bounds.min, bounds.max];
+    const parameterChanged = colorScaleRangeParam !== activeColorParam;
+    setColorScaleRange((current) => {
+      if (!current || parameterChanged) {
+        return fullRange;
+      }
+      const normalized = normalizeColorScaleRange(current, bounds);
+      if (normalized[0] === current[0] && normalized[1] === current[1]) {
+        return current;
+      }
+      return normalized;
+    });
+    if (parameterChanged) {
+      setColorScaleRangeParam(activeColorParam);
+    }
+  }, [activeColorParam, colorScaleBounds, colorScaleRangeParam]);
 
   const runMutation = useMutation({
     mutationFn: (payload: CalibrationConfig) => api.runCalibration(sessionId!, payload),
@@ -1952,13 +2379,20 @@ export default function CalibrationPage() {
     return <div className="text-sm text-red-600">Failed to load calibration workspace.</div>;
   }
 
-  const workspace = workspaceQuery.data as CalibrationWorkspace | undefined;
+  const workspace = persistedWorkspace;
   const activeConfig = config ?? workspace?.config ?? null;
-  const displayedWorkspace = (previewQuery.data as CalibrationWorkspace | undefined) ?? workspace;
+  const displayedWorkspace = workspaceForColorScale;
 
   if (!workspace || !activeConfig || !displayedWorkspace) {
     return null;
   }
+  const colorSliderBounds: ColorScaleBounds = colorScaleBounds ?? { min: 0, max: 1 };
+  const effectiveColorScaleRange = normalizeColorScaleRange(
+    colorScaleRange ?? [colorSliderBounds.min, colorSliderBounds.max],
+    colorSliderBounds,
+  );
+  const withColorScaleRange = (figure: Record<string, unknown> | undefined) =>
+    applyColorScaleRangeToFigure(figure, effectiveColorScaleRange);
 
   const minDate = displayedWorkspace.available_values.min_date ?? undefined;
   const maxDate = displayedWorkspace.available_values.max_date ?? undefined;
@@ -2029,49 +2463,49 @@ export default function CalibrationPage() {
         title: "d13C Calibration",
         description: "Source chart for current selection.",
         chartKey: "VPDB(13C)",
-        figure: displayedWorkspace.figures["VPDB(13C)"],
+        figure: withColorScaleRange(displayedWorkspace.figures["VPDB(13C)"]),
       },
       "VSMOW(18O)": {
         title: "d18O Calibration",
         description: "Source chart for current selection.",
         chartKey: "VSMOW(18O)",
-        figure: displayedWorkspace.figures["VSMOW(18O)"],
+        figure: withColorScaleRange(displayedWorkspace.figures["VSMOW(18O)"]),
       },
       calibration_3d: {
         title: "Calibration 3D Chart",
         description: "Source chart for current selection.",
         chartKey: "calibration_3d",
-        figure: displayedWorkspace.figures.calibration_3d,
+        figure: withColorScaleRange(displayedWorkspace.figures.calibration_3d),
       },
       crossplot: {
         title: "Calibration Crossplot",
         description: "Source chart for current selection.",
         chartKey: "crossplot",
-        figure: displayedWorkspace.figures.crossplot,
+        figure: withColorScaleRange(displayedWorkspace.figures.crossplot),
       },
       "linearity|d13_raw": {
         title: "Linearity d13C Raw",
         description: "Source chart for current selection.",
         chartKey: "linearity|d13_raw",
-        figure: displayedWorkspace.linearity_figures.d13_raw,
+        figure: withColorScaleRange(displayedWorkspace.linearity_figures.d13_raw),
       },
       "linearity|d13_corrected": {
         title: "Linearity d13C Corrected",
         description: "Source chart for current selection.",
         chartKey: "linearity|d13_corrected",
-        figure: displayedWorkspace.linearity_figures.d13_corrected,
+        figure: withColorScaleRange(displayedWorkspace.linearity_figures.d13_corrected),
       },
       "linearity|d18_raw": {
         title: "Linearity d18O Raw",
         description: "Source chart for current selection.",
         chartKey: "linearity|d18_raw",
-        figure: displayedWorkspace.linearity_figures.d18_raw,
+        figure: withColorScaleRange(displayedWorkspace.linearity_figures.d18_raw),
       },
       "linearity|d18_corrected": {
         title: "Linearity d18O Corrected",
         description: "Source chart for current selection.",
         chartKey: "linearity|d18_corrected",
-        figure: displayedWorkspace.linearity_figures.d18_corrected,
+        figure: withColorScaleRange(displayedWorkspace.linearity_figures.d18_corrected),
       },
     };
     if (figureMap[chartKey]) {
@@ -2090,7 +2524,7 @@ export default function CalibrationPage() {
     if (!section) {
       return null;
     }
-    const figure = standardSuffix === "d13C" ? section.d13_figure : section.d18_figure;
+    const figure = standardSuffix === "d13C" ? withColorScaleRange(section.d13_figure) : withColorScaleRange(section.d18_figure);
     return {
       title: `${standardName} ${standardSuffix} Outlier Trace`,
       description: "Source chart for current selection.",
@@ -2626,20 +3060,33 @@ export default function CalibrationPage() {
               />
 
               <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-2">
-                <label className="form-field">
+                <div className="form-field">
                   <span className="form-label">Color parameter</span>
                   <select
                     value={activeConfig.color_param}
                     onChange={(event) => updateConfig("color_param", event.target.value)}
                     className="form-control"
                   >
-                    {displayedWorkspace.available_values.color_params.map((option) => (
+                    {displayedWorkspace.available_values.color_params
+                      .filter((option) => option !== "Date_ordinal")
+                      .map((option) => (
                       <option key={option} value={option}>
                         {option}
                       </option>
                     ))}
                   </select>
-                </label>
+                  <div className="mt-2">
+                    <RangeSliderField
+                      label="Color scale interval"
+                      value={effectiveColorScaleRange}
+                      min={colorSliderBounds.min}
+                      max={colorSliderBounds.max}
+                      step={sliderStep(colorSliderBounds)}
+                      precision={sliderPrecision(colorSliderBounds)}
+                      onChange={(nextRange) => setColorScaleRange(nextRange)}
+                    />
+                  </div>
+                </div>
                 <label className="form-field">
                   <span className="form-label">3D Z axis</span>
                   <select
@@ -3031,7 +3478,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent className="min-w-0 overflow-hidden">
                     <PlotlyChart
-                      figure={displayedWorkspace.figures["VPDB(13C)"]}
+                      figure={withColorScaleRange(displayedWorkspace.figures["VPDB(13C)"])}
                       className="aspect-square w-full"
                       onPointClick={(points) => openProcessingSelectionEditor("VPDB(13C)", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("VPDB(13C)", points, true)}
@@ -3044,7 +3491,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent className="min-w-0 overflow-hidden">
                     <PlotlyChart
-                      figure={displayedWorkspace.figures["VSMOW(18O)"]}
+                      figure={withColorScaleRange(displayedWorkspace.figures["VSMOW(18O)"])}
                       className="aspect-square w-full"
                       onPointClick={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, true)}
@@ -3061,7 +3508,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent>
                     <PlotlyChart
-                      figure={displayedWorkspace.figures.calibration_3d}
+                      figure={withColorScaleRange(displayedWorkspace.figures.calibration_3d)}
                       className="min-h-[520px] xl:aspect-square"
                       onPointClick={(points) => openProcessingSelectionEditor("calibration_3d", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("calibration_3d", points, true)}
@@ -3075,7 +3522,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent>
                     <PlotlyChart
-                      figure={displayedWorkspace.figures.crossplot}
+                      figure={withColorScaleRange(displayedWorkspace.figures.crossplot)}
                       className="min-h-[520px] xl:aspect-square"
                       onPointClick={(points) => openProcessingSelectionEditor("crossplot", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("crossplot", points, true)}
@@ -3098,25 +3545,25 @@ export default function CalibrationPage() {
                 </CardHeader>
                 <CardContent className="grid gap-6 2xl:grid-cols-2">
                   <PlotlyChart
-                    figure={displayedWorkspace.linearity_figures.d13_raw}
+                    figure={withColorScaleRange(displayedWorkspace.linearity_figures.d13_raw)}
                     className="min-h-[440px]"
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, true)}
                   />
                   <PlotlyChart
-                    figure={displayedWorkspace.linearity_figures.d13_corrected}
+                    figure={withColorScaleRange(displayedWorkspace.linearity_figures.d13_corrected)}
                     className="min-h-[440px]"
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, true)}
                   />
                   <PlotlyChart
-                    figure={displayedWorkspace.linearity_figures.d18_raw}
+                    figure={withColorScaleRange(displayedWorkspace.linearity_figures.d18_raw)}
                     className="min-h-[440px]"
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, true)}
                   />
                   <PlotlyChart
-                    figure={displayedWorkspace.linearity_figures.d18_corrected}
+                    figure={withColorScaleRange(displayedWorkspace.linearity_figures.d18_corrected)}
                     className="min-h-[440px]"
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, true)}
@@ -3136,7 +3583,7 @@ export default function CalibrationPage() {
                           </CardHeader>
                           <CardContent>
                             <PlotlyChart
-                              figure={section.d13_figure}
+                              figure={withColorScaleRange(section.d13_figure)}
                               className="min-h-[340px]"
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, false)}
                               onSelection={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, true)}
@@ -3149,7 +3596,7 @@ export default function CalibrationPage() {
                           </CardHeader>
                           <CardContent>
                             <PlotlyChart
-                              figure={section.d18_figure}
+                              figure={withColorScaleRange(section.d18_figure)}
                               className="min-h-[340px]"
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, false)}
                               onSelection={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, true)}
