@@ -200,6 +200,22 @@ def _build_interpolation_source_frame(
     if working_df.empty:
         return working_df
 
+    def _source_to_raw_offset_with_missing_fill(raw_col: str) -> pd.Series:
+        if raw_col not in working_df.columns or raw_col not in df.columns:
+            return pd.Series(np.nan, index=working_df.index, dtype=float)
+        raw_values = pd.to_numeric(df[raw_col], errors="coerce").reindex(working_df.index)
+        source_values = pd.to_numeric(working_df[raw_col], errors="coerce").reindex(working_df.index)
+        offsets = pd.to_numeric(source_values - raw_values, errors="coerce")
+        missing_raw = raw_values.isna()
+        if bool(missing_raw.any()):
+            probe_df = df.copy()
+            probe_df.loc[missing_raw, raw_col] = 0.0
+            probe_working = _derive_working_frame(probe_df, config, calibration_meta=calibration_meta, edit_state=edit_state)
+            if raw_col in probe_working.columns:
+                probe_source = pd.to_numeric(probe_working[raw_col], errors="coerce").reindex(working_df.index)
+                offsets.loc[missing_raw] = probe_source.loc[missing_raw]
+        return offsets
+
     range_config = RangeConfig(
         signal_range=config.signal_range,
         leak_range=config.leak_range,
@@ -244,12 +260,13 @@ def _build_interpolation_source_frame(
     if "d 18O/16O  Mean" in source_df.columns:
         d18_excluded = (excluded_common | stat_mask_d18.reindex(source_df.index, fill_value=False).astype(bool)) & ~target_mask
         source_df.loc[d18_excluded, "d 18O/16O  Mean"] = np.nan
+    source_df["__source_to_raw_offset_d13C__"] = _source_to_raw_offset_with_missing_fill("d 13C/12C  Mean")
+    source_df["__source_to_raw_offset_d18O__"] = _source_to_raw_offset_with_missing_fill("d 18O/16O  Mean")
     return source_df
 
 
 def _candidate_diagnostics_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
-        "Date_ordinal",
         "Date",
         "Identifier 1",
         "Identifier 2",
@@ -806,7 +823,7 @@ def discard_session(session_id: str) -> dict[str, Any]:
 @app.get("/sessions/{session_id}/diagnostics", response_model=ChartBundle)
 def diagnostics(
     session_id: str,
-    color_param: str = Query("Date_ordinal"),
+    color_param: str = Query("Date"),
     z_axis: str | None = Query(None),
     identifier_filter: list[str] = Query([]),
     d13_min: float | None = Query(None),
@@ -818,7 +835,7 @@ def diagnostics(
     df = store.load_frame(session_id)
     available_color_params = _candidate_diagnostics_color_columns(df)
     available_z_axes = _candidate_diagnostics_z_columns(df)
-    if color_param not in df.columns and available_color_params:
+    if available_color_params and color_param not in available_color_params:
         color_param = available_color_params[0]
     if z_axis not in available_z_axes:
         if "1  Cycle Int  Diff Samp-Ref  44" in available_z_axes:
@@ -1128,7 +1145,7 @@ def calibration_workspace_preview(session_id: str, config: CalibrationConfig) ->
 
 
 @app.get("/sessions/{session_id}/calibration/charts", response_model=ChartBundle)
-def calibration_charts(session_id: str, color_param: str = Query("Date_ordinal")) -> ChartBundle:
+def calibration_charts(session_id: str, color_param: str = Query("Date")) -> ChartBundle:
     _session_exists_or_404(session_id)
     workspace = build_calibration_workspace(
         session_id=session_id,

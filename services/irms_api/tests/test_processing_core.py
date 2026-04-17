@@ -145,6 +145,31 @@ class ProcessingCoreTests(unittest.TestCase):
         # True linear interpolation at x=20 between x=10 (1.0) and x=40 (5.0): 1 + (10/30)*4.
         self.assertAlmostEqual(float(interpolated), 2.3333333333, places=6)
 
+    def test_interpolate_single_target_prefers_distinct_identifier2_neighbors(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["A", "A", "A", "A", "A"],
+                "Identifier 2": [20, 21, 22, 22, 23],
+                "d 13C/12C  Mean": [0.5, 2.3, 2.2, np.nan, -0.2],
+            }
+        )
+        interpolated = _interpolate_single_target_within_identifier_group(df, row_label=3, col="d 13C/12C  Mean")
+        self.assertIsNotNone(interpolated)
+        # Use x=21 and x=23 as neighbors (not the duplicate x=22 value), so midpoint is (2.3 + -0.2)/2 = 1.05.
+        self.assertAlmostEqual(float(interpolated), 1.05, places=6)
+
+    def test_interpolate_single_target_does_not_fallback_to_row_position_when_identifier2_missing(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["A", "A", "A"],
+                "Identifier 2": [10, "bad-token", 40],
+                "d 13C/12C  Mean": [1.0, np.nan, 5.0],
+            }
+        )
+        interpolated = _interpolate_single_target_within_identifier_group(df, row_label=1, col="d 13C/12C  Mean")
+        # Identifier 2 is not numeric for the target row; do not use row-index spacing fallback.
+        self.assertIsNone(interpolated)
+
     def test_apply_edit_action_interpolate_uses_identifier_spacing(self) -> None:
         df = pd.DataFrame(
             {
@@ -276,6 +301,32 @@ class ProcessingCoreTests(unittest.TestCase):
         # Interpolation is computed from the source-domain values and mapped back to persisted raw.
         self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 2.0, places=6)
 
+    def test_apply_edit_action_interpolate_missing_target_interpolates_source_to_raw_offset(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["A", "A", "A"],
+                "Identifier 2": [1, 2, 3],
+                "Collector Status": ["", "Failed Sample", ""],
+                "d 13C/12C  Mean": [10.0, np.nan, 30.0],
+                "d 18O/16O  Mean": [2.0, np.nan, 6.0],
+            }
+        )
+        display_source = df.copy()
+        # Simulate processing/display-domain values where source->raw offsets differ by row.
+        display_source["d 13C/12C  Mean"] = [12.0, np.nan, 38.0]
+        edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        updated_df, _ = apply_edit_action(
+            df,
+            edit_state,
+            EditAction(action="interpolate", targets=[{"row_label": "1", "isotope_key": "d13C"}]),
+            interpolation_source_df=display_source,
+        )
+
+        # Source-domain interpolation at Identifier2=2 is 25.0.
+        # Interpolated source->raw offset at the target is 5.0, so persisted raw should be 20.0.
+        self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 20.0, places=6)
+
     def test_apply_edit_action_interpolate_does_not_change_other_isotope(self) -> None:
         df = pd.DataFrame(
             {
@@ -402,6 +453,178 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertNotIn("Restored Samples", d13_trace_names)
         self.assertNotIn("Restored Samples", d18_trace_names)
 
+    def test_restored_rows_stay_in_raw_traces_even_if_statistical_outliers(self) -> None:
+        df = sample_processing_df().copy()
+        df["Identifier 1"] = "SampleA"
+        df["Species"] = "Coral"
+        df["Identifier 2"] = ["1", "2", "3", "4"]
+        df["Collector Status"] = ""
+        df["d 13C/12C  Mean"] = [1.0, 1.0, 1.0, 100.0]
+        df["d 18O/16O  Mean"] = [2.0, 2.0, 2.0, 2.0]
+        df["d13C_calibrated"] = [1.5, 1.5, 1.5, 100.5]
+        df["d18O_calibrated"] = [2.5, 2.5, 2.5, 2.5]
+        df["d13C_calibrated_linearity_corrected"] = [1.4, 1.4, 1.4, 100.4]
+        df["d18O_calibrated_linearity_corrected"] = [2.4, 2.4, 2.4, 2.4]
+
+        metadata = {
+            "processing": {
+                "config": {
+                    "selected_identifier": "SampleA",
+                    "x_axis_option": "By Identifier 2",
+                    "color_param": "Date_ordinal",
+                    "z_axis": "1  Cycle Int  Samp  44",
+                    "signal_range": [0.0, 50.0],
+                    "leak_range": [0.0, 1000.0],
+                    "d13c_range": [-200.0, 200.0],
+                    "d18o_range": [-200.0, 200.0],
+                    "sigma_level_data": 1.0,
+                    "overlays": {
+                        "show_statistical_outliers": True,
+                        "show_range_outliers": False,
+                        "show_manual_outliers": False,
+                        "show_saturated_collectors": False,
+                        "show_saturated_samples": False,
+                        "show_failed_samples": False,
+                    },
+                    "manual_linearity_override": {
+                        "enabled": False,
+                        "d13_per_10v": 0.0,
+                        "d18_per_10v": 0.0,
+                    },
+                    "export": {
+                        "include_outliers": False,
+                        "selected_ids": ["All"],
+                        "interpolate_outliers": False,
+                        "client_name": None,
+                        "comment_map": {},
+                    },
+                }
+            },
+            "edit_state": {
+                "edited_rows": ["3"],
+                "original_delta_values": {},
+                "original_missing_delta_tokens": ["d13C|3", "d18O|3"],
+                "manual_outlier_overrides": {},
+                "restored_delta_tokens": ["d13C|3", "d18O|3"],
+            },
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
+
+        overview_raw = next(
+            (
+                trace
+                for trace in (workspace.overview_figures.get("d13_summary", {}).get("data", []) or [])
+                if str(trace.get("name", "")).startswith("Raw d13C")
+            ),
+            None,
+        )
+        self.assertIsNotNone(overview_raw)
+        overview_raw_ids = [
+            str(item[3])
+            for item in ((overview_raw or {}).get("customdata") or [])
+            if isinstance(item, (list, tuple)) and len(item) > 3
+        ]
+        self.assertIn("4", overview_raw_ids)
+
+        shell_section = next((section for section in workspace.species_sections if section.species == "Coral"), None)
+        self.assertIsNotNone(shell_section)
+        figure_set = next((item for item in (shell_section.identifier_figures if shell_section else []) if item.identifier == "SampleA"), None)
+        self.assertIsNotNone(figure_set)
+        identifier_raw = next(
+            (
+                trace
+                for trace in (figure_set.d13c.get("data", []) if figure_set else [])
+                if str(trace.get("name", "")).startswith("Raw d13C")
+            ),
+            None,
+        )
+        self.assertIsNotNone(identifier_raw)
+        identifier_raw_ids = [
+            str(item[3])
+            for item in ((identifier_raw or {}).get("customdata") or [])
+            if isinstance(item, (list, tuple)) and len(item) > 3
+        ]
+        self.assertIn("4", identifier_raw_ids)
+
+    def test_restored_rows_stay_in_raw_traces_even_if_range_outliers(self) -> None:
+        df = sample_processing_df().copy()
+        df["Identifier 1"] = "SampleA"
+        df["Species"] = "Coral"
+        df["Identifier 2"] = ["1", "2", "3", "4"]
+        df["Collector Status"] = ""
+        df["d 13C/12C  Mean"] = [1.0, 1.1, 1.2, 2.8]
+        df["d 18O/16O  Mean"] = [2.0, 2.1, 2.2, 3.5]
+        # Force row "4" outside leak range, but keep it marked as restored.
+        df["leak_rate"] = [5.0, 5.0, 5.0, 999.0]
+
+        metadata = {
+            "processing": {
+                "config": {
+                    "selected_identifier": "SampleA",
+                    "x_axis_option": "By Identifier 2",
+                    "color_param": "Date_ordinal",
+                    "z_axis": "1  Cycle Int  Samp  44",
+                    "signal_range": [0.0, 50.0],
+                    "leak_range": [0.0, 100.0],
+                    "d13c_range": [-200.0, 200.0],
+                    "d18o_range": [-200.0, 200.0],
+                    "sigma_level_data": 4.0,
+                    "overlays": {
+                        "show_statistical_outliers": True,
+                        "show_range_outliers": True,
+                        "show_manual_outliers": False,
+                        "show_saturated_collectors": False,
+                        "show_saturated_samples": False,
+                        "show_failed_samples": False,
+                    },
+                    "manual_linearity_override": {
+                        "enabled": False,
+                        "d13_per_10v": 0.0,
+                        "d18_per_10v": 0.0,
+                    },
+                    "export": {
+                        "include_outliers": False,
+                        "selected_ids": ["All"],
+                        "interpolate_outliers": False,
+                        "client_name": None,
+                        "comment_map": {},
+                    },
+                }
+            },
+            "edit_state": {
+                "edited_rows": ["3"],
+                "original_delta_values": {},
+                "original_missing_delta_tokens": ["d13C|3", "d18O|3"],
+                "manual_outlier_overrides": {},
+                "restored_delta_tokens": ["d13C|3", "d18O|3"],
+            },
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
+
+        shell_section = next((section for section in workspace.species_sections if section.species == "Coral"), None)
+        self.assertIsNotNone(shell_section)
+        figure_set = next((item for item in (shell_section.identifier_figures if shell_section else []) if item.identifier == "SampleA"), None)
+        self.assertIsNotNone(figure_set)
+        identifier_raw = next(
+            (
+                trace
+                for trace in (figure_set.d13c.get("data", []) if figure_set else [])
+                if str(trace.get("name", "")).startswith("Raw d13C")
+            ),
+            None,
+        )
+        self.assertIsNotNone(identifier_raw)
+        identifier_raw_ids = [
+            str(item[3])
+            for item in ((identifier_raw or {}).get("customdata") or [])
+            if isinstance(item, (list, tuple)) and len(item) > 3
+        ]
+        self.assertIn("4", identifier_raw_ids)
+
     def test_apply_edit_action_set_value_and_reset(self) -> None:
         df = sample_processing_df()
         edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
@@ -470,6 +693,66 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(updated_df.loc[3, "d 13C/12C  Mean"]), 50.0)
         self.assertIn("1", updated_state["edited_rows"])
         self.assertEqual(updated_state["original_delta_values"]["d13C|1"], 99.0)
+
+    def test_apply_edit_action_interpolate_scopes_to_species_within_identifier(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["A", "A", "A", "A", "A", "A"],
+                "Species": ["Uvigerina", "Uvigerina", "Uvigerina", "Other", "Other", "Other"],
+                "Identifier 2": [1, 2, 3, 1, 2, 3],
+                "d 13C/12C  Mean": [1.0, np.nan, 3.0, -10.0, 999.0, -20.0],
+                "d 18O/16O  Mean": [2.0, np.nan, 4.0, 5.0, 6.0, 7.0],
+            }
+        )
+        edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        updated_df, _ = apply_edit_action(
+            df,
+            edit_state,
+            EditAction(action="interpolate", targets=[{"row_label": "1", "isotope_key": "d13C"}]),
+        )
+
+        # Should interpolate from Uvigerina neighbors (1.0 -> 3.0), not from "Other" species values.
+        self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 2.0, places=6)
+
+    def test_apply_edit_action_interpolate_prefers_distinct_identifier2_neighbors(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["A", "A", "A", "A", "A"],
+                "Identifier 2": [20, 21, 22, 22, 23],
+                "d 13C/12C  Mean": [0.5, 2.3, 2.2, np.nan, -0.2],
+                "d 18O/16O  Mean": [2.0, 2.1, 2.2, np.nan, 2.4],
+            }
+        )
+        edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        updated_df, _ = apply_edit_action(
+            df,
+            edit_state,
+            EditAction(action="interpolate", targets=[{"row_label": "3", "isotope_key": "d13C"}]),
+        )
+
+        self.assertAlmostEqual(float(updated_df.loc[3, "d 13C/12C  Mean"]), 1.05, places=6)
+
+    def test_apply_edit_action_interpolate_no_update_when_target_identifier2_not_numeric(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["A", "A", "A"],
+                "Species": ["Uvigerina", "Uvigerina", "Uvigerina"],
+                "Identifier 2": [10, "bad-token", 40],
+                "d 13C/12C  Mean": [1.0, np.nan, 5.0],
+                "d 18O/16O  Mean": [2.0, np.nan, 6.0],
+            }
+        )
+        edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        updated_df, _ = apply_edit_action(
+            df,
+            edit_state,
+            EditAction(action="interpolate", targets=[{"row_label": "1", "isotope_key": "d13C"}]),
+        )
+
+        self.assertTrue(pd.isna(updated_df.loc[1, "d 13C/12C  Mean"]))
 
     def test_apply_edit_action_interpolate_multi_target_excludes_selected_neighbors(self) -> None:
         df = pd.DataFrame(
@@ -661,6 +944,72 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.025, places=6)
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 50.0, places=6)
         self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 2.0, places=6)
+
+    def test_calibration_manual_linearity_override_is_applied_in_processing_working_frame(self) -> None:
+        df = sample_processing_df().copy()
+        df["d 13C/12C  Mean"] = [1.0, 1.0, 1.0, 1.0]
+        df["1  Cycle Int  Samp  44"] = [10.0, 20.0, 30.0, 20.0]
+        config = normalize_processing_config(
+            {
+                "manual_linearity_override": {
+                    "enabled": False,
+                    "use_diff_intensity": False,
+                    "d13_per_10v": 0.0,
+                    "d18_per_10v": 0.0,
+                }
+            }
+        )
+        calibration_meta = {
+            "config": {
+                "linearity": {
+                    "apply": False,
+                    "use_diff_intensity": False,
+                    "manual_override_enabled": True,
+                    "manual_d13_per_10v": 1.0,
+                    "manual_d18_per_10v": 0.0,
+                }
+            },
+            "linearity_fits": {},
+        }
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
+
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 2.0, places=6)
+        self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 0.0, places=6)
+
+    def test_processing_manual_linearity_override_runs_as_second_pass_after_calibration_manual_stage(self) -> None:
+        df = sample_processing_df().copy()
+        df["d 13C/12C  Mean"] = [1.0, 1.0, 1.0, 1.0]
+        df["1  Cycle Int  Samp  44"] = [10.0, 20.0, 30.0, 20.0]
+        config = normalize_processing_config(
+            {
+                "manual_linearity_override": {
+                    "enabled": True,
+                    "use_diff_intensity": False,
+                    "d13_per_10v": 2.0,
+                    "d18_per_10v": 0.0,
+                }
+            }
+        )
+        calibration_meta = {
+            "config": {
+                "linearity": {
+                    "apply": False,
+                    "use_diff_intensity": False,
+                    "manual_override_enabled": True,
+                    "manual_d13_per_10v": 1.0,
+                    "manual_d18_per_10v": 0.0,
+                }
+            },
+            "linearity_fits": {},
+        }
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
+
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 4.0, places=6)
+        self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), -2.0, places=6)
 
     def test_saved_linearity_fits_are_applied_before_processing_outlier_filtering(self) -> None:
         df = sample_processing_df().copy()
@@ -902,6 +1251,45 @@ class ProcessingCoreTests(unittest.TestCase):
             d13_cal_values = []
         self.assertIn(1.4, d13_cal_values)
         self.assertIn(2.4, d13_cal_values)
+
+    def test_overview_summary_traces_split_by_species_and_identifier1(self) -> None:
+        df = sample_processing_df().copy()
+        # Force multiple Identifier 1 values under a single species so summary traces must split by both keys.
+        sample_b_mask = df["Identifier 1"].astype(str) == "SampleB"
+        df.loc[sample_b_mask, "Species"] = "Coral"
+        df.loc[sample_b_mask, "Label"] = "SampleB - Coral"
+        df.loc[sample_b_mask, "Collector Status"] = ""
+        df.loc[sample_b_mask, "d 18O/16O  Mean"] = 2.6
+
+        config = normalize_processing_config({}).model_dump()
+        config["selected_identifier"] = "All"
+        config["sigma_level_data"] = 99.0
+        metadata = {
+            "processing": {"config": config},
+            "edit_state": {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
+        d13_summary_data = workspace.overview_figures.get("d13_summary", {}).get("data", [])
+        raw_trace_names = {
+            str(trace.get("name", ""))
+            for trace in d13_summary_data
+            if str(trace.get("name", "")).startswith("Raw d13C -")
+        }
+        d18_summary_data = workspace.overview_figures.get("d18_summary", {}).get("data", [])
+        raw_d18_trace_names = {
+            str(trace.get("name", ""))
+            for trace in d18_summary_data
+            if str(trace.get("name", "")).startswith("Raw d18O -")
+        }
+
+        self.assertIn("Raw d13C - Coral | SampleA", raw_trace_names)
+        self.assertIn("Raw d13C - Coral | SampleB", raw_trace_names)
+        self.assertNotIn("Raw d13C - Coral", raw_trace_names)
+        self.assertIn("Raw d18O - Coral | SampleA", raw_d18_trace_names)
+        self.assertIn("Raw d18O - Coral | SampleB", raw_d18_trace_names)
+        self.assertNotIn("Raw d18O - Coral", raw_d18_trace_names)
 
     def test_unselected_outlier_overlays_are_hidden_from_base_charts(self) -> None:
         df = sample_processing_df()
@@ -1368,6 +1756,29 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(payload.target["row_label"], 0)
         self.assertEqual(len(payload.table), 2)
         self.assertEqual(payload.cycle_mean["valid_cycles"], 2)
+
+    def test_build_cycle_diagnostics_payload_applies_linearity_for_partially_saturated_target(self) -> None:
+        df = sample_processing_df().copy()
+        df.loc[0, "Collector Status"] = "Partially Saturated Collectors"
+        cycles_df = sample_cycles_df()
+        target = build_target_info(df, 0, "d13C", {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}})
+        self.assertIsNotNone(target)
+
+        payload = build_cycle_diagnostics_payload(
+            session_id="session-1",
+            df=df,
+            cycles_df=cycles_df,
+            target=target,
+            config=RangeConfig(),
+            edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            correct_linearity=False,
+            target_intensity=14.0,
+        )
+
+        self.assertEqual(payload.cycle_mean["method"], "linearity_extrapolated_to_target_intensity")
+        self.assertTrue(bool(payload.cycle_mean["linearity_applied"]))
+        self.assertAlmostEqual(float(payload.cycle_mean["valid_mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(payload.cycle_mean["mean"]), 2.0, places=6)
 
     def test_build_cycle_diagnostics_payload_uses_column_order_for_unlabeled_duplicate_masses(self) -> None:
         df = sample_processing_df()

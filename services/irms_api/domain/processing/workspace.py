@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from ..calibration.core import (
+    _apply_manual_linearity_override_to_standards,
     _apply_isotope_line_offsets,
     _apply_linearity_correction,
     _resolve_linearity_intensity_column_for_fits,
@@ -107,7 +108,6 @@ def _build_export_filename(config: ProcessingWorkspaceConfig) -> str:
 
 def _candidate_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
-        "Date_ordinal",
         "Date",
         "Identifier 1",
         "Identifier 2",
@@ -317,23 +317,52 @@ def _derive_working_frame(
         line_2_offset_d13=linearity_cfg.get("line_2_offset_d13"),
         line_2_offset_d18=linearity_cfg.get("line_2_offset_d18"),
     )
+    calibration_use_diff_intensity = bool(linearity_cfg.get("use_diff_intensity", False))
+    calibration_intensity_col = _resolve_linearity_intensity_column_for_fits(
+        fits=fits if isinstance(fits, dict) else None,
+        df=work,
+        use_diff_intensity=calibration_use_diff_intensity,
+        selected_intensity_col=linearity_cfg.get("intensity_col"),
+    )
+    work, d13_offset_intensity_col, d18_offset_intensity_col = _with_isotope_linearity_intensity_columns(
+        work,
+        calibration_intensity_col,
+        line_1_offset=float(linearity_cfg.get("line_1_offset", 0.0) or 0.0),
+        line_2_offset=float(linearity_cfg.get("line_2_offset", 0.0) or 0.0),
+    )
+    calibration_override_scope = (
+        sorted(
+            {
+                str(value).strip()
+                for value in work.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist()
+                if str(value).strip() != ""
+            }
+        )
+        if "Identifier 1" in work.columns
+        else []
+    )
+    calibration_override_intensity_col = (
+        d13_offset_intensity_col
+        if d13_offset_intensity_col == d18_offset_intensity_col
+        else calibration_intensity_col
+    )
+    work = _apply_manual_linearity_override_to_standards(
+        work,
+        calibration_override_scope,
+        enabled=bool(linearity_cfg.get("manual_override_enabled", False)),
+        d13_per_10v=float(linearity_cfg.get("manual_d13_per_10v", 0.0) or 0.0),
+        d18_per_10v=float(linearity_cfg.get("manual_d18_per_10v", 0.0) or 0.0),
+        d13_per_10v2=float(linearity_cfg.get("manual_d13_per_10v2", 0.0) or 0.0),
+        d18_per_10v2=float(linearity_cfg.get("manual_d18_per_10v2", 0.0) or 0.0),
+        quadratic=bool(linearity_cfg.get("quadratic", False)),
+        use_diff_intensity=calibration_use_diff_intensity,
+        selected_intensity_col=calibration_override_intensity_col,
+    )
     if bool(linearity_cfg.get("apply")) and isinstance(fits, dict) and fits:
-        intensity_col = _resolve_linearity_intensity_column_for_fits(
-            fits=fits,
-            df=work,
-            use_diff_intensity=bool(linearity_cfg.get("use_diff_intensity", False)),
-            selected_intensity_col=linearity_cfg.get("intensity_col"),
-        )
-        work, d13_offset_intensity_col, d18_offset_intensity_col = _with_isotope_linearity_intensity_columns(
-            work,
-            intensity_col,
-            line_1_offset=float(linearity_cfg.get("line_1_offset", 0.0) or 0.0),
-            line_2_offset=float(linearity_cfg.get("line_2_offset", 0.0) or 0.0),
-        )
         fit_payload = dict(fits)
         fit_payload.setdefault("d13_intensity_col", d13_offset_intensity_col)
         fit_payload.setdefault("d18_intensity_col", d18_offset_intensity_col)
-        corrected = _apply_linearity_correction(work, intensity_col, fit_payload)
+        corrected = _apply_linearity_correction(work, calibration_intensity_col, fit_payload)
         if "d13C_linearity_corrected" in corrected.columns:
             corrected_values = pd.to_numeric(corrected["d13C_linearity_corrected"], errors="coerce")
             if corrected_values.notna().any():
@@ -460,6 +489,9 @@ def build_processing_workspace(
     all_standards = sorted(set(standards_repo.standards_list()) | set(selected_standards))
 
     working_df = _derive_working_frame(df, config, calibration_meta=calibration_for_processing, edit_state=edit_state)
+    available_color_params = _candidate_color_columns(working_df)
+    if available_color_params and config.color_param not in available_color_params:
+        config.color_param = "Date" if "Date" in available_color_params else available_color_params[0]
     filtered_df, unfiltered_df = _build_plot_frames(working_df, config, standards_to_exclude=selected_standards)
     range_config = RangeConfig(
         signal_range=config.signal_range,
@@ -537,7 +569,7 @@ def build_processing_workspace(
                 if str(value).strip() != ""
             }
         ),
-        color_params=_candidate_color_columns(working_df),
+        color_params=available_color_params,
         z_axis_options=_candidate_z_columns(working_df),
     )
     export_state = ProcessingExportState(

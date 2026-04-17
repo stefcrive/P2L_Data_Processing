@@ -160,7 +160,7 @@ class ProcessingExportConfig(BaseModel):
 class ProcessingWorkspaceConfig(BaseModel):
     selected_identifier: str = "All"
     x_axis_option: Literal["By Identifier 2", "By Sequence"] = "By Identifier 2"
-    color_param: str = "Date_ordinal"
+    color_param: str = "Date"
     z_axis: str = "1  Cycle Int  Samp  44"
     signal_range: tuple[float, float] = (0.0, 50.0)
     leak_range: tuple[float, float] = (0.0, 1000.0)

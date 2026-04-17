@@ -398,6 +398,10 @@ def get_global_signal_intensity_mean(df: pd.DataFrame, default_value: float = 15
     return mean_val if np.isfinite(mean_val) and mean_val > 0 else float(default_value)
 
 
+def _is_partially_saturated_collector(target: dict[str, Any]) -> bool:
+    return str(target.get("collector_status", "")).strip().lower() == "partially saturated collectors"
+
+
 def compute_cycle_mean_for_target(
     df: pd.DataFrame,
     cycles_df: pd.DataFrame | None,
@@ -419,6 +423,7 @@ def compute_cycle_mean_for_target(
         "linearity_prediction": None,
         "reason": "",
     }
+    apply_linearity = bool(correct_linearity) or _is_partially_saturated_collector(target)
     cycles, _ = get_cycles_for_selected_point(df, cycles_df, target.get("row_label"), target.get("target_col"))
     if cycles is None or cycles.empty:
         result["reason"] = "no_cycle_data"
@@ -464,7 +469,7 @@ def compute_cycle_mean_for_target(
     intensity_col = _pick_cycle_sample_intensity_column(cycles, intensity_cols, [44])
     result["intensity_col"] = intensity_col
     if intensity_col is None:
-        if not bool(correct_linearity):
+        if not apply_linearity:
             return result
         result["reason"] = "missing_intensity_column"
         return result
@@ -478,7 +483,7 @@ def compute_cycle_mean_for_target(
     result["fit_x"] = x.astype(float).tolist()
     result["fit_y"] = y.astype(float).tolist()
     result["linearity_points"] = int(x.shape[0])
-    if not bool(correct_linearity):
+    if not apply_linearity:
         return result
     if x.shape[0] < 2 or x.nunique(dropna=True) < 2:
         result["reason"] = "insufficient_points_for_linearity_fit"

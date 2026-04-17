@@ -205,13 +205,14 @@ def _interpolate_outliers_by_identifier2(
             order = pd.to_numeric(work[id2_col].map(_parse_numeric_token), errors="coerce")
     else:
         order = pd.Series(np.arange(len(work)), index=work.index)
+    use_identifier2_axis = bool(id2_col in work.columns and order.notna().any())
     work["_order_irms"] = order
     work["_orig_pos_irms"] = np.arange(len(work), dtype=float)
     work_sorted = work.sort_values(["_order_irms", "_orig_pos_irms"], na_position="last")
     mask_sorted = outlier_mask.reindex(work_sorted.index).fillna(False).astype(bool)
     x_order = pd.to_numeric(work_sorted["_order_irms"], errors="coerce")
     x_pos = pd.Series(np.arange(len(work_sorted), dtype=float), index=work_sorted.index)
-    x_axis = x_order.where(x_order.notna(), x_pos)
+    x_axis = x_order if use_identifier2_axis else x_order.where(x_order.notna(), x_pos)
     x_values = pd.to_numeric(x_axis, errors="coerce").to_numpy(dtype=float)
     mask_values = mask_sorted.to_numpy(dtype=bool)
     target_positions = np.flatnonzero(mask_values)
@@ -229,8 +230,25 @@ def _interpolate_outliers_by_identifier2(
         for pos in target_positions:
             left = known_positions[known_positions < pos]
             right = known_positions[known_positions > pos]
+            if use_identifier2_axis:
+                left = left[np.isfinite(x_values[left])]
+                right = right[np.isfinite(x_values[right])]
             if left.size == 0 and right.size == 0:
                 continue
+            xt = x_values[pos]
+            if np.isfinite(xt):
+                left_strict = left[np.isfinite(x_values[left]) & (x_values[left] < xt) & ~np.isclose(x_values[left], xt)]
+                right_strict = right[np.isfinite(x_values[right]) & (x_values[right] > xt) & ~np.isclose(x_values[right], xt)]
+                if left_strict.size > 0 and right_strict.size > 0:
+                    left = left_strict
+                    right = right_strict
+                else:
+                    left_non_equal = left[np.isfinite(x_values[left]) & ~np.isclose(x_values[left], xt)]
+                    right_non_equal = right[np.isfinite(x_values[right]) & ~np.isclose(x_values[right], xt)]
+                    if left_non_equal.size > 0:
+                        left = left_non_equal
+                    if right_non_equal.size > 0:
+                        right = right_non_equal
             if left.size == 0:
                 interp_val = y_values[right[0]]
             elif right.size == 0:
@@ -251,12 +269,21 @@ def _interpolate_outliers_by_identifier2(
                 ):
                     ratio = (float(xt) - float(x0)) / (float(x1) - float(x0))
                 else:
-                    denom = float(n - p)
-                    ratio = (float(pos) - float(p)) / denom if denom != 0 else 0.5
-                if not np.isfinite(ratio):
+                    if use_identifier2_axis:
+                        # Identifier-2 interpolation should not degrade to row-position spacing.
+                        interp_val = np.nan
+                        ratio = np.nan
+                    else:
+                        denom = float(n - p)
+                        ratio = (float(pos) - float(p)) / denom if denom != 0 else 0.5
+                if not use_identifier2_axis and not np.isfinite(ratio):
                     ratio = 0.5
-                ratio = float(np.clip(ratio, 0.0, 1.0))
-                interp_val = float(y0) + ratio * (float(y1) - float(y0))
+                if not use_identifier2_axis:
+                    ratio = float(np.clip(ratio, 0.0, 1.0))
+                    interp_val = float(y0) + ratio * (float(y1) - float(y0))
+                elif np.isfinite(ratio):
+                    ratio = float(np.clip(ratio, 0.0, 1.0))
+                    interp_val = float(y0) + ratio * (float(y1) - float(y0))
             if np.isfinite(interp_val):
                 updates[work_sorted.index[pos]] = float(interp_val)
 
@@ -272,6 +299,7 @@ def _interpolate_single_target_within_identifier_group(
     col: str,
     id2_col: str = "Identifier 2",
     id1_col: str = "Identifier 1",
+    species_col: str = "Species",
 ) -> float | None:
     if df is None or col not in df.columns or row_label not in df.index:
         return None
@@ -284,6 +312,13 @@ def _interpolate_single_target_within_identifier_group(
             group_mask = df[id1_col].astype(str).str.strip().eq(id1_value)
             if bool(group_mask.any()):
                 subset = df.loc[group_mask].copy()
+    if species_col in subset.columns:
+        species_value_raw = subset.at[row_label, species_col] if row_label in subset.index else df.at[row_label, species_col]
+        species_value = "" if pd.isna(species_value_raw) else str(species_value_raw).strip()
+        if species_value != "":
+            species_mask = subset[species_col].astype(str).str.strip().eq(species_value)
+            if bool(species_mask.any()):
+                subset = subset.loc[species_mask].copy()
 
     if row_label not in subset.index:
         return None
@@ -295,6 +330,7 @@ def _interpolate_single_target_within_identifier_group(
             order = pd.to_numeric(work[id2_col].map(_parse_numeric_token), errors="coerce")
     else:
         order = pd.Series(np.arange(len(work)), index=work.index, dtype=float)
+    use_identifier2_axis = bool(id2_col in work.columns and order.notna().any())
     work["_order_irms"] = order
     work["_orig_pos_irms"] = np.arange(len(work), dtype=float)
     work_sorted = work.sort_values(["_order_irms", "_orig_pos_irms"], na_position="last")
@@ -304,34 +340,67 @@ def _interpolate_single_target_within_identifier_group(
     y_values = pd.to_numeric(work_sorted[col], errors="coerce")
     x_order = pd.to_numeric(work_sorted["_order_irms"], errors="coerce")
     x_pos = pd.Series(np.arange(len(work_sorted), dtype=float), index=work_sorted.index)
-    x_axis = x_order.where(x_order.notna(), x_pos)
+    x_axis = x_order if use_identifier2_axis else x_order.where(x_order.notna(), x_pos)
     row_positions = np.flatnonzero(work_sorted.index.to_numpy() == row_label)
     if row_positions.size == 0:
         return None
     pos = int(row_positions[0])
 
-    prev_value: float | None = None
-    prev_pos: int | None = None
-    for i in range(pos - 1, -1, -1):
-        value = y_values.iloc[i]
-        if np.isfinite(value):
-            prev_value = float(value)
-            prev_pos = int(i)
-            break
+    xt = pd.to_numeric(pd.Series([x_axis.iloc[pos]]), errors="coerce").iloc[0]
 
-    next_value: float | None = None
+    def _find_prev(require_strict_less: bool, require_not_equal: bool) -> int | None:
+        for i in range(pos - 1, -1, -1):
+            value = y_values.iloc[i]
+            if not np.isfinite(value):
+                continue
+            xi = pd.to_numeric(pd.Series([x_axis.iloc[i]]), errors="coerce").iloc[0]
+            if use_identifier2_axis and not np.isfinite(xi):
+                continue
+            if require_strict_less and np.isfinite(xt) and np.isfinite(xi):
+                if not (float(xi) < float(xt) and not np.isclose(float(xi), float(xt))):
+                    continue
+            if require_not_equal and np.isfinite(xt) and np.isfinite(xi) and np.isclose(float(xi), float(xt)):
+                continue
+            return int(i)
+        return None
+
+    def _find_next(require_strict_greater: bool, require_not_equal: bool) -> int | None:
+        for i in range(pos + 1, len(work_sorted)):
+            value = y_values.iloc[i]
+            if not np.isfinite(value):
+                continue
+            xi = pd.to_numeric(pd.Series([x_axis.iloc[i]]), errors="coerce").iloc[0]
+            if use_identifier2_axis and not np.isfinite(xi):
+                continue
+            if require_strict_greater and np.isfinite(xt) and np.isfinite(xi):
+                if not (float(xi) > float(xt) and not np.isclose(float(xi), float(xt))):
+                    continue
+            if require_not_equal and np.isfinite(xt) and np.isfinite(xi) and np.isclose(float(xi), float(xt)):
+                continue
+            return int(i)
+        return None
+
+    prev_pos: int | None = None
     next_pos: int | None = None
-    for i in range(pos + 1, len(work_sorted)):
-        value = y_values.iloc[i]
-        if np.isfinite(value):
-            next_value = float(value)
-            next_pos = int(i)
-            break
+    if np.isfinite(xt):
+        prev_pos = _find_prev(require_strict_less=True, require_not_equal=False)
+        next_pos = _find_next(require_strict_greater=True, require_not_equal=False)
+        if prev_pos is None:
+            prev_pos = _find_prev(require_strict_less=False, require_not_equal=True)
+        if next_pos is None:
+            next_pos = _find_next(require_strict_greater=False, require_not_equal=True)
+    if not use_identifier2_axis:
+        if prev_pos is None:
+            prev_pos = _find_prev(require_strict_less=False, require_not_equal=False)
+        if next_pos is None:
+            next_pos = _find_next(require_strict_greater=False, require_not_equal=False)
+
+    prev_value: float | None = float(y_values.iloc[prev_pos]) if prev_pos is not None else None
+    next_value: float | None = float(y_values.iloc[next_pos]) if next_pos is not None else None
 
     if prev_value is not None and next_value is not None and prev_pos is not None and next_pos is not None:
         x0 = pd.to_numeric(pd.Series([x_axis.iloc[prev_pos]]), errors="coerce").iloc[0]
         x1 = pd.to_numeric(pd.Series([x_axis.iloc[next_pos]]), errors="coerce").iloc[0]
-        xt = pd.to_numeric(pd.Series([x_axis.iloc[pos]]), errors="coerce").iloc[0]
         if (
             np.isfinite(x0)
             and np.isfinite(x1)
@@ -340,9 +409,13 @@ def _interpolate_single_target_within_identifier_group(
         ):
             ratio = (float(xt) - float(x0)) / (float(x1) - float(x0))
         else:
+            if use_identifier2_axis:
+                return None
             denom = float(next_pos - prev_pos)
             ratio = (float(pos) - float(prev_pos)) / denom if denom != 0 else 0.5
         if not np.isfinite(ratio):
+            if use_identifier2_axis:
+                return None
             ratio = 0.5
         ratio = float(np.clip(ratio, 0.0, 1.0))
         return float(prev_value + ratio * (next_value - prev_value))
@@ -591,19 +664,29 @@ def apply_edit_action(
                 continue
             raw_col, cal_col, _ = _get_isotope_columns(isotope_key)
             std_col = _get_isotope_std_column(isotope_key)
+            source_to_raw_offset_col = "__source_to_raw_offset_d13C__" if isotope_key == "d13C" else "__source_to_raw_offset_d18O__"
             if raw_col is None:
                 continue
             interpolation_base = work.copy()
             interpolation_value_base = interpolation_base.copy()
             source_to_raw_offset_by_row = pd.Series(0.0, index=interpolation_base.index, dtype=float)
+            source_to_raw_offset_interp_base: pd.DataFrame | None = None
             use_interpolation_source_values = interpolation_source_df is not None and raw_col in interpolation_source_df.columns
             if use_interpolation_source_values:
                 source_values = pd.to_numeric(interpolation_source_df[raw_col], errors="coerce").reindex(
                     interpolation_value_base.index
                 )
                 interpolation_value_base[raw_col] = source_values
-                raw_values = pd.to_numeric(interpolation_base[raw_col], errors="coerce").reindex(source_values.index)
-                source_to_raw_offset_by_row = pd.to_numeric(source_values - raw_values, errors="coerce")
+                if source_to_raw_offset_col in interpolation_source_df.columns:
+                    source_to_raw_offset_by_row = pd.to_numeric(
+                        interpolation_source_df[source_to_raw_offset_col],
+                        errors="coerce",
+                    ).reindex(source_values.index)
+                else:
+                    raw_values = pd.to_numeric(interpolation_base[raw_col], errors="coerce").reindex(source_values.index)
+                    source_to_raw_offset_by_row = pd.to_numeric(source_values - raw_values, errors="coerce")
+                source_to_raw_offset_interp_base = interpolation_base.copy()
+                source_to_raw_offset_interp_base["__source_to_raw_offset__"] = source_to_raw_offset_by_row
             interpolation_neighbor_base = interpolation_value_base.copy()
             # When interpolating multiple selected points, exclude all current
             # targets from the neighbor pool so they do not contaminate each
@@ -611,6 +694,8 @@ def apply_edit_action(
             target_row_labels_for_iso = [_resolve_target_row(target.row_label) for target in targets]
             if target_row_labels_for_iso:
                 interpolation_neighbor_base.loc[target_row_labels_for_iso, raw_col] = np.nan
+                if source_to_raw_offset_interp_base is not None:
+                    source_to_raw_offset_interp_base.loc[target_row_labels_for_iso, "__source_to_raw_offset__"] = np.nan
             prev_cal_map: dict[str, float | None] = {}
             prev_raw_map: dict[str, float | None] = {}
             interpolated_map: dict[str, float] = {}
@@ -649,6 +734,12 @@ def apply_edit_action(
                             pd.Series([source_to_raw_offset_by_row.get(row_label)]),
                             errors="coerce",
                         ).iloc[0]
+                        if not np.isfinite(source_to_raw_offset) and source_to_raw_offset_interp_base is not None:
+                            source_to_raw_offset = _interpolate_single_target_within_identifier_group(
+                                source_to_raw_offset_interp_base,
+                                row_label,
+                                "__source_to_raw_offset__",
+                            )
                         if np.isfinite(source_to_raw_offset):
                             raw_value_to_persist = float(next_raw) - float(source_to_raw_offset)
                     work.at[row_label, raw_col] = raw_value_to_persist + interpolation_offset

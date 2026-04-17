@@ -233,6 +233,45 @@ class ProcessingApiTests(unittest.TestCase):
         # Raw persistence is mapped from corrected-domain interpolation back to stored raw values.
         self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), -1.2, places=6)
 
+    def test_interpolate_missing_d13_uses_target_specific_line_offset_mapping(self) -> None:
+        df = sample_processing_df().copy()
+        df = df.iloc[:3].copy()
+        df["Identifier 1"] = ["861", "861", "861"]
+        df["Species"] = ["Uvigerina", "Uvigerina", "Uvigerina"]
+        df["Identifier 2"] = [1, 2, 3]
+        df["Line"] = [1, 2, 2]
+        df["Collector Status"] = ["", "Failed Sample", ""]
+        df["d 13C/12C  Mean"] = [1.0, float("nan"), 3.0]
+        df["d 18O/16O  Mean"] = [2.0, float("nan"), 4.0]
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        metadata = api_main.store.load_metadata(self.session_id)
+        metadata["calibration"] = {
+            **metadata.get("calibration", {}),
+            "config": {
+                "linearity": {
+                    "apply": False,
+                    "use_diff_intensity": False,
+                    "line_1_offset_d13": 2.0,
+                    "line_2_offset_d13": -2.0,
+                    "line_1_offset_d18": 0.0,
+                    "line_2_offset_d18": 0.0,
+                }
+            },
+            "linearity_fits": {},
+        }
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        api_main.edit_processing(
+            self.session_id,
+            EditAction(action="interpolate", targets=[{"row_label": "1", "isotope_key": "d13C"}]),
+        )
+
+        updated_df = api_main.store.load_frame(self.session_id)
+        # Source-domain neighbors become 3.0 (x=1) and 1.0 (x=3), so interpolated source at x=2 is 2.0.
+        # Target row is line 2 with d13 offset -2.0, therefore persisted raw should be 4.0.
+        self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 4.0, places=6)
+
     def test_cycle_diagnostics_and_export_endpoints(self) -> None:
         diagnostics = api_main.processing_cycle_diagnostics(
             self.session_id,

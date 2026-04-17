@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { PlotlyChart, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { Button } from "@/components/ui/button";
@@ -52,6 +52,10 @@ type SelectionSourceChart = {
     title: string;
     figure?: Record<string, unknown>;
   }>;
+};
+type ColorScaleBounds = {
+  min: number;
+  max: number;
 };
 
 function cloneFigure(figure?: Record<string, unknown>): FigureShape {
@@ -135,6 +139,15 @@ function coerceVector(values: unknown): unknown[] | null {
     return values;
   }
   if (values && typeof values === "object") {
+    const encoded = values as { dtype?: unknown; bdata?: unknown };
+    if (typeof encoded.dtype === "string" && typeof encoded.bdata === "string") {
+      const decoded = decodeBinaryVector(encoded.dtype, encoded.bdata);
+      if (decoded) {
+        return decoded;
+      }
+    }
+  }
+  if (values && typeof values === "object") {
     const arrayLike = values as unknown as { [index: number]: unknown; length: number };
     if (ArrayBuffer.isView(values)) {
       return Array.from(arrayLike);
@@ -147,6 +160,63 @@ function coerceVector(values: unknown): unknown[] | null {
         return null;
       }
     }
+  }
+  return null;
+}
+
+function decodeBinaryVector(dtype: string, bdata: string): number[] | null {
+  if (typeof window === "undefined" || typeof window.atob !== "function") {
+    return null;
+  }
+  let binary: string;
+  try {
+    binary = window.atob(bdata);
+  } catch {
+    return null;
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const view = new DataView(bytes.buffer);
+  const littleEndian = true;
+  const values: number[] = [];
+  const pushNumbers = (size: number, reader: (offset: number) => number) => {
+    for (let offset = 0; offset + size <= view.byteLength; offset += size) {
+      values.push(reader(offset));
+    }
+  };
+  if (dtype === "f8") {
+    pushNumbers(8, (offset) => view.getFloat64(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "f4") {
+    pushNumbers(4, (offset) => view.getFloat32(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "i4") {
+    pushNumbers(4, (offset) => view.getInt32(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "u4") {
+    pushNumbers(4, (offset) => view.getUint32(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "i2") {
+    pushNumbers(2, (offset) => view.getInt16(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "u2") {
+    pushNumbers(2, (offset) => view.getUint16(offset, littleEndian));
+    return values;
+  }
+  if (dtype === "i1") {
+    pushNumbers(1, (offset) => view.getInt8(offset));
+    return values;
+  }
+  if (dtype === "u1") {
+    pushNumbers(1, (offset) => view.getUint8(offset));
+    return values;
   }
   return null;
 }
@@ -184,23 +254,6 @@ function highlightSelectionSourceFigure(
     const highlightColor = "#FF00FF";
     const traceMarker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : {};
     const baseSize = typeof traceMarker.size === "number" ? traceMarker.size : 8;
-    trace.selectedpoints = indexes;
-    trace.selected = {
-      marker: {
-        symbol: "circle",
-        size: Math.max(baseSize + 5, 13),
-        color: "rgba(255, 0, 255, 0.28)",
-        line: {
-          color: highlightColor,
-          width: 3,
-        },
-      },
-    };
-    trace.unselected = {
-      marker: {
-        opacity: 1,
-      },
-    };
     const highlightTrace: Record<string, unknown> = {
       type: trace.type ?? "scatter",
       mode: "markers",
@@ -212,7 +265,7 @@ function highlightSelectionSourceFigure(
       customdata: indexes.map((index) => customdata[index]),
       marker: {
         color: is3dTrace ? highlightColor : "rgba(255, 0, 255, 0.28)",
-        size: is3dTrace ? 14 : 18,
+        size: Math.max(baseSize + (is3dTrace ? 5 : 10), is3dTrace ? 14 : 18),
         symbol: "circle",
         line: {
           color: highlightColor,
@@ -496,17 +549,57 @@ function inferIsotopeKeyFromChartKey(chartKey: string): "d13C" | "d18O" | "cross
   return null;
 }
 
+function coerceIndexedObjectToArray(value: unknown): unknown[] | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const numericKeys = Object.keys(record)
+    .filter((key) => /^\d+$/.test(key))
+    .map((key) => Number(key))
+    .sort((left, right) => left - right);
+  if (!numericKeys.length || !numericKeys.every((key, index) => key === index)) {
+    return null;
+  }
+  return numericKeys.map((key) => record[String(key)]);
+}
+
+function coercePointCustomDataArray(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  return coerceVector(value) ?? coerceIndexedObjectToArray(value);
+}
+
+function hasPointCustomDataPayload(value: unknown): boolean {
+  const customArray = coercePointCustomDataArray(value);
+  if (customArray && customArray.length > 0) {
+    return true;
+  }
+  if (value && typeof value === "object") {
+    const payload = value as Record<string, unknown>;
+    return "row_label" in payload || "rowLabel" in payload || "0" in payload;
+  }
+  return false;
+}
+
 function extractPointCustomData(point: PlotlyPoint): unknown {
-  if (point.customdata != null) {
+  if (point.customdata != null && hasPointCustomDataPayload(point.customdata)) {
     return point.customdata;
   }
   const payload = point as unknown as Record<string, unknown>;
-  const pointNumber = typeof payload.pointNumber === "number" ? payload.pointNumber : typeof payload.pointIndex === "number" ? payload.pointIndex : null;
+  const pointNumberRaw = payload.pointNumber ?? payload.pointIndex;
+  const pointNumber =
+    typeof pointNumberRaw === "number"
+      ? pointNumberRaw
+      : Array.isArray(pointNumberRaw) && typeof pointNumberRaw[0] === "number"
+        ? pointNumberRaw[0]
+        : null;
   if (pointNumber == null) {
     return null;
   }
   const dataCandidate = (payload.data ?? payload.fullData) as Record<string, unknown> | undefined;
-  const traceCustomdata = coerceVector(dataCandidate?.customdata);
+  const traceCustomdata = coercePointCustomDataArray(dataCandidate?.customdata);
   if (!traceCustomdata || pointNumber < 0 || pointNumber >= traceCustomdata.length) {
     return null;
   }
@@ -519,14 +612,24 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
   const inferredIsotope = inferIsotopeKeyFromChartKey(chartKey);
   for (const point of points) {
     const rawCustomdata = extractPointCustomData(point);
-    const customdata = Array.isArray(rawCustomdata) ? rawCustomdata : null;
+    const customdata = coercePointCustomDataArray(rawCustomdata);
     const customObj = rawCustomdata && typeof rawCustomdata === "object" ? (rawCustomdata as Record<string, unknown>) : null;
-    const hasArrayRowPayload = Boolean(customdata && customdata.length >= 4);
-    const hasObjectRowPayload = Boolean(customObj && ("row_label" in customObj || "rowLabel" in customObj));
-    if (!hasArrayRowPayload && !hasObjectRowPayload) {
+    const scalarRowLabel =
+      typeof rawCustomdata === "string" || typeof rawCustomdata === "number" ? String(rawCustomdata).trim() : "";
+    const hasArrayRowPayload = Boolean(customdata && customdata.length >= 1);
+    const hasObjectRowPayload = Boolean(customObj && ("row_label" in customObj || "rowLabel" in customObj || "0" in customObj));
+    if (!hasArrayRowPayload && !hasObjectRowPayload && !scalarRowLabel) {
       continue;
     }
-    const rowLabel = String(customdata?.[0] ?? customObj?.row_label ?? customObj?.rowLabel ?? "").trim();
+    const pointPayload = point as unknown as Record<string, unknown>;
+    const rowLabel = String(
+      customdata?.[0] ??
+        customObj?.row_label ??
+        customObj?.rowLabel ??
+        scalarRowLabel ??
+        pointPayload.id ??
+        "",
+    ).trim();
     const isotopeKey = normalizeIsotopeKey(customdata?.[1] ?? customObj?.isotope_key ?? customObj?.isotopeKey) ?? inferredIsotope;
     const identifier1 = String(customdata?.[2] ?? customObj?.identifier_1 ?? customObj?.identifier1 ?? "").trim();
     const identifier2 = String(customdata?.[3] ?? customObj?.identifier_2 ?? customObj?.identifier2 ?? "").trim();
@@ -554,6 +657,10 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
 
 function isPartiallySaturatedCollectorStatus(value: unknown): boolean {
   return String(value ?? "").trim().toLowerCase() === "partially saturated collectors";
+}
+
+function isFailedSampleCollectorStatus(value: unknown): boolean {
+  return String(value ?? "").trim().toLowerCase() === "failed sample";
 }
 
 function targetNumberValue(value: unknown): string {
@@ -754,11 +861,37 @@ function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ lab
     .filter((item): item is { label: string; value: string } => item != null);
 }
 
-function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>; emptyLabel: string }) {
+function DataTable({
+  rows,
+  emptyLabel,
+  selectedRowLabels = [],
+  onSelectedRowLabelsChange,
+}: {
+  rows: Array<Record<string, unknown>>;
+  emptyLabel: string;
+  selectedRowLabels?: string[];
+  onSelectedRowLabelsChange?: (next: string[]) => void;
+}) {
   if (!rows.length) {
     return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{emptyLabel}</div>;
   }
+  const selectable = typeof onSelectedRowLabelsChange === "function";
+  const selectedSet = new Set(selectedRowLabels);
+  const visibleRows = rows.slice(0, 25);
   const columns = Object.keys(rows[0] ?? {}).filter((column) => !column.startsWith("__"));
+
+  function toggleRowSelection(rowLabel: string, checked: boolean) {
+    if (!onSelectedRowLabelsChange) {
+      return;
+    }
+    const next = new Set(selectedRowLabels);
+    if (checked) {
+      next.add(rowLabel);
+    } else {
+      next.delete(rowLabel);
+    }
+    onSelectedRowLabelsChange(Array.from(next));
+  }
 
   function formatValue(value: unknown, column: string): string {
     if (value == null || value === "") {
@@ -781,6 +914,7 @@ function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>;
       <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
         <thead className="bg-stone-50">
           <tr>
+            {selectable ? <th className="w-12 px-3 py-2 font-medium text-stone-700">Sel</th> : null}
             {columns.map((column) => (
               <th key={column} className="px-3 py-2 font-medium text-stone-700">
                 {column}
@@ -789,15 +923,35 @@ function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>;
           </tr>
         </thead>
         <tbody className="divide-y divide-stone-100 bg-white">
-          {rows.slice(0, 25).map((row, rowIndex) => (
-            <tr key={rowIndex}>
+          {visibleRows.map((row, rowIndex) => {
+            const rowLabel = extractOutlierRowLabel(row);
+            const canSelectRow = selectable && rowLabel != null;
+            return (
+              <tr key={rowLabel ?? rowIndex}>
+                {selectable ? (
+                  <td className="px-3 py-2 text-stone-600">
+                    <input
+                      type="checkbox"
+                      aria-label={rowLabel ? `Select row ${rowLabel}` : `Select row ${rowIndex + 1}`}
+                      checked={rowLabel != null ? selectedSet.has(rowLabel) : false}
+                      disabled={!canSelectRow}
+                      onChange={(event) => {
+                        if (rowLabel) {
+                          toggleRowSelection(rowLabel, event.target.checked);
+                        }
+                      }}
+                      className="h-4 w-4"
+                    />
+                  </td>
+                ) : null}
               {columns.map((column) => (
                 <td key={column} className="px-3 py-2 text-stone-600">
                   {formatValue(row[column], column)}
                 </td>
               ))}
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
       {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">Showing first 25 of {rows.length} rows.</div> : null}
@@ -830,6 +984,11 @@ function extractOutlierRowLabel(row: Record<string, unknown>): string | null {
     return String(fallback);
   }
   return null;
+}
+
+function isFailedSampleOutlierTable(table: OutlierTable): boolean {
+  const normalizedName = String(table.name || table.title || "").toLowerCase();
+  return normalizedName.includes("failed sample");
 }
 
 function pickRandomSubset(values: string[], count: number): string[] {
@@ -914,6 +1073,187 @@ function RangeSliderField({
       </div>
     </div>
   );
+}
+
+function collectNumericColorValues(figure?: Record<string, unknown>): number[] {
+  if (!figure) {
+    return [];
+  }
+  const traces = Array.isArray((figure as FigureShape).data) ? ((figure as FigureShape).data as Array<Record<string, unknown>>) : [];
+  const values: number[] = [];
+  for (const trace of traces) {
+    const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : null;
+    if (!marker) {
+      continue;
+    }
+    const colorVector = coerceVector(marker.color);
+    if (!colorVector) {
+      continue;
+    }
+    for (const item of colorVector) {
+      const numericValue = toFiniteNumber(item);
+      if (numericValue != null) {
+        values.push(numericValue);
+      }
+    }
+  }
+  return values;
+}
+
+function deriveColorScaleBounds(figures: Array<Record<string, unknown> | undefined>): ColorScaleBounds | null {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const figure of figures) {
+    if (!figure) {
+      continue;
+    }
+    for (const value of collectNumericColorValues(figure)) {
+      if (value < min) {
+        min = value;
+      }
+      if (value > max) {
+        max = value;
+      }
+    }
+    const traces = Array.isArray((figure as FigureShape).data) ? ((figure as FigureShape).data as Array<Record<string, unknown>>) : [];
+    for (const trace of traces) {
+      const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : null;
+      const markerMin = marker ? toFiniteNumber(marker.cmin) : null;
+      const markerMax = marker ? toFiniteNumber(marker.cmax) : null;
+      if (markerMin != null) {
+        min = Math.min(min, markerMin);
+      }
+      if (markerMax != null) {
+        max = Math.max(max, markerMax);
+      }
+    }
+    const layout = (figure as FigureShape).layout ?? {};
+    for (const key of Object.keys(layout)) {
+      if (!key.toLowerCase().startsWith("coloraxis")) {
+        continue;
+      }
+      const axis = layout[key];
+      if (!axis || typeof axis !== "object") {
+        continue;
+      }
+      const axisMin = toFiniteNumber((axis as Record<string, unknown>).cmin);
+      const axisMax = toFiniteNumber((axis as Record<string, unknown>).cmax);
+      if (axisMin != null) {
+        min = Math.min(min, axisMin);
+      }
+      if (axisMax != null) {
+        max = Math.max(max, axisMax);
+      }
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    return null;
+  }
+  if (min === max) {
+    const pad = Math.max(Math.abs(min) * 0.01, 0.001);
+    return { min: min - pad, max: max + pad };
+  }
+  return { min, max };
+}
+
+function normalizeColorScaleRange(range: [number, number], bounds: ColorScaleBounds): [number, number] {
+  const low = clampNumber(Math.min(range[0], range[1]), bounds.min, bounds.max);
+  const high = clampNumber(Math.max(range[0], range[1]), bounds.min, bounds.max);
+  return [Math.min(low, high), Math.max(low, high)];
+}
+
+function sliderPrecision(bounds: ColorScaleBounds): number {
+  const span = Math.abs(bounds.max - bounds.min);
+  if (span >= 1000) {
+    return 0;
+  }
+  if (span >= 100) {
+    return 1;
+  }
+  if (span >= 10) {
+    return 2;
+  }
+  return 3;
+}
+
+function sliderStep(bounds: ColorScaleBounds): number {
+  const span = Math.abs(bounds.max - bounds.min);
+  if (!Number.isFinite(span) || span <= 0) {
+    return 0.001;
+  }
+  const step = span / 400;
+  if (step >= 1) {
+    return Math.round(step);
+  }
+  if (step >= 0.1) {
+    return Number(step.toFixed(2));
+  }
+  if (step >= 0.01) {
+    return Number(step.toFixed(3));
+  }
+  return Number(step.toFixed(4));
+}
+
+function applyColorScaleRangeToFigure(
+  figure: Record<string, unknown> | undefined,
+  range: [number, number] | null,
+): Record<string, unknown> | undefined {
+  if (!figure || !range) {
+    return figure;
+  }
+  const [cmin, cmax] = [Math.min(range[0], range[1]), Math.max(range[0], range[1])];
+  const cloned = cloneFigure(figure);
+  let hasColorMapping = false;
+  const nextData = cloned.data.map((trace) => {
+    const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : null;
+    if (!marker) {
+      return trace;
+    }
+    const colorVector = coerceVector(marker.color);
+    const hasNumericVector = Boolean(colorVector && colorVector.some((value) => toFiniteNumber(value) != null));
+    const hasNumericBounds = toFiniteNumber(marker.cmin) != null || toFiniteNumber(marker.cmax) != null;
+    if (!hasNumericVector && !hasNumericBounds) {
+      return trace;
+    }
+    hasColorMapping = true;
+    return {
+      ...trace,
+      marker: {
+        ...marker,
+        cauto: false,
+        cmin,
+        cmax,
+      },
+    };
+  });
+  let nextLayout: Record<string, unknown> = cloned.layout;
+  for (const key of Object.keys(cloned.layout)) {
+    if (!key.toLowerCase().startsWith("coloraxis")) {
+      continue;
+    }
+    const axis = cloned.layout[key];
+    if (!axis || typeof axis !== "object") {
+      continue;
+    }
+    hasColorMapping = true;
+    nextLayout = {
+      ...nextLayout,
+      [key]: {
+        ...(axis as Record<string, unknown>),
+        cauto: false,
+        cmin,
+        cmax,
+      },
+    };
+  }
+  if (!hasColorMapping) {
+    return figure;
+  }
+  return {
+    ...cloned,
+    data: nextData,
+    layout: nextLayout,
+  };
 }
 
 function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> }) {
@@ -1034,8 +1374,14 @@ function OutlierTablesPanel({
 }: {
   title: string;
   tables: OutlierTable[];
-  renderTableControls?: (table: OutlierTable) => ReactNode;
+  renderTableControls?: (table: OutlierTable, context: { selectedRowLabels: string[] }) => ReactNode;
 }) {
+  const [selectedRowsByTable, setSelectedRowsByTable] = useState<Record<string, string[]>>({});
+
+  useEffect(() => {
+    setSelectedRowsByTable({});
+  }, [tables]);
+
   return (
     <Card>
       <CardHeader>
@@ -1044,17 +1390,39 @@ function OutlierTablesPanel({
       </CardHeader>
       <CardContent className="space-y-3">
         {tables.length ? (
-          tables.map((table) => (
-            <details key={table.title ?? table.name} className="rounded-lg border border-stone-200 bg-white p-3">
-              <summary className="cursor-pointer text-sm font-medium text-stone-800">
-                {table.title ?? table.name} ({table.rows.length})
-              </summary>
-              <div className="mt-3">
-                <DataTable rows={table.rows} emptyLabel="No rows in this outlier category." />
-                {renderTableControls ? <div className="mt-3">{renderTableControls(table)}</div> : null}
-              </div>
-            </details>
-          ))
+          tables.map((table, tableIndex) => {
+            const tableKey = `${table.title ?? table.name}:${tableIndex}`;
+            const failedSampleTable = isFailedSampleOutlierTable(table);
+            const selectedRowLabels = selectedRowsByTable[tableKey] ?? [];
+            return (
+              <details key={table.title ?? table.name} className="rounded-lg border border-stone-200 bg-white p-3">
+                <summary className="cursor-pointer text-sm font-medium text-stone-800">
+                  {table.title ?? table.name} ({table.rows.length})
+                </summary>
+                <div className="mt-3">
+                  <DataTable
+                    rows={table.rows}
+                    emptyLabel="No rows in this outlier category."
+                    selectedRowLabels={failedSampleTable ? selectedRowLabels : undefined}
+                    onSelectedRowLabelsChange={
+                      failedSampleTable
+                        ? (next) =>
+                            setSelectedRowsByTable((current) => ({
+                              ...current,
+                              [tableKey]: next,
+                            }))
+                        : undefined
+                    }
+                  />
+                  {renderTableControls ? (
+                    <div className="mt-3">
+                      {renderTableControls(table, { selectedRowLabels: failedSampleTable ? selectedRowLabels : [] })}
+                    </div>
+                  ) : null}
+                </div>
+              </details>
+            );
+          })
         ) : (
           <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">No outlier tables returned for this scope.</div>
         )}
@@ -1344,10 +1712,12 @@ function FigureCard({
 }) {
   return (
     <Card className={cardClassName}>
-      <CardHeader>
-        <CardTitle className="text-base">{title}</CardTitle>
+      <CardHeader className="gap-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <CardTitle className="text-base">{title}</CardTitle>
+          {headerActions ? <div className="ml-auto">{headerActions}</div> : null}
+        </div>
         <CardDescription>{description}</CardDescription>
-        {headerActions ? <div>{headerActions}</div> : null}
       </CardHeader>
       <CardContent>
         <PlotlyChart figure={figure} className={chartClassName ?? "min-h-[340px]"} onPointClick={onPointClick} onSelection={onSelection} />
@@ -1386,6 +1756,8 @@ export default function ProcessingPage() {
   const [failedRestoreRate, setFailedRestoreRate] = useState(100);
   const [failedRestoreOffset, setFailedRestoreOffset] = useState(0);
   const [failedRestoreStdev, setFailedRestoreStdev] = useState(0);
+  const [colorScaleRange, setColorScaleRange] = useState<[number, number] | null>(null);
+  const [colorScaleRangeParam, setColorScaleRangeParam] = useState<string | null>(null);
 
   const workspaceQuery = useQuery({
     queryKey: ["processing-workspace", sessionId],
@@ -1612,10 +1984,8 @@ export default function ProcessingPage() {
     const d18Current = d18MatchesActiveRow ? asNumber(d18Target["current_value"]) : null;
     const d13CycleMean = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
     const d18CycleMean = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-    const useD13LinearityDefault =
-      linearityEnabled && isPartiallySaturatedCollectorStatus(d13Status) && d13CycleMean != null;
-    const useD18LinearityDefault =
-      linearityEnabled && isPartiallySaturatedCollectorStatus(d18Status) && d18CycleMean != null;
+    const useD13LinearityDefault = isPartiallySaturatedCollectorStatus(d13Status) && d13CycleMean != null;
+    const useD18LinearityDefault = isPartiallySaturatedCollectorStatus(d18Status) && d18CycleMean != null;
     const d13DisplayToRawDelta = selectedD13 != null && d13Current != null ? selectedD13 - d13Current : 0;
     const d18DisplayToRawDelta = selectedD18 != null && d18Current != null ? selectedD18 - d18Current : 0;
     const d13SeedRawValue = useD13LinearityDefault ? d13CycleMean : d13Current;
@@ -1644,6 +2014,54 @@ export default function ProcessingPage() {
 
   const workspace = workspaceQuery.data;
   const activeConfig = config ?? workspace?.config ?? null;
+  const colorScaleBounds = useMemo(() => {
+    if (!workspace) {
+      return null;
+    }
+    const figures: Array<Record<string, unknown> | undefined> = [
+      workspace.overview_figures.processing_3d,
+      workspace.overview_figures.crossplot,
+      workspace.overview_figures.d13_summary,
+      workspace.overview_figures.d18_summary,
+    ];
+    for (const section of workspace.species_sections) {
+      for (const figureSet of section.identifier_figures) {
+        figures.push(figureSet.d13c, figureSet.d18o);
+      }
+    }
+    return deriveColorScaleBounds(figures);
+  }, [workspace]);
+
+  useEffect(() => {
+    if (!activeConfig) {
+      return;
+    }
+    const bounds = colorScaleBounds ?? { min: 0, max: 1 };
+    const param = activeConfig.color_param;
+    const fullRange: [number, number] = [bounds.min, bounds.max];
+    const parameterChanged = colorScaleRangeParam !== param;
+    setColorScaleRange((current) => {
+      if (!current || parameterChanged) {
+        return fullRange;
+      }
+      const normalized = normalizeColorScaleRange(current, bounds);
+      if (normalized[0] === current[0] && normalized[1] === current[1]) {
+        return current;
+      }
+      return normalized;
+    });
+    if (parameterChanged) {
+      setColorScaleRangeParam(param);
+    }
+  }, [activeConfig, colorScaleBounds, colorScaleRangeParam]);
+
+  const colorSliderBounds: ColorScaleBounds = colorScaleBounds ?? { min: 0, max: 1 };
+  const effectiveColorScaleRange = normalizeColorScaleRange(
+    colorScaleRange ?? [colorSliderBounds.min, colorSliderBounds.max],
+    colorSliderBounds,
+  );
+  const withColorScaleRange = (figure: Record<string, unknown> | undefined) =>
+    applyColorScaleRangeToFigure(figure, effectiveColorScaleRange);
 
   useEffect(() => {
     if (!sessionId || typeof window === "undefined" || !workspaceQuery.data) {
@@ -1795,7 +2213,7 @@ export default function ProcessingPage() {
 
   function handleSelectionSourceChartSelection(chartKey: string, points: PlotlyPoint[]) {
     const targets = parseSelectedTargets(points, chartKey);
-    if (targets.length) {
+    if (targets.length > 1) {
       setTargets(targets);
     }
   }
@@ -1907,9 +2325,27 @@ export default function ProcessingPage() {
     if (!sessionId || !activeSampleTarget) {
       return;
     }
+    const activeRowLabel = String(activeSampleTarget.rowLabel).trim();
+    const d13Target = sampleD13DiagnosticsQuery.data?.target ?? {};
+    const d18Target = sampleD18DiagnosticsQuery.data?.target ?? {};
+    const d13Status =
+      asString(d13Target["row_label"]).trim() === activeRowLabel
+        ? asString(d13Target["collector_status"]).trim()
+        : "";
+    const d18Status =
+      asString(d18Target["row_label"]).trim() === activeRowLabel
+        ? asString(d18Target["collector_status"]).trim()
+        : "";
+    const interpolateBothIsotopes =
+      isFailedSampleCollectorStatus(d13Status) || isFailedSampleCollectorStatus(d18Status);
     await editMutation.mutateAsync({
       action: "interpolate",
-      targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
+      targets: interpolateBothIsotopes
+        ? [
+            { row_label: activeSampleTarget.rowLabel, isotope_key: "d13C" as const },
+            { row_label: activeSampleTarget.rowLabel, isotope_key: "d18O" as const },
+          ]
+        : [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
       offset: singleOffsets[isotopeKey],
     });
   }
@@ -1958,11 +2394,21 @@ export default function ProcessingPage() {
     ]);
   }
 
-  async function restoreFailedSamples(table: OutlierTable) {
+  function buildExplicitFailedSampleTargets(rowLabels: string[]) {
+    const uniqueRowLabels = Array.from(new Set(rowLabels.map((rowLabel) => rowLabel.trim()).filter(Boolean)));
+    return uniqueRowLabels.flatMap((rowLabel) => [
+      { row_label: rowLabel, isotope_key: "d13C" as const },
+      { row_label: rowLabel, isotope_key: "d18O" as const },
+    ]);
+  }
+
+  async function restoreFailedSamples(table: OutlierTable, selectedRowLabels: string[] = []) {
     if (!sessionId) {
       return;
     }
-    const targets = buildRandomFailedSampleTargets(table.rows, failedRestoreRate);
+    const targets = selectedRowLabels.length
+      ? buildExplicitFailedSampleTargets(selectedRowLabels)
+      : buildRandomFailedSampleTargets(table.rows, failedRestoreRate);
     if (!targets.length) {
       return;
     }
@@ -2039,12 +2485,14 @@ export default function ProcessingPage() {
     resetAllMutation.isPending ||
     removeCalibrationMutation.isPending ||
     duplicateCheckMutation.isPending;
-  const renderFailedSampleTableControls = (table: OutlierTable) => {
-    const normalizedName = String(table.name || table.title || "").toLowerCase();
-    const isFailedSampleTable = normalizedName.includes("failed sample");
+  const renderFailedSampleTableControls = (table: OutlierTable, context: { selectedRowLabels: string[] }) => {
+    const isFailedSampleTable = isFailedSampleOutlierTable(table);
     if (!isFailedSampleTable) {
       return null;
     }
+    const selectedRowLabels = context.selectedRowLabels ?? [];
+    const hasSelectedRows = selectedRowLabels.length > 0;
+    const restoreDisabled = busy || (!hasSelectedRows && (!table.rows.length || clampNumber(failedRestoreRate, 0, 100) <= 0));
     return (
       <div className="flex flex-wrap items-end gap-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
         <label className="text-sm">
@@ -2056,7 +2504,11 @@ export default function ProcessingPage() {
             step={1}
             value={failedRestoreRate}
             onChange={(event) => setFailedRestoreRate(clampNumber(parseFinite(event.target.value, 0), 0, 100))}
-            className="w-28 rounded-lg border border-stone-300 px-3 py-2"
+            disabled={hasSelectedRows}
+            className={cn(
+              "w-28 rounded-lg border border-stone-300 px-3 py-2",
+              hasSelectedRows ? "cursor-not-allowed bg-stone-100 text-stone-500" : "",
+            )}
           />
         </label>
         <label className="text-sm">
@@ -2081,14 +2533,15 @@ export default function ProcessingPage() {
           />
         </label>
         <Button
-          onClick={() => restoreFailedSamples(table)}
-          disabled={busy || !table.rows.length || clampNumber(failedRestoreRate, 0, 100) <= 0}
+          onClick={() => restoreFailedSamples(table, selectedRowLabels)}
+          disabled={restoreDisabled}
         >
           Restore
         </Button>
         <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>
           Reset
         </Button>
+        {hasSelectedRows ? <div className="text-xs text-stone-500">{selectedRowLabels.length} row(s) selected for restore.</div> : null}
       </div>
     );
   };
@@ -2150,30 +2603,50 @@ export default function ProcessingPage() {
       : typeof sampleD13DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
         ? (sampleD13DiagnosticsQuery.data.target.effective_outlier as boolean)
         : false;
+  const activeTargetCollectorStatus = (() => {
+    if (!activeSampleTarget) {
+      return "";
+    }
+    const activeRowLabel = String(activeSampleTarget.rowLabel).trim();
+    const d13Target = sampleD13DiagnosticsQuery.data?.target ?? {};
+    const d18Target = sampleD18DiagnosticsQuery.data?.target ?? {};
+    const d13Status =
+      asString(d13Target["row_label"]).trim() === activeRowLabel
+        ? asString(d13Target["collector_status"]).trim()
+        : "";
+    const d18Status =
+      asString(d18Target["row_label"]).trim() === activeRowLabel
+        ? asString(d18Target["collector_status"]).trim()
+        : "";
+    return d13Status || d18Status;
+  })();
+  const singleInterpolateLabel = isFailedSampleCollectorStatus(activeTargetCollectorStatus)
+    ? "Interpolate d13C + d18O"
+    : `Interpolate ${selectionEditorTab}`;
   const overviewCards = {
     processing3d: {
       key: "processing_3d",
       title: "3D Processing Overview",
       description: "Global 3D view for the filtered processing scope.",
-      figure: workspace.overview_figures.processing_3d,
+      figure: withColorScaleRange(workspace.overview_figures.processing_3d),
     },
     d13Summary: {
       key: "d13_summary",
       title: "d13C Summary",
       description: "Summary curve for d13C across the active scope.",
-      figure: workspace.overview_figures.d13_summary,
+      figure: withColorScaleRange(workspace.overview_figures.d13_summary),
     },
     d18Summary: {
       key: "d18_summary",
       title: "d18O Summary",
       description: "Summary curve for d18O across the active scope.",
-      figure: workspace.overview_figures.d18_summary,
+      figure: withColorScaleRange(workspace.overview_figures.d18_summary),
     },
     crossplot: {
       key: "crossplot",
       title: "Crossplot",
       description: "d13C vs d18O selection surface for dual-isotope edits.",
-      figure: workspace.overview_figures.crossplot,
+      figure: withColorScaleRange(workspace.overview_figures.crossplot),
     },
   };
   const d13SummaryState = displayState[overviewCards.d13Summary.key] ?? { rawOnly: false, hideCalibrated: false };
@@ -2197,8 +2670,8 @@ export default function ProcessingPage() {
           const d18Key = `${section.species}|${figureSet.identifier}|d18O`;
           const d13State = displayState[d13Key] ?? { rawOnly: false, hideCalibrated: false };
           const d18State = displayState[d18Key] ?? { rawOnly: false, hideCalibrated: false };
-          const d13FigureBase = applyDisplayState(figureSet.d13c, d13State.rawOnly, d13State.hideCalibrated);
-          const d18FigureBase = applyDisplayState(figureSet.d18o, d18State.rawOnly, d18State.hideCalibrated);
+          const d13FigureBase = applyDisplayState(withColorScaleRange(figureSet.d13c), d13State.rawOnly, d13State.hideCalibrated);
+          const d18FigureBase = applyDisplayState(withColorScaleRange(figureSet.d18o), d18State.rawOnly, d18State.hideCalibrated);
           const containsSelectedRow =
             figureContainsRowLabel(d13FigureBase, activeTarget.rowLabel) || figureContainsRowLabel(d18FigureBase, activeTarget.rowLabel);
           if (!containsSelectedRow) {
@@ -2281,8 +2754,8 @@ export default function ProcessingPage() {
       chartKey: activeSelectionChartKey,
       figure: highlightSelectionSourceFigure(
         isotopeKey === "d13C"
-          ? applyDisplayState(figureSet.d13c, state.rawOnly, state.hideCalibrated)
-          : applyDisplayState(figureSet.d18o, state.rawOnly, state.hideCalibrated),
+          ? applyDisplayState(withColorScaleRange(figureSet.d13c), state.rawOnly, state.hideCalibrated)
+          : applyDisplayState(withColorScaleRange(figureSet.d18o), state.rawOnly, state.hideCalibrated),
         activeTarget,
       ),
     };
@@ -2345,20 +2818,33 @@ export default function ProcessingPage() {
                     <option value="By Sequence">By Sequence</option>
                   </select>
                 </label>
-                <label className="text-sm">
+                <div className="text-sm">
                   <span className="mb-1 block font-medium text-stone-700">Color parameter</span>
                   <select
                     value={activeConfig.color_param}
                     onChange={(event) => updateConfig("color_param", event.target.value)}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
-                    {workspace.available_values.color_params.map((option) => (
+                    {workspace.available_values.color_params
+                      .filter((option) => option !== "Date_ordinal")
+                      .map((option) => (
                       <option key={option} value={option}>
                         {option}
                       </option>
                     ))}
                   </select>
-                </label>
+                  <div className="mt-2">
+                    <RangeSliderField
+                      label="Color scale interval"
+                      value={effectiveColorScaleRange}
+                      min={colorSliderBounds.min}
+                      max={colorSliderBounds.max}
+                      step={sliderStep(colorSliderBounds)}
+                      precision={sliderPrecision(colorSliderBounds)}
+                      onChange={(nextRange) => setColorScaleRange(nextRange)}
+                    />
+                  </div>
+                </div>
                 <label className="text-sm">
                   <span className="mb-1 block font-medium text-stone-700">3D Z axis</span>
                   <select
@@ -2451,7 +2937,7 @@ export default function ProcessingPage() {
               </div>
 
               <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-800">Outliers</div>
+                <div className="text-sm font-medium text-stone-800">Show on chart</div>
                 <CheckboxField checked={activeConfig.overlays.show_statistical_outliers} label="Statistical outliers" onChange={(checked) => updateOverlay("show_statistical_outliers", checked)} />
                 <CheckboxField checked={activeConfig.overlays.show_range_outliers} label="Range outliers" onChange={(checked) => updateOverlay("show_range_outliers", checked)} />
                 <CheckboxField checked={activeConfig.overlays.show_manual_outliers} label="Manual outliers" onChange={(checked) => updateOverlay("show_manual_outliers", checked)} />
@@ -2478,7 +2964,7 @@ export default function ProcessingPage() {
                 <CheckboxField
                   checked={activeConfig.manual_linearity_override.enabled}
                   label="Enable manual linearity transform"
-                  description="Applied to all workspace samples before outlier filtering; raw stored values are not overwritten."
+                  description="Applied as a second-pass transform after calibration-page linearity correction (if enabled), before outlier filtering; raw stored values are not overwritten."
                   onChange={(checked) => updateManualLinearity("enabled", checked)}
                 />
                 <CheckboxField
@@ -3018,7 +3504,7 @@ export default function ProcessingPage() {
                               Offset {selectionEditorTab}
                             </Button>
                             <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
-                              Interpolate {selectionEditorTab}
+                              {singleInterpolateLabel}
                             </Button>
                           </div>
 
@@ -3229,7 +3715,7 @@ export default function ProcessingPage() {
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
-                                  figure={applyDisplayState(figureSet.d13c, d13State.rawOnly, d13State.hideCalibrated)}
+                                  figure={applyDisplayState(withColorScaleRange(figureSet.d13c), d13State.rawOnly, d13State.hideCalibrated)}
                                   className="h-full w-full"
                                   onPointClick={(points) => handleChartClick(d13Key, points)}
                                   onSelection={(points) => handleChartSelection(d13Key, points)}
@@ -3259,7 +3745,7 @@ export default function ProcessingPage() {
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
-                                  figure={applyDisplayState(figureSet.d18o, d18State.rawOnly, d18State.hideCalibrated)}
+                                  figure={applyDisplayState(withColorScaleRange(figureSet.d18o), d18State.rawOnly, d18State.hideCalibrated)}
                                   className="h-full w-full"
                                   onPointClick={(points) => handleChartClick(d18Key, points)}
                                   onSelection={(points) => handleChartSelection(d18Key, points)}
