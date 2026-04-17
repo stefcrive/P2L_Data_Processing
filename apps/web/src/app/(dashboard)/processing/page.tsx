@@ -3199,7 +3199,7 @@ export default function ProcessingPage() {
                               </Button>
                             </div>
                             <div className="text-xs text-stone-600">
-                              Checks for repeated Identifier 2 or Sequence in the current client-output scope.
+                              Checks for repeated Identifier 1 + Identifier 2 + Species in the current client-output scope.
                             </div>
                             {duplicateCheckMutation.isError ? (
                               <div className="text-xs font-medium text-red-700">Duplicate check failed.</div>
@@ -3218,21 +3218,11 @@ export default function ProcessingPage() {
                                     ? `${duplicateCheckResult.duplicate_row_count} duplicate row(s) found.`
                                     : "No duplicates found."}
                                 </div>
-                                {duplicateCheckResult.duplicate_identifier2_values.length ? (
+                                {duplicateCheckResult.duplicate_identifier1_identifier2_species_values.length ? (
                                   <div>
-                                    Identifier 2:{" "}
-                                    {duplicateCheckResult.duplicate_identifier2_values.slice(0, 8).join(", ")}
-                                    {duplicateCheckResult.duplicate_identifier2_values.length > 8 ? "..." : ""}
-                                  </div>
-                                ) : null}
-                                {duplicateCheckResult.duplicate_sequence_values.length ? (
-                                  <div>
-                                    Sequence:{" "}
-                                    {duplicateCheckResult.duplicate_sequence_values
-                                      .slice(0, 8)
-                                      .map((value) => String(value))
-                                      .join(", ")}
-                                    {duplicateCheckResult.duplicate_sequence_values.length > 8 ? "..." : ""}
+                                    Identifier 1 + Identifier 2 + Species:{" "}
+                                    {duplicateCheckResult.duplicate_identifier1_identifier2_species_values.slice(0, 8).join(", ")}
+                                    {duplicateCheckResult.duplicate_identifier1_identifier2_species_values.length > 8 ? "..." : ""}
                                   </div>
                                 ) : null}
                               </div>

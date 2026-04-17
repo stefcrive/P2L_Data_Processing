@@ -227,8 +227,7 @@ class ExportRequest(BaseModel):
 
 class ClientOutputDuplicateCheckResponse(BaseModel):
     duplicate_row_count: int = 0
-    duplicate_identifier2_values: list[str] = Field(default_factory=list)
-    duplicate_sequence_values: list[int | float] = Field(default_factory=list)
+    duplicate_identifier1_identifier2_species_values: list[str] = Field(default_factory=list)
     duplicate_rows: list[dict[str, Any]] = Field(default_factory=list)
 
 

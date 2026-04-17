@@ -121,14 +121,8 @@ def _normalize_duplicate_key_series(values: pd.Series) -> pd.Series:
     return values.fillna("").astype(str).map(str.strip)
 
 
-def _serialize_sequence_token(value: Any) -> int | float | None:
-    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(numeric):
-        return None
-    as_float = float(numeric)
-    if as_float.is_integer():
-        return int(as_float)
-    return as_float
+def _build_duplicate_identity_key(identifier1: str, identifier2: str, species: str) -> str:
+    return f"{identifier1} | {identifier2} | {species}"
 
 
 def summarize_client_output_duplicates(client_df: pd.DataFrame) -> dict[str, Any]:
@@ -136,43 +130,49 @@ def summarize_client_output_duplicates(client_df: pd.DataFrame) -> dict[str, Any
         return {
             "duplicate_row_mask": pd.Series(dtype=bool),
             "duplicate_rows": [],
-            "duplicate_identifier2_values": [],
-            "duplicate_sequence_values": [],
+            "duplicate_identifier1_identifier2_species_values": [],
             "duplicate_row_count": 0,
         }
 
+    identifier1_series = _normalize_duplicate_key_series(
+        client_df.get("Identifier", pd.Series("", index=client_df.index, dtype=object))
+    )
     identifier2_series = _normalize_duplicate_key_series(
         client_df.get("__identifier_2_key", pd.Series("", index=client_df.index, dtype=object))
     )
-    sequence_series = pd.to_numeric(
-        client_df.get("Sequence", pd.Series(index=client_df.index, dtype=object)),
-        errors="coerce",
+    species_series = _normalize_duplicate_key_series(
+        client_df.get("Species", pd.Series("", index=client_df.index, dtype=object))
     )
-    duplicate_identifier2_mask = identifier2_series.ne("") & identifier2_series.duplicated(keep=False)
-    duplicate_sequence_mask = sequence_series.notna() & sequence_series.duplicated(keep=False)
-    duplicate_row_mask = (duplicate_identifier2_mask | duplicate_sequence_mask).astype(bool)
+    duplicate_identity_series = pd.Series(
+        (
+            _build_duplicate_identity_key(identifier1_value, identifier2_value, species_value)
+            for identifier1_value, identifier2_value, species_value in zip(
+                identifier1_series.tolist(), identifier2_series.tolist(), species_series.tolist()
+            )
+        ),
+        index=client_df.index,
+        dtype=object,
+    )
+    duplicate_identity_mask = identifier2_series.ne("") & duplicate_identity_series.duplicated(keep=False)
+    duplicate_row_mask = duplicate_identity_mask.astype(bool)
 
-    duplicate_rows_df = client_df.loc[duplicate_row_mask, ["Identifier", "Sample #", "Sequence"]].copy()
-    duplicate_rows_df["Duplicate Identifier 2"] = duplicate_identifier2_mask.loc[duplicate_rows_df.index].astype(bool)
-    duplicate_rows_df["Duplicate Sequence"] = duplicate_sequence_mask.loc[duplicate_rows_df.index].astype(bool)
+    duplicate_rows_df = client_df.loc[duplicate_row_mask, ["Identifier", "Sample #", "Species", "Sequence"]].copy()
+    duplicate_rows_df["Duplicate Identifier 1 + Identifier 2 + Species"] = (
+        duplicate_identity_mask.loc[duplicate_rows_df.index].astype(bool)
+    )
     duplicate_rows_df = duplicate_rows_df.fillna("")
 
-    duplicate_identifier2_values = sorted(
-        {token for token in identifier2_series.loc[duplicate_identifier2_mask].tolist() if str(token).strip()}
-    )
-    duplicate_sequence_values = sorted(
+    duplicate_identity_values = sorted(
         {
-            serialized
-            for serialized in (_serialize_sequence_token(value) for value in sequence_series.loc[duplicate_sequence_mask].tolist())
-            if serialized is not None
+            token
+            for token in duplicate_identity_series.loc[duplicate_identity_mask].tolist()
+            if str(token).strip()
         },
-        key=float,
     )
     return {
         "duplicate_row_mask": duplicate_row_mask,
         "duplicate_rows": duplicate_rows_df.to_dict(orient="records"),
-        "duplicate_identifier2_values": duplicate_identifier2_values,
-        "duplicate_sequence_values": duplicate_sequence_values,
+        "duplicate_identifier1_identifier2_species_values": duplicate_identity_values,
         "duplicate_row_count": int(duplicate_row_mask.sum()),
     }
 
@@ -261,7 +261,6 @@ def _format_client_output_worksheet(
     worksheet.write(5, equip_value_col, f"{d13_std:.2f} \u2030 for d13C")
     worksheet.write(6, equip_value_col, f"{d18_std:.2f} \u2030 for d18O")
     worksheet.write(7, equip_value_col, f"d13C n={n13}, d18O n={n18}")
-    worksheet.write(8, equip_value_col, "Yellow rows indicate duplicate Identifier 2 and/or Sequence values.")
     textbox_anchor = f"{_excel_col_name(equip_value_col)}10"
     worksheet.insert_textbox(
         textbox_anchor,

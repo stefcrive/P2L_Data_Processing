@@ -337,17 +337,16 @@ class ProcessingApiTests(unittest.TestCase):
                 output_type="client_output",
             ),
         )
-        self.assertEqual(duplicate_check.duplicate_row_count, 2)
+        self.assertEqual(duplicate_check.duplicate_row_count, 0)
         self.assertEqual(
-            {str(value) for value in duplicate_check.duplicate_identifier2_values},
-            {"1"},
+            duplicate_check.duplicate_identifier1_identifier2_species_values,
+            [],
         )
-        self.assertEqual(duplicate_check.duplicate_sequence_values, [])
-        self.assertEqual(len(duplicate_check.duplicate_rows), 2)
+        self.assertEqual(len(duplicate_check.duplicate_rows), 0)
 
         workbook_with_styles = load_workbook(io.BytesIO(export_client_output.body))
         worksheet = workbook_with_styles["Client Output"]
-        self.assertGreater(len(list(worksheet.conditional_formatting)), 0)
+        self.assertEqual(len(list(worksheet.conditional_formatting)), 0)
 
         export_client_output_capped = api_main.export_dataset(
             self.session_id,
@@ -481,6 +480,31 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertTrue(d13_line.startswith(f"{float(expected_d13):.2f}"))
         self.assertTrue(d18_line.startswith(f"{float(expected_d18):.2f}"))
         self.assertEqual(n_line, f"d13C n={int(shp_summary.included_d13)}, d18O n={int(shp_summary.included_d18)}")
+
+    def test_duplicate_check_uses_identifier1_identifier2_species_composite(self) -> None:
+        df = sample_processing_df().copy()
+        df.loc[3, "Identifier 1"] = "SampleA"
+        df.loc[3, "Species"] = "Coral"
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        duplicate_check = api_main.check_client_output_duplicates(
+            self.session_id,
+            ExportRequest(
+                include_outliers=False,
+                selected_ids=["All"],
+                interpolate_outliers=False,
+                client_name="Client A",
+                comment_map={"Coral": "Porites"},
+                output_type="client_output",
+            ),
+        )
+
+        self.assertEqual(duplicate_check.duplicate_row_count, 2)
+        self.assertEqual(
+            set(duplicate_check.duplicate_identifier1_identifier2_species_values),
+            {"SampleA | 1 | Porites"},
+        )
+        self.assertEqual(len(duplicate_check.duplicate_rows), 2)
 
     def test_client_output_matches_chart_scoped_statistical_filtering(self) -> None:
         df = sample_processing_df().copy()

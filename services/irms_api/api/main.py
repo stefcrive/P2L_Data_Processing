@@ -1388,13 +1388,9 @@ def check_client_output_duplicates(session_id: str, request: ExportRequest) -> C
     duplicate_summary = summarize_client_output_duplicates(client_df)
     return ClientOutputDuplicateCheckResponse(
         duplicate_row_count=int(duplicate_summary["duplicate_row_count"]),
-        duplicate_identifier2_values=[
+        duplicate_identifier1_identifier2_species_values=[
             str(value)
-            for value in duplicate_summary["duplicate_identifier2_values"]
-        ],
-        duplicate_sequence_values=[
-            float(value) if isinstance(value, float) else int(value)
-            for value in duplicate_summary["duplicate_sequence_values"]
+            for value in duplicate_summary["duplicate_identifier1_identifier2_species_values"]
         ],
         duplicate_rows=[
             dict(row)
