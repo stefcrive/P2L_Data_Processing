@@ -1453,6 +1453,58 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(str(d13_calibrated_legend_entries[0].get("name", "")), "Calibrated")
         self.assertEqual(str(d18_calibrated_legend_entries[0].get("name", "")), "Calibrated")
 
+    def test_overview_crossplot_and_3d_use_species_specific_marker_symbols(self) -> None:
+        df = sample_processing_df().copy()
+        sample_b_mask = df["Identifier 1"].astype(str) == "SampleB"
+        # Keep SampleB rows within plotting domain so both species appear in overview charts.
+        df.loc[sample_b_mask, "Collector Status"] = ""
+        df.loc[sample_b_mask, "d 18O/16O  Mean"] = 2.8
+        df.loc[sample_b_mask, "d 13C/12C  Mean"] = 2.9
+        df.loc[sample_b_mask, "leak_rate"] = 5.0
+
+        config = normalize_processing_config({}).model_dump()
+        config["selected_identifier"] = "All"
+        config["sigma_level_data"] = 99.0
+        config["signal_range"] = [0.0, 100.0]
+        config["leak_range"] = [0.0, 1000.0]
+        config["d13c_range"] = [-100.0, 100.0]
+        config["d18o_range"] = [-100.0, 100.0]
+        metadata = {
+            "processing": {"config": config},
+            "edit_state": {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
+
+        crossplot_data = workspace.overview_figures.get("crossplot", {}).get("data", [])
+        species_symbols: dict[str, str] = {}
+        for trace in crossplot_data:
+            if not isinstance(trace, dict):
+                continue
+            name = str(trace.get("name", ""))
+            marker = trace.get("marker", {})
+            symbol = marker.get("symbol") if isinstance(marker, dict) else None
+            if name in {"Coral", "Shell"} and isinstance(symbol, str):
+                species_symbols[name] = symbol
+        self.assertIn("Coral", species_symbols)
+        self.assertIn("Shell", species_symbols)
+        self.assertNotEqual(species_symbols["Coral"], species_symbols["Shell"])
+
+        processing_3d_data = workspace.overview_figures.get("processing_3d", {}).get("data", [])
+        species_3d_symbols: dict[str, str] = {}
+        for trace in processing_3d_data:
+            if not isinstance(trace, dict):
+                continue
+            name = str(trace.get("name", ""))
+            marker = trace.get("marker", {})
+            symbol = marker.get("symbol") if isinstance(marker, dict) else None
+            if name in {"Coral", "Shell"} and isinstance(symbol, str):
+                species_3d_symbols[name] = symbol
+        self.assertIn("Coral", species_3d_symbols)
+        self.assertIn("Shell", species_3d_symbols)
+        self.assertNotEqual(species_3d_symbols["Coral"], species_3d_symbols["Shell"])
+
     def test_unselected_outlier_overlays_are_hidden_from_base_charts(self) -> None:
         df = sample_processing_df()
         metadata = {

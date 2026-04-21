@@ -15,6 +15,7 @@ from ..shared.dataframe import _get_species_series, _parse_numeric_token
 from ..shared.json_compat import to_json_compatible
 from ..shared.plotting import (
     _apply_cycle_std_error_bars,
+    _build_species_symbol_map,
     _build_cycle_std_lookups,
     _build_date_colorbar_ticks,
     _build_delta_point_customdata,
@@ -24,6 +25,7 @@ from ..shared.plotting import (
     _is_date_color_column,
     _prefer_datetime_color_values,
     _prepare_color_values,
+    _species_symbol_for_label,
 )
 from .outliers import (
     RangeConfig,
@@ -1001,17 +1003,18 @@ def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
         if colorbar is None:
             continue
         # Push the colorbar into the right margin so the 3D scene can use the full chart domain.
-        colorbar.x = 1.09
+        colorbar.x = 1.01
         colorbar.xanchor = "left"
         colorbar.y = 0.5
         colorbar.yanchor = "middle"
-        colorbar.len = 0.78
+        colorbar.len = 0.74
         colorbar_updated = True
         break
 
     layout_updates: dict[str, Any] = {
-        "scene": {"domain": {"x": [0.0, 1.0], "y": [0.0, 1.0]}},
-        "margin": {"l": 8, "r": 130 if colorbar_updated else 24, "t": 56, "b": 8},
+        "scene": {"domain": {"x": [0.0, 1.0], "y": [0.0, 1.0]}, "aspectmode": "cube"},
+        "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0, "xanchor": "left"},
+        "margin": {"l": 12, "r": 84 if colorbar_updated else 24, "t": 56, "b": 12},
     }
     fig.update_layout(**layout_updates)
 
@@ -1125,6 +1128,7 @@ def build_overview_figures(
     color_series, colorbar_category_ticks, has_numeric_colors, color_min, color_max = _color_series_for_plot(cross_df, config.color_param)
     is_date_color = _is_date_color_column(config.color_param)
     cross_df["_color_value"] = color_series
+    species_symbol_map = _build_species_symbol_map(cross_df.get("_species_label", pd.Series(index=cross_df.index, dtype=object)))
     fig_cross = go.Figure()
     show_colorbar = has_numeric_colors
     for species, species_df in cross_df.groupby("_species_label", dropna=False):
@@ -1135,7 +1139,11 @@ def build_overview_figures(
         if not valid.any():
             continue
         plot_df = plot_df.loc[valid].copy()
-        marker: dict[str, Any] = dict(size=10, opacity=1.0)
+        marker: dict[str, Any] = dict(
+            size=10,
+            opacity=1.0,
+            symbol=_species_symbol_for_label(species, species_symbol_map),
+        )
         if has_numeric_colors:
             marker.update(
                 color=plot_df["_color_value"],
@@ -1209,12 +1217,25 @@ def build_overview_figures(
     else:
         y_axis["autorange"] = True
     fig_cross.update_layout(
-        title="d13C vs d18O",
+        title=dict(
+            text="d13C vs d18O",
+            x=0.0,
+            xanchor="left",
+            y=0.99,
+            yanchor="top",
+        ),
         xaxis=x_axis,
         yaxis=y_axis,
         hovermode="closest",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0, xanchor="left"),
-        margin=dict(l=40, r=20, t=80, b=40),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=1.12,
+            x=0.0,
+            xanchor="left",
+            tracegroupgap=6,
+        ),
+        margin=dict(l=40, r=24, t=136, b=48),
         height=720,
     )
     figures["crossplot"] = _figure_json(fig_cross)

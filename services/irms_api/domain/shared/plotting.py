@@ -9,6 +9,48 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - optional for logic-only tests
     go = None
 
+_SPECIES_SYMBOL_SEQUENCE = (
+    "circle",
+    "square",
+    "diamond",
+    "cross",
+    "x",
+    "circle-open",
+    "square-open",
+    "diamond-open",
+)
+
+
+def _clean_species_label(value):
+    text = '' if value is None else str(value).strip()
+    if not text or text.lower() == 'nan':
+        return 'Unknown'
+    return text
+
+
+def _build_species_symbol_map(species_values):
+    series = pd.Series(species_values if species_values is not None else [], dtype=object)
+    if series.empty:
+        return {'Unknown': _SPECIES_SYMBOL_SEQUENCE[0]}
+    labels = sorted({_clean_species_label(value) for value in series.tolist()})
+    if not labels:
+        labels = ['Unknown']
+    return {
+        label: _SPECIES_SYMBOL_SEQUENCE[idx % len(_SPECIES_SYMBOL_SEQUENCE)]
+        for idx, label in enumerate(labels)
+    }
+
+
+def _species_symbol_for_label(label, symbol_map=None):
+    key = _clean_species_label(label)
+    if isinstance(symbol_map, dict):
+        if key in symbol_map:
+            return symbol_map[key]
+        if 'Unknown' in symbol_map:
+            return symbol_map['Unknown']
+    return _SPECIES_SYMBOL_SEQUENCE[0]
+
+
 def _normalize_color_key(value):
     return ''.join(ch.lower() for ch in str(value or '') if ch.isalnum())
 
@@ -327,6 +369,7 @@ def _build_isotope_3d_scatter(
         .astype(str)
     )
     species_series = species_source.where(species_source.str.strip() != "", "Unknown")
+    species_symbol_map = _build_species_symbol_map(species_series)
     color_hover_series = plot_df.get('__hover_color_value', plot_df.get(color_col, pd.Series(index=plot_df.index, dtype=object)))
     color_hover_series = color_hover_series.map(_format_hover_color_value)
     color_hover_label = 'Date' if _is_date_color_column(color_col) else str(color_label or color_col or 'Color')
@@ -349,10 +392,14 @@ def _build_isotope_3d_scatter(
 
     fig = go.Figure()
 
-    def _add_trace(mask, *, symbol, name, show_scale):
+    def _add_trace(mask, *, symbol, name, show_scale, show_legend=True):
         if not np.any(mask):
             return
+        symbol_value = symbol
+        if isinstance(symbol, np.ndarray) and symbol.ndim == 1 and symbol.shape[0] == len(mask):
+            symbol_value = symbol[mask]
         marker = dict(size=6, opacity=1.0, symbol=symbol)
+        marker['symbol'] = symbol_value
         if has_numeric_color and color_array is not None:
             marker.update(
                 color=color_array[mask],
@@ -404,20 +451,35 @@ def _build_isotope_3d_scatter(
             mode='markers',
             name=name,
             marker=marker,
-            showlegend=bool(np.any(standard_mask)),
+            showlegend=show_legend,
             customdata=customdata,
             hovertemplate=hovertemplate,
             hoverlabel=dict(namelength=-1),
         ))
 
-    if has_numeric_color and np.any(non_standard_mask):
-        _add_trace(non_standard_mask, symbol='circle', name='Samples', show_scale=True)
-        _add_trace(standard_mask, symbol='circle-open', name='SHP2L', show_scale=False)
-    elif has_numeric_color:
-        _add_trace(standard_mask, symbol='circle-open', name='SHP2L', show_scale=True)
-    else:
-        _add_trace(non_standard_mask, symbol='circle', name='Samples', show_scale=False)
-        _add_trace(standard_mask, symbol='circle-open', name='SHP2L', show_scale=False)
+    colorbar_shown = False
+    non_standard_species = sorted({_clean_species_label(value) for value in species_series[non_standard_mask].tolist()})
+    for species_label in non_standard_species:
+        species_mask = non_standard_mask & species_series.eq(species_label).to_numpy(dtype=bool)
+        if not np.any(species_mask):
+            continue
+        _add_trace(
+            species_mask,
+            symbol=_species_symbol_for_label(species_label, species_symbol_map),
+            name=species_label,
+            show_scale=has_numeric_color and not colorbar_shown,
+            show_legend=True,
+        )
+        if has_numeric_color and not colorbar_shown:
+            colorbar_shown = True
+    standard_name = str(open_circle_identifier).strip() if open_circle_identifier else 'SHP2L'
+    _add_trace(
+        standard_mask,
+        symbol='circle-open',
+        name=standard_name,
+        show_scale=has_numeric_color and not colorbar_shown,
+        show_legend=bool(np.any(standard_mask)),
+    )
     fig.update_layout(
         title=title or "d18O vs d13C (3D)",
         scene=dict(
