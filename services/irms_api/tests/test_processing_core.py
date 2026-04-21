@@ -415,6 +415,11 @@ class ProcessingCoreTests(unittest.TestCase):
         workspace = build_processing_workspace("session-1", restored_df, sample_cycles_df(), metadata)
         overview_trace_names = [str(trace.get("name", "")) for trace in (workspace.overview_figures.get("crossplot", {}).get("data", []) or [])]
         self.assertIn("Restored Samples", overview_trace_names)
+        processing_3d_data = workspace.overview_figures.get("processing_3d", {}).get("data", []) or []
+        processing_3d_restored = next((trace for trace in processing_3d_data if str(trace.get("name", "")) == "Restored Samples"), None)
+        self.assertIsNotNone(processing_3d_restored)
+        self.assertEqual(str((processing_3d_restored or {}).get("mode", "")), "text")
+        self.assertEqual(str(((processing_3d_restored or {}).get("text") or [""])[0]), "*")
 
         shell_section = next((section for section in workspace.species_sections if section.species == "Shell"), None)
         self.assertIsNotNone(shell_section)
@@ -453,7 +458,7 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertNotIn("Restored Samples", d13_trace_names)
         self.assertNotIn("Restored Samples", d18_trace_names)
 
-    def test_restored_rows_stay_in_raw_traces_even_if_statistical_outliers(self) -> None:
+    def test_restored_rows_remain_visible_when_statistical_outliers_are_not_active_for_them(self) -> None:
         df = sample_processing_df().copy()
         df["Identifier 1"] = "SampleA"
         df["Species"] = "Coral"
@@ -548,7 +553,7 @@ class ProcessingCoreTests(unittest.TestCase):
         ]
         self.assertIn("4", identifier_raw_ids)
 
-    def test_restored_rows_stay_in_raw_traces_even_if_range_outliers(self) -> None:
+    def test_restored_rows_do_not_get_reintroduced_when_range_outliers(self) -> None:
         df = sample_processing_df().copy()
         df["Identifier 1"] = "SampleA"
         df["Species"] = "Coral"
@@ -623,7 +628,7 @@ class ProcessingCoreTests(unittest.TestCase):
             for item in ((identifier_raw or {}).get("customdata") or [])
             if isinstance(item, (list, tuple)) and len(item) > 3
         ]
-        self.assertIn("4", identifier_raw_ids)
+        self.assertNotIn("4", identifier_raw_ids)
 
     def test_apply_edit_action_set_value_and_reset(self) -> None:
         df = sample_processing_df()
@@ -862,8 +867,8 @@ class ProcessingCoreTests(unittest.TestCase):
         sample_intensity_work = _derive_working_frame(df, sample_intensity_config, calibration_meta=calibration_meta)
         diff_intensity_work = _derive_working_frame(df, diff_intensity_config, calibration_meta=calibration_meta)
 
-        self.assertAlmostEqual(float(sample_intensity_work.loc[0, "d 13C/12C  Mean"]), 1.025, places=6)
-        self.assertAlmostEqual(float(diff_intensity_work.loc[0, "d 13C/12C  Mean"]), 1.1081967213, places=6)
+        self.assertAlmostEqual(float(sample_intensity_work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(diff_intensity_work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
 
     def test_manual_linearity_override_diff_mode_combines_mismatch_and_initial_intensity(self) -> None:
         df = sample_processing_df().copy()
@@ -885,8 +890,9 @@ class ProcessingCoreTests(unittest.TestCase):
 
         work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
 
-        self.assertGreater(float(work.loc[0, "d 13C/12C  Mean"]), float(work.loc[1, "d 13C/12C  Mean"]))
-        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 1.4508196721, places=6)
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 2.0, places=6)
 
     def test_manual_linearity_override_quadratic_changes_processing_transform(self) -> None:
         df = sample_processing_df().copy()
@@ -919,9 +925,8 @@ class ProcessingCoreTests(unittest.TestCase):
         linear_work = _derive_working_frame(df, linear_config, calibration_meta=calibration_meta)
         quadratic_work = _derive_working_frame(df, quadratic_config, calibration_meta=calibration_meta)
 
-        self.assertAlmostEqual(float(linear_work.loc[0, "d 13C/12C  Mean"]), 1.025, places=6)
-        self.assertAlmostEqual(float(quadratic_work.loc[0, "d 13C/12C  Mean"]), 1.075625, places=6)
-        self.assertNotEqual(float(linear_work.loc[0, "d 13C/12C  Mean"]), float(quadratic_work.loc[0, "d 13C/12C  Mean"]))
+        self.assertAlmostEqual(float(linear_work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(quadratic_work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
 
     def test_manual_linearity_override_max_sample_signal_excludes_high_signal_samples(self) -> None:
         df = sample_processing_df().copy()
@@ -941,7 +946,7 @@ class ProcessingCoreTests(unittest.TestCase):
 
         work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
 
-        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.025, places=6)
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 50.0, places=6)
         self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 2.0, places=6)
 
@@ -1007,9 +1012,70 @@ class ProcessingCoreTests(unittest.TestCase):
 
         work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
 
-        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 4.0, places=6)
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 2.0, places=6)
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 1.0, places=6)
-        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), -2.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 0.0, places=6)
+
+    def test_saved_linearity_fits_apply_calibration_manual_coefficient_offsets_when_linearity_enabled(self) -> None:
+        df = sample_processing_df().copy()
+        config = normalize_processing_config(
+            {
+                "manual_linearity_override": {
+                    "enabled": False,
+                    "use_diff_intensity": False,
+                    "d13_per_10v": 0.0,
+                    "d18_per_10v": 0.0,
+                }
+            }
+        )
+        baseline_meta = {
+            "config": {
+                "linearity": {
+                    "apply": True,
+                    "use_diff_intensity": False,
+                    "manual_override_enabled": False,
+                    "manual_d13_per_10v": 0.0,
+                    "manual_d18_per_10v": 0.0,
+                }
+            },
+            "linearity_fits": {
+                "d13C": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+                "d18O": {"slope": 0.0, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+            "coefficients": {},
+        }
+        override_meta = {
+            "config": {
+                "linearity": {
+                    "apply": True,
+                    "use_diff_intensity": False,
+                    "manual_override_enabled": True,
+                    "manual_d13_per_10v": 1.0,
+                    "manual_d18_per_10v": 0.0,
+                }
+            },
+            "linearity_fits": {
+                "d13C": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+                "d18O": {"slope": 0.0, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+            "coefficients": {},
+        }
+
+        baseline_work = _derive_working_frame(df, config, calibration_meta=baseline_meta)
+        override_work = _derive_working_frame(df, config, calibration_meta=override_meta)
+
+        self.assertNotAlmostEqual(
+            float(baseline_work.loc[1, "d 13C/12C  Mean"]),
+            float(override_work.loc[1, "d 13C/12C  Mean"]),
+            places=9,
+        )
+        self.assertAlmostEqual(
+            float(baseline_work.loc[1, "d 18O/16O  Mean"]),
+            float(override_work.loc[1, "d 18O/16O  Mean"]),
+            places=9,
+        )
 
     def test_saved_linearity_fits_are_applied_before_processing_outlier_filtering(self) -> None:
         df = sample_processing_df().copy()
@@ -1163,6 +1229,86 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertTrue(pd.isna(work.loc[2, "d13C_calibrated"]))
         self.assertTrue(pd.isna(work.loc[2, "d13C_calibrated_linearity_corrected"]))
 
+    def test_derive_working_frame_preserves_edited_raw_values_in_working_view(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["SampleA", "SampleB"],
+                "Identifier 2": ["1", "1"],
+                "d 13C/12C  Mean": [1.0, -0.844],
+                "d 18O/16O  Mean": [2.0, 2.1],
+                "1  Cycle Int  Samp  44": [15.0, 16.0],
+                "1  Cycle Int  Ref  44": [10.0, 10.0],
+                "1  Cycle Int  Diff Samp-Ref  44": [5.0, 6.0],
+                "leak_rate": [5.0, 5.0],
+                "Collector Status": ["", "Partially Saturated Collectors"],
+            }
+        )
+        config = normalize_processing_config(
+            {
+                "manual_linearity_override": {
+                    "enabled": False,
+                    "use_diff_intensity": False,
+                    "d13_per_10v": 0.0,
+                    "d18_per_10v": 0.0,
+                }
+            }
+        )
+        calibration_meta = {
+            "config": {"linearity": {"apply": True, "use_diff_intensity": False}},
+            "linearity_fits": {
+                "d13C": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 2},
+                "d18O": {"slope": 0.0, "intercept": 0.0, "x_ref": 15.0, "n": 2},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+            "coefficients": {"d13C": {"slope": 2.0, "intercept": 0.0}},
+            "selected_standards": [],
+        }
+        edit_state = {"edited_rows": ["1"], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta, edit_state=edit_state)
+
+        # Unedited rows can still flow through the working-frame transforms.
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
+        # Edited rows must preserve the explicitly set raw value in charts/tables.
+        self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), -0.844, places=6)
+
+    def test_derive_working_frame_applies_manual_override_to_edited_rows_when_enabled(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["SampleA", "SampleB"],
+                "Identifier 2": ["1", "1"],
+                "d 13C/12C  Mean": [1.0, -0.844],
+                "d 18O/16O  Mean": [2.0, 2.1],
+                "1  Cycle Int  Samp  44": [10.0, 30.0],
+                "1  Cycle Int  Ref  44": [10.0, 10.0],
+                "1  Cycle Int  Diff Samp-Ref  44": [0.0, 20.0],
+                "leak_rate": [5.0, 5.0],
+                "Collector Status": ["", "Partially Saturated Collectors"],
+            }
+        )
+        config = normalize_processing_config(
+            {
+                "manual_linearity_override": {
+                    "enabled": True,
+                    "use_diff_intensity": False,
+                    "d13_per_10v": 1.0,
+                    "d18_per_10v": 0.0,
+                }
+            }
+        )
+        calibration_meta = {
+            "config": {"linearity": {"apply": False, "use_diff_intensity": False}},
+            "linearity_fits": {"d13C": {"x_ref": 15.0, "n": 2}, "intensity_col": "1  Cycle Int  Samp  44"},
+            "coefficients": {},
+            "selected_standards": [],
+        }
+        edit_state = {"edited_rows": ["1"], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta, edit_state=edit_state)
+
+        # Processing-page manual override is no longer applied in the working frame.
+        self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), -0.844, places=6)
+
     def test_overview_and_sequence_charts_handle_missing_species_and_color_parameter(self) -> None:
         df = sample_processing_df().copy()
         df["Species"] = np.nan
@@ -1283,6 +1429,18 @@ class ProcessingCoreTests(unittest.TestCase):
             for trace in d18_summary_data
             if str(trace.get("name", "")).startswith("Raw d18O -")
         }
+        calibrated_d13_traces = [
+            trace
+            for trace in d13_summary_data
+            if str(trace.get("name", "")).startswith("Calibrated")
+        ]
+        calibrated_d18_traces = [
+            trace
+            for trace in d18_summary_data
+            if str(trace.get("name", "")).startswith("Calibrated")
+        ]
+        d13_calibrated_legend_entries = [trace for trace in calibrated_d13_traces if trace.get("showlegend", True)]
+        d18_calibrated_legend_entries = [trace for trace in calibrated_d18_traces if trace.get("showlegend", True)]
 
         self.assertIn("Raw d13C - Coral | SampleA", raw_trace_names)
         self.assertIn("Raw d13C - Coral | SampleB", raw_trace_names)
@@ -1290,6 +1448,10 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertIn("Raw d18O - Coral | SampleA", raw_d18_trace_names)
         self.assertIn("Raw d18O - Coral | SampleB", raw_d18_trace_names)
         self.assertNotIn("Raw d18O - Coral", raw_d18_trace_names)
+        self.assertEqual(len(d13_calibrated_legend_entries), 1)
+        self.assertEqual(len(d18_calibrated_legend_entries), 1)
+        self.assertEqual(str(d13_calibrated_legend_entries[0].get("name", "")), "Calibrated")
+        self.assertEqual(str(d18_calibrated_legend_entries[0].get("name", "")), "Calibrated")
 
     def test_unselected_outlier_overlays_are_hidden_from_base_charts(self) -> None:
         df = sample_processing_df()

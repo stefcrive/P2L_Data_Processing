@@ -436,8 +436,9 @@ def _apply_cycle_averages(df):
             has_cycle_intensity = True
             sat_mask_d13 = _build_saturation_mask(intensity_df, [44, 45])
             sat_mask_d18 = _build_saturation_mask(intensity_df, [44, 45, 46])
+            sat_mask_44 = _build_saturation_mask(intensity_df, [44])
 
-            # Use Cycle 1 m/z44 sample/reference collectors to derive signal metrics.
+            # Derive m/z44 signal metrics from the last available valid cycle pair.
             samp44_col = _pick_mass_sample_column(sample_cycles, 44)
             ref44_col = None
             def _pick_mass_reference_column(cycles_df, mass_value):
@@ -465,26 +466,37 @@ def _apply_cycle_averages(df):
                 return medians[0][0] if medians else None
 
             ref44_col = _pick_mass_reference_column(sample_cycles, 44)
-            if samp44_col is not None:
-                cycle1 = sample_cycles[sample_cycles['_cycle_order'] == 1]
-                if not cycle1.empty:
-                    cycle1_val = _normalize_signal_intensity(cycle1[samp44_col]).iloc[0]
-                else:
-                    cycle1_val = _normalize_signal_intensity(sample_cycles[samp44_col]).dropna().iloc[0] if _normalize_signal_intensity(sample_cycles[samp44_col]).notna().any() else np.nan
-                if pd.notna(cycle1_val):
-                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] = float(cycle1_val)
-            if ref44_col is not None:
-                cycle1 = sample_cycles[sample_cycles['_cycle_order'] == 1]
-                if not cycle1.empty:
-                    cycle1_ref = _normalize_signal_intensity(cycle1[ref44_col]).iloc[0]
-                else:
-                    cycle1_ref = _normalize_signal_intensity(sample_cycles[ref44_col]).dropna().iloc[0] if _normalize_signal_intensity(sample_cycles[ref44_col]).notna().any() else np.nan
-                if pd.notna(cycle1_ref):
-                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] = float(cycle1_ref)
-            sample_cycle1 = pd.to_numeric(pd.Series([pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] if CYCLE1_SIGNAL_SAMP44_COL in pre_rows.columns else np.nan]), errors='coerce').iloc[0]
-            ref_cycle1 = pd.to_numeric(pd.Series([pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] if CYCLE1_SIGNAL_REF44_COL in pre_rows.columns else np.nan]), errors='coerce').iloc[0]
-            if np.isfinite(sample_cycle1) and np.isfinite(ref_cycle1):
-                pre_rows.at[sample_idx, CYCLE1_SIGNAL_DIFF44_COL] = float(sample_cycle1 - ref_cycle1)
+            ordered_cycles = sample_cycles.sort_values('_cycle_order')
+            selected_pair_idx = None
+            if samp44_col is not None and ref44_col is not None and not ordered_cycles.empty:
+                samp_vals = _normalize_signal_intensity(ordered_cycles[samp44_col])
+                ref_vals = _normalize_signal_intensity(ordered_cycles[ref44_col])
+                valid_pair_mask = samp_vals.notna() & ref_vals.notna()
+                if sat_mask_44 is not None:
+                    sat44 = sat_mask_44.reindex(ordered_cycles.index).fillna(False)
+                    valid_pair_mask = valid_pair_mask & ~sat44
+                if valid_pair_mask.any():
+                    selected_pair_idx = ordered_cycles.index[valid_pair_mask][-1]
+                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] = float(samp_vals.loc[selected_pair_idx])
+                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] = float(ref_vals.loc[selected_pair_idx])
+
+            # Fallback: if no valid paired cycle was found, keep the last finite value per channel.
+            if selected_pair_idx is None and not ordered_cycles.empty:
+                if samp44_col is not None:
+                    samp_fallback = _normalize_signal_intensity(ordered_cycles[samp44_col])
+                    finite_samp = samp_fallback.dropna()
+                    if not finite_samp.empty:
+                        pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] = float(finite_samp.iloc[-1])
+                if ref44_col is not None:
+                    ref_fallback = _normalize_signal_intensity(ordered_cycles[ref44_col])
+                    finite_ref = ref_fallback.dropna()
+                    if not finite_ref.empty:
+                        pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] = float(finite_ref.iloc[-1])
+
+            sample_signal = pd.to_numeric(pd.Series([pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] if CYCLE1_SIGNAL_SAMP44_COL in pre_rows.columns else np.nan]), errors='coerce').iloc[0]
+            ref_signal = pd.to_numeric(pd.Series([pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] if CYCLE1_SIGNAL_REF44_COL in pre_rows.columns else np.nan]), errors='coerce').iloc[0]
+            if np.isfinite(sample_signal) and np.isfinite(ref_signal):
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_DIFF44_COL] = float(sample_signal - ref_signal)
         low_signal_failed = False
         pre_intensity_cols = [c for c in sample_intensity_cols if c in pre_rows.columns]
         if pre_intensity_cols:

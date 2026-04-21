@@ -302,6 +302,7 @@ def _build_summary_figure(
         work["x_axis"] = range(len(work))
     color_series, _, has_numeric_colors, color_min, color_max = _color_series_for_plot(work, color_col)
     work["_color_value"] = color_series
+    calibrated_legend_shown = False
     for (species, identifier), species_df in work.groupby(["_species_label", "_identifier1_label"], dropna=False):
         trace_label = _summary_trace_label(species, identifier)
         plot_df = species_df.sort_values("x_axis", na_position="last")
@@ -325,16 +326,20 @@ def _build_summary_figure(
             )
         )
         if show_calibrated and cal_col and cal_col in plot_df.columns and pd.to_numeric(plot_df[cal_col], errors="coerce").notna().any():
+            show_calibrated_legend = not calibrated_legend_shown
             fig.add_trace(
                 go.Scatter(
                     x=plot_df["x_axis"],
                     y=pd.to_numeric(plot_df[cal_col], errors="coerce"),
                     mode="lines",
                     line=dict(color="#f97316", width=2),
-                    name=f"Calibrated {isotope_key} - {trace_label}",
+                    name="Calibrated" if show_calibrated_legend else f"Calibrated {isotope_key} - {trace_label}",
+                    showlegend=show_calibrated_legend,
+                    legendgroup=f"{isotope_key.lower()}_calibrated",
                     customdata=_build_processing_point_customdata(plot_df, isotope_key),
                 )
             )
+            calibrated_legend_shown = True
     _apply_processing_isotope_hover_templates(fig, isotope_key, color_col)
     if (
         config is not None
@@ -358,12 +363,18 @@ def _build_summary_figure(
         )
         _apply_processing_isotope_hover_templates(fig, isotope_key, color_col)
     fig.update_layout(
-        title=f"{isotope_key} Summary",
+        title=dict(
+            text=f"{isotope_key} Summary",
+            x=0.0,
+            xanchor="left",
+            y=0.99,
+            yanchor="top",
+        ),
         xaxis_title=x_axis_option,
         yaxis_title=isotope_key,
         hovermode="closest",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0, xanchor="left"),
-        margin=dict(l=40, r=20, t=80, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0.0, xanchor="left"),
+        margin=dict(l=40, r=20, t=120, b=40),
     )
     return _figure_json(fig)
 
@@ -455,7 +466,7 @@ def _add_processing_summary_overlays(
                     y=pd.to_numeric(rows.get(y_col), errors="coerce"),
                     mode="markers",
                     name=label_map[key],
-                    marker=dict(color="red", symbol=symbol_map[key], size=12, line=dict(width=1.5, color="black")),
+                    marker=dict(color="red", symbol=symbol_map[key], size=13, opacity=1.0, line=dict(width=1.5, color="black")),
                     customdata=_build_processing_point_customdata(rows, isotope_key),
                 )
             )
@@ -469,7 +480,7 @@ def _add_processing_summary_overlays(
                     y=pd.to_numeric(manual_rows.get(y_col), errors="coerce"),
                     mode="markers",
                     name="Manual Outliers",
-                    marker=dict(color="#ec4899", symbol="circle-open", size=13, line=dict(width=2, color="black")),
+                    marker=dict(color="#ec4899", symbol="circle-open", size=14, opacity=1.0, line=dict(width=2, color="black")),
                     customdata=_build_processing_point_customdata(manual_rows, isotope_key),
                 )
             )
@@ -483,7 +494,7 @@ def _add_processing_summary_overlays(
                     y=pd.to_numeric(partial_rows.get(y_col), errors="coerce"),
                     mode="markers",
                     name="Partially Failed (Recovered Mean)",
-                    marker=dict(color="#ff7f0e", symbol="diamond-open", size=12, line=dict(width=2, color="#ff7f0e")),
+                    marker=dict(color="#ff7f0e", symbol="diamond-open", size=13, opacity=1.0, line=dict(width=2, color="#ff7f0e")),
                     customdata=_build_processing_point_customdata(partial_rows, isotope_key),
                 )
             )
@@ -499,7 +510,7 @@ def _add_processing_summary_overlays(
                         y=pd.to_numeric(full_values.get(y_col), errors="coerce"),
                         mode="markers",
                         name="Failed Samples (Fully Saturated)",
-                        marker=dict(color="#d62728", symbol="triangle-down", size=10, line=dict(width=1, color="black")),
+                        marker=dict(color="#d62728", symbol="triangle-down", size=11, opacity=1.0, line=dict(width=1, color="black")),
                         customdata=_build_processing_point_customdata(full_values, isotope_key),
                     )
                 )
@@ -511,7 +522,7 @@ def _add_processing_summary_overlays(
                         y=[y_failed] * len(full_missing),
                         mode="markers",
                         name="Failed Samples (Fully Saturated)",
-                        marker=dict(color="#d62728", symbol="triangle-down", size=10, line=dict(width=1, color="black")),
+                        marker=dict(color="#d62728", symbol="triangle-down", size=11, opacity=1.0, line=dict(width=1, color="black")),
                         customdata=_build_processing_point_customdata(full_missing, isotope_key),
                         showlegend=full_values.empty,
                     )
@@ -530,7 +541,7 @@ def _add_processing_summary_overlays(
                         y=pd.to_numeric(failed_interp.get(y_col), errors="coerce"),
                         mode="markers",
                         name="Failed Samples (Interpolated)",
-                        marker=dict(color="#ff00ff", symbol="triangle-down", size=10, line=dict(width=1)),
+                        marker=dict(color="#ff00ff", symbol="triangle-down", size=11, opacity=1.0, line=dict(width=1)),
                         customdata=_build_processing_point_customdata(failed_interp, isotope_key),
                     )
                 )
@@ -541,12 +552,20 @@ def _add_processing_summary_overlays(
                         y=[y_failed] * len(failed_missing),
                         mode="markers",
                         name="Failed Samples (No Values)",
-                        marker=dict(color="#7f7f7f", symbol="triangle-down", size=10, line=dict(width=1)),
+                        marker=dict(color="#7f7f7f", symbol="triangle-down", size=11, opacity=1.0, line=dict(width=1)),
                         customdata=_build_processing_point_customdata(failed_missing, isotope_key),
                     )
                 )
 
-    restored_mask = pd.Series([str(idx) in restored_rows_for_isotope for idx in overlays.index], index=overlays.index, dtype=bool)
+    visible_restored_rows = {str(idx) for idx in filtered_df.index}
+    restored_mask = pd.Series(
+        [
+            (str(idx) in restored_rows_for_isotope) and (str(idx) in visible_restored_rows)
+            for idx in overlays.index
+        ],
+        index=overlays.index,
+        dtype=bool,
+    )
     restored_rows = _finite_value_rows(_rows(restored_mask, include_restored=True))
     if not restored_rows.empty:
         fig.add_trace(
@@ -555,7 +574,7 @@ def _add_processing_summary_overlays(
                 y=pd.to_numeric(restored_rows.get(y_col), errors="coerce"),
                 mode="markers",
                 name="Restored Samples",
-                marker=dict(color="#22c55e", symbol="star", size=13, line=dict(width=1.5, color="#166534")),
+                marker=dict(color="#22c55e", symbol="star", size=14, opacity=1.0, line=dict(width=1.5, color="#166534")),
                 customdata=_build_processing_point_customdata(restored_rows, isotope_key),
             )
         )
@@ -663,6 +682,7 @@ def _add_processing_crossplot_overlays(
     summary_masks: dict[str, pd.Series],
     sat_masks: dict[str, pd.Series],
     config: Any,
+    restored_visible_index: pd.Index | None = None,
     edit_state: dict[str, Any] | None = None,
 ) -> None:
     if fig is None or overlay_df is None or overlay_df.empty:
@@ -675,6 +695,7 @@ def _add_processing_crossplot_overlays(
         return
 
     restored_rows_all = _restored_crossplot_rows(edit_state)
+    visible_restored_rows = {str(idx) for idx in restored_visible_index} if restored_visible_index is not None else None
 
     def _rows(mask: pd.Series | None, include_restored: bool = False) -> pd.DataFrame:
         if mask is None:
@@ -773,7 +794,11 @@ def _add_processing_crossplot_overlays(
 
     restored_rows = _rows(
         pd.Series(
-            [str(idx) in _restored_crossplot_rows(edit_state) for idx in overlay_df.index],
+            [
+                (str(idx) in restored_rows_all)
+                and (visible_restored_rows is None or str(idx) in visible_restored_rows)
+                for idx in overlay_df.index
+            ],
             index=overlay_df.index,
             dtype=bool,
         ),
@@ -800,6 +825,7 @@ def _add_processing_3d_overlays(
     z_col: str,
     z_label: str,
     config: Any,
+    restored_visible_index: pd.Index | None = None,
     edit_state: dict[str, Any] | None = None,
 ) -> None:
     if fig is None or overlay_df is None or overlay_df.empty:
@@ -813,6 +839,7 @@ def _add_processing_3d_overlays(
         return
 
     restored_rows_all = _restored_crossplot_rows(edit_state)
+    visible_restored_rows = {str(idx) for idx in restored_visible_index} if restored_visible_index is not None else None
 
     def _rows(mask: pd.Series | None, include_restored: bool = False) -> pd.DataFrame:
         if mask is None:
@@ -844,7 +871,7 @@ def _add_processing_3d_overlays(
                     z=pd.to_numeric(statistical_rows.get(z_col), errors="coerce"),
                     mode="markers",
                     name="Statistical Outliers",
-                    marker=dict(size=7, symbol="square", color="red", line=dict(width=1.5, color="black"), opacity=0.95),
+                    marker=dict(size=8, symbol="square", color="red", line=dict(width=1.5, color="black"), opacity=1.0),
                     customdata=_build_processing_point_customdata(statistical_rows, "cross"),
                     hovertemplate=hover_template,
                 )
@@ -877,7 +904,7 @@ def _add_processing_3d_overlays(
                     z=pd.to_numeric(rows.get(z_col), errors="coerce"),
                     mode="markers",
                     name=label_map[key],
-                    marker=dict(size=7, symbol=symbol_map[key], color="red", line=dict(width=1.5, color="black"), opacity=0.95),
+                    marker=dict(size=8, symbol=symbol_map[key], color="red", line=dict(width=1.5, color="black"), opacity=1.0),
                     customdata=_build_processing_point_customdata(rows, "cross"),
                     hovertemplate=hover_template,
                 )
@@ -893,7 +920,7 @@ def _add_processing_3d_overlays(
                     z=pd.to_numeric(manual_rows.get(z_col), errors="coerce"),
                     mode="markers",
                     name="Manual Outliers",
-                    marker=dict(size=8, symbol="circle-open", color="#ec4899", line=dict(width=2, color="black"), opacity=0.95),
+                    marker=dict(size=9, symbol="circle-open", color="#ec4899", line=dict(width=2, color="black"), opacity=1.0),
                     customdata=_build_processing_point_customdata(manual_rows, "cross"),
                     hovertemplate=hover_template,
                 )
@@ -909,7 +936,7 @@ def _add_processing_3d_overlays(
                     z=pd.to_numeric(partial_rows.get(z_col), errors="coerce"),
                     mode="markers",
                     name="Partially Failed (Recovered Mean)",
-                    marker=dict(size=8, symbol="diamond-open", color="#ff7f0e", line=dict(width=2, color="#ff7f0e"), opacity=1.0),
+                    marker=dict(size=9, symbol="diamond-open", color="#ff7f0e", line=dict(width=2, color="#ff7f0e"), opacity=1.0),
                     customdata=_build_processing_point_customdata(partial_rows, "cross"),
                     hovertemplate=hover_template,
                 )
@@ -925,7 +952,7 @@ def _add_processing_3d_overlays(
                     z=pd.to_numeric(full_rows.get(z_col), errors="coerce"),
                     mode="markers",
                     name="Failed Samples (Fully Saturated)",
-                    marker=dict(size=8, symbol="square-open", color="#d62728", line=dict(width=2, color="#d62728"), opacity=0.95),
+                    marker=dict(size=9, symbol="square-open", color="#d62728", line=dict(width=2, color="#d62728"), opacity=1.0),
                     customdata=_build_processing_point_customdata(full_rows, "cross"),
                     hovertemplate=hover_template,
                 )
@@ -933,7 +960,11 @@ def _add_processing_3d_overlays(
 
     restored_rows = _rows(
         pd.Series(
-            [str(idx) in _restored_crossplot_rows(edit_state) for idx in overlay_df.index],
+            [
+                (str(idx) in restored_rows_all)
+                and (visible_restored_rows is None or str(idx) in visible_restored_rows)
+                for idx in overlay_df.index
+            ],
             index=overlay_df.index,
             dtype=bool,
         ),
@@ -945,9 +976,11 @@ def _add_processing_3d_overlays(
                 x=pd.to_numeric(restored_rows.get("d 18O/16O  Mean"), errors="coerce"),
                 y=pd.to_numeric(restored_rows.get("d 13C/12C  Mean"), errors="coerce"),
                 z=pd.to_numeric(restored_rows.get(z_col), errors="coerce"),
-                mode="markers",
+                mode="text",
                 name="Restored Samples",
-                marker=dict(size=9, symbol="x", color="#22c55e", line=dict(width=2, color="#166534"), opacity=0.95),
+                text=["*"] * len(restored_rows),
+                textposition="middle center",
+                textfont=dict(size=18, color="#22c55e"),
                 customdata=_build_processing_point_customdata(restored_rows, "cross"),
                 hovertemplate=hover_template,
             )
@@ -1025,6 +1058,7 @@ def build_overview_figures(
             z_col=config.z_axis,
             z_label=config.z_axis,
             config=config,
+            restored_visible_index=filtered_base_df.index,
             edit_state=edit_state,
         )
         axis_cols = ["d 18O/16O  Mean", "d 13C/12C  Mean", str(config.z_axis)]
@@ -1052,12 +1086,8 @@ def build_overview_figures(
         _apply_processing_3d_layout_tuning(fig_3d)
     figures["processing_3d"] = _figure_json(fig_3d)
     scoped_base_df = scoped_df.copy() if scoped_df is not None else pd.DataFrame()
-    restored_d13 = _restored_row_labels(edit_state, isotope_key="d13C")
-    restored_d18 = _restored_row_labels(edit_state, isotope_key="d18O")
     scoped_d13_mask = stat_mask_d13.reindex(scoped_base_df.index, fill_value=False).astype(bool)
-    scoped_d13_mask = scoped_d13_mask & ~_restored_index_mask(scoped_base_df.index, restored_d13)
     scoped_d18_mask = stat_mask_d18.reindex(scoped_base_df.index, fill_value=False).astype(bool)
-    scoped_d18_mask = scoped_d18_mask & ~_restored_index_mask(scoped_base_df.index, restored_d18)
     scoped_d13 = scoped_base_df.loc[~scoped_d13_mask].copy()
     scoped_d18 = scoped_base_df.loc[~scoped_d18_mask].copy()
     figures["d13_summary"] = _build_summary_figure(
@@ -1105,7 +1135,7 @@ def build_overview_figures(
         if not valid.any():
             continue
         plot_df = plot_df.loc[valid].copy()
-        marker: dict[str, Any] = dict(size=9, opacity=0.85)
+        marker: dict[str, Any] = dict(size=10, opacity=1.0)
         if has_numeric_colors:
             marker.update(
                 color=plot_df["_color_value"],
@@ -1147,7 +1177,15 @@ def build_overview_figures(
                 customdata=_build_processing_point_customdata(plot_df, "cross"),
             )
         )
-    _add_processing_crossplot_overlays(fig_cross, overlays_df, summary_masks, sat_masks, config, edit_state=edit_state)
+    _add_processing_crossplot_overlays(
+        fig_cross,
+        overlays_df,
+        summary_masks,
+        sat_masks,
+        config,
+        restored_visible_index=cross_df.index,
+        edit_state=edit_state,
+    )
     _apply_processing_crossplot_hover_templates(fig_cross, config.color_param)
     axis_cols = ["d 18O/16O  Mean", "d 13C/12C  Mean"]
     axis_df = pd.concat(
@@ -1265,15 +1303,6 @@ def _build_identifier_figure(
         restored_rows_for_isotope,
     )
     filtered_identifier = filtered_identifier.loc[~filtered_identifier_stat_mask].copy()
-    if restored_rows_for_isotope:
-        restored_from_unfiltered = unfiltered_identifier.loc[
-            pd.Series([str(idx) in restored_rows_for_isotope for idx in unfiltered_identifier.index], index=unfiltered_identifier.index, dtype=bool)
-        ]
-        if not restored_from_unfiltered.empty:
-            missing_restored = restored_from_unfiltered.loc[~restored_from_unfiltered.index.isin(filtered_identifier.index)]
-            if not missing_restored.empty:
-                filtered_identifier = pd.concat([filtered_identifier, missing_restored], axis=0)
-                filtered_identifier = filtered_identifier.sort_values("x_axis", na_position="last")
     color_series, _, has_numeric_colors, color_min, color_max = _color_series_for_plot(filtered_identifier, config.color_param)
     filtered_identifier["_color_value"] = color_series
     edited_row_tokens = {str(row) for row in (edit_state or {}).get("edited_rows", [])}
@@ -1300,7 +1329,7 @@ def _build_identifier_figure(
                     x=statistical_outliers["x_axis"],
                     y=pd.to_numeric(statistical_outliers.get(y_col), errors="coerce"),
                     mode="markers",
-                    marker=dict(color="red", symbol="square", size=12, line=dict(width=1.5, color="black")),
+                    marker=dict(color="red", symbol="square", size=13, opacity=1.0, line=dict(width=1.5, color="black")),
                     name="Statistical Outliers",
                     customdata=_build_processing_point_customdata(statistical_outliers, isotope_key),
                 )
@@ -1336,7 +1365,7 @@ def _build_identifier_figure(
                     x=rows["x_axis"],
                     y=pd.to_numeric(rows.get(y_col), errors="coerce"),
                     mode="markers",
-                    marker=dict(color="red", symbol=symbol_map[key], size=12, line=dict(width=1.5, color="black")),
+                    marker=dict(color="red", symbol=symbol_map[key], size=13, opacity=1.0, line=dict(width=1.5, color="black")),
                     name=label_map[key],
                     customdata=_build_processing_point_customdata(rows, isotope_key),
                 )
@@ -1351,7 +1380,7 @@ def _build_identifier_figure(
                     x=manual_rows["x_axis"],
                     y=pd.to_numeric(manual_rows.get(y_col), errors="coerce"),
                     mode="markers",
-                    marker=dict(color="#ec4899", symbol="circle-open", size=13, line=dict(width=2, color="black")),
+                    marker=dict(color="#ec4899", symbol="circle-open", size=14, opacity=1.0, line=dict(width=2, color="black")),
                     name="Manual Outliers",
                     customdata=_build_processing_point_customdata(manual_rows, isotope_key),
                 )
@@ -1365,7 +1394,7 @@ def _build_identifier_figure(
                     x=status_rows["x_axis"],
                     y=pd.to_numeric(status_rows.get(y_col), errors="coerce"),
                     mode="markers",
-                    marker=dict(color="#ff7f0e", symbol="diamond-open", size=12, line=dict(width=2)),
+                    marker=dict(color="#ff7f0e", symbol="diamond-open", size=13, opacity=1.0, line=dict(width=2, color="#ff7f0e")),
                     name="Partially Failed (Recovered Mean)",
                     customdata=_build_processing_point_customdata(status_rows, isotope_key),
                 )
@@ -1384,7 +1413,7 @@ def _build_identifier_figure(
                     x=full_rows["x_axis"],
                     y=[y_failed] * len(full_rows),
                     mode="markers",
-                    marker=dict(color="#d62728", symbol="triangle-down", size=10, line=dict(width=1)),
+                    marker=dict(color="#d62728", symbol="triangle-down", size=11, opacity=1.0, line=dict(width=1)),
                     name="Failed Samples (Fully Saturated)",
                     customdata=_build_processing_point_customdata(full_rows, isotope_key),
                 )
@@ -1402,7 +1431,7 @@ def _build_identifier_figure(
                         x=failed_interp["x_axis"],
                         y=pd.to_numeric(failed_interp.get(y_col), errors="coerce"),
                         mode="markers",
-                        marker=dict(color="#ff00ff", symbol="triangle-down", size=10, line=dict(width=1)),
+                        marker=dict(color="#ff00ff", symbol="triangle-down", size=11, opacity=1.0, line=dict(width=1)),
                         name="Failed Samples (Interpolated)",
                         customdata=_build_processing_point_customdata(failed_interp, isotope_key),
                     )
@@ -1418,13 +1447,17 @@ def _build_identifier_figure(
                         x=failed_missing["x_axis"],
                         y=[y_failed] * len(failed_missing),
                         mode="markers",
-                        marker=dict(color="#7f7f7f", symbol="triangle-down", size=10, line=dict(width=1)),
+                        marker=dict(color="#7f7f7f", symbol="triangle-down", size=11, opacity=1.0, line=dict(width=1)),
                         name="Failed Samples (No Values)",
                         customdata=_build_processing_point_customdata(failed_missing, isotope_key),
                     )
                 )
-    restored_rows = unfiltered_identifier.loc[
-        pd.Series([str(idx) in restored_rows_for_isotope for idx in unfiltered_identifier.index], index=unfiltered_identifier.index, dtype=bool)
+    restored_rows = filtered_identifier.loc[
+        pd.Series(
+            [str(idx) in restored_rows_for_isotope for idx in filtered_identifier.index],
+            index=filtered_identifier.index,
+            dtype=bool,
+        )
     ]
     if not restored_rows.empty:
         restored_values = pd.to_numeric(restored_rows.get(y_col), errors="coerce")
@@ -1436,7 +1469,7 @@ def _build_identifier_figure(
                     x=restored_interp["x_axis"],
                     y=pd.to_numeric(restored_interp.get(y_col), errors="coerce"),
                     mode="markers",
-                    marker=dict(color="#22c55e", symbol="star", size=13, line=dict(width=1.5, color="#166534")),
+                    marker=dict(color="#22c55e", symbol="star", size=14, opacity=1.0, line=dict(width=1.5, color="#166534")),
                     name="Restored Samples",
                     showlegend=show_legend,
                     customdata=_build_processing_point_customdata(restored_interp, isotope_key),

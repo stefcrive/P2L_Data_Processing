@@ -38,6 +38,7 @@ from ..standards import StandardsRepository
 from .core import (
     _apply_isotope_line_offsets,
     _apply_linearity_correction,
+    _apply_manual_linearity_offsets_to_fits,
     _apply_manual_linearity_override_to_standards,
     _compute_linearity_fit,
     _filter_linearity_fit_input_by_max_intensity,
@@ -440,7 +441,7 @@ def _build_calibration_crossplot(df: pd.DataFrame, color_param: str) -> dict[str
     color_label = _color_param_label(color_param)
     show_colorbar = has_color
     for group, group_df in plot_df.groupby("_group", dropna=False):
-        marker: dict[str, Any] = {"size": 9, "opacity": 0.85}
+        marker: dict[str, Any] = {"size": 11, "opacity": 1}
         if has_color and color_min is not None and color_max is not None:
             marker.update(
                 color=color_numeric.loc[group_df.index],
@@ -860,10 +861,19 @@ def build_calibration_workspace(
                 "d13_intensity_col": d13_offset_intensity_col,
                 "d18_intensity_col": d18_offset_intensity_col,
             }
+            effective_pre_outlier_fits = _apply_manual_linearity_offsets_to_fits(
+                pre_outlier_fits,
+                enabled=bool(config.linearity.manual_override_enabled),
+                quadratic=bool(config.linearity.quadratic),
+                d13_per_10v=float(config.linearity.manual_d13_per_10v),
+                d18_per_10v=float(config.linearity.manual_d18_per_10v),
+                d13_per_10v2=float(config.linearity.manual_d13_per_10v2),
+                d18_per_10v2=float(config.linearity.manual_d18_per_10v2),
+            )
             corrected_for_outliers = _apply_linearity_correction(
                 standards_adjusted_df,
                 intensity_col,
-                pre_outlier_fits,
+                effective_pre_outlier_fits,
             )
             outlier_reference_df = _promote_linearity_corrected_raw_columns(corrected_for_outliers)
     available_color_params = _candidate_color_columns(work_df)
@@ -1035,11 +1045,20 @@ def build_calibration_workspace(
     else:
         display_fits = {}
         calculation_fits = {}
+    correction_fits = _apply_manual_linearity_offsets_to_fits(
+        calculation_fits,
+        enabled=bool(config.linearity.manual_override_enabled),
+        quadratic=bool(config.linearity.quadratic),
+        d13_per_10v=float(config.linearity.manual_d13_per_10v),
+        d18_per_10v=float(config.linearity.manual_d18_per_10v),
+        d13_per_10v2=float(config.linearity.manual_d13_per_10v2),
+        d18_per_10v2=float(config.linearity.manual_d18_per_10v2),
+    )
 
-    if bool(config.linearity.apply) and chart_src is not None and not chart_src.empty and calculation_fits:
-        correction_intensity_col = str(calculation_fits.get("intensity_col") or selected_linearity_intensity_col)
+    if bool(config.linearity.apply) and chart_src is not None and not chart_src.empty and correction_fits:
+        correction_intensity_col = str(correction_fits.get("intensity_col") or selected_linearity_intensity_col)
         corrected_chart_src = _promote_linearity_corrected_raw_columns(
-            _apply_linearity_correction(chart_src, correction_intensity_col, calculation_fits)
+            _apply_linearity_correction(chart_src, correction_intensity_col, correction_fits)
         )
         corrected_calibration_figs = create_calibration_plots(
             standards_reference,
@@ -1067,7 +1086,7 @@ def build_calibration_workspace(
                 standard,
                 std_df,
                 config,
-                calculation_fits,
+                correction_fits,
                 outlier_reference_df=std_outlier_ref_df,
             )
         )
@@ -1100,7 +1119,7 @@ def build_calibration_workspace(
             )
         )
 
-    stored_fits = calibration_meta.get("linearity_fits", {}) or calculation_fits
+    stored_fits = calculation_fits if config_override is not None else (calibration_meta.get("linearity_fits", {}) or calculation_fits)
     return CalibrationWorkspace(
         session_id=session_id,
         config=config,

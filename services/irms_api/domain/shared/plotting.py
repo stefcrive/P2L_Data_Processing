@@ -352,7 +352,7 @@ def _build_isotope_3d_scatter(
     def _add_trace(mask, *, symbol, name, show_scale):
         if not np.any(mask):
             return
-        marker = dict(size=5, opacity=0.85, symbol=symbol)
+        marker = dict(size=6, opacity=1.0, symbol=symbol)
         if has_numeric_color and color_array is not None:
             marker.update(
                 color=color_array[mask],

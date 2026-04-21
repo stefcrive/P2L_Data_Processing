@@ -827,6 +827,27 @@ function linearityOffsetWithFallback(value: number | null | undefined, fallback:
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function normalizeLinearityConfigForCompare(linearity: CalibrationConfig["linearity"] | null | undefined) {
+  if (!linearity) {
+    return null;
+  }
+  return {
+    ...linearity,
+    max_sample_intensity: linearity.max_sample_intensity ?? null,
+    line_1_offset_d13: linearity.line_1_offset_d13 ?? null,
+    line_1_offset_d18: linearity.line_1_offset_d18 ?? null,
+    line_2_offset_d13: linearity.line_2_offset_d13 ?? null,
+    line_2_offset_d18: linearity.line_2_offset_d18 ?? null,
+  };
+}
+
+function linearityConfigEquals(
+  left: CalibrationConfig["linearity"] | null | undefined,
+  right: CalibrationConfig["linearity"] | null | undefined,
+): boolean {
+  return JSON.stringify(normalizeLinearityConfigForCompare(left)) === JSON.stringify(normalizeLinearityConfigForCompare(right));
+}
+
 function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ label: string; value: string }> {
   if (!summary || !summary.trim()) {
     return [];
@@ -926,6 +947,36 @@ function RangeSliderField({
         <span>{resolvedMax.toFixed(precision)}</span>
       </div>
     </div>
+  );
+}
+
+function CheckboxField({
+  checked,
+  label,
+  description,
+  onChange,
+  disabled = false,
+}: {
+  checked: boolean;
+  label: string;
+  description?: string;
+  onChange: (checked: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label className={cn("flex items-start gap-3 rounded-lg border border-stone-200 p-3", disabled ? "cursor-not-allowed opacity-60" : "")}>
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+        className="mt-1 h-4 w-4"
+      />
+      <span className="space-y-1">
+        <span className="block text-sm font-medium text-stone-800">{label}</span>
+        {description ? <span className="block text-xs text-stone-500">{description}</span> : null}
+      </span>
+    </label>
   );
 }
 
@@ -1680,6 +1731,7 @@ export default function CalibrationPage() {
   const [multiOffsetD18, setMultiOffsetD18] = useState(0);
   const [linearityEnabled, setLinearityEnabled] = useState(false);
   const [linearityTargetIntensity, setLinearityTargetIntensity] = useState(15);
+  const [linearityTouched, setLinearityTouched] = useState(false);
   const [setValueHighlightNonce, setSetValueHighlightNonce] = useState(0);
   const [isSetValueInputHighlighted, setIsSetValueInputHighlighted] = useState(false);
   const [colorScaleRange, setColorScaleRange] = useState<[number, number] | null>(null);
@@ -1801,6 +1853,7 @@ export default function CalibrationPage() {
   useEffect(() => {
     setConfig(null);
     setHasLoadedDraft(false);
+    setLinearityTouched(false);
     setOfficialValuesModalOpen(false);
     setOfficialValuesEditMode(false);
     setOfficialValuesDraftRows({});
@@ -1839,7 +1892,6 @@ export default function CalibrationPage() {
             ...current,
             linearity: {
               ...workspaceQuery.data.config.linearity,
-              ...current.linearity,
             },
           }
         : workspaceQuery.data.config,
@@ -1945,6 +1997,38 @@ export default function CalibrationPage() {
     }
   }, [activeColorParam, colorScaleBounds, colorScaleRangeParam]);
 
+  const saveLinearityMutation = useMutation({
+    mutationFn: (payload: CalibrationConfig["linearity"]) => api.setCalibrationLinearity(sessionId!, payload),
+    onSuccess: async (workspace) => {
+      queryClient.setQueryData(["calibration-workspace", sessionId], workspace);
+      await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
+    },
+  });
+
+  useEffect(() => {
+    if (!sessionId || !hasLoadedDraft || !linearityTouched || !config || !workspaceQuery.data || saveLinearityMutation.isPending) {
+      return;
+    }
+    if (linearityConfigEquals(config.linearity, workspaceQuery.data.config.linearity)) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      saveLinearityMutation.mutate(config.linearity);
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [
+    config,
+    hasLoadedDraft,
+    linearityTouched,
+    saveLinearityMutation,
+    saveLinearityMutation.isPending,
+    sessionId,
+    workspaceQuery.data,
+  ]);
+
   const runMutation = useMutation({
     mutationFn: (payload: CalibrationConfig) => api.runCalibration(sessionId!, payload),
     onSuccess: async () => {
@@ -2021,6 +2105,7 @@ export default function CalibrationPage() {
   }
 
   function updateLinearity(key: keyof CalibrationConfig["linearity"], value: boolean | number | string | null) {
+    setLinearityTouched(true);
     setConfig((current) =>
       current
         ? {
@@ -2035,6 +2120,7 @@ export default function CalibrationPage() {
   }
 
   function updateLinearityIntensityCol(intensityCol: string) {
+    setLinearityTouched(true);
     setConfig((current) =>
       current
         ? {
@@ -2047,6 +2133,36 @@ export default function CalibrationPage() {
           }
         : current,
     );
+  }
+
+  function updateLinearityCoefficientOffset(isotopeKey: "d13C" | "d18O", value: number) {
+    setLinearityTouched(true);
+    setConfig((current) => {
+      if (!current) {
+        return current;
+      }
+      const next = { ...current };
+      if (next.linearity.quadratic) {
+        if (isotopeKey === "d13C") {
+          next.linearity.manual_d13_per_10v2 = value;
+        } else {
+          next.linearity.manual_d18_per_10v2 = value;
+        }
+      } else if (isotopeKey === "d13C") {
+        next.linearity.manual_d13_per_10v = value;
+      } else {
+        next.linearity.manual_d18_per_10v = value;
+      }
+      const d13Offset = next.linearity.quadratic
+        ? Number(next.linearity.manual_d13_per_10v2 ?? 0)
+        : Number(next.linearity.manual_d13_per_10v ?? 0);
+      const d18Offset = next.linearity.quadratic
+        ? Number(next.linearity.manual_d18_per_10v2 ?? 0)
+        : Number(next.linearity.manual_d18_per_10v ?? 0);
+      const hasOffset = Math.abs(d13Offset) > 1e-12 || Math.abs(d18Offset) > 1e-12;
+      next.linearity.manual_override_enabled = hasOffset;
+      return next;
+    });
   }
 
   function handleLinearityOffsetDraftChange(field: LinearityOffsetField, rawValue: string) {
@@ -2414,16 +2530,23 @@ export default function CalibrationPage() {
     : activeConfig.linearity.use_diff_intensity
       ? LINEARITY_INTENSITY_DIFF44
       : LINEARITY_INTENSITY_SAMP44;
-  const linearityControlsEnabled = activeConfig.linearity.apply || activeConfig.linearity.manual_override_enabled;
   const selectedLinearityBasisLabel = getLinearityIntensityOptionLabel(selectedLinearityIntensityCol);
+  const d13Fit = (displayedWorkspace.linearity_fits?.d13C ?? {}) as Record<string, unknown>;
+  const d18Fit = (displayedWorkspace.linearity_fits?.d18O ?? {}) as Record<string, unknown>;
+  const d13FitSlope = asNumber(d13Fit.slope);
+  const d18FitSlope = asNumber(d18Fit.slope);
+  const d13FitQuad = asNumber(d13Fit.quad);
+  const d18FitQuad = asNumber(d18Fit.quad);
   const lineIntensityBasis = String(displayedWorkspace.linearity_fits?.intensity_col ?? selectedLinearityIntensityCol ?? "N/A");
   const previewError = previewQuery.error instanceof Error ? previewQuery.error.message : null;
   const runError = runMutation.error instanceof Error ? runMutation.error.message : null;
   const resetError = resetCalibrationMutation.error instanceof Error ? resetCalibrationMutation.error.message : null;
   const hasUnsavedPreview = JSON.stringify(activeConfig) !== JSON.stringify(workspace.config);
   const precisionSummaries = displayedWorkspace.precision_summaries;
+  const standardPrecisionRows = precisionSummaries.filter((summary) => selectedStandards.includes(summary.standard)).slice(0, 6);
+  const coefficientOffsetEnabled = Boolean(activeConfig.linearity.manual_override_enabled);
   const linePrecisionCount = precisionSummaries.reduce((count, summary) => count + Object.keys(summary.line_precisions).length, 0);
-  const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending;
+  const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending || saveLinearityMutation.isPending;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
   const crossSharedDiagnostics = crossD18DiagnosticsQuery.data ?? crossD13DiagnosticsQuery.data;
   const crossSharedDiagnosticsLoading =
@@ -3104,152 +3227,110 @@ export default function CalibrationPage() {
               </div>
 
               <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">
-                <div className="form-section-title">Linearity</div>
-                <label className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={activeConfig.linearity.manual_override_enabled}
-                    onChange={(event) => updateLinearity("manual_override_enabled", event.target.checked)}
-                    className="mt-1 h-4 w-4 accent-stone-900"
-                  />
-                  <span>
-                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Manual linearity override (all samples)</span>
-                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
-                      Applies a manual transform to all rows before outlier filtering and calibration. Stored imported values are preserved.
-                    </span>
-                  </span>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-medium text-stone-800">Linearity (shared with processing)</div>
+                  <span className="rounded-full bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                </div>
+                <CheckboxField
+                  checked={activeConfig.linearity.apply}
+                  label="Enable linearity correction"
+                  description="Uses the same basis, fits, and offsets as Processing."
+                  onChange={(checked) => updateLinearity("apply", checked)}
+                />
+                <CheckboxField
+                  checked={Boolean(activeConfig.linearity.quadratic)}
+                  label="Use quadratic linearity relationship"
+                  description="Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I."
+                  onChange={(checked) => updateLinearity("quadratic", checked)}
+                />
+                <label className="text-sm">
+                  <span className="mb-1 block text-stone-700">Linearity basis</span>
+                  <select
+                    value={selectedLinearityIntensityCol}
+                    onChange={(event) => updateLinearityIntensityCol(event.target.value)}
+                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                  >
+                    {LINEARITY_INTENSITY_OPTIONS.map((option) => (
+                      <option key={option} value={option}>
+                        {getLinearityIntensityOptionLabel(option)}
+                      </option>
+                    ))}
+                  </select>
                 </label>
-
-                {activeConfig.linearity.manual_override_enabled ? (
-                  <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
-                    <label className="form-field">
-                      <span className="form-label">
-                        {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, Boolean(activeConfig.linearity.quadratic))}
-                      </span>
-                      <input
-                        type="number"
-                        step="0.01"
-                        value={
-                          activeConfig.linearity.quadratic
-                            ? (activeConfig.linearity.manual_d13_per_10v2 ?? 0)
-                            : (activeConfig.linearity.manual_d13_per_10v ?? 0)
+                {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">Max sample intensity</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.1"
+                      value={activeConfig.linearity.max_sample_intensity ?? ""}
+                      onChange={(event) => {
+                        const rawValue = event.target.value.trim();
+                        if (rawValue === "") {
+                          updateLinearity("max_sample_intensity", null);
+                          return;
                         }
-                        onChange={(event) =>
-                          updateLinearity(
-                            activeConfig.linearity.quadratic ? "manual_d13_per_10v2" : "manual_d13_per_10v",
-                            Number(event.target.value),
-                          )
-                        }
-                        className="form-control"
-                      />
-                    </label>
-                    <label className="form-field">
-                      <span className="form-label">
-                        {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, Boolean(activeConfig.linearity.quadratic))}
-                      </span>
-                      <input
-                        type="number"
-                        step="0.01"
-                        value={
-                          activeConfig.linearity.quadratic
-                            ? (activeConfig.linearity.manual_d18_per_10v2 ?? 0)
-                            : (activeConfig.linearity.manual_d18_per_10v ?? 0)
-                        }
-                        onChange={(event) =>
-                          updateLinearity(
-                            activeConfig.linearity.quadratic ? "manual_d18_per_10v2" : "manual_d18_per_10v",
-                            Number(event.target.value),
-                          )
-                        }
-                        className="form-control"
-                      />
-                    </label>
+                        const parsed = Number(rawValue);
+                        updateLinearity("max_sample_intensity", Number.isFinite(parsed) ? parsed : null);
+                      }}
+                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                ) : null}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-lg border border-stone-200 p-3 text-sm">
+                    <div className="text-xs uppercase tracking-wide text-stone-500">d13C fitted coefficient</div>
+                    <div className="mt-1 font-semibold text-stone-900">
+                      {activeConfig.linearity.quadratic
+                        ? `${formatDeltaValue(d13FitSlope, 6)} (linear), ${formatDeltaValue(d13FitQuad, 8)} (quadratic)`
+                        : formatDeltaValue(d13FitSlope, 6)}
+                    </div>
                   </div>
-                ) : null}
-
-                <label className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={activeConfig.linearity.apply}
-                    onChange={(event) => updateLinearity("apply", event.target.checked)}
-                    className="mt-1 h-4 w-4 accent-stone-900"
-                  />
-                  <span>
-                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Enable linearity correction</span>
-                    <span className="mt-1 block text-xs leading-relaxed text-stone-500">
-                      Corrects selected-standard fits and sample raw measurements with the same linearity relationship before calibration is applied.
+                  <div className="rounded-lg border border-stone-200 p-3 text-sm">
+                    <div className="text-xs uppercase tracking-wide text-stone-500">d18O fitted coefficient</div>
+                    <div className="mt-1 font-semibold text-stone-900">
+                      {activeConfig.linearity.quadratic
+                        ? `${formatDeltaValue(d18FitSlope, 6)} (linear), ${formatDeltaValue(d18FitQuad, 8)} (quadratic)`
+                        : formatDeltaValue(d18FitSlope, 6)}
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">
+                      {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, Boolean(activeConfig.linearity.quadratic))}
                     </span>
-                  </span>
-                </label>
-
-                {linearityControlsEnabled ? (
-                  <>
-                    <label className="flex items-start gap-3">
-                      <input
-                        type="checkbox"
-                        checked={Boolean(activeConfig.linearity.quadratic)}
-                        onChange={(event) => updateLinearity("quadratic", event.target.checked)}
-                        className="mt-1 h-4 w-4 accent-stone-900"
-                      />
-                      <span>
-                        <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Use quadratic linearity relationship</span>
-                        <span className="mt-1 block text-xs leading-relaxed text-stone-500">
-                          Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I for the selected linearity basis.
-                        </span>
-                      </span>
-                    </label>
-
-                    <label className="form-field">
-                      <span className="form-label">Linearity basis</span>
-                      <select
-                        value={selectedLinearityIntensityCol}
-                        onChange={(event) => updateLinearityIntensityCol(event.target.value)}
-                        className="form-control"
-                      >
-                        {LINEARITY_INTENSITY_OPTIONS.map((option) => (
-                          <option key={option} value={option}>
-                            {getLinearityIntensityOptionLabel(option)}
-                          </option>
-                        ))}
-                      </select>
-                      <span className="mt-2 block text-xs leading-relaxed text-stone-500">
-                        Used for standards-side linearity fits, sample-side linearity correction, and manual override coefficients.
-                      </span>
-                    </label>
-
-                    {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
-                      <label className="form-field">
-                        <span className="form-label">Max sample intensity</span>
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.1"
-                          value={activeConfig.linearity.max_sample_intensity ?? ""}
-                          onChange={(event) => {
-                            const rawValue = event.target.value.trim();
-                            if (rawValue === "") {
-                              updateLinearity("max_sample_intensity", null);
-                              return;
-                            }
-                            const parsed = Number(rawValue);
-                            updateLinearity("max_sample_intensity", Number.isFinite(parsed) ? parsed : null);
-                          }}
-                          className="form-control"
-                        />
-                        <span className="mt-2 block text-xs leading-relaxed text-stone-500">
-                          Excludes standards above this sample intensity from linearity-fit calculations.
-                        </span>
-                      </label>
-                    ) : null}
-                  </>
-                ) : null}
-
-                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={activeConfig.linearity.quadratic ? (activeConfig.linearity.manual_d13_per_10v2 ?? 0) : (activeConfig.linearity.manual_d13_per_10v ?? 0)}
+                      onChange={(event) => updateLinearityCoefficientOffset("d13C", Number(event.target.value))}
+                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">
+                      {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, Boolean(activeConfig.linearity.quadratic))}
+                    </span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={activeConfig.linearity.quadratic ? (activeConfig.linearity.manual_d18_per_10v2 ?? 0) : (activeConfig.linearity.manual_d18_per_10v ?? 0)}
+                      onChange={(event) => updateLinearityCoefficientOffset("d18O", Number(event.target.value))}
+                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                </div>
+                <div className="text-xs text-stone-500">
+                  Coefficient offset active: {coefficientOffsetEnabled ? "Yes" : "No"}
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
                   <div className="space-y-3">
-                    <span className="text-sm font-semibold tracking-[0.01em] text-stone-800">Line 1 offset</span>
+                    <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
                     <div className="grid gap-3 sm:grid-cols-2">
-                      <label className="form-field">
-                        <span className="form-label">d13C</span>
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">d13C</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -3258,12 +3339,11 @@ export default function CalibrationPage() {
                           onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d13", event.target.value)}
                           onBlur={() => commitLinearityOffsetDraft("line_1_offset_d13")}
                           onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d13")}
-                          className="form-control"
-                          disabled={!linearityControlsEnabled}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
-                      <label className="form-field">
-                        <span className="form-label">d18O</span>
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">d18O</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -3272,17 +3352,16 @@ export default function CalibrationPage() {
                           onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d18", event.target.value)}
                           onBlur={() => commitLinearityOffsetDraft("line_1_offset_d18")}
                           onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d18")}
-                          className="form-control"
-                          disabled={!linearityControlsEnabled}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
                     </div>
                   </div>
                   <div className="space-y-3">
-                    <span className="text-sm font-semibold tracking-[0.01em] text-stone-800">Line 2 offset</span>
+                    <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
                     <div className="grid gap-3 sm:grid-cols-2">
-                      <label className="form-field">
-                        <span className="form-label">d13C</span>
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">d13C</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -3291,12 +3370,11 @@ export default function CalibrationPage() {
                           onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d13", event.target.value)}
                           onBlur={() => commitLinearityOffsetDraft("line_2_offset_d13")}
                           onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d13")}
-                          className="form-control"
-                          disabled={!linearityControlsEnabled}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
-                      <label className="form-field">
-                        <span className="form-label">d18O</span>
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">d18O</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -3305,16 +3383,28 @@ export default function CalibrationPage() {
                           onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d18", event.target.value)}
                           onBlur={() => commitLinearityOffsetDraft("line_2_offset_d18")}
                           onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d18")}
-                          className="form-control"
-                          disabled={!linearityControlsEnabled}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
                     </div>
                   </div>
                 </div>
-                <div className="text-xs leading-relaxed text-stone-500">
-                  Line offsets are applied directly to d13C/d18O values for each line before outlier filtering, fitting, and calibration.
-                </div>
+                {activeConfig.linearity.apply ? (
+                  <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
+                    <div className="text-sm font-medium text-stone-800">Linearity-corrected standard precision</div>
+                    {standardPrecisionRows.length ? (
+                      standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
+                        <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
+                          <span className="font-medium text-stone-800">{summary.standard}</span>
+                          <span>d13C: {formatMetricWithUnit(summary.d13_linearity_corrected_precision)}</span>
+                          <span>d18O: {formatMetricWithUnit(summary.d18_linearity_corrected_precision)}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-xs text-stone-500">No selected standards available for precision.</div>
+                    )}
+                  </div>
+                ) : null}
               </div>
 
               <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">

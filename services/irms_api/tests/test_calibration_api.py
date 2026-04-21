@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 from services.irms_api.api import main as api_main
 from services.irms_api.domain.constants import ISOTYPE_D13C
-from services.irms_api.domain.contracts import CalibrationConfig, CalibrationOfficialValueUpsertRequest
+from services.irms_api.domain.contracts import CalibrationConfig, CalibrationOfficialValueUpsertRequest, LinearityConfig
 from services.irms_api.session_store import FileSessionStore
 
 
@@ -125,6 +125,60 @@ class CalibrationApiTests(unittest.TestCase):
         metadata = api_main.store.load_metadata(self.session_id)
         self.assertEqual(metadata.get("calibration", {}), {})
 
+    def test_set_calibration_linearity_config_persists_shared_linearity_parameters(self) -> None:
+        api_main.run_calibration(
+            self.session_id,
+            CalibrationConfig(
+                selected_standards=["SHP2L", "NBS19"],
+                calibration_type="IQR",
+                sigma_level=1.0,
+                iqr_multiplier=1.5,
+                independent_isotope_outliers=True,
+                color_param="Date_ordinal",
+                z_axis="1  Cycle Int  Samp  44",
+                precision_date_range=("2025-01-01", "2025-01-03"),
+                linearity={"apply": True, "use_diff_intensity": False},
+            ),
+        )
+        baseline_metadata = api_main.store.load_metadata(self.session_id)
+        baseline_coeffs = baseline_metadata.get("calibration", {}).get("coefficients", {})
+
+        updated_workspace = api_main.set_calibration_linearity_config(
+            self.session_id,
+            LinearityConfig(
+                apply=True,
+                intensity_col="1  Cycle Int  Diff Samp-Ref  44",
+                use_diff_intensity=True,
+                quadratic=True,
+                max_sample_intensity=None,
+                line_1_offset_d13=0.11,
+                line_1_offset_d18=-0.22,
+                manual_d13_per_10v2=0.33,
+                manual_d18_per_10v2=-0.44,
+            ),
+        )
+
+        self.assertTrue(updated_workspace.config.linearity.apply)
+        self.assertTrue(updated_workspace.config.linearity.use_diff_intensity)
+        self.assertTrue(updated_workspace.config.linearity.quadratic)
+        self.assertEqual(updated_workspace.config.linearity.intensity_col, "1  Cycle Int  Diff Samp-Ref  44")
+        self.assertAlmostEqual(float(updated_workspace.config.linearity.line_1_offset_d13 or 0.0), 0.11, places=6)
+        self.assertAlmostEqual(float(updated_workspace.config.linearity.manual_d13_per_10v2 or 0.0), 0.33, places=6)
+
+        metadata = api_main.store.load_metadata(self.session_id)
+        stored_linearity = metadata.get("calibration", {}).get("config", {}).get("linearity", {})
+        self.assertTrue(bool(stored_linearity.get("apply")))
+        self.assertTrue(bool(stored_linearity.get("use_diff_intensity")))
+        self.assertTrue(bool(stored_linearity.get("quadratic")))
+        self.assertEqual(stored_linearity.get("intensity_col"), "1  Cycle Int  Diff Samp-Ref  44")
+        stored_fits = metadata.get("calibration", {}).get("linearity_fits", {})
+        self.assertEqual(stored_fits.get("intensity_col"), "1  Cycle Int  Diff Samp-Ref  44")
+        stored_coeffs = metadata.get("calibration", {}).get("coefficients", {})
+        self.assertTrue(bool(stored_coeffs))
+        self.assertIn("d13C", stored_coeffs)
+        self.assertIn("d18O", stored_coeffs)
+        self.assertNotEqual(stored_coeffs, baseline_coeffs)
+
     def test_preview_workspace_manual_linearity_override_updates_standard_measurements(self) -> None:
         base_config = CalibrationConfig(
             selected_standards=["SHP2L", "NBS19"],
@@ -168,6 +222,54 @@ class CalibrationApiTests(unittest.TestCase):
         override_summary = next(item for item in overridden.precision_summaries if item.standard == "SHP2L")
         self.assertNotEqual(base_summary.d13_average, override_summary.d13_average)
         self.assertNotEqual(base_summary.d18_average, override_summary.d18_average)
+
+    def test_preview_workspace_manual_linearity_override_changes_corrected_precision_when_linearity_is_applied(self) -> None:
+        base_config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+            precision_date_range=("2025-01-01", "2025-01-03"),
+            linearity={
+                "apply": True,
+                "intensity_col": "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44",
+                "use_diff_intensity": False,
+                "manual_override_enabled": False,
+                "manual_d13_per_10v": 0.0,
+                "manual_d18_per_10v": 0.0,
+            },
+        )
+        override_config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+            precision_date_range=("2025-01-01", "2025-01-03"),
+            linearity={
+                "apply": True,
+                "intensity_col": "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44",
+                "use_diff_intensity": False,
+                "manual_override_enabled": True,
+                "manual_d13_per_10v": -0.1,
+                "manual_d18_per_10v": 0.0,
+            },
+        )
+
+        baseline = api_main.calibration_workspace_preview(self.session_id, base_config)
+        overridden = api_main.calibration_workspace_preview(self.session_id, override_config)
+        base_summary = next(item for item in baseline.precision_summaries if item.standard == "SHP2L")
+        override_summary = next(item for item in overridden.precision_summaries if item.standard == "SHP2L")
+        self.assertNotAlmostEqual(
+            float(base_summary.d13_linearity_corrected_precision or 0.0),
+            float(override_summary.d13_linearity_corrected_precision or 0.0),
+            places=9,
+        )
 
     def test_preview_workspace_linearity_apply_toggle_does_not_change_standard_precision(self) -> None:
         base_config = CalibrationConfig(

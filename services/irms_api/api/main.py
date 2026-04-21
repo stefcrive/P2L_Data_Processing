@@ -15,6 +15,7 @@ from fastapi.responses import Response
 from ..domain.calibration.core import (
     _apply_isotope_line_offsets,
     _apply_linearity_correction,
+    _apply_manual_linearity_offsets_to_fits,
     _apply_manual_linearity_override_to_standards,
     _compute_calibration_coefficients,
     _compute_linearity_fit,
@@ -41,6 +42,7 @@ from ..domain.contracts import (
     EditAction,
     ExportRequest,
     ImportResult,
+    LinearityConfig,
     ProcessingConfig,
     ProcessingExportConfig,
     ProcessingWorkspace,
@@ -1000,9 +1002,20 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
             "d13_intensity_col": d13_offset_intensity_col,
             "d18_intensity_col": d18_offset_intensity_col,
         }
-        outlier_reference_df = _promote_linearity_corrected_raw_columns(
-            _apply_linearity_correction(outlier_input_df, intensity_col, fits)
+        effective_fits = _apply_manual_linearity_offsets_to_fits(
+            fits,
+            enabled=bool(config.linearity.manual_override_enabled),
+            quadratic=bool(config.linearity.quadratic),
+            d13_per_10v=float(config.linearity.manual_d13_per_10v),
+            d18_per_10v=float(config.linearity.manual_d18_per_10v),
+            d13_per_10v2=float(config.linearity.manual_d13_per_10v2),
+            d18_per_10v2=float(config.linearity.manual_d18_per_10v2),
         )
+        outlier_reference_df = _promote_linearity_corrected_raw_columns(
+            _apply_linearity_correction(outlier_input_df, intensity_col, effective_fits)
+        )
+    else:
+        effective_fits = fits
     clean_stds = _filter_standards_remove_outliers(
         outlier_input_df,
         config.selected_standards,
@@ -1016,10 +1029,18 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
     calibration_source = outlier_input_df
     if bool(config.linearity.apply) and fits:
         standards_source = _promote_linearity_corrected_raw_columns(
-            _apply_linearity_correction(standards_source, fits.get("intensity_col", selected_linearity_intensity_col), fits)
+            _apply_linearity_correction(
+                standards_source,
+                effective_fits.get("intensity_col", selected_linearity_intensity_col),
+                effective_fits,
+            )
         )
         calibration_source = _promote_linearity_corrected_raw_columns(
-            _apply_linearity_correction(outlier_input_df, fits.get("intensity_col", selected_linearity_intensity_col), fits)
+            _apply_linearity_correction(
+                outlier_input_df,
+                effective_fits.get("intensity_col", selected_linearity_intensity_col),
+                effective_fits,
+            )
         )
     calibrated = calibrate_results(
         standards_source if standards_source is not None and not standards_source.empty else calibration_source,
@@ -1141,6 +1162,183 @@ def calibration_workspace_preview(session_id: str, config: CalibrationConfig) ->
         df=store.load_frame(session_id),
         metadata=store.load_metadata(session_id),
         config_override=config,
+    )
+
+
+def _compute_preview_coefficients_for_calibration_linearity(
+    df: pd.DataFrame,
+    config: CalibrationConfig,
+) -> dict[str, dict[str, float]]:
+    if len(config.selected_standards) not in (1, 2):
+        return {}
+
+    working_df = _ensure_cycle1_signal_difference_columns(df.copy())
+    working_df = _apply_isotope_line_offsets(
+        working_df,
+        line_1_offset_d13=getattr(config.linearity, "line_1_offset_d13", None),
+        line_1_offset_d18=getattr(config.linearity, "line_1_offset_d18", None),
+        line_2_offset_d13=getattr(config.linearity, "line_2_offset_d13", None),
+        line_2_offset_d18=getattr(config.linearity, "line_2_offset_d18", None),
+    )
+
+    standards_repo = StandardsRepository.default()
+    override_scope = (
+        sorted(
+            {
+                str(value).strip()
+                for value in working_df.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist()
+                if str(value).strip() != ""
+            }
+        )
+        if "Identifier 1" in working_df.columns
+        else list(config.selected_standards)
+    )
+    selected_linearity_intensity_col = _resolve_selected_linearity_intensity_column(
+        df=working_df,
+        use_diff_intensity=config.linearity.use_diff_intensity,
+        selected_intensity_col=getattr(config.linearity, "intensity_col", None),
+    )
+    max_sample_intensity = (
+        getattr(config.linearity, "max_sample_intensity", None)
+        if selected_linearity_intensity_col == CYCLE1_SIGNAL_SAMP44_COL
+        else None
+    )
+    line_adjusted_df, d13_offset_intensity_col, d18_offset_intensity_col = _with_isotope_linearity_intensity_columns(
+        working_df,
+        selected_linearity_intensity_col,
+        line_1_offset=config.linearity.line_1_offset,
+        line_2_offset=config.linearity.line_2_offset,
+    )
+    manual_override_intensity_col = (
+        d13_offset_intensity_col
+        if d13_offset_intensity_col == d18_offset_intensity_col
+        else selected_linearity_intensity_col
+    )
+    standards_adjusted_df = _apply_manual_linearity_override_to_standards(
+        line_adjusted_df,
+        override_scope,
+        enabled=config.linearity.manual_override_enabled,
+        d13_per_10v=config.linearity.manual_d13_per_10v,
+        d18_per_10v=config.linearity.manual_d18_per_10v,
+        d13_per_10v2=config.linearity.manual_d13_per_10v2,
+        d18_per_10v2=config.linearity.manual_d18_per_10v2,
+        quadratic=bool(config.linearity.quadratic),
+        use_diff_intensity=config.linearity.use_diff_intensity,
+        selected_intensity_col=manual_override_intensity_col,
+    )
+    outlier_input_df = standards_adjusted_df
+    selected_mask = (
+        outlier_input_df["Identifier 1"].astype(str).isin({str(item) for item in config.selected_standards})
+        if "Identifier 1" in outlier_input_df.columns
+        else pd.Series(False, index=outlier_input_df.index, dtype=bool)
+    )
+    standards_for_calibration = outlier_input_df.loc[selected_mask].copy() if bool(selected_mask.any()) else pd.DataFrame()
+
+    fits: dict[str, Any] = {}
+    outlier_reference_df = outlier_input_df
+    if bool(config.linearity.apply) and standards_for_calibration is not None and not standards_for_calibration.empty:
+        fit_input = standards_for_calibration
+        intensity_col = _resolve_selected_linearity_intensity_column(
+            df=fit_input,
+            use_diff_intensity=config.linearity.use_diff_intensity,
+            selected_intensity_col=selected_linearity_intensity_col,
+        )
+        fit13_intensity_col = d13_offset_intensity_col if d13_offset_intensity_col in fit_input.columns else intensity_col
+        fit18_intensity_col = d18_offset_intensity_col if d18_offset_intensity_col in fit_input.columns else intensity_col
+        fits = {
+            "d13C": _compute_linearity_fit(
+                _filter_linearity_fit_input_by_max_intensity(
+                    fit_input,
+                    fit13_intensity_col,
+                    max_sample_intensity,
+                ),
+                "d 13C/12C  Mean",
+                fit13_intensity_col,
+                quadratic=bool(config.linearity.quadratic),
+            ),
+            "d18O": _compute_linearity_fit(
+                _filter_linearity_fit_input_by_max_intensity(
+                    fit_input,
+                    fit18_intensity_col,
+                    max_sample_intensity,
+                ),
+                "d 18O/16O  Mean",
+                fit18_intensity_col,
+                quadratic=bool(config.linearity.quadratic),
+            ),
+            "intensity_col": intensity_col,
+            "d13_intensity_col": d13_offset_intensity_col,
+            "d18_intensity_col": d18_offset_intensity_col,
+        }
+        effective_fits = _apply_manual_linearity_offsets_to_fits(
+            fits,
+            enabled=bool(config.linearity.manual_override_enabled),
+            quadratic=bool(config.linearity.quadratic),
+            d13_per_10v=float(config.linearity.manual_d13_per_10v),
+            d18_per_10v=float(config.linearity.manual_d18_per_10v),
+            d13_per_10v2=float(config.linearity.manual_d13_per_10v2),
+            d18_per_10v2=float(config.linearity.manual_d18_per_10v2),
+        )
+        outlier_reference_df = _promote_linearity_corrected_raw_columns(
+            _apply_linearity_correction(outlier_input_df, intensity_col, effective_fits)
+        )
+    else:
+        effective_fits = fits
+
+    clean_stds = _filter_standards_remove_outliers(
+        outlier_input_df,
+        config.selected_standards,
+        config.calibration_type,
+        config.sigma_level,
+        config.iqr_multiplier,
+        config.independent_isotope_outliers,
+        outlier_reference_df=outlier_reference_df,
+    )
+    standards_source = clean_stds if not clean_stds.empty else standards_for_calibration
+    if bool(config.linearity.apply) and fits and standards_source is not None and not standards_source.empty:
+        standards_source = _promote_linearity_corrected_raw_columns(
+            _apply_linearity_correction(
+                standards_source,
+                effective_fits.get("intensity_col", selected_linearity_intensity_col),
+                effective_fits,
+            )
+        )
+    return _compute_calibration_coefficients(standards_source, config.selected_standards, standards_repo)
+
+
+@app.post("/sessions/{session_id}/calibration/linearity", response_model=CalibrationWorkspace)
+def set_calibration_linearity_config(session_id: str, linearity: LinearityConfig) -> CalibrationWorkspace:
+    _session_exists_or_404(session_id)
+    metadata = store.load_metadata(session_id)
+    source_df = store.load_frame(session_id)
+    calibration_meta = metadata.setdefault("calibration", {})
+    if not isinstance(calibration_meta, dict):
+        calibration_meta = {}
+        metadata["calibration"] = calibration_meta
+    raw_config = calibration_meta.get("config", {})
+    config_payload = dict(raw_config) if isinstance(raw_config, dict) else {}
+    config_payload["linearity"] = linearity.model_dump()
+    normalized_config = normalize_calibration_config(config_payload)
+    preview_workspace = build_calibration_workspace(
+        session_id=session_id,
+        df=source_df,
+        metadata=metadata,
+        config_override=normalized_config,
+    )
+    calibration_meta["config"] = normalized_config.model_dump()
+    calibration_meta["linearity_fits"] = to_json_compatible(preview_workspace.linearity_fits)
+    calibration_meta["coefficients"] = _compute_preview_coefficients_for_calibration_linearity(source_df, normalized_config)
+    calibration_meta["selected_standards"] = list(normalized_config.selected_standards)
+    _persist_session_update(
+        session_id,
+        action="calibration_linearity_config_updated",
+        payload={"linearity": normalized_config.linearity.model_dump()},
+        metadata=metadata,
+    )
+    return build_calibration_workspace(
+        session_id=session_id,
+        df=source_df,
+        metadata=metadata,
     )
 
 

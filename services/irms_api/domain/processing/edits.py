@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from ..calibration.core import (
+    _apply_manual_linearity_offsets_to_fits,
     _apply_isotope_line_offsets,
     _linearity_correction_delta,
     _resolve_linearity_intensity_column_for_fits,
@@ -109,7 +110,20 @@ def _refresh_calibrated_after_delta_edit(
     intercept = None
     linearity_cfg = linearity_config or {}
     fits = linearity_fits or {}
-    fit = fits.get(str(isotope_key).strip(), {}) if isinstance(fits, dict) else {}
+    fits_for_correction = (
+        _apply_manual_linearity_offsets_to_fits(
+            fits if isinstance(fits, dict) else {},
+            enabled=bool(linearity_cfg.get("manual_override_enabled", False)),
+            quadratic=bool(linearity_cfg.get("quadratic", False)),
+            d13_per_10v=float(linearity_cfg.get("manual_d13_per_10v", 0.0) or 0.0),
+            d18_per_10v=float(linearity_cfg.get("manual_d18_per_10v", 0.0) or 0.0),
+            d13_per_10v2=float(linearity_cfg.get("manual_d13_per_10v2", 0.0) or 0.0),
+            d18_per_10v2=float(linearity_cfg.get("manual_d18_per_10v2", 0.0) or 0.0),
+        )
+        if isinstance(fits, dict)
+        else {}
+    )
+    fit = fits_for_correction.get(str(isotope_key).strip(), {}) if isinstance(fits_for_correction, dict) else {}
     apply_linearity_before_calibration = bool(linearity_cfg.get("apply")) and isinstance(fits, dict) and bool(fits)
     context = _apply_isotope_line_offsets(
         work,
@@ -140,10 +154,10 @@ def _refresh_calibrated_after_delta_edit(
         iso_key = str(isotope_key).strip()
         if iso_key == "d13C":
             fallback_intensity_col = d13_offset_intensity_col
-            configured_intensity_col = str(fits.get("d13_intensity_col", "")).strip()
+            configured_intensity_col = str(fits_for_correction.get("d13_intensity_col", "")).strip()
         else:
             fallback_intensity_col = d18_offset_intensity_col
-            configured_intensity_col = str(fits.get("d18_intensity_col", "")).strip()
+            configured_intensity_col = str(fits_for_correction.get("d18_intensity_col", "")).strip()
         intensity_col = configured_intensity_col if configured_intensity_col in context.columns else fallback_intensity_col
         if intensity_col not in context.columns:
             intensity_col = resolved_intensity_col

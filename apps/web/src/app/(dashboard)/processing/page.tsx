@@ -1,13 +1,15 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { PlotlyChart, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api } from "@/lib/api";
 import type {
+  CalibrationConfig,
+  CalibrationPrecisionSummary,
   ClientOutputDuplicateCheckResponse,
   CycleDiagnosticsPayload,
   EditAction,
@@ -33,8 +35,23 @@ type SelectedTarget = {
 type IsotopeKey = "d13C" | "d18O";
 const ISOTOPE_KEYS: IsotopeKey[] = ["d13C", "d18O"];
 type IsotopeNumericMap = Record<IsotopeKey, number>;
+type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
+type LinearityOffsetDraftState = Record<LinearityOffsetField, string>;
 const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const RESTORE_STDEV_DEFAULT_CAP = 0.04;
+const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
+const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
+const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
+const LINEARITY_INTENSITY_OPTIONS = [
+  LINEARITY_INTENSITY_SAMP44,
+  LINEARITY_INTENSITY_DIFF44,
+  LINEARITY_INTENSITY_MISMATCH44,
+] as const;
+const LINEARITY_INTENSITY_OPTION_LABELS: Record<(typeof LINEARITY_INTENSITY_OPTIONS)[number], string> = {
+  [LINEARITY_INTENSITY_SAMP44]: "Sample intensity",
+  [LINEARITY_INTENSITY_DIFF44]: "Intensity diff",
+  [LINEARITY_INTENSITY_MISMATCH44]: "Pressure-adjusted int diff",
+};
 
 type DisplayStateMap = Record<string, { rawOnly: boolean; hideCalibrated: boolean }>;
 type FigureShape = Record<string, unknown> & {
@@ -57,6 +74,92 @@ type ColorScaleBounds = {
   min: number;
   max: number;
 };
+
+function getLinearityIntensityOptionLabel(value: string): string {
+  if (value in LINEARITY_INTENSITY_OPTION_LABELS) {
+    return LINEARITY_INTENSITY_OPTION_LABELS[value as (typeof LINEARITY_INTENSITY_OPTIONS)[number]];
+  }
+  return value;
+}
+
+function getLinearityCoefficientLabel(
+  isotope: "d13C" | "d18O",
+  intensityCol: string,
+  quadratic: boolean,
+): string {
+  const prefix = isotope === "d13C" ? "d13C" : "d18O";
+  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
+    return quadratic
+      ? `${prefix} pressure-weighted mismatch coefficient per (10V)^2`
+      : `${prefix} pressure-weighted mismatch coefficient`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
+    return quadratic ? `${prefix} intensity-diff coefficient per (10V)^2` : `${prefix} intensity-diff coefficient per 10V`;
+  }
+  return quadratic ? `${prefix} coefficient per (10V)^2` : `${prefix} coefficient per 10V`;
+}
+
+function parseDecimalInput(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  const normalized = trimmed.replace(",", ".");
+  if (!/^[-+]?(\d+(\.\d*)?|\.\d+)$/.test(normalized)) {
+    return null;
+  }
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatDecimalInput(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "0";
+}
+
+function linearityOffsetWithFallback(value: number | null | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function readLinearityOffsetValue(linearity: CalibrationConfig["linearity"], field: LinearityOffsetField): number {
+  if (field === "line_1_offset_d13") {
+    return linearityOffsetWithFallback(linearity.line_1_offset_d13, linearityOffsetWithFallback(linearity.line_1_offset, 0));
+  }
+  if (field === "line_1_offset_d18") {
+    return linearityOffsetWithFallback(linearity.line_1_offset_d18, linearityOffsetWithFallback(linearity.line_1_offset, 0));
+  }
+  if (field === "line_2_offset_d13") {
+    return linearityOffsetWithFallback(linearity.line_2_offset_d13, linearityOffsetWithFallback(linearity.line_2_offset, 0));
+  }
+  return linearityOffsetWithFallback(linearity.line_2_offset_d18, linearityOffsetWithFallback(linearity.line_2_offset, 0));
+}
+
+function normalizeLinearityConfigForCompare(linearity: CalibrationConfig["linearity"] | null | undefined) {
+  if (!linearity) {
+    return null;
+  }
+  return {
+    ...linearity,
+    max_sample_intensity: linearity.max_sample_intensity ?? null,
+    line_1_offset_d13: linearity.line_1_offset_d13 ?? null,
+    line_1_offset_d18: linearity.line_1_offset_d18 ?? null,
+    line_2_offset_d13: linearity.line_2_offset_d13 ?? null,
+    line_2_offset_d18: linearity.line_2_offset_d18 ?? null,
+  };
+}
+
+function linearityConfigEquals(
+  left: CalibrationConfig["linearity"] | null | undefined,
+  right: CalibrationConfig["linearity"] | null | undefined,
+): boolean {
+  return JSON.stringify(normalizeLinearityConfigForCompare(left)) === JSON.stringify(normalizeLinearityConfigForCompare(right));
+}
+
+function formatPrecisionMetric(value?: number | null): string {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "N/A";
+  }
+  return `${value.toFixed(3)} ‰`;
+}
 
 function cloneFigure(figure?: Record<string, unknown>): FigureShape {
   if (!figure) {
@@ -94,7 +197,7 @@ function applyDisplayState(
   if (rawOnly) {
     traces = traces.filter((trace) => String(trace.name ?? "").startsWith("Raw "));
   } else if (hideCalibrated) {
-    traces = traces.filter((trace) => !String(trace.name ?? "").startsWith("Calibrated "));
+    traces = traces.filter((trace) => !String(trace.name ?? "").startsWith("Calibrated"));
   }
   return { ...cloned, data: traces };
 }
@@ -1533,16 +1636,21 @@ function DiagnosticsPanel({
   linearityTargetIntensity?: number;
   onLinearityTargetIntensityChange?: (value: number) => void;
   displayDelta?: number;
-  onPickDeltaValue?: (value: number) => void;
+  onPickDeltaValue?: (value: number, valueSpace?: "raw" | "display") => void;
 }) {
   const cycleMean = diagnostics?.cycle_mean ?? {};
   const validMean = asNumber(cycleMean.valid_mean);
   const finalMean = asNumber(cycleMean.mean);
+  const collectorStatus = asString((diagnostics?.target ?? {})["collector_status"]);
+  const isPartiallySaturated = isPartiallySaturatedCollectorStatus(collectorStatus);
   const validMeanDisplay = validMean == null ? null : validMean + displayDelta;
-  const finalMeanDisplay = finalMean == null ? null : finalMean + displayDelta;
   const targetIntensity = asNumber(cycleMean.linearity_target_intensity);
   const prediction = asNumber(cycleMean.linearity_prediction);
+  const finalMeanPreferredRaw = prediction ?? finalMean;
+  const finalMeanDisplay = finalMean == null ? null : finalMean + displayDelta;
+  const finalMeanCardValue = isPartiallySaturated ? finalMeanPreferredRaw : finalMeanDisplay;
   const predictionDisplay = prediction == null ? null : prediction + displayDelta;
+  const predictionCardValue = isPartiallySaturated ? prediction : predictionDisplay;
   const prevNeighbor = cycleMean.prev_neighbor as Record<string, unknown> | undefined;
   const nextNeighbor = cycleMean.next_neighbor as Record<string, unknown> | undefined;
   const reason = asString(cycleMean.reason);
@@ -1556,7 +1664,7 @@ function DiagnosticsPanel({
     typeof onLinearityTargetIntensityChange === "function";
   const shouldRenderLinearityPreview = showLinearityChart || Boolean(linearityEnabled);
   const canPickValidMean = typeof onPickDeltaValue === "function" && validMeanDisplay != null;
-  const canPickFinalMean = typeof onPickDeltaValue === "function" && finalMeanDisplay != null;
+  const canPickFinalMean = typeof onPickDeltaValue === "function" && finalMeanCardValue != null;
 
   return (
     <Card className="border-stone-300">
@@ -1574,7 +1682,7 @@ function DiagnosticsPanel({
                 type="button"
                 onClick={() => {
                   if (canPickValidMean) {
-                    onPickDeltaValue(validMeanDisplay);
+                    onPickDeltaValue(validMeanDisplay, "display");
                   }
                 }}
                 disabled={!canPickValidMean}
@@ -1590,7 +1698,7 @@ function DiagnosticsPanel({
                 type="button"
                 onClick={() => {
                   if (canPickFinalMean) {
-                    onPickDeltaValue(finalMeanDisplay);
+                    onPickDeltaValue(finalMeanCardValue, isPartiallySaturated ? "raw" : "display");
                   }
                 }}
                 disabled={!canPickFinalMean}
@@ -1600,7 +1708,7 @@ function DiagnosticsPanel({
                 )}
               >
                 <div className="text-xs uppercase tracking-wide text-stone-500">Final Mean</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(finalMeanDisplay)}</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(finalMeanCardValue)}</div>
               </button>
               <div className="rounded-lg border border-stone-200 p-3">
                 <div className="text-xs uppercase tracking-wide text-stone-500">Method</div>
@@ -1648,7 +1756,7 @@ function DiagnosticsPanel({
                 </div>
                 <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
                   <div className="font-medium text-stone-800">Linearity Prediction</div>
-                  <div>{formatDeltaValue(predictionDisplay)}</div>
+                  <div>{formatDeltaValue(predictionCardValue)}</div>
                 </div>
               </div>
             ) : null}
@@ -1730,12 +1838,17 @@ export default function ProcessingPage() {
   const sessionId = useSessionStore((state) => state.sessionId);
   const queryClient = useQueryClient();
   const [config, setConfig] = useState<ProcessingConfig | null>(null);
+  const [sharedLinearityConfig, setSharedLinearityConfig] = useState<CalibrationConfig["linearity"] | null>(null);
   const [commentMapText, setCommentMapText] = useState("");
   const [selectedTargets, setSelectedTargets] = useState<SelectedTarget[]>([]);
   const [activeTargetIndex, setActiveTargetIndex] = useState(0);
   const [displayState, setDisplayState] = useState<DisplayStateMap>({});
   const [selectionEditorTab, setSelectionEditorTab] = useState<IsotopeKey>("d13C");
   const [singleValues, setSingleValues] = useState<IsotopeNumericMap>({ d13C: 0, d18O: 0 });
+  const [singleValueSpaces, setSingleValueSpaces] = useState<Record<IsotopeKey, "raw" | "display">>({
+    d13C: "display",
+    d18O: "display",
+  });
   const [singleOffsets, setSingleOffsets] = useState<IsotopeNumericMap>({
     d13C: SELECTION_EDITOR_DEFAULT_OFFSET,
     d18O: SELECTION_EDITOR_DEFAULT_OFFSET,
@@ -1745,6 +1858,13 @@ export default function ProcessingPage() {
   const [linearityEnabled, setLinearityEnabled] = useState(false);
   const [linearityManuallySet, setLinearityManuallySet] = useState(false);
   const [linearityTargetIntensity, setLinearityTargetIntensity] = useState(15);
+  const [linearityOffsetDrafts, setLinearityOffsetDrafts] = useState<LinearityOffsetDraftState>({
+    line_1_offset_d13: "0",
+    line_1_offset_d18: "0",
+    line_2_offset_d13: "0",
+    line_2_offset_d18: "0",
+  });
+  const [linearityOffsetEditing, setLinearityOffsetEditing] = useState<LinearityOffsetField | null>(null);
   const [setValueHighlightNonce, setSetValueHighlightNonce] = useState(0);
   const [isSetValueInputHighlighted, setIsSetValueInputHighlighted] = useState(false);
   const [isSelectionEditorOpen, setSelectionEditorOpen] = useState(false);
@@ -1764,6 +1884,11 @@ export default function ProcessingPage() {
     queryFn: () => api.getProcessingWorkspace(sessionId!),
     enabled: Boolean(sessionId),
   });
+  const calibrationWorkspaceQuery = useQuery({
+    queryKey: ["calibration-workspace", sessionId],
+    queryFn: () => api.getCalibrationWorkspace(sessionId!),
+    enabled: Boolean(sessionId),
+  });
 
   useEffect(() => {
     if (workspaceQuery.data) {
@@ -1772,9 +1897,39 @@ export default function ProcessingPage() {
   }, [workspaceQuery.data]);
 
   useEffect(() => {
+    if (calibrationWorkspaceQuery.data?.config?.linearity) {
+      setSharedLinearityConfig(calibrationWorkspaceQuery.data.config.linearity);
+    }
+  }, [calibrationWorkspaceQuery.data]);
+
+  useEffect(() => {
     const nextText = serializeCommentMap(config?.export.comment_map ?? {});
     setCommentMapText(nextText);
   }, [config?.export.comment_map]);
+
+  useEffect(() => {
+    const sourceLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config.linearity;
+    if (!sourceLinearity || linearityOffsetEditing) {
+      return;
+    }
+    const nextDrafts: LinearityOffsetDraftState = {
+      line_1_offset_d13: formatDecimalInput(readLinearityOffsetValue(sourceLinearity, "line_1_offset_d13")),
+      line_1_offset_d18: formatDecimalInput(readLinearityOffsetValue(sourceLinearity, "line_1_offset_d18")),
+      line_2_offset_d13: formatDecimalInput(readLinearityOffsetValue(sourceLinearity, "line_2_offset_d13")),
+      line_2_offset_d18: formatDecimalInput(readLinearityOffsetValue(sourceLinearity, "line_2_offset_d18")),
+    };
+    setLinearityOffsetDrafts((current) => {
+      if (
+        current.line_1_offset_d13 === nextDrafts.line_1_offset_d13 &&
+        current.line_1_offset_d18 === nextDrafts.line_1_offset_d18 &&
+        current.line_2_offset_d13 === nextDrafts.line_2_offset_d13 &&
+        current.line_2_offset_d18 === nextDrafts.line_2_offset_d18
+      ) {
+        return current;
+      }
+      return nextDrafts;
+    });
+  }, [calibrationWorkspaceQuery.data, linearityOffsetEditing, sharedLinearityConfig]);
 
   useEffect(() => {
     if (exportOutputType !== "client_output") {
@@ -1810,11 +1965,23 @@ export default function ProcessingPage() {
       setConfig(workspace.config);
     },
   });
+  const saveSharedLinearityMutation = useMutation({
+    mutationFn: (nextLinearity: CalibrationConfig["linearity"]) => api.setCalibrationLinearity(sessionId!, nextLinearity),
+    onSuccess: async (workspace) => {
+      queryClient.setQueryData(["calibration-workspace", sessionId], workspace);
+      setSharedLinearityConfig(workspace.config.linearity);
+      await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
+    },
+  });
 
   const editMutation = useMutation({
     mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload),
     onSuccess: (workspace) => {
       queryClient.setQueryData(["processing-workspace", sessionId], workspace);
+      queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -1879,6 +2046,25 @@ export default function ProcessingPage() {
     return () => window.clearTimeout(timer);
   }, [config, saveConfigMutation, saveConfigMutation.isPending, sessionId, workspaceQuery.data]);
 
+  useEffect(() => {
+    if (!sessionId || !sharedLinearityConfig || !calibrationWorkspaceQuery.data || saveSharedLinearityMutation.isPending) {
+      return;
+    }
+    if (linearityConfigEquals(sharedLinearityConfig, calibrationWorkspaceQuery.data.config.linearity)) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      saveSharedLinearityMutation.mutate(sharedLinearityConfig);
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [
+    calibrationWorkspaceQuery.data,
+    saveSharedLinearityMutation,
+    saveSharedLinearityMutation.isPending,
+    sessionId,
+    sharedLinearityConfig,
+  ]);
+
   const activeTarget = selectedTargets.length ? selectedTargets[Math.min(activeTargetIndex, selectedTargets.length - 1)] : null;
   const activeSampleTarget = activeTarget;
 
@@ -1935,6 +2121,7 @@ export default function ProcessingPage() {
     }
     setSelectionEditorTab(activeSampleTarget.isotopeKey === "d18O" ? "d18O" : "d13C");
     setSingleOffsets({ d13C: SELECTION_EDITOR_DEFAULT_OFFSET, d18O: SELECTION_EDITOR_DEFAULT_OFFSET });
+    setSingleValueSpaces({ d13C: "display", d18O: "display" });
     setLinearityManuallySet(false);
     setLinearityEnabled(false);
   }, [activeSampleTarget?.rowLabel, activeSampleTarget?.isotopeKey]);
@@ -1984,25 +2171,36 @@ export default function ProcessingPage() {
     const d18Current = d18MatchesActiveRow ? asNumber(d18Target["current_value"]) : null;
     const d13CycleMean = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
     const d18CycleMean = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-    const useD13LinearityDefault = isPartiallySaturatedCollectorStatus(d13Status) && d13CycleMean != null;
-    const useD18LinearityDefault = isPartiallySaturatedCollectorStatus(d18Status) && d18CycleMean != null;
+    const d13Prediction = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["linearity_prediction"]);
+    const d18Prediction = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["linearity_prediction"]);
+    const useD13LinearityDefault =
+      isPartiallySaturatedCollectorStatus(d13Status) && (d13Prediction != null || d13CycleMean != null);
+    const useD18LinearityDefault =
+      isPartiallySaturatedCollectorStatus(d18Status) && (d18Prediction != null || d18CycleMean != null);
     const d13DisplayToRawDelta = selectedD13 != null && d13Current != null ? selectedD13 - d13Current : 0;
     const d18DisplayToRawDelta = selectedD18 != null && d18Current != null ? selectedD18 - d18Current : 0;
-    const d13SeedRawValue = useD13LinearityDefault ? d13CycleMean : d13Current;
-    const d18SeedRawValue = useD18LinearityDefault ? d18CycleMean : d18Current;
+    const d13SeedRawValue = useD13LinearityDefault ? (d13Prediction ?? d13CycleMean) : d13Current;
+    const d18SeedRawValue = useD18LinearityDefault ? (d18Prediction ?? d18CycleMean) : d18Current;
+    const d13ValueSpace: "raw" | "display" = useD13LinearityDefault ? "raw" : "display";
+    const d18ValueSpace: "raw" | "display" = useD18LinearityDefault ? "raw" : "display";
     const nextValues: IsotopeNumericMap = {
       d13C: roundDeltaValue(
         d13SeedRawValue != null
-          ? d13SeedRawValue + d13DisplayToRawDelta
+          ? d13ValueSpace === "raw"
+            ? d13SeedRawValue
+            : d13SeedRawValue + d13DisplayToRawDelta
           : selectedD13 ?? fallbackTargetValue(activeSampleTarget, "d13C"),
       ),
       d18O: roundDeltaValue(
         d18SeedRawValue != null
-          ? d18SeedRawValue + d18DisplayToRawDelta
+          ? d18ValueSpace === "raw"
+            ? d18SeedRawValue
+            : d18SeedRawValue + d18DisplayToRawDelta
           : selectedD18 ?? fallbackTargetValue(activeSampleTarget, "d18O"),
       ),
     };
     setSingleValues(nextValues);
+    setSingleValueSpaces({ d13C: d13ValueSpace, d18O: d18ValueSpace });
   }, [
     activeSampleTarget,
     linearityEnabled,
@@ -2110,21 +2308,101 @@ export default function ProcessingPage() {
     );
   }
 
-  function updateManualLinearity<T extends keyof ProcessingConfig["manual_linearity_override"]>(
-    key: T,
-    value: ProcessingConfig["manual_linearity_override"][T],
+  function updateSharedLinearity(
+    key: keyof CalibrationConfig["linearity"],
+    value: boolean | number | string | null,
   ) {
-    setConfig((current) =>
+    setSharedLinearityConfig((current) =>
       current
         ? {
             ...current,
-            manual_linearity_override: {
-              ...current.manual_linearity_override,
-              [key]: value,
-            },
+            [key]: value,
           }
         : current,
     );
+  }
+
+  function updateSharedLinearityIntensityCol(intensityCol: string) {
+    setSharedLinearityConfig((current) =>
+      current
+        ? {
+            ...current,
+            intensity_col: intensityCol,
+            use_diff_intensity: intensityCol === LINEARITY_INTENSITY_DIFF44,
+          }
+        : current,
+    );
+  }
+
+  function updateLinearityCoefficientOffset(isotopeKey: "d13C" | "d18O", value: number) {
+    setSharedLinearityConfig((current) => {
+      if (!current) {
+        return current;
+      }
+      const next = { ...current };
+      if (next.quadratic) {
+        if (isotopeKey === "d13C") {
+          next.manual_d13_per_10v2 = value;
+        } else {
+          next.manual_d18_per_10v2 = value;
+        }
+      } else if (isotopeKey === "d13C") {
+        next.manual_d13_per_10v = value;
+      } else {
+        next.manual_d18_per_10v = value;
+      }
+      const d13Offset = next.quadratic ? Number(next.manual_d13_per_10v2 ?? 0) : Number(next.manual_d13_per_10v ?? 0);
+      const d18Offset = next.quadratic ? Number(next.manual_d18_per_10v2 ?? 0) : Number(next.manual_d18_per_10v ?? 0);
+      const hasOffset = Math.abs(d13Offset) > 1e-12 || Math.abs(d18Offset) > 1e-12;
+      next.manual_override_enabled = hasOffset;
+      return next;
+    });
+  }
+
+  function handleLinearityOffsetDraftChange(field: LinearityOffsetField, rawValue: string) {
+    setLinearityOffsetEditing(field);
+    setLinearityOffsetDrafts((current) => ({ ...current, [field]: rawValue }));
+    const parsed = parseDecimalInput(rawValue);
+    if (parsed == null) {
+      return;
+    }
+    updateSharedLinearity(field, parsed);
+  }
+
+  function resetLinearityOffsetDraft(field: LinearityOffsetField) {
+    const sourceLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config.linearity;
+    if (!sourceLinearity) {
+      return;
+    }
+    const value = readLinearityOffsetValue(sourceLinearity, field);
+    setLinearityOffsetDrafts((current) => ({ ...current, [field]: formatDecimalInput(value) }));
+  }
+
+  function commitLinearityOffsetDraft(field: LinearityOffsetField) {
+    const parsed = parseDecimalInput(linearityOffsetDrafts[field]);
+    if (parsed == null) {
+      resetLinearityOffsetDraft(field);
+      setLinearityOffsetEditing((current) => (current === field ? null : current));
+      return;
+    }
+    updateSharedLinearity(field, parsed);
+    setLinearityOffsetDrafts((current) => ({ ...current, [field]: formatDecimalInput(parsed) }));
+    setLinearityOffsetEditing((current) => (current === field ? null : current));
+  }
+
+  function handleLinearityOffsetKeyDown(event: ReactKeyboardEvent<HTMLInputElement>, field: LinearityOffsetField) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitLinearityOffsetDraft(field);
+      event.currentTarget.blur();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      resetLinearityOffsetDraft(field);
+      setLinearityOffsetEditing((current) => (current === field ? null : current));
+      event.currentTarget.blur();
+    }
   }
 
   function updateExport(
@@ -2172,22 +2450,29 @@ export default function ProcessingPage() {
     value: number,
     valueSpace: "raw" | "display" = "raw",
   ) {
-    const resolvedDisplayValue = valueSpace === "raw" ? value + rawToDisplayDelta(isotopeKey) : value;
     setSelectionEditorTab(isotopeKey);
-    setSingleValues((current) => ({ ...current, [isotopeKey]: roundDeltaValue(resolvedDisplayValue) }));
+    setSingleValues((current) => ({ ...current, [isotopeKey]: roundDeltaValue(value) }));
+    setSingleValueSpaces((current) => ({ ...current, [isotopeKey]: valueSpace }));
     setSetValueHighlightNonce((current) => current + 1);
   }
 
-  function resolveSetValuePayload(isotopeKey: IsotopeKey, requestedDisplayValue: number): number {
+  function resolveSetValuePayload(
+    isotopeKey: IsotopeKey,
+    requestedValue: number,
+    valueSpace: "raw" | "display",
+  ): number {
+    if (valueSpace === "raw") {
+      return requestedValue;
+    }
     const selectedDisplayValue = selectedTargetPointValue(activeSampleTarget, isotopeKey);
     const diagnosticsCurrentValue =
       isotopeKey === "d13C"
         ? asNumber((sampleD13DiagnosticsQuery.data?.target ?? {})["current_value"])
         : asNumber((sampleD18DiagnosticsQuery.data?.target ?? {})["current_value"]);
     if (selectedDisplayValue == null || diagnosticsCurrentValue == null) {
-      return requestedDisplayValue;
+      return requestedValue;
     }
-    return requestedDisplayValue - rawToDisplayDelta(isotopeKey);
+    return requestedValue - rawToDisplayDelta(isotopeKey);
   }
 
   function handleChartClick(chartKey: string, points: PlotlyPoint[]) {
@@ -2302,7 +2587,7 @@ export default function ProcessingPage() {
     if (!sessionId || !activeSampleTarget) {
       return;
     }
-    const payloadValue = resolveSetValuePayload(isotopeKey, singleValues[isotopeKey]);
+    const payloadValue = resolveSetValuePayload(isotopeKey, singleValues[isotopeKey], singleValueSpaces[isotopeKey]);
     await editMutation.mutateAsync({
       action: "set_value",
       targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
@@ -2481,10 +2766,31 @@ export default function ProcessingPage() {
 
   const busy =
     saveConfigMutation.isPending ||
+    saveSharedLinearityMutation.isPending ||
     editMutation.isPending ||
     resetAllMutation.isPending ||
     removeCalibrationMutation.isPending ||
     duplicateCheckMutation.isPending;
+  const activeLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config.linearity ?? null;
+  const selectedLinearityIntensityCol = activeLinearity
+    ? LINEARITY_INTENSITY_OPTIONS.includes(activeLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
+      ? activeLinearity.intensity_col
+      : activeLinearity.use_diff_intensity
+        ? LINEARITY_INTENSITY_DIFF44
+        : LINEARITY_INTENSITY_SAMP44
+    : LINEARITY_INTENSITY_SAMP44;
+  const selectedLinearityBasisLabel = getLinearityIntensityOptionLabel(selectedLinearityIntensityCol);
+  const d13Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d13C ?? {}) as Record<string, unknown>;
+  const d18Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d18O ?? {}) as Record<string, unknown>;
+  const d13FitSlope = asNumber(d13Fit.slope);
+  const d18FitSlope = asNumber(d18Fit.slope);
+  const d13FitQuad = asNumber(d13Fit.quad);
+  const d18FitQuad = asNumber(d18Fit.quad);
+  const selectedStandards = calibrationWorkspaceQuery.data?.config.selected_standards ?? [];
+  const standardPrecisionRows = (calibrationWorkspaceQuery.data?.precision_summaries ?? [])
+    .filter((summary) => selectedStandards.includes(summary.standard))
+    .slice(0, 6);
+  const coefficientOffsetEnabled = Boolean(activeLinearity?.manual_override_enabled);
   const renderFailedSampleTableControls = (table: OutlierTable, context: { selectedRowLabels: string[] }) => {
     const isFailedSampleTable = isFailedSampleOutlierTable(table);
     if (!isFailedSampleTable) {
@@ -2587,39 +2893,52 @@ export default function ProcessingPage() {
       settableIsotope,
     };
   });
-  const d13CycleMeanDisplayValue = (() => {
-    const raw = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-    return raw == null ? null : raw + rawToDisplayDelta("d13C");
-  })();
-  const d18CycleMeanDisplayValue = (() => {
-    const raw = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-    return raw == null ? null : raw + rawToDisplayDelta("d18O");
-  })();
-  const d13CurrentDisplayValue = selectedPointD13 ?? asNumber((sampleD13DiagnosticsQuery.data?.target ?? {})["current_value"]);
-  const d18CurrentDisplayValue = selectedPointD18 ?? asNumber((sampleD18DiagnosticsQuery.data?.target ?? {})["current_value"]);
+  const activeRowLabel = activeSampleTarget ? String(activeSampleTarget.rowLabel).trim() : "";
+  const d13TargetPayload = sampleD13DiagnosticsQuery.data?.target ?? {};
+  const d18TargetPayload = sampleD18DiagnosticsQuery.data?.target ?? {};
+  const d13ActiveStatus =
+    asString(d13TargetPayload["row_label"]).trim() === activeRowLabel
+      ? asString(d13TargetPayload["collector_status"]).trim()
+      : "";
+  const d18ActiveStatus =
+    asString(d18TargetPayload["row_label"]).trim() === activeRowLabel
+      ? asString(d18TargetPayload["collector_status"]).trim()
+      : "";
+  const d13IsPartiallySaturated = isPartiallySaturatedCollectorStatus(d13ActiveStatus);
+  const d18IsPartiallySaturated = isPartiallySaturatedCollectorStatus(d18ActiveStatus);
+  const d13CurrentRawValue = asNumber(d13TargetPayload["current_value"]);
+  const d18CurrentRawValue = asNumber(d18TargetPayload["current_value"]);
+  const d13CycleMeanRawValue = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
+  const d18CycleMeanRawValue = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
+  const d13PredictionRawValue = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["linearity_prediction"]);
+  const d18PredictionRawValue = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["linearity_prediction"]);
+  const d13CurrentDisplayValue = d13IsPartiallySaturated
+    ? (d13CurrentRawValue ?? selectedPointD13)
+    : d13CurrentRawValue == null
+      ? selectedPointD13
+      : d13CurrentRawValue + rawToDisplayDelta("d13C");
+  const d18CurrentDisplayValue = d18IsPartiallySaturated
+    ? (d18CurrentRawValue ?? selectedPointD18)
+    : d18CurrentRawValue == null
+      ? selectedPointD18
+      : d18CurrentRawValue + rawToDisplayDelta("d18O");
+  const d13CycleMeanDisplayValue = d13IsPartiallySaturated
+    ? (d13PredictionRawValue ?? d13CycleMeanRawValue)
+    : d13CycleMeanRawValue == null
+      ? null
+      : d13CycleMeanRawValue + rawToDisplayDelta("d13C");
+  const d18CycleMeanDisplayValue = d18IsPartiallySaturated
+    ? (d18PredictionRawValue ?? d18CycleMeanRawValue)
+    : d18CycleMeanRawValue == null
+      ? null
+      : d18CycleMeanRawValue + rawToDisplayDelta("d18O");
   const effectiveOutlier =
     typeof sampleD18DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
       ? (sampleD18DiagnosticsQuery.data.target.effective_outlier as boolean)
       : typeof sampleD13DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
         ? (sampleD13DiagnosticsQuery.data.target.effective_outlier as boolean)
         : false;
-  const activeTargetCollectorStatus = (() => {
-    if (!activeSampleTarget) {
-      return "";
-    }
-    const activeRowLabel = String(activeSampleTarget.rowLabel).trim();
-    const d13Target = sampleD13DiagnosticsQuery.data?.target ?? {};
-    const d18Target = sampleD18DiagnosticsQuery.data?.target ?? {};
-    const d13Status =
-      asString(d13Target["row_label"]).trim() === activeRowLabel
-        ? asString(d13Target["collector_status"]).trim()
-        : "";
-    const d18Status =
-      asString(d18Target["row_label"]).trim() === activeRowLabel
-        ? asString(d18Target["collector_status"]).trim()
-        : "";
-    return d13Status || d18Status;
-  })();
+  const activeTargetCollectorStatus = d13ActiveStatus || d18ActiveStatus;
   const singleInterpolateLabel = isFailedSampleCollectorStatus(activeTargetCollectorStatus)
     ? "Interpolate d13C + d18O"
     : `Interpolate ${selectionEditorTab}`;
@@ -2651,8 +2970,8 @@ export default function ProcessingPage() {
   };
   const d13SummaryState = displayState[overviewCards.d13Summary.key] ?? { rawOnly: false, hideCalibrated: false };
   const d18SummaryState = displayState[overviewCards.d18Summary.key] ?? { rawOnly: false, hideCalibrated: false };
-  const d13SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d13Summary.figure, "Calibrated ");
-  const d18SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d18Summary.figure, "Calibrated ");
+  const d13SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d13Summary.figure, "Calibrated");
+  const d18SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d18Summary.figure, "Calibrated");
   const d13SummaryFigure = applyDisplayState(overviewCards.d13Summary.figure, d13SummaryState.rawOnly, d13SummaryState.hideCalibrated);
   const d18SummaryFigure = applyDisplayState(overviewCards.d18Summary.figure, d18SummaryState.rawOnly, d18SummaryState.hideCalibrated);
   const activeSelectionChartKey = isSelectionEditorOpen ? (activeTarget?.chartKey ?? selectedTargets[0]?.chartKey ?? null) : null;
@@ -2789,7 +3108,7 @@ export default function ProcessingPage() {
           <Card>
             <CardHeader>
               <CardTitle>Processing Controls</CardTitle>
-              <CardDescription>Filters, outliers, and manual linearity override.</CardDescription>
+              <CardDescription>Filters, outliers, and shared linearity controls synced with Calibration.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-6 xl:max-h-[calc(100vh-12rem)] xl:overflow-y-auto xl:pr-2">
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
@@ -2959,109 +3278,209 @@ export default function ProcessingPage() {
                 </Button>
               </div>
 
-              <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-800">Manual linearity override</div>
-                <CheckboxField
-                  checked={activeConfig.manual_linearity_override.enabled}
-                  label="Enable manual linearity transform"
-                  description="Applied as a second-pass transform after calibration-page linearity correction (if enabled), before outlier filtering; raw stored values are not overwritten."
-                  onChange={(checked) => updateManualLinearity("enabled", checked)}
-                />
-                <CheckboxField
-                  checked={activeConfig.manual_linearity_override.use_diff_intensity}
-                  label="Use Samp-Ref intensity difference"
-                  description="Switches manual override to pressure-weighted mismatch: 10 x (Samp-Ref)/Ref x (Samp/Samp median)."
-                  disabled={!activeConfig.manual_linearity_override.enabled}
-                  onChange={(checked) => updateManualLinearity("use_diff_intensity", checked)}
-                />
-                <CheckboxField
-                  checked={Boolean(activeConfig.manual_linearity_override.quadratic)}
-                  label="Use quadratic relationship"
-                  description="Applies c*(I^2 - Iref^2) instead of b*(I - Iref) for manual override in both intensity modes."
-                  disabled={!activeConfig.manual_linearity_override.enabled}
-                  onChange={(checked) => updateManualLinearity("quadratic", checked)}
-                />
-                <label className="text-sm">
-                  <span className="mb-1 block text-stone-700">Max sample signal (optional)</span>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min={0}
-                    value={activeConfig.manual_linearity_override.max_sample_signal ?? ""}
-                    onChange={(event) => {
-                      const nextValue = event.target.value.trim();
-                      updateManualLinearity("max_sample_signal", nextValue === "" ? null : Number(nextValue));
-                    }}
-                    disabled={!activeConfig.manual_linearity_override.enabled}
-                    className="w-full rounded-lg border border-stone-300 px-3 py-2 disabled:bg-stone-100"
-                  />
-                  <span className="mt-1 block text-xs text-stone-500">
-                    Samples above this 44-intensity are excluded from manual linearity correction.
-                  </span>
-                </label>
-                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-2">
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">
-                      {activeConfig.manual_linearity_override.use_diff_intensity
-                        ? activeConfig.manual_linearity_override.quadratic
-                          ? "d13 pressure-weighted mismatch coefficient per (10V)^2"
-                          : "d13 pressure-weighted mismatch coefficient"
-                        : activeConfig.manual_linearity_override.quadratic
-                          ? "d13 per (10V)^2"
-                          : "d13 per 10V"}
-                    </span>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={
-                        activeConfig.manual_linearity_override.quadratic
-                          ? (activeConfig.manual_linearity_override.d13_per_10v2 ?? 0)
-                          : (activeConfig.manual_linearity_override.d13_per_10v ?? 0)
-                      }
-                      onChange={(event) =>
-                        updateManualLinearity(
-                          activeConfig.manual_linearity_override.quadratic ? "d13_per_10v2" : "d13_per_10v",
-                          Number(event.target.value),
-                        )
-                      }
-                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">
-                      {activeConfig.manual_linearity_override.use_diff_intensity
-                        ? activeConfig.manual_linearity_override.quadratic
-                          ? "d18 pressure-weighted mismatch coefficient per (10V)^2"
-                          : "d18 pressure-weighted mismatch coefficient"
-                        : activeConfig.manual_linearity_override.quadratic
-                          ? "d18 per (10V)^2"
-                          : "d18 per 10V"}
-                    </span>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={
-                        activeConfig.manual_linearity_override.quadratic
-                          ? (activeConfig.manual_linearity_override.d18_per_10v2 ?? 0)
-                          : (activeConfig.manual_linearity_override.d18_per_10v ?? 0)
-                      }
-                      onChange={(event) =>
-                        updateManualLinearity(
-                          activeConfig.manual_linearity_override.quadratic ? "d18_per_10v2" : "d18_per_10v",
-                          Number(event.target.value),
-                        )
-                      }
-                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
+              <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-medium text-stone-800">Linearity (shared with calibration)</div>
+                  <span className="rounded-full bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
                 </div>
+                {activeLinearity ? (
+                  <>
+                    <CheckboxField
+                      checked={activeLinearity.apply}
+                      label="Enable linearity correction"
+                      description="Uses the same basis, fits, and offsets as Calibration."
+                      onChange={(checked) => updateSharedLinearity("apply", checked)}
+                    />
+                    <CheckboxField
+                      checked={Boolean(activeLinearity.quadratic)}
+                      label="Use quadratic linearity relationship"
+                      description="Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I."
+                      onChange={(checked) => updateSharedLinearity("quadratic", checked)}
+                    />
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">Linearity basis</span>
+                      <select
+                        value={selectedLinearityIntensityCol}
+                        onChange={(event) => updateSharedLinearityIntensityCol(event.target.value)}
+                        className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                      >
+                        {LINEARITY_INTENSITY_OPTIONS.map((option) => (
+                          <option key={option} value={option}>
+                            {getLinearityIntensityOptionLabel(option)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">Max sample intensity</span>
+                        <input
+                          type="number"
+                          step="0.1"
+                          min={0}
+                          value={activeLinearity.max_sample_intensity ?? ""}
+                          onChange={(event) => {
+                            const rawValue = event.target.value.trim();
+                            if (rawValue === "") {
+                              updateSharedLinearity("max_sample_intensity", null);
+                              return;
+                            }
+                            const parsed = Number(rawValue);
+                            updateSharedLinearity("max_sample_intensity", Number.isFinite(parsed) ? parsed : null);
+                          }}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                    ) : null}
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="rounded-lg border border-stone-200 p-3 text-sm">
+                        <div className="text-xs uppercase tracking-wide text-stone-500">d13C fitted coefficient</div>
+                        <div className="mt-1 font-semibold text-stone-900">
+                          {activeLinearity.quadratic
+                            ? `${formatDeltaValue(d13FitSlope, 6)} (linear), ${formatDeltaValue(d13FitQuad, 8)} (quadratic)`
+                            : formatDeltaValue(d13FitSlope, 6)}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-stone-200 p-3 text-sm">
+                        <div className="text-xs uppercase tracking-wide text-stone-500">d18O fitted coefficient</div>
+                        <div className="mt-1 font-semibold text-stone-900">
+                          {activeLinearity.quadratic
+                            ? `${formatDeltaValue(d18FitSlope, 6)} (linear), ${formatDeltaValue(d18FitQuad, 8)} (quadratic)`
+                            : formatDeltaValue(d18FitSlope, 6)}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">
+                          {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, Boolean(activeLinearity.quadratic))}
+                        </span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={activeLinearity.quadratic ? (activeLinearity.manual_d13_per_10v2 ?? 0) : (activeLinearity.manual_d13_per_10v ?? 0)}
+                          onChange={(event) => updateLinearityCoefficientOffset("d13C", Number(event.target.value))}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">
+                          {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, Boolean(activeLinearity.quadratic))}
+                        </span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={activeLinearity.quadratic ? (activeLinearity.manual_d18_per_10v2 ?? 0) : (activeLinearity.manual_d18_per_10v ?? 0)}
+                          onChange={(event) => updateLinearityCoefficientOffset("d18O", Number(event.target.value))}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                    </div>
+                    <div className="text-xs text-stone-500">
+                      Coefficient offset active: {coefficientOffsetEnabled ? "Yes" : "No"}
+                    </div>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <div className="space-y-3">
+                        <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <label className="text-sm">
+                            <span className="mb-1 block text-stone-700">d13C</span>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={linearityOffsetDrafts.line_1_offset_d13}
+                              onFocus={() => setLinearityOffsetEditing("line_1_offset_d13")}
+                              onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d13", event.target.value)}
+                              onBlur={() => commitLinearityOffsetDraft("line_1_offset_d13")}
+                              onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d13")}
+                              className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                            />
+                          </label>
+                          <label className="text-sm">
+                            <span className="mb-1 block text-stone-700">d18O</span>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={linearityOffsetDrafts.line_1_offset_d18}
+                              onFocus={() => setLinearityOffsetEditing("line_1_offset_d18")}
+                              onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d18", event.target.value)}
+                              onBlur={() => commitLinearityOffsetDraft("line_1_offset_d18")}
+                              onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d18")}
+                              className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                      <div className="space-y-3">
+                        <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <label className="text-sm">
+                            <span className="mb-1 block text-stone-700">d13C</span>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={linearityOffsetDrafts.line_2_offset_d13}
+                              onFocus={() => setLinearityOffsetEditing("line_2_offset_d13")}
+                              onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d13", event.target.value)}
+                              onBlur={() => commitLinearityOffsetDraft("line_2_offset_d13")}
+                              onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d13")}
+                              className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                            />
+                          </label>
+                          <label className="text-sm">
+                            <span className="mb-1 block text-stone-700">d18O</span>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={linearityOffsetDrafts.line_2_offset_d18}
+                              onFocus={() => setLinearityOffsetEditing("line_2_offset_d18")}
+                              onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d18", event.target.value)}
+                              onBlur={() => commitLinearityOffsetDraft("line_2_offset_d18")}
+                              onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d18")}
+                              className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                    {activeLinearity.apply ? (
+                      <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
+                        <div className="text-sm font-medium text-stone-800">Linearity-corrected standard precision</div>
+                        {standardPrecisionRows.length ? (
+                          standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
+                            <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
+                              <span className="font-medium text-stone-800">{summary.standard}</span>
+                              <span>δ13C: {formatPrecisionMetric(summary.d13_linearity_corrected_precision)}</span>
+                              <span>δ18O: {formatPrecisionMetric(summary.d18_linearity_corrected_precision)}</span>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="text-xs text-stone-500">No selected standards available for precision.</div>
+                        )}
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">
+                    Load calibration workspace to edit shared linearity parameters.
+                  </div>
+                )}
               </div>
 
               <div className="flex flex-wrap gap-2">
                 <Button onClick={applyConfig} disabled={busy}>
                   Apply config
                 </Button>
-                <Button variant="outline" onClick={() => setConfig(workspace.config)} disabled={busy}>
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    setConfig(workspace.config);
+                    if (calibrationWorkspaceQuery.data?.config?.linearity) {
+                      setSharedLinearityConfig(calibrationWorkspaceQuery.data.config.linearity);
+                    }
+                  }}
+                  disabled={busy}
+                >
                   Restore saved
                 </Button>
                 <Button variant="outline" onClick={() => removeCalibrationMutation.mutate()} disabled={busy}>
@@ -3542,7 +3961,9 @@ export default function ProcessingPage() {
                             linearityTargetIntensity={linearityTargetIntensity}
                             onLinearityTargetIntensityChange={setLinearityTargetIntensity}
                             displayDelta={rawToDisplayDelta(selectionEditorTab)}
-                            onPickDeltaValue={(value) => setSingleValueFromSuggestion(selectionEditorTab, value, "display")}
+                            onPickDeltaValue={(value, valueSpace = "raw") =>
+                              setSingleValueFromSuggestion(selectionEditorTab, value, valueSpace)
+                            }
                           />
                         </div>
                       ) : null}

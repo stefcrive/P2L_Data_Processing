@@ -260,6 +260,66 @@ def _linearity_correction_delta(intensity: pd.Series, fit: dict[str, Any]) -> pd
     return pd.to_numeric(delta, errors="coerce")
 
 
+def _apply_manual_linearity_offsets_to_fits(
+    fits: dict[str, Any] | None,
+    *,
+    enabled: bool = False,
+    quadratic: bool = False,
+    d13_per_10v: float = 0.0,
+    d18_per_10v: float = 0.0,
+    d13_per_10v2: float = 0.0,
+    d18_per_10v2: float = 0.0,
+) -> dict[str, Any]:
+    """Apply manual coefficient offsets directly to linearity fits.
+
+    This keeps manual offsets effective for downstream correction paths instead
+    of letting them be fully absorbed by pre-fit value transforms.
+    """
+    if not isinstance(fits, dict):
+        return {}
+    adjusted: dict[str, Any] = dict(fits)
+    if not bool(enabled):
+        return adjusted
+
+    config_by_isotope = {
+        "d13C": {"linear": d13_per_10v, "quadratic": d13_per_10v2},
+        "d18O": {"linear": d18_per_10v, "quadratic": d18_per_10v2},
+    }
+    for isotope_key, coeffs in config_by_isotope.items():
+        fit_payload = adjusted.get(isotope_key, {})
+        fit = dict(fit_payload) if isinstance(fit_payload, dict) else {}
+        x_ref_num = pd.to_numeric(pd.Series([fit.get("x_ref")]), errors="coerce").iloc[0]
+        x_ref = float(x_ref_num) if np.isfinite(x_ref_num) else 0.0
+
+        if bool(quadratic):
+            offset_raw = pd.to_numeric(pd.Series([coeffs["quadratic"]]), errors="coerce").iloc[0]
+            if not np.isfinite(offset_raw):
+                offset_raw = pd.to_numeric(pd.Series([coeffs["linear"]]), errors="coerce").iloc[0]
+            if np.isfinite(offset_raw):
+                quad_offset = float(offset_raw) / 100.0
+                base_quad = pd.to_numeric(pd.Series([fit.get("quad")]), errors="coerce").iloc[0]
+                base_quad_value = float(base_quad) if np.isfinite(base_quad) else 0.0
+                fit["quad"] = base_quad_value + quad_offset
+                base_intercept = pd.to_numeric(pd.Series([fit.get("intercept")]), errors="coerce").iloc[0]
+                if np.isfinite(base_intercept):
+                    # Keep the reference-intensity anchor stable after offsetting curvature.
+                    fit["intercept"] = float(base_intercept) - quad_offset * (x_ref**2)
+                fit["degree"] = max(int(fit.get("degree", 1) or 1), 2)
+        else:
+            offset_raw = pd.to_numeric(pd.Series([coeffs["linear"]]), errors="coerce").iloc[0]
+            if np.isfinite(offset_raw):
+                slope_offset = float(offset_raw) / 10.0
+                base_slope = pd.to_numeric(pd.Series([fit.get("slope")]), errors="coerce").iloc[0]
+                base_slope_value = float(base_slope) if np.isfinite(base_slope) else 0.0
+                fit["slope"] = base_slope_value + slope_offset
+                base_intercept = pd.to_numeric(pd.Series([fit.get("intercept")]), errors="coerce").iloc[0]
+                if np.isfinite(base_intercept):
+                    # Keep the reference-intensity anchor stable after offsetting slope.
+                    fit["intercept"] = float(base_intercept) - slope_offset * x_ref
+        adjusted[isotope_key] = fit
+    return adjusted
+
+
 def _offset_number(value: Any, fallback: float = 0.0) -> float:
     parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if np.isfinite(parsed):

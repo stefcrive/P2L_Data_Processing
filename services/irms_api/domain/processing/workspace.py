@@ -8,12 +8,12 @@ import pandas as pd
 
 from ..calibration.core import (
     _apply_manual_linearity_override_to_standards,
+    _apply_manual_linearity_offsets_to_fits,
     _apply_isotope_line_offsets,
     _apply_linearity_correction,
     _resolve_linearity_intensity_column_for_fits,
     _resolve_manual_linearity_override_intensity,
     _resolve_linearity_reference_intensity,
-    _resolve_selected_linearity_intensity_column,
     _with_isotope_linearity_intensity_columns,
 )
 from ..constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, CYCLE1_SIGNAL_SAMP44_COL
@@ -147,6 +147,30 @@ def _range_config_from_processing_config(config: ProcessingWorkspaceConfig) -> R
         d18o_range=config.d18o_range,
         partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
     )
+
+
+def _restore_edited_raw_isotope_values(
+    work: pd.DataFrame,
+    source_df: pd.DataFrame,
+    edit_state: dict[str, Any] | None,
+) -> pd.DataFrame:
+    if work is None or work.empty or source_df is None or source_df.empty:
+        return work
+    edited_rows = {
+        str(token).strip()
+        for token in (edit_state or {}).get("edited_rows", [])
+        if str(token).strip() != ""
+    }
+    if not edited_rows:
+        return work
+    raw_cols = ("d 13C/12C  Mean", "d 18O/16O  Mean")
+    for row_label in work.index:
+        if str(row_label) not in edited_rows or row_label not in source_df.index:
+            continue
+        for col in raw_cols:
+            if col in work.columns and col in source_df.columns:
+                work.at[row_label, col] = source_df.at[row_label, col]
+    return work
 
 
 def _apply_manual_linearity_override(
@@ -362,6 +386,15 @@ def _derive_working_frame(
         fit_payload = dict(fits)
         fit_payload.setdefault("d13_intensity_col", d13_offset_intensity_col)
         fit_payload.setdefault("d18_intensity_col", d18_offset_intensity_col)
+        fit_payload = _apply_manual_linearity_offsets_to_fits(
+            fit_payload,
+            enabled=bool(linearity_cfg.get("manual_override_enabled", False)),
+            quadratic=bool(linearity_cfg.get("quadratic", False)),
+            d13_per_10v=float(linearity_cfg.get("manual_d13_per_10v", 0.0) or 0.0),
+            d18_per_10v=float(linearity_cfg.get("manual_d18_per_10v", 0.0) or 0.0),
+            d13_per_10v2=float(linearity_cfg.get("manual_d13_per_10v2", 0.0) or 0.0),
+            d18_per_10v2=float(linearity_cfg.get("manual_d18_per_10v2", 0.0) or 0.0),
+        )
         corrected = _apply_linearity_correction(work, calibration_intensity_col, fit_payload)
         if "d13C_linearity_corrected" in corrected.columns:
             corrected_values = pd.to_numeric(corrected["d13C_linearity_corrected"], errors="coerce")
@@ -372,20 +405,22 @@ def _derive_working_frame(
             if corrected_values.notna().any():
                 corrected["d 18O/16O  Mean"] = corrected_values
         work = corrected
-    use_diff_intensity = bool(config.manual_linearity_override.use_diff_intensity)
-    intensity_col = _resolve_selected_linearity_intensity_column(df=work, use_diff_intensity=use_diff_intensity)
-    work = _apply_manual_linearity_override(
-        work,
-        config.manual_linearity_override,
-        intensity_col=intensity_col,
-        linearity_fits=fits,
-    )
-    return _recompute_calibration_after_modifications(
+    work = _recompute_calibration_after_modifications(
         work,
         config,
         calibration_meta=calibration,
         edit_state=edit_state,
     )
+    # Keep edited raw values stable in charts/tables even when calibration-side
+    # linearity correction is enabled.
+    work = _restore_edited_raw_isotope_values(work, df, edit_state)
+    work = _recompute_calibration_after_modifications(
+        work,
+        config,
+        calibration_meta=calibration,
+        edit_state=edit_state,
+    )
+    return work
 
 
 def _build_plot_frames(
