@@ -31,6 +31,7 @@ from ..domain.calibration.core import (
 )
 from ..domain.contracts import (
     CalibrationConfig,
+    CalibrationLinearityUpdateRequest,
     CalibrationOfficialValue,
     CalibrationOfficialValueDeleteResult,
     CalibrationOfficialValueUpsertRequest,
@@ -1307,16 +1308,38 @@ def _compute_preview_coefficients_for_calibration_linearity(
 
 
 @app.post("/sessions/{session_id}/calibration/linearity", response_model=CalibrationWorkspace)
-def set_calibration_linearity_config(session_id: str, linearity: LinearityConfig) -> CalibrationWorkspace:
+def set_calibration_linearity_config(
+    session_id: str,
+    payload: CalibrationLinearityUpdateRequest | LinearityConfig,
+) -> CalibrationWorkspace:
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
     source_df = store.load_frame(session_id)
+    if isinstance(payload, CalibrationLinearityUpdateRequest):
+        linearity = payload.linearity
+        selected_standards_override = payload.selected_standards
+    else:
+        linearity = payload
+        selected_standards_override = None
     calibration_meta = metadata.setdefault("calibration", {})
     if not isinstance(calibration_meta, dict):
         calibration_meta = {}
         metadata["calibration"] = calibration_meta
     raw_config = calibration_meta.get("config", {})
     config_payload = dict(raw_config) if isinstance(raw_config, dict) else {}
+    if (
+        (
+            "selected_standards" not in config_payload
+            or not isinstance(config_payload.get("selected_standards"), list)
+            or len(config_payload.get("selected_standards", [])) == 0
+        )
+        and isinstance(calibration_meta.get("selected_standards"), list)
+    ):
+        config_payload["selected_standards"] = list(calibration_meta.get("selected_standards", []))
+    if selected_standards_override is not None:
+        config_payload["selected_standards"] = [
+            str(item).strip() for item in selected_standards_override if str(item).strip() != ""
+        ]
     config_payload["linearity"] = linearity.model_dump()
     normalized_config = normalize_calibration_config(config_payload)
     preview_workspace = build_calibration_workspace(
@@ -1332,7 +1355,10 @@ def set_calibration_linearity_config(session_id: str, linearity: LinearityConfig
     _persist_session_update(
         session_id,
         action="calibration_linearity_config_updated",
-        payload={"linearity": normalized_config.linearity.model_dump()},
+        payload={
+            "linearity": normalized_config.linearity.model_dump(),
+            "selected_standards": list(normalized_config.selected_standards),
+        },
         metadata=metadata,
     )
     return build_calibration_workspace(

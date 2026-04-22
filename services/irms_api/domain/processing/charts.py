@@ -1005,16 +1005,27 @@ def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
         # Push the colorbar into the right margin so the 3D scene can use the full chart domain.
         colorbar.x = 1.01
         colorbar.xanchor = "left"
-        colorbar.y = 0.5
+        colorbar.y = 0.56
         colorbar.yanchor = "middle"
-        colorbar.len = 0.74
+        colorbar.len = 0.82
         colorbar_updated = True
         break
 
     layout_updates: dict[str, Any] = {
         "scene": {"domain": {"x": [0.0, 1.0], "y": [0.0, 1.0]}, "aspectmode": "cube"},
-        "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0, "xanchor": "left"},
-        "margin": {"l": 12, "r": 84 if colorbar_updated else 24, "t": 56, "b": 12},
+        "title": {"x": 0.0, "xanchor": "left", "y": 0.99, "yanchor": "top"},
+        "legend": {
+            "orientation": "h",
+            "yanchor": "top",
+            "y": -0.16,
+            "x": 0.0,
+            "xanchor": "left",
+            "entrywidthmode": "pixels",
+            "entrywidth": 140,
+            "itemsizing": "constant",
+            "tracegroupgap": 6,
+        },
+        "margin": {"l": 12, "r": 92 if colorbar_updated else 28, "t": 64, "b": 162},
     }
     fig.update_layout(**layout_updates)
 
@@ -1159,8 +1170,10 @@ def build_overview_figures(
                         "side": "right",
                     },
                     "thickness": 16,
-                    "len": 0.7,
-                    "y": 0.5,
+                    "len": 0.86,
+                    "x": 1.02,
+                    "xanchor": "left",
+                    "y": 0.53,
                     "yanchor": "middle",
                 }
                 if is_date_color:
@@ -1230,12 +1243,15 @@ def build_overview_figures(
         legend=dict(
             orientation="h",
             yanchor="top",
-            y=1.12,
+            y=-0.18,
             x=0.0,
             xanchor="left",
+            entrywidthmode="pixels",
+            entrywidth=140,
+            itemsizing="constant",
             tracegroupgap=6,
         ),
-        margin=dict(l=40, r=24, t=136, b=48),
+        margin=dict(l=40, r=108, t=92, b=170),
         height=720,
     )
     figures["crossplot"] = _figure_json(fig_cross)

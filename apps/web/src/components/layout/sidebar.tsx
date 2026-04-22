@@ -16,7 +16,7 @@ const navItems = [
 export function Sidebar() {
   const pathname = usePathname();
   return (
-    <aside className="flex h-screen w-[18.75rem] flex-col border-r border-slate-200/80 bg-[linear-gradient(180deg,#eaf3ff_0%,#f7fbff_66%)] px-5 py-6">
+    <aside className="fixed left-0 top-0 z-30 flex h-screen w-[18.75rem] flex-col overflow-hidden border-r border-slate-200/80 bg-[linear-gradient(180deg,#eaf3ff_0%,#f7fbff_66%)] px-5 py-6">
       <div className="mb-8">
         <div className="text-[0.72rem] font-semibold uppercase tracking-[0.2em] text-sky-700">Gas Isotope Ratio Mass Spectrometer</div>
         <div className="mt-2 font-serif text-[2rem] font-semibold leading-[1.02] text-slate-900">IRMS Results</div>

@@ -1297,6 +1297,100 @@ function sliderStep(bounds: ColorScaleBounds): number {
   return Number(step.toFixed(4));
 }
 
+const PYTHON_ORDINAL_UNIX_EPOCH = 719163;
+const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+function extractTitleText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value && typeof value === "object") {
+    const text = (value as { text?: unknown }).text;
+    if (typeof text === "string") {
+      return text;
+    }
+  }
+  return "";
+}
+
+function isIsoDateText(value: unknown): boolean {
+  return typeof value === "string" && ISO_DATE_REGEX.test(value.trim());
+}
+
+function pythonOrdinalToIsoDate(value: number): string {
+  const rounded = Math.round(value);
+  const utcMs = (rounded - PYTHON_ORDINAL_UNIX_EPOCH) * 86_400_000;
+  const date = new Date(utcMs);
+  if (Number.isNaN(date.getTime())) {
+    return String(rounded);
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+function buildDateColorbarTicksForRange(cmin: number, cmax: number, maxTicks = 6): { tickvals: number[]; ticktext: string[] } {
+  const low = Math.min(cmin, cmax);
+  const high = Math.max(cmin, cmax);
+  if (!Number.isFinite(low) || !Number.isFinite(high)) {
+    return { tickvals: [], ticktext: [] };
+  }
+  const start = Math.floor(low);
+  const end = Math.ceil(high);
+  if (end <= start) {
+    const only = [start];
+    return { tickvals: only, ticktext: only.map((value) => pythonOrdinalToIsoDate(value)) };
+  }
+
+  const targetTicks = Math.max(2, Math.floor(maxTicks));
+  let values: number[] = [];
+  if (end - start + 1 <= targetTicks) {
+    values = Array.from({ length: end - start + 1 }, (_, idx) => start + idx);
+  } else {
+    const raw = Array.from({ length: targetTicks }, (_, idx) => start + ((end - start) * idx) / (targetTicks - 1));
+    const deduped: number[] = [];
+    const seen = new Set<number>();
+    for (const value of raw) {
+      const rounded = Math.round(value);
+      if (seen.has(rounded)) {
+        continue;
+      }
+      seen.add(rounded);
+      deduped.push(rounded);
+    }
+    if (!deduped.includes(start)) {
+      deduped.unshift(start);
+    }
+    if (!deduped.includes(end)) {
+      deduped.push(end);
+    }
+    values = deduped.sort((a, b) => a - b);
+  }
+  return {
+    tickvals: values,
+    ticktext: values.map((value) => pythonOrdinalToIsoDate(value)),
+  };
+}
+
+function getColorbarRecord(container: Record<string, unknown>): Record<string, unknown> | null {
+  const colorbar = container.colorbar;
+  return colorbar && typeof colorbar === "object" ? (colorbar as Record<string, unknown>) : null;
+}
+
+function containerUsesDateColorbar(container: Record<string, unknown>): boolean {
+  const colorbar = getColorbarRecord(container);
+  if (!colorbar) {
+    return false;
+  }
+  const title = extractTitleText(colorbar.title).trim().toLowerCase();
+  if (title === "date" || title.includes("date")) {
+    return true;
+  }
+  const ticktext = colorbar.ticktext;
+  if (!Array.isArray(ticktext)) {
+    return false;
+  }
+  return ticktext.some((value) => isIsoDateText(value));
+}
+
 function applyColorScaleRangeToFigure(
   figure: Record<string, unknown> | undefined,
   range: [number, number] | null,
@@ -1319,14 +1413,27 @@ function applyColorScaleRangeToFigure(
       return trace;
     }
     hasColorMapping = true;
+    const nextMarker: Record<string, unknown> = {
+      ...marker,
+      cauto: false,
+      cmin,
+      cmax,
+    };
+    if (containerUsesDateColorbar(marker)) {
+      const { tickvals, ticktext } = buildDateColorbarTicksForRange(cmin, cmax);
+      if (tickvals.length && ticktext.length) {
+        const existingColorbar = getColorbarRecord(marker) ?? {};
+        nextMarker.colorbar = {
+          ...existingColorbar,
+          tickmode: "array",
+          tickvals,
+          ticktext,
+        };
+      }
+    }
     return {
       ...trace,
-      marker: {
-        ...marker,
-        cauto: false,
-        cmin,
-        cmax,
-      },
+      marker: nextMarker,
     };
   });
   let nextLayout: Record<string, unknown> = cloned.layout;
@@ -1339,14 +1446,31 @@ function applyColorScaleRangeToFigure(
       continue;
     }
     hasColorMapping = true;
+    const axisRecord = axis as Record<string, unknown>;
+    let nextAxis: Record<string, unknown> = {
+      ...axisRecord,
+      cauto: false,
+      cmin,
+      cmax,
+    };
+    if (containerUsesDateColorbar(axisRecord)) {
+      const { tickvals, ticktext } = buildDateColorbarTicksForRange(cmin, cmax);
+      if (tickvals.length && ticktext.length) {
+        const existingColorbar = getColorbarRecord(axisRecord) ?? {};
+        nextAxis = {
+          ...nextAxis,
+          colorbar: {
+            ...existingColorbar,
+            tickmode: "array",
+            tickvals,
+            ticktext,
+          },
+        };
+      }
+    }
     nextLayout = {
       ...nextLayout,
-      [key]: {
-        ...(axis as Record<string, unknown>),
-        cauto: false,
-        cmin,
-        cmax,
-      },
+      [key]: nextAxis,
     };
   }
   if (!hasColorMapping) {
@@ -1966,7 +2090,12 @@ export default function ProcessingPage() {
     },
   });
   const saveSharedLinearityMutation = useMutation({
-    mutationFn: (nextLinearity: CalibrationConfig["linearity"]) => api.setCalibrationLinearity(sessionId!, nextLinearity),
+    mutationFn: (nextLinearity: CalibrationConfig["linearity"]) =>
+      api.setCalibrationLinearity(
+        sessionId!,
+        nextLinearity,
+        calibrationWorkspaceQuery.data?.config?.selected_standards ?? [],
+      ),
     onSuccess: async (workspace) => {
       queryClient.setQueryData(["calibration-workspace", sessionId], workspace);
       setSharedLinearityConfig(workspace.config.linearity);

@@ -848,6 +848,20 @@ function linearityConfigEquals(
   return JSON.stringify(normalizeLinearityConfigForCompare(left)) === JSON.stringify(normalizeLinearityConfigForCompare(right));
 }
 
+function normalizeSelectedStandardsForCompare(values: string[] | null | undefined): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return values
+    .map((value) => String(value ?? "").trim().toUpperCase())
+    .filter((value) => value.length > 0)
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function selectedStandardsEquals(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
+  return JSON.stringify(normalizeSelectedStandardsForCompare(left)) === JSON.stringify(normalizeSelectedStandardsForCompare(right));
+}
+
 function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ label: string; value: string }> {
   if (!summary || !summary.trim()) {
     return [];
@@ -1998,7 +2012,8 @@ export default function CalibrationPage() {
   }, [activeColorParam, colorScaleBounds, colorScaleRangeParam]);
 
   const saveLinearityMutation = useMutation({
-    mutationFn: (payload: CalibrationConfig["linearity"]) => api.setCalibrationLinearity(sessionId!, payload),
+    mutationFn: (payload: { linearity: CalibrationConfig["linearity"]; selectedStandards: string[] }) =>
+      api.setCalibrationLinearity(sessionId!, payload.linearity, payload.selectedStandards),
     onSuccess: async (workspace) => {
       queryClient.setQueryData(["calibration-workspace", sessionId], workspace);
       await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
@@ -2012,11 +2027,17 @@ export default function CalibrationPage() {
     if (!sessionId || !hasLoadedDraft || !linearityTouched || !config || !workspaceQuery.data || saveLinearityMutation.isPending) {
       return;
     }
-    if (linearityConfigEquals(config.linearity, workspaceQuery.data.config.linearity)) {
+    if (
+      linearityConfigEquals(config.linearity, workspaceQuery.data.config.linearity) &&
+      selectedStandardsEquals(config.selected_standards, workspaceQuery.data.config.selected_standards)
+    ) {
       return;
     }
     const timer = window.setTimeout(() => {
-      saveLinearityMutation.mutate(config.linearity);
+      saveLinearityMutation.mutate({
+        linearity: config.linearity,
+        selectedStandards: config.selected_standards,
+      });
     }, 450);
     return () => window.clearTimeout(timer);
   }, [
@@ -3182,8 +3203,8 @@ export default function CalibrationPage() {
                 placeholder="Select standards"
               />
 
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-2">
-                <div className="form-field">
+              <div className="grid gap-4">
+                <label className="form-field">
                   <span className="form-label">Color parameter</span>
                   <select
                     value={activeConfig.color_param}
@@ -3198,18 +3219,7 @@ export default function CalibrationPage() {
                       </option>
                     ))}
                   </select>
-                  <div className="mt-2">
-                    <RangeSliderField
-                      label="Color scale interval"
-                      value={effectiveColorScaleRange}
-                      min={colorSliderBounds.min}
-                      max={colorSliderBounds.max}
-                      step={sliderStep(colorSliderBounds)}
-                      precision={sliderPrecision(colorSliderBounds)}
-                      onChange={(nextRange) => setColorScaleRange(nextRange)}
-                    />
-                  </div>
-                </div>
+                </label>
                 <label className="form-field">
                   <span className="form-label">3D Z axis</span>
                   <select
@@ -3224,6 +3234,17 @@ export default function CalibrationPage() {
                     ))}
                   </select>
                 </label>
+                <div className="form-field">
+                  <RangeSliderField
+                    label="Color scale interval"
+                    value={effectiveColorScaleRange}
+                    min={colorSliderBounds.min}
+                    max={colorSliderBounds.max}
+                    step={sliderStep(colorSliderBounds)}
+                    precision={sliderPrecision(colorSliderBounds)}
+                    onChange={(nextRange) => setColorScaleRange(nextRange)}
+                  />
+                </div>
               </div>
 
               <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">

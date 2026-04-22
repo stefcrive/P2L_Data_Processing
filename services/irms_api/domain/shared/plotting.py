@@ -67,21 +67,35 @@ def _build_date_colorbar_ticks(values, n=6, date_format='%Y-%m-%d'):
         return None, None
     if s.empty:
         return None, None
-    vmin, vmax = float(s.min()), float(s.max())
-    if not np.isfinite(vmin) or not np.isfinite(vmax):
+    ordinals = sorted({int(round(v)) for v in s.tolist() if np.isfinite(v)})
+    if not ordinals:
         return None, None
-    # Evenly spaced tick locations across the ordinal range
-    tickvals = np.linspace(vmin, vmax, int(max(2, n)))
-    # Convert ordinal numbers back to date strings
+    if len(ordinals) <= int(max(2, n)):
+        selected = ordinals
+    else:
+        idx = np.linspace(0, len(ordinals) - 1, int(max(2, n)))
+        selected = []
+        seen = set()
+        for i in idx:
+            ordinal = ordinals[int(round(i))]
+            if ordinal in seen:
+                continue
+            selected.append(ordinal)
+            seen.add(ordinal)
+        if selected[0] != ordinals[0]:
+            selected = [ordinals[0], *selected]
+        if selected[-1] != ordinals[-1]:
+            selected = [*selected, ordinals[-1]]
+
+    tickvals = [float(v) for v in selected]
     ticktext = []
-    for v in tickvals:
+    for v in selected:
         try:
-            # Round to the nearest day to avoid fractional ordinals
-            ts = pd.Timestamp.fromordinal(int(round(v)))
+            ts = pd.Timestamp.fromordinal(int(v))
             ticktext.append(ts.strftime(date_format))
         except Exception:
             ticktext.append(str(v))
-    return tickvals.tolist(), ticktext
+    return tickvals, ticktext
 
 def _prepare_color_values(values, prefer_dates=False):
     """Coerce color values to numeric, with categorical fallback + ticks."""
@@ -343,8 +357,8 @@ def _build_isotope_3d_scatter(
                     side='right',
                 ),
                 thickness=18,
-                len=0.7,
-                y=0.5,
+                len=0.84,
+                y=0.52,
                 yanchor='middle'
             )
             if is_date_color:

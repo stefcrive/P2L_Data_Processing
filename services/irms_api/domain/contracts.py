@@ -53,6 +53,11 @@ class LinearityConfig(BaseModel):
     manual_d18_per_10v2: float = 0.0
 
 
+class CalibrationLinearityUpdateRequest(BaseModel):
+    linearity: LinearityConfig
+    selected_standards: list[str] | None = None
+
+
 class CalibrationConfig(BaseModel):
     selected_standards: list[str] = Field(default_factory=list)
     calibration_type: Literal["Z-Score", "IQR"] = "IQR"
