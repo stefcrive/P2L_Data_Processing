@@ -27,6 +27,8 @@ except ModuleNotFoundError:  # pragma: no cover - optional for logic-only tests
 
 from ..constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_DIFF45_COL,
+    CYCLE1_SIGNAL_DIFF46_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
@@ -452,7 +454,20 @@ def _with_isotope_linearity_intensity_columns(
     line_2_offset_d13: float | None = None,
     line_2_offset_d18: float | None = None,
 ) -> tuple[pd.DataFrame, str, str]:
-    if df is None or df.empty or intensity_col not in df.columns:
+    if df is None or df.empty:
+        return df, intensity_col, intensity_col
+    d13_base_col = intensity_col
+    d18_base_col = intensity_col
+    if intensity_col == CYCLE1_SIGNAL_DIFF44_COL:
+        if CYCLE1_SIGNAL_DIFF45_COL in df.columns:
+            d13_vals = pd.to_numeric(df[CYCLE1_SIGNAL_DIFF45_COL], errors="coerce")
+            if d13_vals.notna().any():
+                d13_base_col = CYCLE1_SIGNAL_DIFF45_COL
+        if CYCLE1_SIGNAL_DIFF46_COL in df.columns:
+            d18_vals = pd.to_numeric(df[CYCLE1_SIGNAL_DIFF46_COL], errors="coerce")
+            if d18_vals.notna().any():
+                d18_base_col = CYCLE1_SIGNAL_DIFF46_COL
+    if d13_base_col not in df.columns and d18_base_col not in df.columns:
         return df, intensity_col, intensity_col
     offsets = _resolve_isotope_line_offsets(
         line_1_offset=line_1_offset,
@@ -467,21 +482,27 @@ def _with_isotope_linearity_intensity_columns(
     d13_has_offsets = _has_effective_line_offsets(*d13_offsets)
     d18_has_offsets = _has_effective_line_offsets(*d18_offsets)
     if not d13_has_offsets and not d18_has_offsets:
-        return df, intensity_col, intensity_col
+        return df, d13_base_col, d18_base_col
 
     work = df.copy()
-    d13_intensity_col = intensity_col
-    d18_intensity_col = intensity_col
-    if d13_has_offsets and d18_has_offsets and d13_offsets == d18_offsets:
-        shared_col = f"{intensity_col}__linearity_line_offset"
-        work[shared_col] = _linearity_adjusted_intensity_series(work, intensity_col, d13_offsets[0], d13_offsets[1])
+    d13_intensity_col = d13_base_col
+    d18_intensity_col = d18_base_col
+    if (
+        d13_has_offsets
+        and d18_has_offsets
+        and d13_offsets == d18_offsets
+        and d13_base_col == d18_base_col
+        and d13_base_col in work.columns
+    ):
+        shared_col = f"{d13_base_col}__linearity_line_offset"
+        work[shared_col] = _linearity_adjusted_intensity_series(work, d13_base_col, d13_offsets[0], d13_offsets[1])
         return work, shared_col, shared_col
-    if d13_has_offsets:
-        d13_intensity_col = f"{intensity_col}__linearity_d13"
-        work[d13_intensity_col] = _linearity_adjusted_intensity_series(work, intensity_col, d13_offsets[0], d13_offsets[1])
-    if d18_has_offsets:
-        d18_intensity_col = f"{intensity_col}__linearity_d18"
-        work[d18_intensity_col] = _linearity_adjusted_intensity_series(work, intensity_col, d18_offsets[0], d18_offsets[1])
+    if d13_has_offsets and d13_base_col in work.columns:
+        d13_intensity_col = f"{d13_base_col}__linearity_d13"
+        work[d13_intensity_col] = _linearity_adjusted_intensity_series(work, d13_base_col, d13_offsets[0], d13_offsets[1])
+    if d18_has_offsets and d18_base_col in work.columns:
+        d18_intensity_col = f"{d18_base_col}__linearity_d18"
+        work[d18_intensity_col] = _linearity_adjusted_intensity_series(work, d18_base_col, d18_offsets[0], d18_offsets[1])
     return work, d13_intensity_col, d18_intensity_col
 
 

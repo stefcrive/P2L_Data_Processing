@@ -950,7 +950,7 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 50.0, places=6)
         self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 2.0, places=6)
 
-    def test_calibration_manual_linearity_override_is_applied_in_processing_working_frame(self) -> None:
+    def test_calibration_manual_linearity_override_does_not_apply_in_processing_working_frame_when_disabled(self) -> None:
         df = sample_processing_df().copy()
         df["d 13C/12C  Mean"] = [1.0, 1.0, 1.0, 1.0]
         df["1  Cycle Int  Samp  44"] = [10.0, 20.0, 30.0, 20.0]
@@ -979,11 +979,11 @@ class ProcessingCoreTests(unittest.TestCase):
 
         work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
 
-        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 2.0, places=6)
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 1.0, places=6)
-        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 0.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 1.0, places=6)
 
-    def test_processing_manual_linearity_override_runs_as_second_pass_after_calibration_manual_stage(self) -> None:
+    def test_processing_manual_linearity_override_is_ignored_when_calibration_linearity_is_disabled(self) -> None:
         df = sample_processing_df().copy()
         df["d 13C/12C  Mean"] = [1.0, 1.0, 1.0, 1.0]
         df["1  Cycle Int  Samp  44"] = [10.0, 20.0, 30.0, 20.0]
@@ -1012,9 +1012,9 @@ class ProcessingCoreTests(unittest.TestCase):
 
         work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
 
-        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 2.0, places=6)
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), 1.0, places=6)
-        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 0.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 1.0, places=6)
 
     def test_saved_linearity_fits_apply_calibration_manual_coefficient_offsets_when_linearity_enabled(self) -> None:
         df = sample_processing_df().copy()
@@ -1985,12 +1985,9 @@ class ProcessingCoreTests(unittest.TestCase):
             target=target,
             config=RangeConfig(),
             edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
-            correct_linearity=False,
-            target_intensity=14.0,
         )
 
         self.assertEqual(payload.cycle_mean["method"], "first_valid_cycle")
-        self.assertFalse(bool(payload.cycle_mean["linearity_applied"]))
         self.assertEqual(payload.cycle_mean["reason"], "partially_saturated_use_first_valid_cycle")
         self.assertEqual(int(payload.cycle_mean["selected_cycle"]), 1)
         self.assertAlmostEqual(float(payload.cycle_mean["selected_value"]), 0.9, places=6)
@@ -2032,13 +2029,10 @@ class ProcessingCoreTests(unittest.TestCase):
             target=target,
             config=RangeConfig(),
             edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
-            correct_linearity=False,
-            target_intensity=14.0,
         )
 
         self.assertEqual(int(payload.cycle_mean["valid_cycles"]), 6)
         self.assertEqual(payload.cycle_mean["method"], "first_valid_cycle")
-        self.assertFalse(bool(payload.cycle_mean["linearity_applied"]))
         self.assertEqual(payload.cycle_mean["reason"], "partially_saturated_use_first_valid_cycle")
         self.assertEqual(int(payload.cycle_mean["selected_cycle"]), 1)
         self.assertAlmostEqual(float(payload.cycle_mean["selected_value"]), 0.6, places=6)

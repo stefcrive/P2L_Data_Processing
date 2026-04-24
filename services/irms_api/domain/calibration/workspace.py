@@ -12,6 +12,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from ..constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_DIFF45_COL,
+    CYCLE1_SIGNAL_DIFF46_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     ISOTYPE_D13C,
@@ -229,6 +231,25 @@ def _build_point_customdata(df: pd.DataFrame, isotope_key: str) -> np.ndarray:
     return np.column_stack((row_labels, np.full(len(df), isotope_key, dtype=object), id1_values, id2_values, species_values, color_values))
 
 
+def _resolve_isotope_specific_color_param(
+    df: pd.DataFrame | None,
+    color_param: str,
+    isotope_key: str | None = None,
+) -> str:
+    chosen = str(color_param or "")
+    if chosen != CYCLE1_SIGNAL_DIFF44_COL:
+        return chosen
+    target = None
+    if isotope_key == "d13C":
+        target = CYCLE1_SIGNAL_DIFF45_COL
+    elif isotope_key == "d18O":
+        target = CYCLE1_SIGNAL_DIFF46_COL
+    if not target or df is None or target not in df.columns:
+        return chosen
+    vals = pd.to_numeric(df[target], errors="coerce")
+    return target if vals.notna().any() else chosen
+
+
 def _build_standard_outlier_figure(
     std_df: pd.DataFrame,
     outlier_mask: pd.Series,
@@ -240,33 +261,36 @@ def _build_standard_outlier_figure(
 ) -> dict[str, Any]:
     if go is None or std_df is None or std_df.empty or value_col not in std_df.columns:
         return {}
-    work = _attach_hover_context(std_df, color_param)
+    isotope_key = "d13C" if "13" in str(value_col) else "d18O"
+    effective_color_param = _resolve_isotope_specific_color_param(std_df, color_param, isotope_key=isotope_key)
+    work = _attach_hover_context(std_df, effective_color_param)
     work["x_axis"] = _sequence_axis(work)
     values = pd.to_numeric(work[value_col], errors="coerce")
     inlier_mask = ~outlier_mask.reindex(work.index, fill_value=False)
-    isotope_key = "d13C" if "13" in str(value_col) else "d18O"
-    color_label = _color_param_label(color_param)
+    color_label = _color_param_label(effective_color_param)
     fig = go.Figure()
-    is_date_color = _is_date_color_column(color_param)
+    is_date_color = _is_date_color_column(effective_color_param)
     color_values, colorbar_category_ticks = _prepare_color_values(
-        work[color_param] if color_param in work.columns else None,
-        prefer_dates=_prefer_datetime_color_values(color_param),
+        work[effective_color_param] if effective_color_param in work.columns else None,
+        prefer_dates=_prefer_datetime_color_values(effective_color_param),
     )
     color_numeric = pd.to_numeric(color_values, errors="coerce") if color_values is not None else pd.Series(np.nan, index=work.index)
     has_color = bool(color_numeric.notna().any())
+    colorbar_title = "Date" if is_date_color else " ".join(str(effective_color_param).split())
     coloraxis_cfg: dict[str, Any] = {
         "colorscale": "Viridis",
         "colorbar": {
             "title": {
-                "text": "Date" if is_date_color else color_param,
-                "side": "right",
+                "text": colorbar_title,
+                "side": "top",
             },
-            "thickness": 16,
-            "len": 0.75,
+            "thickness": 14,
+            "len": 0.72,
             "y": 0.5,
             "yanchor": "middle",
-            "x": 1.04,
+            "x": 1.02,
             "xanchor": "left",
+            "xpad": 4,
         },
     }
     if has_color:
@@ -281,7 +305,7 @@ def _build_standard_outlier_figure(
                 coloraxis_cfg["cmin"] = cmin
                 coloraxis_cfg["cmax"] = cmax
         if is_date_color:
-            tickvals, ticktext = _build_date_colorbar_ticks(color_values if color_values is not None else work.get(color_param))
+            tickvals, ticktext = _build_date_colorbar_ticks(color_values if color_values is not None else work.get(effective_color_param))
             if tickvals and ticktext:
                 coloraxis_cfg["colorbar"].update(tickmode="array", tickvals=tickvals, ticktext=ticktext)
         elif colorbar_category_ticks is not None:
@@ -390,9 +414,27 @@ def _build_standard_outlier_figure(
         )
     fig.update_layout(
         title=title,
-        xaxis_title="Sequence",
-        yaxis_title=y_label,
+        xaxis={
+            "title": {"text": "Sequence", "standoff": 10},
+            "automargin": True,
+        },
+        yaxis={
+            "title": {"text": y_label, "standoff": 10},
+            "automargin": True,
+        },
         hovermode="closest",
+        legend={
+            "orientation": "h",
+            "yanchor": "top",
+            "y": -0.24,
+            "x": 0.0,
+            "xanchor": "left",
+            "bgcolor": "rgba(255,255,255,0.9)",
+            "borderwidth": 0,
+            "font": {"size": 11},
+        },
+        margin={"l": 64, "r": 120, "t": 56, "b": 116},
+        height=560,
         coloraxis=coloraxis_cfg if has_color else None,
     )
     return _figure_json(fig)
@@ -519,11 +561,13 @@ def _build_linearity_figure(
 ) -> dict[str, Any]:
     if go is None or df_src is None or df_src.empty or y_col not in df_src.columns or intensity_col not in df_src.columns:
         return {}
+    isotope_key = "d13C" if "13" in str(y_col) else "d18O"
+    effective_color_param = _resolve_isotope_specific_color_param(df_src, color_param, isotope_key=isotope_key)
     intensity = pd.to_numeric(df_src[intensity_col], errors="coerce")
     y = pd.to_numeric(df_src[y_col], errors="coerce")
     color_values, _ = _prepare_color_values(
-        df_src[color_param] if color_param in df_src.columns else None,
-        prefer_dates=_prefer_datetime_color_values(color_param),
+        df_src[effective_color_param] if effective_color_param in df_src.columns else None,
+        prefer_dates=_prefer_datetime_color_values(effective_color_param),
     )
     work = pd.DataFrame({"intensity": intensity, "y": y}, index=df_src.index)
     work["identifier_1"] = df_src.get("Identifier 1", pd.Series("", index=df_src.index)).fillna("").astype(str)
@@ -533,7 +577,11 @@ def _build_linearity_figure(
     else:
         work["color"] = np.nan
     work["__hover_species"] = _resolve_species_labels(df_src).reindex(work.index)
-    work["__hover_color_value"] = df_src.get(color_param, pd.Series(index=df_src.index, dtype=object)).reindex(work.index).map(_format_hover_color_value)
+    work["__hover_color_value"] = (
+        df_src.get(effective_color_param, pd.Series(index=df_src.index, dtype=object))
+        .reindex(work.index)
+        .map(_format_hover_color_value)
+    )
     slope = pd.to_numeric(pd.Series([fit.get("slope")]), errors="coerce").iloc[0]
     intercept = pd.to_numeric(pd.Series([fit.get("intercept")]), errors="coerce").iloc[0]
     quad = pd.to_numeric(pd.Series([fit.get("quad")]), errors="coerce").iloc[0]
@@ -557,8 +605,7 @@ def _build_linearity_figure(
             marker_kwargs.update(color=work["color"], colorscale="Viridis", showscale=False)
         else:
             marker_kwargs.update(color="#2563eb")
-        isotope_key = "d13C" if "13" in str(y_col) else "d18O"
-        color_label = _color_param_label(color_param)
+        color_label = _color_param_label(effective_color_param)
         customdata = np.column_stack(
             (
                 work.index.astype(str).to_numpy(),
@@ -793,6 +840,7 @@ def build_calibration_workspace(
         use_diff_intensity=config.linearity.use_diff_intensity,
         selected_intensity_col=getattr(config.linearity, "intensity_col", None),
     )
+    linearity_enabled = bool(config.linearity.apply)
     max_sample_intensity = (
         getattr(config.linearity, "max_sample_intensity", None)
         if selected_linearity_intensity_col == CYCLE1_SIGNAL_SAMP44_COL
@@ -812,7 +860,7 @@ def build_calibration_workspace(
     standards_adjusted_df = _apply_manual_linearity_override_to_standards(
         line_adjusted_df,
         override_scope,
-        enabled=config.linearity.manual_override_enabled,
+        enabled=linearity_enabled and bool(config.linearity.manual_override_enabled),
         d13_per_10v=config.linearity.manual_d13_per_10v,
         d18_per_10v=config.linearity.manual_d18_per_10v,
         d13_per_10v2=config.linearity.manual_d13_per_10v2,
@@ -823,7 +871,7 @@ def build_calibration_workspace(
     )
     standards_for_outliers_df = standards_adjusted_df
     outlier_reference_df = standards_adjusted_df
-    if bool(config.linearity.apply) and not standards_adjusted_df.empty and "Identifier 1" in standards_adjusted_df.columns:
+    if linearity_enabled and not standards_adjusted_df.empty and "Identifier 1" in standards_adjusted_df.columns:
         selected_mask = standards_adjusted_df["Identifier 1"].astype(str).isin({str(item) for item in selected_standards})
         fit_input = standards_adjusted_df.loc[selected_mask].copy() if bool(selected_mask.any()) else pd.DataFrame()
         if not fit_input.empty:
@@ -1047,7 +1095,7 @@ def build_calibration_workspace(
         calculation_fits = {}
     correction_fits = _apply_manual_linearity_offsets_to_fits(
         calculation_fits,
-        enabled=bool(config.linearity.manual_override_enabled),
+        enabled=linearity_enabled and bool(config.linearity.manual_override_enabled),
         quadratic=bool(config.linearity.quadratic),
         d13_per_10v=float(config.linearity.manual_d13_per_10v),
         d18_per_10v=float(config.linearity.manual_d18_per_10v),
@@ -1055,7 +1103,7 @@ def build_calibration_workspace(
         d18_per_10v2=float(config.linearity.manual_d18_per_10v2),
     )
 
-    if bool(config.linearity.apply) and chart_src is not None and not chart_src.empty and correction_fits:
+    if linearity_enabled and chart_src is not None and not chart_src.empty and correction_fits:
         correction_intensity_col = str(correction_fits.get("intensity_col") or selected_linearity_intensity_col)
         corrected_chart_src = _promote_linearity_corrected_raw_columns(
             _apply_linearity_correction(chart_src, correction_intensity_col, correction_fits)
@@ -1080,7 +1128,7 @@ def build_calibration_workspace(
             outlier_reference_df["Identifier 1"].astype(str) == str(standard)
         ].copy()
         std_outlier_ref_df = _apply_precision_date_range(std_outlier_ref_df, config)
-        std_display_df = std_outlier_ref_df if bool(config.linearity.apply) else std_df
+        std_display_df = std_outlier_ref_df if linearity_enabled else std_df
         precision_summaries.append(
             _compute_precision_summary(
                 standard,

@@ -308,8 +308,6 @@ class CycleDiagnosticsPayload(BaseModel):
 
 class CycleDiagnosticsRequest(BaseModel):
     target: EditTarget
-    correct_linearity: bool = False
-    target_intensity: float | None = None
 
 
 class ProcessingWorkspace(BaseModel):

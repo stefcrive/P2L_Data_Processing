@@ -387,17 +387,6 @@ def _pick_mass_role_columns(
     return smp_col, std_col
 
 
-def get_global_signal_intensity_mean(df: pd.DataFrame, default_value: float = 15.0) -> float:
-    if df is None or CYCLE1_SIGNAL_SAMP44_COL not in df.columns:
-        return float(default_value)
-    vals = pd.to_numeric(df[CYCLE1_SIGNAL_SAMP44_COL], errors="coerce")
-    vals = vals[np.isfinite(vals)]
-    if vals.empty:
-        return float(default_value)
-    mean_val = float(vals.mean())
-    return mean_val if np.isfinite(mean_val) and mean_val > 0 else float(default_value)
-
-
 def _is_partially_saturated_collector(target: dict[str, Any]) -> bool:
     return str(target.get("collector_status", "")).strip().lower() == "partially saturated collectors"
 
@@ -406,27 +395,17 @@ def compute_cycle_mean_for_target(
     df: pd.DataFrame,
     cycles_df: pd.DataFrame | None,
     target: dict[str, Any],
-    correct_linearity: bool = False,
-    target_intensity: float = 15.0,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "mean": None,
         "valid_mean": None,
         "valid_cycles": 0,
         "method": "valid_cycle_mean",
-        "linearity_applied": False,
-        "linearity_points": 0,
-        "linearity_target_intensity": float(target_intensity),
-        "intensity_col": None,
-        "fit_x": [],
-        "fit_y": [],
-        "linearity_prediction": None,
         "selected_cycle": None,
         "selected_value": None,
         "reason": "",
     }
     is_partially_saturated = _is_partially_saturated_collector(target)
-    apply_linearity = bool(correct_linearity)
     cycles, _ = get_cycles_for_selected_point(df, cycles_df, target.get("row_label"), target.get("target_col"))
     if cycles is None or cycles.empty:
         result["reason"] = "no_cycle_data"
@@ -487,43 +466,6 @@ def compute_cycle_mean_for_target(
         result["reason"] = "partially_saturated_use_first_valid_cycle"
         return result
 
-    intensity_col = _pick_cycle_sample_intensity_column(cycles, intensity_cols, [44])
-    result["intensity_col"] = intensity_col
-    if intensity_col is None:
-        if not apply_linearity:
-            return result
-        result["reason"] = "missing_intensity_column"
-        return result
-
-    intensity_vals = _normalize_signal_intensity(cycles[intensity_col])
-    x = pd.to_numeric(intensity_vals[valid_mask], errors="coerce")
-    y = valid_delta.reindex(x.index)
-    xy_mask = x.notna() & y.notna()
-    x = x[xy_mask]
-    y = y[xy_mask]
-    result["fit_x"] = x.astype(float).tolist()
-    result["fit_y"] = y.astype(float).tolist()
-    result["linearity_points"] = int(x.shape[0])
-    if not apply_linearity:
-        return result
-    if x.shape[0] < 2 or x.nunique(dropna=True) < 2:
-        result["reason"] = "insufficient_points_for_linearity_fit"
-        return result
-
-    try:
-        slope, intercept = np.polyfit(x.to_numpy(dtype=float), y.to_numpy(dtype=float), 1)
-        predicted = float(slope * float(target_intensity) + intercept)
-        if np.isfinite(predicted):
-            result["mean"] = predicted
-            result["linearity_applied"] = True
-            result["method"] = "linearity_extrapolated_to_target_intensity"
-            result["linearity_prediction"] = predicted
-            result["linearity_slope"] = float(slope)
-            result["linearity_intercept"] = float(intercept)
-            return result
-    except Exception:
-        pass
-    result["reason"] = "linearity_fit_failed"
     return result
 
 
@@ -729,8 +671,6 @@ def build_cycle_diagnostics_payload(
     target: dict[str, Any],
     config: RangeConfig,
     edit_state: dict[str, Any] | None = None,
-    target_intensity: float | None = None,
-    correct_linearity: bool = False,
     sigma_level: float = 4.0,
     statistical_outlier_method: str = "Z-Score",
     iqr_multiplier: float = 1.5,
@@ -820,8 +760,6 @@ def build_cycle_diagnostics_payload(
         df,
         cycles_df,
         target,
-        correct_linearity=correct_linearity,
-        target_intensity=float(target_intensity) if target_intensity is not None else get_global_signal_intensity_mean(df),
     )
     selected_cycle = pd.to_numeric(pd.Series([mean_payload.get("selected_cycle")]), errors="coerce").iloc[0]
     selected_cycle_mask = pd.Series(False, index=cycle_table.index, dtype=bool)

@@ -162,9 +162,6 @@ Each server-managed session lives under the backend session root:
   - `valid_mean`
   - `valid_cycles`
   - `method`
-  - `linearity_applied`
-  - `linearity_target_intensity`
-  - `linearity_prediction`
   - `prev_neighbor`
   - `next_neighbor`
   - `reason`

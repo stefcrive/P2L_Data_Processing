@@ -8,9 +8,15 @@ import pandas as pd
 
 from ..constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_DIFF45_COL,
+    CYCLE1_SIGNAL_DIFF46_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_REF44_COL,
+    CYCLE1_SIGNAL_REF45_COL,
+    CYCLE1_SIGNAL_REF46_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
+    CYCLE1_SIGNAL_SAMP45_COL,
+    CYCLE1_SIGNAL_SAMP46_COL,
 )
 
 def extract_number(text):
@@ -22,6 +28,15 @@ def _parse_numeric_token(token):
     if token is None or pd.isna(token):
         return None
     text = str(token).strip()
+    # Normalize common unicode sign characters to preserve numeric polarity.
+    text = (
+        text.replace('\u2212', '-')
+        .replace('\u2010', '-')
+        .replace('\u2011', '-')
+        .replace('\u2012', '-')
+        .replace('\u2013', '-')
+        .replace('\u2014', '-')
+    )
     if text == "":
         return None
     # Find the first number-like chunk (digits with optional separators/sign).
@@ -130,6 +145,9 @@ def _find_cycle_intensity_columns(df):
         has_mass = bool(re.search(r'\b4[4-6](?:\.\d+)?\b', low) or 'm/z' in low or 'mz' in low)
         is_signal_named = bool('intensit' in low or re.search(r'\bint\b', low) or 'signal' in low)
         looks_delta = bool('delta' in low or re.search(r'\bd4[5-6]co2\b', low) or low.startswith('d45') or low.startswith('d46'))
+        looks_derived_mismatch = bool('diff' in low or 'mismatch' in low or 'samp-ref' in low or 'ref-samp' in low)
+        if looks_delta or looks_derived_mismatch:
+            continue
         if (is_signal_named and has_mass) or (has_mass and not looks_delta):
             cols.append(col)
     if cols:
@@ -439,8 +457,7 @@ def _apply_cycle_averages(df):
             sat_mask_d18 = _build_saturation_mask(intensity_df, [44, 45, 46])
             sat_mask_44 = _build_saturation_mask(intensity_df, [44])
 
-            # Derive m/z44 signal metrics from the last available valid cycle pair.
-            samp44_col = _pick_mass_sample_column(sample_cycles, 44)
+            # Derive cycle intensity metrics from the first available valid cycle pair.
             ref44_col = None
             def _pick_mass_reference_column(cycles_df, mass_value):
                 cols = [c for c in intensity_cols if c in cycles_df.columns and _extract_col_mass(c) == mass_value]
@@ -466,38 +483,98 @@ def _apply_cycle_averages(df):
                 medians.sort(key=lambda t: t[1])
                 return medians[0][0] if medians else None
 
-            ref44_col = _pick_mass_reference_column(sample_cycles, 44)
             ordered_cycles = sample_cycles.sort_values('_cycle_order')
-            selected_pair_idx = None
-            if samp44_col is not None and ref44_col is not None and not ordered_cycles.empty:
-                samp_vals = _normalize_signal_intensity(ordered_cycles[samp44_col])
-                ref_vals = _normalize_signal_intensity(ordered_cycles[ref44_col])
-                valid_pair_mask = samp_vals.notna() & ref_vals.notna()
-                if sat_mask_44 is not None:
-                    sat44 = sat_mask_44.reindex(ordered_cycles.index).fillna(False)
-                    valid_pair_mask = valid_pair_mask & ~sat44
-                if valid_pair_mask.any():
-                    selected_pair_idx = ordered_cycles.index[valid_pair_mask][-1]
-                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] = float(samp_vals.loc[selected_pair_idx])
-                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] = float(ref_vals.loc[selected_pair_idx])
+            sat_mask_45 = _build_saturation_mask(intensity_df, [45])
+            sat_mask_46 = _build_saturation_mask(intensity_df, [46])
 
-            # Fallback: if no valid paired cycle was found, keep the last finite value per channel.
-            if selected_pair_idx is None and not ordered_cycles.empty:
-                if samp44_col is not None:
-                    samp_fallback = _normalize_signal_intensity(ordered_cycles[samp44_col])
-                    finite_samp = samp_fallback.dropna()
-                    if not finite_samp.empty:
-                        pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] = float(finite_samp.iloc[-1])
-                if ref44_col is not None:
-                    ref_fallback = _normalize_signal_intensity(ordered_cycles[ref44_col])
-                    finite_ref = ref_fallback.dropna()
-                    if not finite_ref.empty:
-                        pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] = float(finite_ref.iloc[-1])
+            def _resolve_mass_pair(mass_value, sat_mask_mass):
+                selected_idx = None
+                sample_val = np.nan
+                ref_val = np.nan
+                samp_col = _pick_mass_sample_column(sample_cycles, mass_value)
+                ref_col = _pick_mass_reference_column(sample_cycles, mass_value)
+                if samp_col is not None and ref_col is not None and not ordered_cycles.empty:
+                    samp_vals = _normalize_signal_intensity(ordered_cycles[samp_col])
+                    ref_vals = _normalize_signal_intensity(ordered_cycles[ref_col])
+                    valid_pair_mask = samp_vals.notna() & ref_vals.notna()
+                    if sat_mask_mass is not None:
+                        sat_mass = sat_mask_mass.reindex(ordered_cycles.index).fillna(False)
+                        valid_pair_mask = valid_pair_mask & ~sat_mass
+                    if valid_pair_mask.any():
+                        # Use the first valid cycle pair by request.
+                        selected_idx = ordered_cycles.index[valid_pair_mask][0]
+                    else:
+                        finite_pair_mask = samp_vals.notna() & ref_vals.notna()
+                        if finite_pair_mask.any():
+                            selected_idx = ordered_cycles.index[finite_pair_mask][0]
+                    if selected_idx is not None:
+                        sample_val = float(samp_vals.loc[selected_idx])
+                        ref_val = float(ref_vals.loc[selected_idx])
+                    else:
+                        finite_samp = samp_vals.dropna()
+                        finite_ref = ref_vals.dropna()
+                        if not finite_samp.empty:
+                            sample_val = float(finite_samp.iloc[0])
+                        if not finite_ref.empty:
+                            ref_val = float(finite_ref.iloc[0])
+                return sample_val, ref_val, selected_idx
 
-            sample_signal = pd.to_numeric(pd.Series([pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] if CYCLE1_SIGNAL_SAMP44_COL in pre_rows.columns else np.nan]), errors='coerce').iloc[0]
-            ref_signal = pd.to_numeric(pd.Series([pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] if CYCLE1_SIGNAL_REF44_COL in pre_rows.columns else np.nan]), errors='coerce').iloc[0]
+            sample_signal, ref_signal, selected_pair_idx = _resolve_mass_pair(44, sat_mask_44)
             if np.isfinite(sample_signal) and np.isfinite(ref_signal):
-                pre_rows.at[sample_idx, CYCLE1_SIGNAL_DIFF44_COL] = float(sample_signal - ref_signal)
+                existing_diff = (
+                    pd.to_numeric(
+                        pd.Series(
+                            [
+                                pre_rows.at[sample_idx, CYCLE1_SIGNAL_DIFF44_COL]
+                                if CYCLE1_SIGNAL_DIFF44_COL in pre_rows.columns
+                                else np.nan
+                            ]
+                        ),
+                        errors='coerce',
+                    ).iloc[0]
+                )
+                if not np.isfinite(existing_diff):
+                    diff_col = _pick_cycle1_diff44_column(ordered_cycles)
+                    if diff_col:
+                        diff_series = pd.to_numeric(_cycle1_diff44_as_samp_minus_ref(ordered_cycles, diff_col), errors='coerce')
+                        if sat_mask_44 is not None:
+                            sat44 = sat_mask_44.reindex(ordered_cycles.index).fillna(False)
+                            diff_series = diff_series.where(~sat44)
+                        if selected_pair_idx is not None:
+                            selected_diff = pd.to_numeric(pd.Series([diff_series.get(selected_pair_idx)]), errors='coerce').iloc[0]
+                            if np.isfinite(selected_diff):
+                                existing_diff = float(selected_diff)
+                        if not np.isfinite(existing_diff):
+                            finite_diff = diff_series[np.isfinite(diff_series) & (np.abs(diff_series) > 1e-12)]
+                            if not finite_diff.empty:
+                                existing_diff = float(finite_diff.iloc[-1])
+                computed_diff = float(sample_signal - ref_signal)
+                if (
+                    np.isfinite(existing_diff)
+                    and abs(float(existing_diff)) > 1e-12
+                    and abs(computed_diff) > 1e-12
+                    and np.sign(computed_diff) != np.sign(float(existing_diff))
+                ):
+                    # Preserve signed Samp-Ref direction when cycle channels are unlabeled/ambiguous.
+                    sample_signal, ref_signal = ref_signal, sample_signal
+                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] = float(sample_signal)
+                    pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] = float(ref_signal)
+                    computed_diff = float(sample_signal - ref_signal)
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP44_COL] = float(sample_signal)
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF44_COL] = float(ref_signal)
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_DIFF44_COL] = computed_diff
+
+            samp45, ref45, _ = _resolve_mass_pair(45, sat_mask_45)
+            if np.isfinite(samp45) and np.isfinite(ref45):
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP45_COL] = float(samp45)
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF45_COL] = float(ref45)
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_DIFF45_COL] = float(samp45 - ref45)
+
+            samp46, ref46, _ = _resolve_mass_pair(46, sat_mask_46)
+            if np.isfinite(samp46) and np.isfinite(ref46):
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_SAMP46_COL] = float(samp46)
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_REF46_COL] = float(ref46)
+                pre_rows.at[sample_idx, CYCLE1_SIGNAL_DIFF46_COL] = float(samp46 - ref46)
         low_signal_failed = False
         pre_intensity_cols = [c for c in sample_intensity_cols if c in pre_rows.columns]
         if pre_intensity_cols:
@@ -511,6 +588,7 @@ def _apply_cycle_averages(df):
                 low_signal_failed = True
         # d13C
         d13_mean = np.nan
+        d13_first_valid = np.nan
         d13_std = np.nan
         d13_used = 0
         d13_excl = 0
@@ -535,9 +613,13 @@ def _apply_cycle_averages(df):
                     d13_mean = float(d13_filtered.mean())
                     d13_std = float(d13_filtered.std()) if len(d13_filtered) > 1 else np.nan
                     d13_used = int(d13_filtered.shape[0])
+                    d13_filtered_cycles = d13_cycles.loc[d13_filtered.index].sort_values('_cycle_order')
+                    if not d13_filtered_cycles.empty:
+                        d13_first_valid = float(d13_filtered_cycles['_d13'].iloc[0])
 
         # d18O
         d18_mean = np.nan
+        d18_first_valid = np.nan
         d18_std = np.nan
         d18_used = 0
         d18_excl = 0
@@ -562,14 +644,27 @@ def _apply_cycle_averages(df):
                     d18_mean = float(d18_filtered.mean())
                     d18_std = float(d18_filtered.std()) if len(d18_filtered) > 1 else np.nan
                     d18_used = int(d18_filtered.shape[0])
+                    d18_filtered_cycles = d18_cycles.loc[d18_filtered.index].sort_values('_cycle_order')
+                    if not d18_filtered_cycles.empty:
+                        d18_first_valid = float(d18_filtered_cycles['_d18'].iloc[0])
 
-        # Apply cycle-derived means when available; otherwise keep existing pre values
-        if np.isfinite(d13_mean):
-            pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = d13_mean
+        # For partially saturated samples, persist first valid cycle values
+        # to align stored deltas with cycle diagnostics/set-value defaults.
+        d13_value_to_apply = d13_mean
+        d18_value_to_apply = d18_mean
+        if saturated_any:
+            if np.isfinite(d13_first_valid):
+                d13_value_to_apply = d13_first_valid
+            if np.isfinite(d18_first_valid):
+                d18_value_to_apply = d18_first_valid
+
+        # Apply cycle-derived values when available; otherwise keep existing pre values.
+        if np.isfinite(d13_value_to_apply):
+            pre_rows.at[sample_idx, 'd 13C/12C  Mean'] = float(d13_value_to_apply)
         if np.isfinite(d13_std):
             pre_rows.at[sample_idx, 'd 13C/12C  Std Dev'] = d13_std
-        if np.isfinite(d18_mean):
-            pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = d18_mean
+        if np.isfinite(d18_value_to_apply):
+            pre_rows.at[sample_idx, 'd 18O/16O  Mean'] = float(d18_value_to_apply)
         if np.isfinite(d18_std):
             pre_rows.at[sample_idx, 'd 18O/16O  Std Dev'] = d18_std
 
@@ -703,6 +798,101 @@ def _find_column(df, *candidates):
             return norm_map[key]
     return None
 
+def _is_cycle1_diff44_like_column(col_name):
+    if not isinstance(col_name, str):
+        return False
+    low = _normalize_column_key(col_name)
+    if low == "":
+        return False
+    has_mass44 = re.search(r'(?<!\d)(44|44\.0+)(?!\d)', low) is not None
+    has_cycle1 = bool(re.search(r'(?:^|\s)1(?:\s|$)', low))
+    if "cycle" in low:
+        has_cycle1 = has_cycle1 or bool(re.search(r'cycle\s*0*1(?:\D|$)', low))
+    if not has_mass44 or not has_cycle1:
+        return False
+    return bool("diff" in low or "mismatch" in low or "samp-ref" in low or "ref-samp" in low)
+
+
+def _is_ref_minus_sample_label(col_name):
+    if not isinstance(col_name, str):
+        return False
+    low = _normalize_column_key(col_name)
+    if "samp-ref" in low or "sample-reference" in low:
+        return False
+    if "ref-samp" in low or "reference-sample" in low:
+        return True
+
+    samp_pos_candidates = [pos for pos in (low.find("samp"), low.find("sample")) if pos >= 0]
+    ref_pos_candidates = [pos for pos in (low.find("ref"), low.find("reference")) if pos >= 0]
+    if not samp_pos_candidates or not ref_pos_candidates:
+        return False
+    return min(ref_pos_candidates) < min(samp_pos_candidates)
+
+
+def _pick_cycle1_diff44_column(df):
+    if df is None:
+        return None
+    if CYCLE1_SIGNAL_DIFF44_COL in df.columns:
+        return CYCLE1_SIGNAL_DIFF44_COL
+    candidates = [col for col in df.columns if _is_cycle1_diff44_like_column(col)]
+    if not candidates:
+        return None
+    scored: list[tuple[str, int]] = []
+    for col in candidates:
+        vals = pd.to_numeric(df[col], errors='coerce')
+        nonzero = vals[np.isfinite(vals) & (np.abs(vals) > 1e-12)]
+        scored.append((col, int(nonzero.shape[0])))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored[0][0] if scored else None
+
+
+def _cycle1_diff44_as_samp_minus_ref(df, col_name):
+    if df is None or not col_name or col_name not in df.columns:
+        return pd.Series(np.nan, index=(df.index if isinstance(df, pd.DataFrame) else pd.Index([])), dtype=float)
+    values = pd.to_numeric(df[col_name], errors='coerce')
+    if _is_ref_minus_sample_label(col_name):
+        return -values
+    return values
+
+
+def _orient_cycle1_sample_ref_by_existing_diff(
+    df,
+    sample_col,
+    ref_col,
+    diff_col=None,
+):
+    """Orient ambiguous sample/ref picks using existing signed Samp-Ref values."""
+    if df is None:
+        return sample_col, ref_col
+    if not sample_col or not ref_col or sample_col == ref_col:
+        return sample_col, ref_col
+    if sample_col not in df.columns or ref_col not in df.columns:
+        return sample_col, ref_col
+    resolved_diff_col = str(diff_col).strip() if isinstance(diff_col, str) and str(diff_col).strip() != "" else _pick_cycle1_diff44_column(df)
+    if not resolved_diff_col or resolved_diff_col not in df.columns:
+        return sample_col, ref_col
+
+    sample_vals = pd.to_numeric(_normalize_signal_intensity(df[sample_col]), errors='coerce')
+    ref_vals = pd.to_numeric(_normalize_signal_intensity(df[ref_col]), errors='coerce')
+    existing_diff = pd.to_numeric(_cycle1_diff44_as_samp_minus_ref(df, resolved_diff_col), errors='coerce')
+    computed_diff = sample_vals - ref_vals
+    valid = (
+        np.isfinite(sample_vals)
+        & np.isfinite(ref_vals)
+        & np.isfinite(existing_diff)
+        & (np.abs(computed_diff) > 1e-12)
+        & (np.abs(existing_diff) > 1e-12)
+    )
+    if not bool(valid.any()):
+        return sample_col, ref_col
+
+    existing_sign = np.sign(existing_diff[valid])
+    direct_match_count = int((np.sign(computed_diff[valid]) == existing_sign).sum())
+    swapped_match_count = int((np.sign(-computed_diff[valid]) == existing_sign).sum())
+    if swapped_match_count > direct_match_count:
+        return ref_col, sample_col
+    return sample_col, ref_col
+
 def _pick_cycle1_signal_columns(df):
     """Pick cycle-1 m/z44 sample/reference intensity columns from a dataframe."""
     if df is None:
@@ -714,6 +904,8 @@ def _pick_cycle1_signal_columns(df):
     def _is_cycle1_mz44_col(col_name):
         low = _normalize_column_key(col_name)
         if low == '':
+            return False
+        if 'diff' in low or 'mismatch' in low or 'samp-ref' in low or 'ref-samp' in low:
             return False
         has_mass44 = re.search(r'(?<!\d)(44|44\.0+)(?!\d)', low) is not None
         has_intensity = ('intensit' in low) or ('signal' in low) or bool(re.search(r'\bint\b', low))
@@ -779,6 +971,8 @@ def _pick_cycle1_signal_columns(df):
         sample_col = explicit_sample
     if explicit_ref is not None:
         ref_col = explicit_ref
+    if explicit_sample is None and explicit_ref is None:
+        sample_col, ref_col = _orient_cycle1_sample_ref_by_existing_diff(df, sample_col, ref_col)
 
     return sample_col, ref_col
 
@@ -789,29 +983,135 @@ def _ensure_cycle1_signal_difference_columns(df):
 
     sample_col, ref_col = _pick_cycle1_signal_columns(df)
 
-    if CYCLE1_SIGNAL_SAMP44_COL in df.columns:
-        df[CYCLE1_SIGNAL_SAMP44_COL] = _normalize_signal_intensity(df[CYCLE1_SIGNAL_SAMP44_COL])
-    elif sample_col is not None and sample_col in df.columns:
-        df[CYCLE1_SIGNAL_SAMP44_COL] = _normalize_signal_intensity(df[sample_col])
-    else:
-        df[CYCLE1_SIGNAL_SAMP44_COL] = np.nan
+    def _ensure_signal_column(target_col, fallback_col=None):
+        if target_col in df.columns:
+            df[target_col] = _normalize_signal_intensity(df[target_col])
+            return
+        if fallback_col is not None and fallback_col in df.columns:
+            df[target_col] = _normalize_signal_intensity(df[fallback_col])
+            return
+        df[target_col] = np.nan
 
-    if CYCLE1_SIGNAL_REF44_COL in df.columns:
-        df[CYCLE1_SIGNAL_REF44_COL] = _normalize_signal_intensity(df[CYCLE1_SIGNAL_REF44_COL])
-    elif ref_col is not None and ref_col in df.columns:
-        df[CYCLE1_SIGNAL_REF44_COL] = _normalize_signal_intensity(df[ref_col])
-    else:
-        df[CYCLE1_SIGNAL_REF44_COL] = np.nan
+    _ensure_signal_column(CYCLE1_SIGNAL_SAMP44_COL, sample_col)
+    _ensure_signal_column(CYCLE1_SIGNAL_REF44_COL, ref_col)
 
-    samp_vals = pd.to_numeric(df[CYCLE1_SIGNAL_SAMP44_COL], errors='coerce')
-    ref_vals = pd.to_numeric(df[CYCLE1_SIGNAL_REF44_COL], errors='coerce')
-    valid = np.isfinite(samp_vals) & np.isfinite(ref_vals)
-    diff_vals = (samp_vals - ref_vals).where(valid)
-    if CYCLE1_SIGNAL_DIFF44_COL in df.columns:
-        existing_diff = pd.to_numeric(df[CYCLE1_SIGNAL_DIFF44_COL], errors='coerce')
-        df[CYCLE1_SIGNAL_DIFF44_COL] = diff_vals.where(valid, existing_diff)
-    else:
-        df[CYCLE1_SIGNAL_DIFF44_COL] = diff_vals
+    def _collect_mass_signal_candidates(mass_value):
+        candidates = []
+        for col in df.columns:
+            if not isinstance(col, str):
+                continue
+            low = _normalize_column_key(col)
+            if low == "":
+                continue
+            if re.search(rf'(?<!\d){int(mass_value)}(?:\.0+)?(?!\d)', low) is None:
+                continue
+            looks_delta = bool(
+                'delta' in low
+                or re.search(r'\bd4[5-6]co2\b', low)
+                or low.startswith('d45')
+                or low.startswith('d46')
+            )
+            looks_derived = bool('diff' in low or 'mismatch' in low or 'samp-ref' in low or 'ref-samp' in low)
+            if looks_delta or looks_derived:
+                continue
+            candidates.append(col)
+        return candidates
+
+    def _resolve_mass_pair_columns(mass_value):
+        sample_target = CYCLE1_SIGNAL_SAMP45_COL if int(mass_value) == 45 else CYCLE1_SIGNAL_SAMP46_COL
+        ref_target = CYCLE1_SIGNAL_REF45_COL if int(mass_value) == 45 else CYCLE1_SIGNAL_REF46_COL
+        if sample_target in df.columns and ref_target in df.columns:
+            return sample_target, ref_target
+        candidates = [c for c in _collect_mass_signal_candidates(mass_value) if c not in (sample_target, ref_target)]
+        if not candidates:
+            return None, None
+        labeled_sample = []
+        labeled_ref = []
+        unlabeled = []
+        for col in candidates:
+            low = _normalize_column_key(col)
+            is_ref = ('reference' in low) or ('standard' in low) or bool(re.search(r'\bref\b|\bstd\b', low))
+            is_sample = ('sample' in low) or ('samp' in low) or bool(re.search(r'\bsmp\b', low))
+            if is_sample and not is_ref:
+                labeled_sample.append(col)
+            elif is_ref and not is_sample:
+                labeled_ref.append(col)
+            else:
+                unlabeled.append(col)
+        sample_source = labeled_sample[0] if labeled_sample else None
+        ref_source = labeled_ref[0] if labeled_ref else None
+        remaining = [c for c in candidates if c not in {sample_source, ref_source}]
+        if sample_source is None and remaining:
+            sample_source = remaining[0]
+            remaining = [c for c in remaining if c != sample_source]
+        if ref_source is None and remaining:
+            ref_source = remaining[0]
+        if sample_source is None or ref_source is None:
+            return sample_source, ref_source
+
+        # If roles are unlabeled/ambiguous, align mass-45/46 role ordering to mass-44 ordering.
+        ambig = (
+            sample_source in unlabeled
+            and ref_source in unlabeled
+            and CYCLE1_SIGNAL_SAMP44_COL in df.columns
+            and CYCLE1_SIGNAL_REF44_COL in df.columns
+        )
+        if ambig:
+            s44 = pd.to_numeric(df[CYCLE1_SIGNAL_SAMP44_COL], errors='coerce')
+            r44 = pd.to_numeric(df[CYCLE1_SIGNAL_REF44_COL], errors='coerce')
+            anchor_order = s44 - r44
+            a = pd.to_numeric(_normalize_signal_intensity(df[sample_source]), errors='coerce')
+            b = pd.to_numeric(_normalize_signal_intensity(df[ref_source]), errors='coerce')
+            valid = (
+                np.isfinite(anchor_order)
+                & np.isfinite(a)
+                & np.isfinite(b)
+                & (np.abs(anchor_order) > 1e-12)
+                & (np.abs(a - b) > 1e-12)
+            )
+            if bool(valid.any()):
+                score_ab = int((np.sign(a[valid] - b[valid]) == np.sign(anchor_order[valid])).sum())
+                score_ba = int((np.sign(b[valid] - a[valid]) == np.sign(anchor_order[valid])).sum())
+                if score_ba > score_ab:
+                    sample_source, ref_source = ref_source, sample_source
+            else:
+                # Median fallback: follow the dominant mass-44 sample/ref ordering.
+                anchor_med = float(np.nanmedian(anchor_order)) if anchor_order.notna().any() else np.nan
+                a_med = float(np.nanmedian(a)) if a.notna().any() else np.nan
+                b_med = float(np.nanmedian(b)) if b.notna().any() else np.nan
+                if np.isfinite(anchor_med) and np.isfinite(a_med) and np.isfinite(b_med):
+                    if anchor_med < 0 and a_med > b_med:
+                        sample_source, ref_source = ref_source, sample_source
+                    if anchor_med > 0 and a_med < b_med:
+                        sample_source, ref_source = ref_source, sample_source
+        return sample_source, ref_source
+
+    def _ensure_mass_pair_columns(mass_value):
+        sample_target = CYCLE1_SIGNAL_SAMP45_COL if int(mass_value) == 45 else CYCLE1_SIGNAL_SAMP46_COL
+        ref_target = CYCLE1_SIGNAL_REF45_COL if int(mass_value) == 45 else CYCLE1_SIGNAL_REF46_COL
+        sample_source, ref_source = _resolve_mass_pair_columns(mass_value)
+        _ensure_signal_column(sample_target, sample_source)
+        _ensure_signal_column(ref_target, ref_source)
+
+    _ensure_mass_pair_columns(45)
+    _ensure_mass_pair_columns(46)
+
+    def _ensure_diff_column(sample_signal_col, ref_signal_col, diff_col):
+        if sample_signal_col not in df.columns or ref_signal_col not in df.columns:
+            return
+        samp_vals = pd.to_numeric(df[sample_signal_col], errors='coerce')
+        ref_vals = pd.to_numeric(df[ref_signal_col], errors='coerce')
+        valid = np.isfinite(samp_vals) & np.isfinite(ref_vals)
+        diff_vals = (samp_vals - ref_vals).where(valid)
+        if diff_col in df.columns:
+            existing_diff = pd.to_numeric(df[diff_col], errors='coerce')
+            df[diff_col] = diff_vals.where(valid, existing_diff)
+        else:
+            df[diff_col] = diff_vals
+
+    _ensure_diff_column(CYCLE1_SIGNAL_SAMP44_COL, CYCLE1_SIGNAL_REF44_COL, CYCLE1_SIGNAL_DIFF44_COL)
+    _ensure_diff_column(CYCLE1_SIGNAL_SAMP45_COL, CYCLE1_SIGNAL_REF45_COL, CYCLE1_SIGNAL_DIFF45_COL)
+    _ensure_diff_column(CYCLE1_SIGNAL_SAMP46_COL, CYCLE1_SIGNAL_REF46_COL, CYCLE1_SIGNAL_DIFF46_COL)
 
     _ensure_cycle1_pressure_weighted_mismatch_column(df)
     return df

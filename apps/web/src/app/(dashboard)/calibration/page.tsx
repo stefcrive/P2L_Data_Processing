@@ -1,9 +1,9 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useDeferredValue, useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
-import { PlotlyChart, type PlotlyPoint } from "@/components/charts/plotly-chart";
+import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
@@ -27,6 +27,11 @@ type SelectedTarget = {
   currentD13?: number | null;
   currentD18?: number | null;
   chartKey: string;
+};
+type HoverPreviewState = {
+  target: SelectedTarget;
+  clientX: number;
+  clientY: number;
 };
 type FigureShape = Record<string, unknown> & {
   data: Array<Record<string, unknown>>;
@@ -749,100 +754,27 @@ function ensureCollectorIntensityTraces(
   };
 }
 
-function buildLinearityPreviewFigure(
-  cycleMean: Record<string, unknown>,
-  isotopeKey: string,
-  tableRows: Array<Record<string, unknown>>,
-) {
-  const fitPairs: Array<[number, number]> = [];
-  const rawFitX = Array.isArray(cycleMean.fit_x) ? cycleMean.fit_x : [];
-  const rawFitY = Array.isArray(cycleMean.fit_y) ? cycleMean.fit_y : [];
-  const pairCount = Math.min(rawFitX.length, rawFitY.length);
-  for (let i = 0; i < pairCount; i += 1) {
-    const x = toFiniteNumber(rawFitX[i]);
-    const y = toFiniteNumber(rawFitY[i]);
-    if (x == null || y == null) {
-      continue;
-    }
-    fitPairs.push([x, y]);
+function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!figure) {
+    return figure;
   }
-
-  if (fitPairs.length < 2) {
-    const yCol = isotopeKey === "d18O" ? "d18O" : isotopeKey === "d13C" ? "d13C" : null;
-    const excludedCol = isotopeKey === "d18O" ? "Excluded d18O" : isotopeKey === "d13C" ? "Excluded d13C" : null;
-    if (yCol) {
-      for (const row of tableRows) {
-        if (excludedCol && asBoolean(row[excludedCol])) {
-          continue;
-        }
-        const x = toFiniteNumber(row["SMP Int m/z 44 (V)"]);
-        const y = toFiniteNumber(row[yCol]);
-        if (x == null || y == null) {
-          continue;
-        }
-        fitPairs.push([x, y]);
-      }
-    }
-  }
-
-  if (fitPairs.length < 2) {
-    return null;
-  }
-
-  const fitX = fitPairs.map(([x]) => x);
-  const fitY = fitPairs.map(([, y]) => y);
-  const slope = toFiniteNumber(cycleMean.linearity_slope);
-  const intercept = toFiniteNumber(cycleMean.linearity_intercept);
-  const targetIntensity = toFiniteNumber(cycleMean.linearity_target_intensity);
-  const prediction = toFiniteNumber(cycleMean.linearity_prediction);
-  const xMin = Math.min(...fitX);
-  const xMax = Math.max(...fitX);
-  const lineX = [xMin, xMax];
-  const lineY =
-    slope != null && intercept != null
-      ? [slope * xMin + intercept, slope * xMax + intercept]
-      : [fitY[0], fitY[fitY.length - 1]];
-
-  const traces: Array<Record<string, unknown>> = [
-    {
-      type: "scatter",
-      mode: "markers",
-      name: "Valid cycles",
-      x: fitX,
-      y: fitY,
-      marker: { color: "#334155", size: 7 },
+  const cloned = cloneFigure(figure);
+  const nextLayout: Record<string, unknown> = {
+    ...cloned.layout,
+    title: {
+      text: "Cycle Intensities (Sample vs Reference Gas)",
+      x: 0.5,
+      xanchor: "center",
+      font: { size: 14 },
     },
-    {
-      type: "scatter",
-      mode: "lines",
-      name: "Linear fit",
-      x: lineX,
-      y: lineY,
-      line: { color: "#0F766E", width: 2 },
-    },
-  ];
-
-  if (targetIntensity != null && prediction != null) {
-    traces.push({
-      type: "scatter",
-      mode: "markers",
-      name: "Target prediction",
-      x: [targetIntensity],
-      y: [prediction],
-      marker: { color: "#B91C1C", size: 10, symbol: "diamond" },
-    });
-  }
-
+    margin: { l: 42, r: 12, t: 46, b: 126 },
+    legend: { orientation: "h", yanchor: "top", y: -0.28, x: 0, xanchor: "left", font: { size: 10 } },
+    hovermode: "closest",
+    height: 460,
+  };
   return {
-    data: traces,
-    layout: {
-      title: `${isotopeKey || "Isotope"} linearity preview`,
-      xaxis: { title: "Intensity (V)" },
-      yaxis: { title: "Cycle delta" },
-      height: 300,
-      margin: { l: 30, r: 20, t: 45, b: 35 },
-      legend: { orientation: "h", yanchor: "top", y: -0.22, x: 0 },
-    },
+    ...cloned,
+    layout: nextLayout,
   };
 }
 
@@ -973,6 +905,42 @@ function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ lab
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function computeHoverPreviewPosition(
+  clientX: number,
+  clientY: number,
+  tooltipWidth = 420,
+  tooltipHeight = 320,
+): { left: number; top: number } {
+  if (typeof window === "undefined") {
+    return { left: clientX + 220, top: clientY - 24 };
+  }
+  // Keep the diagnostics card to the right of Plotly's native hover label.
+  const horizontalOffset = 220;
+  const fallbackLeftOffset = 24;
+  const verticalOffset = -24;
+  const edgePadding = 10;
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+
+  let left = clientX + horizontalOffset;
+  if (left + tooltipWidth > viewportWidth - edgePadding) {
+    left = clientX - tooltipWidth - fallbackLeftOffset;
+  }
+  if (left < edgePadding) {
+    left = edgePadding;
+  }
+
+  let top = clientY + verticalOffset;
+  if (top + tooltipHeight > viewportHeight - edgePadding) {
+    top = viewportHeight - tooltipHeight - edgePadding;
+  }
+  if (top < edgePadding) {
+    top = edgePadding;
+  }
+
+  return { left, top };
 }
 
 function parseFinite(value: string, fallback: number) {
@@ -1159,6 +1127,40 @@ function deriveColorScaleBounds(figures: Array<Record<string, unknown> | undefin
     return { min: min - pad, max: max + pad };
   }
   return { min, max };
+}
+
+function deriveTwoSigmaColorScaleRange(
+  figures: Array<Record<string, unknown> | undefined>,
+  bounds: ColorScaleBounds,
+): [number, number] | null {
+  const values: number[] = [];
+  for (const figure of figures) {
+    values.push(...collectNumericColorValues(figure));
+  }
+  if (!values.length) {
+    return null;
+  }
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  if (!Number.isFinite(mean)) {
+    return null;
+  }
+  const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+  if (!Number.isFinite(variance) || variance < 0) {
+    return null;
+  }
+  const sigma = Math.sqrt(variance);
+  if (!Number.isFinite(sigma) || sigma <= 0) {
+    return null;
+  }
+  const twoSigmaRange: [number, number] = [mean - 2 * sigma, mean + 2 * sigma];
+  const normalized = normalizeColorScaleRange(twoSigmaRange, bounds);
+  if (!Number.isFinite(normalized[0]) || !Number.isFinite(normalized[1])) {
+    return null;
+  }
+  if (normalized[0] === normalized[1]) {
+    return null;
+  }
+  return normalized;
 }
 
 function normalizeColorScaleRange(range: [number, number], bounds: ColorScaleBounds): [number, number] {
@@ -1397,43 +1399,18 @@ function DiagnosticsPanel({
   title,
   diagnostics,
   loading,
-  showLinearityChart = false,
-  linearityEnabled,
-  onLinearityEnabledChange,
-  linearityTargetIntensity,
-  onLinearityTargetIntensityChange,
   onPickDeltaValue,
 }: {
   title: string;
   diagnostics?: CycleDiagnosticsPayload;
   loading: boolean;
-  showLinearityChart?: boolean;
-  linearityEnabled?: boolean;
-  onLinearityEnabledChange?: (value: boolean) => void;
-  linearityTargetIntensity?: number;
-  onLinearityTargetIntensityChange?: (value: number) => void;
   onPickDeltaValue?: (value: number) => void;
 }) {
   const cycleMean = diagnostics?.cycle_mean ?? {};
   const validMean = asNumber(cycleMean.valid_mean);
   const firstValidCycle = asNumber(cycleMean.selected_value) ?? asNumber(cycleMean.mean);
-  const collectorStatus = asString((diagnostics?.target ?? {})["collector_status"]);
-  const isPartiallySaturated = isPartiallySaturatedCollectorStatus(collectorStatus);
-  const targetIntensity = asNumber(cycleMean.linearity_target_intensity);
-  const prediction = asNumber(cycleMean.linearity_prediction);
-  const prevNeighbor = cycleMean.prev_neighbor as Record<string, unknown> | undefined;
-  const nextNeighbor = cycleMean.next_neighbor as Record<string, unknown> | undefined;
   const reason = asString(cycleMean.reason);
   const diagnosticsFigure = ensureCollectorIntensityTraces(diagnostics?.figure, diagnostics?.table ?? []);
-  const isotopeKey = asString((diagnostics?.target ?? {})["isotope_key"]);
-  const linearityPreviewFigure = buildLinearityPreviewFigure(cycleMean, isotopeKey, diagnostics?.table ?? []);
-  const showLinearityControls =
-    typeof linearityEnabled === "boolean" &&
-    typeof onLinearityEnabledChange === "function" &&
-    typeof linearityTargetIntensity === "number" &&
-    typeof onLinearityTargetIntensityChange === "function" &&
-    !isPartiallySaturated;
-  const shouldRenderLinearityPreview = showLinearityChart || Boolean(linearityEnabled);
   const canPickValidMean = typeof onPickDeltaValue === "function" && validMean != null;
   const canPickFinalMean = typeof onPickDeltaValue === "function" && firstValidCycle != null;
 
@@ -1486,70 +1463,6 @@ function DiagnosticsPanel({
                 <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
               </div>
             </div>
-
-            {showLinearityControls ? (
-              <div className="space-y-3 rounded-lg border border-stone-200 p-3">
-                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_220px] md:items-end">
-                  <label className={cn("flex items-start gap-3 rounded-lg border border-stone-200 p-3")}>
-                    <input
-                      type="checkbox"
-                      checked={Boolean(linearityEnabled)}
-                      onChange={(event) => onLinearityEnabledChange(event.target.checked)}
-                      className="mt-1 h-4 w-4"
-                    />
-                    <span className="space-y-1">
-                      <span className="block text-sm font-medium text-stone-800">Preview linearity-corrected cycle mean</span>
-                    </span>
-                  </label>
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">Target intensity (V)</span>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={linearityTargetIntensity}
-                      onChange={(event) => onLinearityTargetIntensityChange(Number(event.target.value))}
-                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
-                </div>
-              </div>
-            ) : null}
-
-            {shouldRenderLinearityPreview ? (
-              linearityPreviewFigure ? (
-                <PlotlyChart figure={linearityPreviewFigure} className="h-[300px] w-full" />
-              ) : (
-                <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">
-                  No linearity fit available for this selection.
-                </div>
-              )
-            ) : null}
-
-            {prediction != null || targetIntensity != null ? (
-              <div className="grid gap-3 md:grid-cols-2">
-                <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
-                  <div className="font-medium text-stone-800">Linearity Target Intensity</div>
-                  <div>{targetIntensity == null ? "N/A" : `${targetIntensity.toFixed(2)} V`}</div>
-                </div>
-                <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
-                  <div className="font-medium text-stone-800">Linearity Prediction</div>
-                  <div>{formatDeltaValue(prediction)}</div>
-                </div>
-              </div>
-            ) : null}
-
-            {prevNeighbor || nextNeighbor ? (
-              <div className="grid gap-3 md:grid-cols-2">
-                <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
-                  <div className="font-medium text-stone-800">Previous interpolation neighbor</div>
-                  <div>{prevNeighbor ? `${asString(prevNeighbor.identifier_2)} -> ${asString(prevNeighbor.value)}` : "Not available"}</div>
-                </div>
-                <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
-                  <div className="font-medium text-stone-800">Next interpolation neighbor</div>
-                  <div>{nextNeighbor ? `${asString(nextNeighbor.identifier_2)} -> ${asString(nextNeighbor.value)}` : "Not available"}</div>
-                </div>
-              </div>
-            ) : null}
 
             {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
 
@@ -1844,8 +1757,6 @@ export default function CalibrationPage() {
   const [crossD18Value, setCrossD18Value] = useState(0);
   const [multiOffsetD13, setMultiOffsetD13] = useState(0);
   const [multiOffsetD18, setMultiOffsetD18] = useState(0);
-  const [linearityEnabled, setLinearityEnabled] = useState(false);
-  const [linearityTargetIntensity, setLinearityTargetIntensity] = useState(15);
   const [linearityTouched, setLinearityTouched] = useState(false);
   const [setValueHighlightNonce, setSetValueHighlightNonce] = useState(0);
   const [isSetValueInputHighlighted, setIsSetValueInputHighlighted] = useState(false);
@@ -1858,10 +1769,21 @@ export default function CalibrationPage() {
     line_2_offset_d18: "0",
   });
   const [linearityOffsetEditing, setLinearityOffsetEditing] = useState<LinearityOffsetField | null>(null);
+  const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
+  const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const colorScaledFigureCacheRef = useRef<WeakMap<Record<string, unknown>, Record<string, unknown>>>(new WeakMap());
+  const colorScaleSignatureRef = useRef<string>("");
   const draftStorageKey = sessionId ? `calibration-config:${sessionId}` : null;
   const activeTarget = selectedTargets.length ? selectedTargets[Math.min(activeTargetIndex, selectedTargets.length - 1)] : null;
   const activeIsotopeTarget = activeTarget && activeTarget.isotopeKey !== "cross" ? activeTarget : null;
   const activeCrossTarget = activeTarget && activeTarget.isotopeKey === "cross" ? activeTarget : null;
+  const hoverPreviewTarget = hoverPreview?.target ?? null;
+  const hoverPreviewDiagnosticsTarget: SelectedTarget | null =
+    hoverPreviewTarget == null
+      ? null
+      : hoverPreviewTarget.isotopeKey === "cross"
+        ? { ...hoverPreviewTarget, isotopeKey: "d13C" }
+        : hoverPreviewTarget;
 
   useEffect(() => {
     if (!(isSelectionEditorOpen || isOfficialValuesModalOpen) || typeof window === "undefined") {
@@ -1880,11 +1802,24 @@ export default function CalibrationPage() {
   }, [isOfficialValuesModalOpen, isSelectionEditorOpen]);
 
   useEffect(() => {
+    return () => {
+      if (hoverPreviewHideTimerRef.current != null) {
+        clearTimeout(hoverPreviewHideTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isSelectionEditorOpen || isOfficialValuesModalOpen) {
+      setHoverPreview(null);
+    }
+  }, [isOfficialValuesModalOpen, isSelectionEditorOpen]);
+
+  useEffect(() => {
     if (!activeIsotopeTarget) {
       return;
     }
     setSingleOffset(SELECTION_EDITOR_DEFAULT_OFFSET);
-    setLinearityEnabled(false);
   }, [activeIsotopeTarget?.rowLabel, activeIsotopeTarget?.isotopeKey]);
 
   useEffect(() => {
@@ -1911,20 +1846,12 @@ export default function CalibrationPage() {
   });
 
   const singleDiagnosticsQuery = useQuery({
-    queryKey: [
-      "processing-diagnostics",
-      sessionId,
-      activeIsotopeTarget?.rowLabel,
-      activeIsotopeTarget?.isotopeKey,
-      linearityEnabled,
-      linearityTargetIntensity,
-    ],
+    queryKey: ["processing-diagnostics", sessionId, activeIsotopeTarget?.rowLabel, activeIsotopeTarget?.isotopeKey],
     queryFn: () =>
-      api.getProcessingCycleDiagnostics(sessionId!, {
-        ...diagnosticsTargetPayload(activeIsotopeTarget!, activeIsotopeTarget!.isotopeKey as "d13C" | "d18O"),
-        correct_linearity: linearityEnabled,
-        target_intensity: linearityEnabled ? linearityTargetIntensity : null,
-      }),
+      api.getProcessingCycleDiagnostics(
+        sessionId!,
+        diagnosticsTargetPayload(activeIsotopeTarget!, activeIsotopeTarget!.isotopeKey as "d13C" | "d18O"),
+      ),
     enabled: Boolean(sessionId && activeIsotopeTarget),
   });
 
@@ -1938,6 +1865,25 @@ export default function CalibrationPage() {
     queryKey: ["processing-diagnostics-cross-d18", sessionId, activeCrossTarget?.rowLabel],
     queryFn: () => api.getProcessingCycleDiagnostics(sessionId!, diagnosticsTargetPayload(activeCrossTarget!, "d18O")),
     enabled: Boolean(sessionId && activeCrossTarget),
+  });
+
+  const hoverDiagnosticsQuery = useQuery({
+    queryKey: [
+      "processing-diagnostics-hover",
+      sessionId,
+      hoverPreviewDiagnosticsTarget?.rowLabel,
+      hoverPreviewDiagnosticsTarget?.isotopeKey,
+    ],
+    queryFn: () =>
+      api.getProcessingCycleDiagnostics(
+        sessionId!,
+        diagnosticsTargetPayload(
+          hoverPreviewDiagnosticsTarget!,
+          hoverPreviewDiagnosticsTarget!.isotopeKey as "d13C" | "d18O",
+        ),
+      ),
+    enabled: Boolean(sessionId && hoverPreviewDiagnosticsTarget && !isSelectionEditorOpen && !isOfficialValuesModalOpen),
+    staleTime: 60_000,
   });
 
   useEffect(() => {
@@ -2090,9 +2036,9 @@ export default function CalibrationPage() {
   const persistedWorkspace = workspaceQuery.data as CalibrationWorkspace | undefined;
   const workspaceForColorScale = previewWorkspace ?? persistedWorkspace;
   const activeColorParam = config?.color_param ?? workspaceForColorScale?.config.color_param ?? null;
-  const colorScaleBounds = useMemo(() => {
+  const colorScaleFigures = useMemo<Array<Record<string, unknown> | undefined>>(() => {
     if (!workspaceForColorScale) {
-      return null;
+      return [];
     }
     const figures: Array<Record<string, unknown> | undefined> = [
       workspaceForColorScale.figures["VPDB(13C)"],
@@ -2107,8 +2053,15 @@ export default function CalibrationPage() {
     for (const section of workspaceForColorScale.standard_sections) {
       figures.push(section.d13_figure, section.d18_figure);
     }
-    return deriveColorScaleBounds(figures);
+    return figures;
   }, [workspaceForColorScale]);
+  const colorScaleBounds = useMemo(() => deriveColorScaleBounds(colorScaleFigures), [colorScaleFigures]);
+  const colorScaleTwoSigmaRange = useMemo(() => {
+    if (!colorScaleBounds) {
+      return null;
+    }
+    return deriveTwoSigmaColorScaleRange(colorScaleFigures, colorScaleBounds);
+  }, [colorScaleBounds, colorScaleFigures]);
 
   useEffect(() => {
     if (!activeColorParam || !colorScaleBounds) {
@@ -2116,10 +2069,11 @@ export default function CalibrationPage() {
     }
     const bounds = colorScaleBounds;
     const fullRange: [number, number] = [bounds.min, bounds.max];
+    const defaultRange = colorScaleTwoSigmaRange ?? fullRange;
     const parameterChanged = colorScaleRangeParam !== activeColorParam;
     setColorScaleRange((current) => {
       if (!current || parameterChanged) {
-        return fullRange;
+        return defaultRange;
       }
       const isOutsideBounds = current[1] < bounds.min || current[0] > bounds.max;
       if (isOutsideBounds) {
@@ -2134,7 +2088,7 @@ export default function CalibrationPage() {
     if (parameterChanged) {
       setColorScaleRangeParam(activeColorParam);
     }
-  }, [activeColorParam, colorScaleBounds, colorScaleRangeParam]);
+  }, [activeColorParam, colorScaleBounds, colorScaleRangeParam, colorScaleTwoSigmaRange]);
 
   const saveLinearityMutation = useMutation({
     mutationFn: (payload: { linearity: CalibrationConfig["linearity"]; selectedStandards: string[] }) =>
@@ -2438,6 +2392,62 @@ export default function CalibrationPage() {
     setTargets(multi ? targets : targets.slice(0, 1));
   }
 
+  function clearHoverPreviewHideTimer() {
+    if (hoverPreviewHideTimerRef.current != null) {
+      clearTimeout(hoverPreviewHideTimerRef.current);
+      hoverPreviewHideTimerRef.current = null;
+    }
+  }
+
+  function scheduleHoverPreviewHide() {
+    clearHoverPreviewHideTimer();
+    hoverPreviewHideTimerRef.current = setTimeout(() => {
+      setHoverPreview(null);
+    }, 140);
+  }
+
+  function handleChartPointHover(chartKey: string, payload: PlotlyHoverPayload) {
+    if (isSelectionEditorOpen || isOfficialValuesModalOpen) {
+      return;
+    }
+    const targets = parseSelectedTargets(payload.points, chartKey);
+    if (!targets.length) {
+      setHoverPreview(null);
+      return;
+    }
+    clearHoverPreviewHideTimer();
+    const firstTarget = targets[0];
+    const normalizedTarget =
+      firstTarget.isotopeKey === "cross"
+        ? ({
+            ...firstTarget,
+            isotopeKey: "d13C",
+          } as SelectedTarget)
+        : firstTarget;
+    setHoverPreview((current) => {
+      if (
+        current &&
+        current.target.rowLabel === normalizedTarget.rowLabel &&
+        current.target.isotopeKey === normalizedTarget.isotopeKey &&
+        current.target.chartKey === normalizedTarget.chartKey
+      ) {
+        return current;
+      }
+      return {
+        target: normalizedTarget,
+        clientX: payload.clientX,
+        clientY: payload.clientY,
+      };
+    });
+  }
+
+  function chartHoverProps(chartKey: string) {
+    return {
+      onPointHover: (payload: PlotlyHoverPayload) => handleChartPointHover(chartKey, payload),
+      onHoverEnd: scheduleHoverPreviewHide,
+    };
+  }
+
   function buildTargetsForAction(selection: SelectedTarget[], isotopeKey?: "d13C" | "d18O") {
     const targets: Array<{ row_label: string; isotope_key: "d13C" | "d18O" }> = [];
     const seen = new Set<string>();
@@ -2716,11 +2726,26 @@ export default function CalibrationPage() {
   }
   const colorSliderBounds: ColorScaleBounds = colorScaleBounds ?? { min: 0, max: 1 };
   const effectiveColorScaleRange = normalizeColorScaleRange(
-    colorScaleRange ?? [colorSliderBounds.min, colorSliderBounds.max],
+    colorScaleRange ?? colorScaleTwoSigmaRange ?? [colorSliderBounds.min, colorSliderBounds.max],
     colorSliderBounds,
   );
-  const withColorScaleRange = (figure: Record<string, unknown> | undefined) =>
-    applyColorScaleRangeToFigure(figure, effectiveColorScaleRange);
+  const colorScaleSignature = `${effectiveColorScaleRange[0]}:${effectiveColorScaleRange[1]}`;
+  if (colorScaleSignatureRef.current !== colorScaleSignature) {
+    colorScaleSignatureRef.current = colorScaleSignature;
+    colorScaledFigureCacheRef.current = new WeakMap();
+  }
+  const withColorScaleRange = (figure: Record<string, unknown> | undefined) => {
+    if (!figure) {
+      return figure;
+    }
+    const cached = colorScaledFigureCacheRef.current.get(figure);
+    if (cached) {
+      return cached;
+    }
+    const nextFigure = applyColorScaleRangeToFigure(figure, effectiveColorScaleRange) ?? figure;
+    colorScaledFigureCacheRef.current.set(figure, nextFigure);
+    return nextFigure;
+  };
 
   const minDate = displayedWorkspace.available_values.min_date ?? undefined;
   const maxDate = displayedWorkspace.available_values.max_date ?? undefined;
@@ -2760,6 +2785,20 @@ export default function CalibrationPage() {
   const linePrecisionCount = precisionSummaries.reduce((count, summary) => count + Object.keys(summary.line_precisions).length, 0);
   const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending || saveLinearityMutation.isPending;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
+  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
+  const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
+    ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
+  );
+  const hasHoverDiagnosticsFigureData = Boolean(
+    hoverDiagnosticsFigure &&
+      Array.isArray((hoverDiagnosticsFigure as FigureShape).data) &&
+      ((hoverDiagnosticsFigure as FigureShape).data as Array<Record<string, unknown>>).length > 0,
+  );
+  const shouldShowHoverPreview =
+    Boolean(hoverPreview) &&
+    !isSelectionEditorOpen &&
+    !isOfficialValuesModalOpen &&
+    hoverPreviewPosition != null;
   const crossSharedDiagnostics = crossD18DiagnosticsQuery.data ?? crossD13DiagnosticsQuery.data;
   const crossSharedDiagnosticsLoading =
     (crossD18DiagnosticsQuery.isLoading && !crossD18DiagnosticsQuery.data) ||
@@ -3106,6 +3145,7 @@ export default function CalibrationPage() {
                     <PlotlyChart
                       figure={selectionSourceChart.figure}
                       className="h-[360px] w-full"
+                      {...chartHoverProps(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "")}
                       onPointClick={(points) =>
                         openProcessingSelectionEditor(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "", points, false)
                       }
@@ -3238,11 +3278,6 @@ export default function CalibrationPage() {
                         title={`${activeIsotopeTarget.isotopeKey} cycle diagnostics`}
                         diagnostics={singleDiagnosticsQuery.data}
                         loading={singleDiagnosticsQuery.isLoading}
-                        showLinearityChart={linearityEnabled}
-                        linearityEnabled={linearityEnabled}
-                        onLinearityEnabledChange={setLinearityEnabled}
-                        linearityTargetIntensity={linearityTargetIntensity}
-                        onLinearityTargetIntensityChange={setLinearityTargetIntensity}
                         onPickDeltaValue={setSingleValueFromSuggestion}
                       />
                     </div>
@@ -3791,6 +3826,7 @@ export default function CalibrationPage() {
                     <PlotlyChart
                       figure={withColorScaleRange(displayedWorkspace.figures["VPDB(13C)"])}
                       className="aspect-square w-full"
+                      {...chartHoverProps("VPDB(13C)")}
                       onPointClick={(points) => openProcessingSelectionEditor("VPDB(13C)", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("VPDB(13C)", points, true)}
                     />
@@ -3804,6 +3840,7 @@ export default function CalibrationPage() {
                     <PlotlyChart
                       figure={withColorScaleRange(displayedWorkspace.figures["VSMOW(18O)"])}
                       className="aspect-square w-full"
+                      {...chartHoverProps("VSMOW(18O)")}
                       onPointClick={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, true)}
                     />
@@ -3821,6 +3858,7 @@ export default function CalibrationPage() {
                     <PlotlyChart
                       figure={withColorScaleRange(displayedWorkspace.figures.calibration_3d)}
                       className="min-h-[520px] xl:aspect-square"
+                      {...chartHoverProps("calibration_3d")}
                       onPointClick={(points) => openProcessingSelectionEditor("calibration_3d", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("calibration_3d", points, true)}
                     />
@@ -3835,6 +3873,7 @@ export default function CalibrationPage() {
                     <PlotlyChart
                       figure={withColorScaleRange(displayedWorkspace.figures.crossplot)}
                       className="min-h-[520px] xl:aspect-square"
+                      {...chartHoverProps("crossplot")}
                       onPointClick={(points) => openProcessingSelectionEditor("crossplot", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("crossplot", points, true)}
                     />
@@ -3858,24 +3897,28 @@ export default function CalibrationPage() {
                   <PlotlyChart
                     figure={withColorScaleRange(displayedWorkspace.linearity_figures.d13_raw)}
                     className="min-h-[440px]"
+                    {...chartHoverProps("linearity|d13_raw")}
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, true)}
                   />
                   <PlotlyChart
                     figure={withColorScaleRange(displayedWorkspace.linearity_figures.d13_corrected)}
                     className="min-h-[440px]"
+                    {...chartHoverProps("linearity|d13_corrected")}
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, true)}
                   />
                   <PlotlyChart
                     figure={withColorScaleRange(displayedWorkspace.linearity_figures.d18_raw)}
                     className="min-h-[440px]"
+                    {...chartHoverProps("linearity|d18_raw")}
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, true)}
                   />
                   <PlotlyChart
                     figure={withColorScaleRange(displayedWorkspace.linearity_figures.d18_corrected)}
                     className="min-h-[440px]"
+                    {...chartHoverProps("linearity|d18_corrected")}
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, true)}
                   />
@@ -3896,6 +3939,7 @@ export default function CalibrationPage() {
                             <PlotlyChart
                               figure={withColorScaleRange(section.d13_figure)}
                               className="min-h-[340px]"
+                              {...chartHoverProps(`${section.standard}|d13C`)}
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, false)}
                               onSelection={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, true)}
                             />
@@ -3909,6 +3953,7 @@ export default function CalibrationPage() {
                             <PlotlyChart
                               figure={withColorScaleRange(section.d18_figure)}
                               className="min-h-[340px]"
+                              {...chartHoverProps(`${section.standard}|d18O`)}
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, false)}
                               onSelection={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, true)}
                             />
@@ -3948,6 +3993,30 @@ export default function CalibrationPage() {
           )}
         </div>
       </div>
+      {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
+        <div
+          className="pointer-events-none fixed z-[80] w-[560px] rounded-xl border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
+        >
+          <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
+            <span className="font-medium text-stone-800">
+              {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
+            </span>
+            <span className="rounded-full bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-wide text-stone-700">
+              {hoverPreview.target.isotopeKey}
+            </span>
+          </div>
+          {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
+            <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
+          ) : hasHoverDiagnosticsFigureData ? (
+            <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
+          ) : (
+            <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
+              Cycle-intensity preview unavailable for this point.
+            </div>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -11,11 +11,18 @@ from services.irms_api.domain.calibration.core import (
     _apply_manual_linearity_override_to_standards,
     _compute_linearity_fit,
     _filter_linearity_fit_input_by_max_intensity,
+    _with_isotope_linearity_intensity_columns,
     create_calibration_plots,
     identify_outliers_iqr,
     single_point_calibration,
 )
-from services.irms_api.domain.constants import ISOTYPE_D13C, ISOTYPE_D18O
+from services.irms_api.domain.constants import (
+    CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_DIFF45_COL,
+    CYCLE1_SIGNAL_DIFF46_COL,
+    ISOTYPE_D13C,
+    ISOTYPE_D18O,
+)
 
 
 class CalibrationCoreTests(unittest.TestCase):
@@ -153,6 +160,24 @@ class CalibrationCoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(d13.iloc[1]), 101.0, places=6)
         self.assertAlmostEqual(float(d18.iloc[0]), 200.0, places=6)
         self.assertAlmostEqual(float(d18.iloc[1]), 200.0, places=6)
+
+    def test_with_isotope_linearity_intensity_columns_uses_diff45_for_d13_and_diff46_for_d18(self) -> None:
+        df = pd.DataFrame(
+            {
+                CYCLE1_SIGNAL_DIFF44_COL: [-0.7, -0.8],
+                CYCLE1_SIGNAL_DIFF45_COL: [-1.6, -1.7],
+                CYCLE1_SIGNAL_DIFF46_COL: [-2.3, -2.4],
+            }
+        )
+
+        work, d13_col, d18_col = _with_isotope_linearity_intensity_columns(
+            df,
+            CYCLE1_SIGNAL_DIFF44_COL,
+        )
+
+        self.assertIs(work, df)
+        self.assertEqual(d13_col, CYCLE1_SIGNAL_DIFF45_COL)
+        self.assertEqual(d18_col, CYCLE1_SIGNAL_DIFF46_COL)
 
     def test_identify_outliers_iqr(self) -> None:
         df = pd.DataFrame({"value": [1, 1, 1, 1, 25]})

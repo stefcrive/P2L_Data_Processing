@@ -1026,6 +1026,7 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         use_diff_intensity=config.linearity.use_diff_intensity,
         selected_intensity_col=getattr(config.linearity, "intensity_col", None),
     )
+    linearity_enabled = bool(config.linearity.apply)
     max_sample_intensity = (
         getattr(config.linearity, "max_sample_intensity", None)
         if selected_linearity_intensity_col == CYCLE1_SIGNAL_SAMP44_COL
@@ -1045,7 +1046,7 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
     standards_adjusted_df = _apply_manual_linearity_override_to_standards(
         line_adjusted_df,
         override_scope,
-        enabled=config.linearity.manual_override_enabled,
+        enabled=linearity_enabled and bool(config.linearity.manual_override_enabled),
         d13_per_10v=config.linearity.manual_d13_per_10v,
         d18_per_10v=config.linearity.manual_d18_per_10v,
         d13_per_10v2=config.linearity.manual_d13_per_10v2,
@@ -1063,7 +1064,7 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
     standards_for_calibration = outlier_input_df.loc[selected_mask].copy() if bool(selected_mask.any()) else pd.DataFrame()
     outlier_reference_df = outlier_input_df
     fits: dict[str, Any] = {}
-    if bool(config.linearity.apply):
+    if linearity_enabled:
         fit_input = standards_for_calibration
         intensity_col = _resolve_selected_linearity_intensity_column(
             df=fit_input if fit_input is not None and not fit_input.empty else outlier_input_df,
@@ -1132,7 +1133,7 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
     )
     standards_source = clean_stds if not clean_stds.empty else standards_for_calibration
     calibration_source = outlier_input_df
-    if bool(config.linearity.apply) and fits:
+    if linearity_enabled and fits:
         standards_source = _promote_linearity_corrected_raw_columns(
             _apply_linearity_correction(
                 standards_source,
@@ -1303,6 +1304,7 @@ def _compute_preview_coefficients_for_calibration_linearity(
         use_diff_intensity=config.linearity.use_diff_intensity,
         selected_intensity_col=getattr(config.linearity, "intensity_col", None),
     )
+    linearity_enabled = bool(config.linearity.apply)
     max_sample_intensity = (
         getattr(config.linearity, "max_sample_intensity", None)
         if selected_linearity_intensity_col == CYCLE1_SIGNAL_SAMP44_COL
@@ -1322,7 +1324,7 @@ def _compute_preview_coefficients_for_calibration_linearity(
     standards_adjusted_df = _apply_manual_linearity_override_to_standards(
         line_adjusted_df,
         override_scope,
-        enabled=config.linearity.manual_override_enabled,
+        enabled=linearity_enabled and bool(config.linearity.manual_override_enabled),
         d13_per_10v=config.linearity.manual_d13_per_10v,
         d18_per_10v=config.linearity.manual_d18_per_10v,
         d13_per_10v2=config.linearity.manual_d13_per_10v2,
@@ -1341,7 +1343,7 @@ def _compute_preview_coefficients_for_calibration_linearity(
 
     fits: dict[str, Any] = {}
     outlier_reference_df = outlier_input_df
-    if bool(config.linearity.apply) and standards_for_calibration is not None and not standards_for_calibration.empty:
+    if linearity_enabled and standards_for_calibration is not None and not standards_for_calibration.empty:
         fit_input = standards_for_calibration
         intensity_col = _resolve_selected_linearity_intensity_column(
             df=fit_input,
@@ -1400,7 +1402,7 @@ def _compute_preview_coefficients_for_calibration_linearity(
         outlier_reference_df=outlier_reference_df,
     )
     standards_source = clean_stds if not clean_stds.empty else standards_for_calibration
-    if bool(config.linearity.apply) and fits and standards_source is not None and not standards_source.empty:
+    if linearity_enabled and fits and standards_source is not None and not standards_source.empty:
         standards_source = _promote_linearity_corrected_raw_columns(
             _apply_linearity_correction(
                 standards_source,
@@ -1626,8 +1628,6 @@ def processing_cycle_diagnostics(session_id: str, request: CycleDiagnosticsReque
             partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
         ),
         edit_state=metadata.get("edit_state", {}),
-        target_intensity=request.target_intensity,
-        correct_linearity=bool(request.correct_linearity),
         sigma_level=float(config.sigma_level_data),
         statistical_outlier_method=str(getattr(config, "statistical_outlier_method", "Z-Score")),
         iqr_multiplier=float(getattr(config, "iqr_multiplier_data", 1.5)),

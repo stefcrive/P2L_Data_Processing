@@ -16,11 +16,19 @@ export type PlotlyPoint = {
   pointNumber?: number;
 };
 
+export type PlotlyHoverPayload = {
+  points: PlotlyPoint[];
+  clientX: number;
+  clientY: number;
+};
+
 type PlotlyChartProps = {
   figure?: Record<string, unknown>;
   className?: string;
   onPointClick?: (points: PlotlyPoint[]) => void;
   onSelection?: (points: PlotlyPoint[]) => void;
+  onPointHover?: (payload: PlotlyHoverPayload) => void;
+  onHoverEnd?: () => void;
 };
 
 function deepClone<T>(value: T): T {
@@ -86,7 +94,7 @@ function applyD18AxisInversion(layout: Record<string, unknown>) {
   }
 }
 
-export function PlotlyChart({ figure, className, onPointClick, onSelection }: PlotlyChartProps) {
+export function PlotlyChart({ figure, className, onPointClick, onSelection, onPointHover, onHoverEnd }: PlotlyChartProps) {
   const preparedFigure = useMemo(() => {
     if (!figure || Object.keys(figure).length === 0) {
       return null;
@@ -97,29 +105,56 @@ export function PlotlyChart({ figure, className, onPointClick, onSelection }: Pl
     const hoverLabel = layout.hoverlabel && typeof layout.hoverlabel === "object" ? { ...(layout.hoverlabel as Record<string, unknown>) } : {};
     hoverLabel.namelength = -1;
     layout.hoverlabel = hoverLabel;
-    layout.autosize = true;
-    delete (layout as { width?: unknown }).width;
-    delete (layout as { height?: unknown }).height;
+    const hasExplicitWidth = typeof (layout as { width?: unknown }).width === "number";
+    const hasExplicitHeight = typeof (layout as { height?: unknown }).height === "number";
+    if (!hasExplicitWidth && !hasExplicitHeight && typeof (layout as { autosize?: unknown }).autosize !== "boolean") {
+      layout.autosize = true;
+    }
     return {
       data: (safeFigure.data as never[]) ?? [],
       layout: layout as never,
+      useResizeHandler: !hasExplicitHeight,
     };
   }, [figure]);
 
   if (!preparedFigure) {
     return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">No chart data yet.</div>;
   }
+  const shouldUseContainerHeight = preparedFigure.useResizeHandler;
   return (
-    <div className={cn("min-w-0 w-full overflow-hidden", className)}>
+    <div className={cn("min-w-0 w-full", className)}>
       <Plot
         data={preparedFigure.data}
         layout={preparedFigure.layout}
         config={{ responsive: true }}
-        useResizeHandler
-        className="h-full w-full max-w-full"
-        style={{ width: "100%", height: "100%" }}
+        useResizeHandler={preparedFigure.useResizeHandler}
+        className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}
+        style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%" }}
         onClick={(event: { points?: PlotlyPoint[] }) => onPointClick?.(event.points ?? [])}
         onSelected={(event: { points?: PlotlyPoint[] } | undefined) => onSelection?.(event?.points ?? [])}
+        onHover={(
+          event:
+            | {
+                points?: PlotlyPoint[];
+                event?: { clientX?: number; clientY?: number; x?: number; y?: number };
+              }
+            | undefined,
+        ) => {
+          if (!onPointHover) {
+            return;
+          }
+          const points = event?.points ?? [];
+          if (!points.length) {
+            return;
+          }
+          const clientX = event?.event?.clientX ?? event?.event?.x;
+          const clientY = event?.event?.clientY ?? event?.event?.y;
+          if (typeof clientX !== "number" || typeof clientY !== "number") {
+            return;
+          }
+          onPointHover({ points, clientX, clientY });
+        }}
+        onUnhover={() => onHoverEnd?.()}
       />
     </div>
   );

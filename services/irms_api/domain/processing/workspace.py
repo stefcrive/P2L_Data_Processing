@@ -334,6 +334,7 @@ def _derive_working_frame(
     calibration = calibration_meta or {}
     fits = calibration.get("linearity_fits", {})
     linearity_cfg = calibration.get("config", {}).get("linearity", {}) if isinstance(calibration.get("config"), dict) else {}
+    linearity_enabled = bool(linearity_cfg.get("apply", False))
     work = _apply_isotope_line_offsets(
         work,
         line_1_offset_d13=linearity_cfg.get("line_1_offset_d13"),
@@ -373,7 +374,7 @@ def _derive_working_frame(
     work = _apply_manual_linearity_override_to_standards(
         work,
         calibration_override_scope,
-        enabled=bool(linearity_cfg.get("manual_override_enabled", False)),
+        enabled=linearity_enabled and bool(linearity_cfg.get("manual_override_enabled", False)),
         d13_per_10v=float(linearity_cfg.get("manual_d13_per_10v", 0.0) or 0.0),
         d18_per_10v=float(linearity_cfg.get("manual_d18_per_10v", 0.0) or 0.0),
         d13_per_10v2=float(linearity_cfg.get("manual_d13_per_10v2", 0.0) or 0.0),
@@ -382,7 +383,7 @@ def _derive_working_frame(
         use_diff_intensity=calibration_use_diff_intensity,
         selected_intensity_col=calibration_override_intensity_col,
     )
-    if bool(linearity_cfg.get("apply")) and isinstance(fits, dict) and fits:
+    if linearity_enabled and isinstance(fits, dict) and fits:
         fit_payload = dict(fits)
         fit_payload.setdefault("d13_intensity_col", d13_offset_intensity_col)
         fit_payload.setdefault("d18_intensity_col", d18_offset_intensity_col)

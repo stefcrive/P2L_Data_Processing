@@ -179,7 +179,7 @@ class CalibrationApiTests(unittest.TestCase):
         self.assertIn("d18O", stored_coeffs)
         self.assertNotEqual(stored_coeffs, baseline_coeffs)
 
-    def test_preview_workspace_manual_linearity_override_updates_standard_measurements(self) -> None:
+    def test_preview_workspace_manual_linearity_override_does_not_update_measurements_when_disabled(self) -> None:
         base_config = CalibrationConfig(
             selected_standards=["SHP2L", "NBS19"],
             calibration_type="IQR",
@@ -220,8 +220,8 @@ class CalibrationApiTests(unittest.TestCase):
 
         base_summary = next(item for item in baseline.precision_summaries if item.standard == "SHP2L")
         override_summary = next(item for item in overridden.precision_summaries if item.standard == "SHP2L")
-        self.assertNotEqual(base_summary.d13_average, override_summary.d13_average)
-        self.assertNotEqual(base_summary.d18_average, override_summary.d18_average)
+        self.assertEqual(base_summary.d13_average, override_summary.d13_average)
+        self.assertEqual(base_summary.d18_average, override_summary.d18_average)
 
     def test_preview_workspace_manual_linearity_override_changes_corrected_precision_when_linearity_is_applied(self) -> None:
         base_config = CalibrationConfig(
@@ -837,7 +837,7 @@ class CalibrationApiTests(unittest.TestCase):
             stored_raw = pd.to_numeric(stored_df[raw_col], errors="coerce").reset_index(drop=True)
             pd.testing.assert_series_equal(stored_raw, baseline_raw, check_names=False)
 
-    def test_run_calibration_manual_linearity_override_changes_coefficients(self) -> None:
+    def test_run_calibration_manual_linearity_override_does_not_change_coefficients_when_disabled(self) -> None:
         baseline_session = api_main.store.create_session()
         override_session = api_main.store.create_session()
         api_main.store.save_frames(baseline_session, sample_calibration_df(), pd.DataFrame())
@@ -887,8 +887,8 @@ class CalibrationApiTests(unittest.TestCase):
         baseline_coeffs = baseline_meta["calibration"]["coefficients"]
         override_coeffs = override_meta["calibration"]["coefficients"]
 
-        self.assertNotEqual(baseline_coeffs["d13C"]["slope"], override_coeffs["d13C"]["slope"])
-        self.assertNotEqual(baseline_coeffs["d18O"]["slope"], override_coeffs["d18O"]["slope"])
+        self.assertEqual(baseline_coeffs["d13C"]["slope"], override_coeffs["d13C"]["slope"])
+        self.assertEqual(baseline_coeffs["d18O"]["slope"], override_coeffs["d18O"]["slope"])
         self.assertTrue(bool(override_meta["calibration"]["config"]["linearity"]["manual_override_enabled"]))
 
     def test_run_calibration_linearity_changes_calibrated_base_and_keeps_corrected_column_in_sync(self) -> None:
