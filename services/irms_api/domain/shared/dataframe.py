@@ -265,6 +265,7 @@ def _apply_cycle_averages(df):
 
     intensity_cols = _find_cycle_intensity_columns(work)
     saturation_threshold = 48.0
+    min_valid_cycles_for_saturation_recovery = 3
     low_signal_threshold = 0.2
 
     def _pick_sample_intensity_columns(source_df, cols):
@@ -594,11 +595,18 @@ def _apply_cycle_averages(df):
         has_pre_d18 = bool(np.isfinite(pre_d18))
         both_missing = (not has_pre_d13) and (not has_pre_d18)
         one_missing = has_pre_d13 ^ has_pre_d18
+        insufficient_valid_cycles = (
+            (d13_has_cycles and d13_used < min_valid_cycles_for_saturation_recovery) or
+            (d18_has_cycles and d18_used < min_valid_cycles_for_saturation_recovery)
+        )
         fully_saturated = (
             has_cycle_intensity and
+            saturated_any and
             (d13_has_cycles or d18_has_cycles) and
-            d13_used == 0 and d18_used == 0 and
-            (d13_excl > 0 or d18_excl > 0)
+            (
+                (d13_used == 0 and d18_used == 0 and (d13_excl > 0 or d18_excl > 0))
+                or insufficient_valid_cycles
+            )
         )
         if fully_saturated:
             pre_rows.at[sample_idx, 'Collector Status'] = 'Fully Saturated Collectors'

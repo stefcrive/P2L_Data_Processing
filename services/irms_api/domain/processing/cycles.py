@@ -421,9 +421,12 @@ def compute_cycle_mean_for_target(
         "fit_x": [],
         "fit_y": [],
         "linearity_prediction": None,
+        "selected_cycle": None,
+        "selected_value": None,
         "reason": "",
     }
-    apply_linearity = bool(correct_linearity) or _is_partially_saturated_collector(target)
+    is_partially_saturated = _is_partially_saturated_collector(target)
+    apply_linearity = bool(correct_linearity)
     cycles, _ = get_cycles_for_selected_point(df, cycles_df, target.get("row_label"), target.get("target_col"))
     if cycles is None or cycles.empty:
         result["reason"] = "no_cycle_data"
@@ -465,7 +468,25 @@ def compute_cycle_mean_for_target(
     valid_mean = float(valid_delta.mean())
     result["mean"] = valid_mean
     result["valid_mean"] = valid_mean
-    result["valid_cycles"] = int(valid_delta.shape[0])
+    valid_cycles = int(valid_delta.shape[0])
+    result["valid_cycles"] = valid_cycles
+    first_valid_idx = valid_delta.index[0]
+    first_valid_value = float(valid_delta.iloc[0])
+    first_valid_cycle = pd.to_numeric(pd.Series([cycles.loc[first_valid_idx, "_cycle_order"]]), errors="coerce").iloc[0]
+
+    if is_partially_saturated:
+        if np.isfinite(first_valid_cycle):
+            cycle_value = float(first_valid_cycle)
+            if cycle_value.is_integer():
+                result["selected_cycle"] = int(cycle_value)
+            else:
+                result["selected_cycle"] = cycle_value
+        result["selected_value"] = first_valid_value
+        result["mean"] = first_valid_value
+        result["method"] = "first_valid_cycle"
+        result["reason"] = "partially_saturated_use_first_valid_cycle"
+        return result
+
     intensity_col = _pick_cycle_sample_intensity_column(cycles, intensity_cols, [44])
     result["intensity_col"] = intensity_col
     if intensity_col is None:
@@ -802,6 +823,13 @@ def build_cycle_diagnostics_payload(
         correct_linearity=correct_linearity,
         target_intensity=float(target_intensity) if target_intensity is not None else get_global_signal_intensity_mean(df),
     )
+    selected_cycle = pd.to_numeric(pd.Series([mean_payload.get("selected_cycle")]), errors="coerce").iloc[0]
+    selected_cycle_mask = pd.Series(False, index=cycle_table.index, dtype=bool)
+    if np.isfinite(selected_cycle):
+        cycle_numbers = pd.to_numeric(cycle_table["Cycle"], errors="coerce")
+        selected_cycle_mask = cycle_numbers.eq(float(selected_cycle))
+    cycle_table["Set Value Cycle"] = selected_cycle_mask.to_numpy(dtype=bool)
+
     prev_neighbor, next_neighbor = find_interpolation_neighbors(
         df,
         target,

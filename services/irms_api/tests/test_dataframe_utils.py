@@ -63,6 +63,52 @@ class DataframeUtilsTests(unittest.TestCase):
         self.assertAlmostEqual(float(result.loc[0, CYCLE1_SIGNAL_REF44_COL]), 21.0, places=6)
         self.assertAlmostEqual(float(result.loc[0, CYCLE1_SIGNAL_DIFF44_COL]), 4.0, places=6)
 
+    def test_apply_cycle_averages_marks_fully_saturated_when_valid_cycles_below_three(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Cycle Number": ["Pre", "1", "2", "3"],
+                "Identifier 1": ["SampleA", None, None, None],
+                "Identifier 2": ["1", None, None, None],
+                "Label": ["SampleA - Coral", None, None, None],
+                "Species": ["Coral", None, None, None],
+                "d 13C/12C  Mean": [None, 1.00, 1.10, 1.20],
+                "d 18O/16O  Mean": [None, 2.00, 2.10, 2.20],
+                "Cycle Intensity Samp 44": [None, 60.0, 30.0, 25.0],
+                "Cycle Intensity Ref 44": [None, 50.0, 23.0, 21.0],
+            }
+        )
+
+        result = _apply_cycle_averages(df)
+
+        self.assertEqual(str(result.loc[0, "Collector Status"]), "Fully Saturated Collectors")
+        self.assertEqual(int(result.loc[0, "d13C Cycles Used"]), 2)
+        self.assertEqual(int(result.loc[0, "d18O Cycles Used"]), 2)
+        self.assertTrue(pd.isna(result.loc[0, "d 13C/12C  Mean"]))
+        self.assertTrue(pd.isna(result.loc[0, "d 18O/16O  Mean"]))
+
+    def test_apply_cycle_averages_keeps_partially_saturated_when_valid_cycles_at_least_three(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Cycle Number": ["Pre", "1", "2", "3", "4"],
+                "Identifier 1": ["SampleA", None, None, None, None],
+                "Identifier 2": ["1", None, None, None, None],
+                "Label": ["SampleA - Coral", None, None, None, None],
+                "Species": ["Coral", None, None, None, None],
+                "d 13C/12C  Mean": [None, 1.00, 1.10, 1.20, 1.30],
+                "d 18O/16O  Mean": [None, 2.00, 2.10, 2.20, 2.30],
+                "Cycle Intensity Samp 44": [None, 60.0, 30.0, 25.0, 24.0],
+                "Cycle Intensity Ref 44": [None, 50.0, 23.0, 21.0, 20.0],
+            }
+        )
+
+        result = _apply_cycle_averages(df)
+
+        self.assertEqual(str(result.loc[0, "Collector Status"]), "Partially Saturated Collectors")
+        self.assertEqual(int(result.loc[0, "d13C Cycles Used"]), 3)
+        self.assertEqual(int(result.loc[0, "d18O Cycles Used"]), 3)
+        self.assertAlmostEqual(float(result.loc[0, "d 13C/12C  Mean"]), 1.2, places=6)
+        self.assertAlmostEqual(float(result.loc[0, "d 18O/16O  Mean"]), 2.2, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

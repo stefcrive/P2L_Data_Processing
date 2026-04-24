@@ -62,7 +62,9 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         raise ValueError(f"Error loading standards from {standards_file}: {e}")
 
 
-    # Create a subplot with 5 rows and 3 columns
+    diff_signal_col = '1  Cycle Int  Diff Samp-Ref  44'
+
+    # Create a subplot with 7 rows and 3 columns
     fig = make_subplots(
         rows=7, cols=3,
         subplot_titles=(
@@ -72,7 +74,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
             'Signal Intensity vs d18O', 'd13C vs Line', 'd18O vs Line',
             'Leak Rate vs pCO2', 'd13C vs d18O', 'Total CO2 vs Line',
             'Leak Rate vs Signal Intensity', 'P no Acid vs Leak Rate', 'P Gasses vs Leak Rate',
-            'PCA: Principal Components'
+            'PCA: Principal Components', 'd18O vs Diff Signal Intensity', 'd13C vs Diff Signal Intensity',
         ),
         vertical_spacing=0.03,
         specs=[[{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}],
@@ -238,6 +240,32 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         hoverinfo='text+x+y'
     ), row=6, col=3)
 
+    if diff_signal_col in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df[diff_signal_col],
+                y=df['d 18O/16O  Mean'],
+                mode='markers',
+                marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False),
+                text=hover_text,
+                hoverinfo='text+x+y',
+            ),
+            row=7,
+            col=2,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df[diff_signal_col],
+                y=df['d 13C/12C  Mean'],
+                mode='markers',
+                marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False),
+                text=hover_text,
+                hoverinfo='text+x+y',
+            ),
+            row=7,
+            col=3,
+        )
+
     # Perform PCA
     features = ['leak_rate', 'd 13C/12C  Mean', 'p_no_acid', 'total_co2', 'd 18O/16O  Mean', 'Line',
                 '1  Cycle Int  Samp  44']
@@ -324,6 +352,8 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         (6, 2): ("P no Acid", "Leak Rate"),
         (6, 3): ("P Gasses", "Leak Rate"),
         (7, 1): ("Principal Component 1", "Principal Component 2"),
+        (7, 2): ("Diff Signal Intensity (Cycle 1 m/z 44)", "d18O/16O Mean"),
+        (7, 3): ("Diff Signal Intensity (Cycle 1 m/z 44)", "d13C/12C Mean"),
     }
     for (row, col), (x_title, y_title) in axis_titles.items():
         fig.update_xaxes(title_text=x_title, row=row, col=col)

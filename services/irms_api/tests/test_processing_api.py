@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import io
 import tempfile
 import unittest
 
+import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
 
@@ -385,6 +387,152 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertIn("Outlier Types", data_sheet.columns)
         self.assertIn("Original d 13C/12C  Mean", data_sheet.columns)
         self.assertIn("Statistics", workbook_with.sheet_names)
+
+    def test_cycle_diagnostics_includes_linearity_corrected_target_value(self) -> None:
+        metadata = api_main.store.load_metadata(self.session_id)
+        calibration = dict(metadata.get("calibration", {}))
+        calibration["config"] = {
+            "linearity": {
+                "apply": True,
+                "use_diff_intensity": False,
+                "intensity_col": "1  Cycle Int  Samp  44",
+                "manual_override_enabled": False,
+                "quadratic": False,
+            }
+        }
+        calibration["linearity_fits"] = {
+            "d13C": {"slope": 0.05, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+            "d18O": {"slope": 0.0, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+            "intensity_col": "1  Cycle Int  Samp  44",
+        }
+        metadata["calibration"] = calibration
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        diagnostics = api_main.processing_cycle_diagnostics(
+            self.session_id,
+            CycleDiagnosticsRequest(target={"row_label": "1", "isotope_key": "d13C"}),
+        )
+
+        self.assertAlmostEqual(float(diagnostics.target["current_value"]), 50.0, places=6)
+        self.assertAlmostEqual(float(diagnostics.target["linearity_corrected_value"]), 49.975, places=6)
+
+    def test_diagnostics_endpoint_uses_linearity_corrected_values_when_enabled(self) -> None:
+        df = sample_processing_df().copy()
+        df["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
+        df["total_co2"] = [1.0, 1.1, 1.2, 1.3]
+        df["p_gases"] = [201.0, 202.0, 203.0, 204.0]
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        metadata = api_main.store.load_metadata(self.session_id)
+        calibration = dict(metadata.get("calibration", {}))
+        calibration["config"] = {
+            "linearity": {
+                "apply": False,
+                "use_diff_intensity": False,
+                "intensity_col": "1  Cycle Int  Samp  44",
+            }
+        }
+        calibration["linearity_fits"] = {
+            "d13C": {"slope": 100.0, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+            "d18O": {"slope": 0.0, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+            "intensity_col": "1  Cycle Int  Samp  44",
+        }
+        metadata["calibration"] = calibration
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        raw_bundle = api_main.diagnostics(
+            self.session_id,
+            color_param="Date",
+            identifier_filter=[],
+            d13_min=None,
+            d13_max=None,
+            d18_min=None,
+            d18_max=None,
+        )
+        raw_bounds = raw_bundle.summary.get("d13_bounds", [])
+        self.assertEqual(len(raw_bounds), 2)
+
+        calibration["config"]["linearity"]["apply"] = True
+        metadata["calibration"] = calibration
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        corrected_bundle = api_main.diagnostics(
+            self.session_id,
+            color_param="Date",
+            identifier_filter=[],
+            d13_min=None,
+            d13_max=None,
+            d18_min=None,
+            d18_max=None,
+        )
+        corrected_bounds = corrected_bundle.summary.get("d13_bounds", [])
+        self.assertEqual(len(corrected_bounds), 2)
+        self.assertLess(float(corrected_bounds[0]), float(raw_bounds[0]))
+
+        raw_y = raw_bundle.figures.get("diagnostics", {}).get("data", [{}])[0].get("y", [])
+        corrected_y = corrected_bundle.figures.get("diagnostics", {}).get("data", [{}])[0].get("y", [])
+        self.assertNotEqual(raw_y, corrected_y)
+
+    def test_diagnostics_endpoint_includes_diff_signal_vs_isotope_scatter_plots(self) -> None:
+        df = sample_processing_df().copy()
+        df["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
+        df["total_co2"] = [1.0, 1.1, 1.2, 1.3]
+        df["p_gases"] = [201.0, 202.0, 203.0, 204.0]
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        bundle = api_main.diagnostics(
+            self.session_id,
+            color_param="Date",
+            identifier_filter=[],
+            d13_min=None,
+            d13_max=None,
+            d18_min=None,
+            d18_max=None,
+        )
+
+        diagnostics_figure = bundle.figures.get("diagnostics", {})
+        traces = diagnostics_figure.get("data", [])
+        expected_x = pd.to_numeric(df["1  Cycle Int  Diff Samp-Ref  44"], errors="coerce").tolist()
+        expected_d18 = pd.to_numeric(df["d 18O/16O  Mean"], errors="coerce").tolist()
+        expected_d13 = pd.to_numeric(df["d 13C/12C  Mean"], errors="coerce").tolist()
+
+        def _parse_numeric_vector(payload: object) -> list[float]:
+            if isinstance(payload, list):
+                values: list[float] = []
+                for item in payload:
+                    try:
+                        values.append(float(item))
+                    except (TypeError, ValueError):
+                        continue
+                return values
+            if isinstance(payload, dict) and "bdata" in payload:
+                dtype_name = str(payload.get("dtype", "f8"))
+                encoded = str(payload.get("bdata", ""))
+                if not encoded:
+                    return []
+                try:
+                    decoded = base64.b64decode(encoded)
+                    return np.frombuffer(decoded, dtype=np.dtype(dtype_name)).astype(float).tolist()
+                except Exception:
+                    return []
+            return []
+
+        def _trace_matches(trace: dict[str, object], expected_y: list[float]) -> bool:
+            x_values = _parse_numeric_vector(trace.get("x", []))
+            y_values = _parse_numeric_vector(trace.get("y", []))
+            return x_values == expected_x and y_values == expected_y
+
+        self.assertTrue(any(_trace_matches(trace, expected_d18) for trace in traces))
+        self.assertTrue(any(_trace_matches(trace, expected_d13) for trace in traces))
+
+        annotations = diagnostics_figure.get("layout", {}).get("annotations", [])
+        subplot_titles = {
+            str(annotation.get("text", "")).strip()
+            for annotation in annotations
+            if isinstance(annotation, dict)
+        }
+        self.assertIn("d18O vs Diff Signal Intensity", subplot_titles)
+        self.assertIn("d13C vs Diff Signal Intensity", subplot_titles)
 
     def test_client_output_precision_uses_full_working_frame(self) -> None:
         df = sample_processing_df()

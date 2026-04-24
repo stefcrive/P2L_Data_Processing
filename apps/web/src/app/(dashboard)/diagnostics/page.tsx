@@ -1,15 +1,30 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 
 import { PlotlyChart } from "@/components/charts/plotly-chart";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
 import { api } from "@/lib/api";
+import type { CalibrationConfig, CalibrationPrecisionSummary } from "@/lib/types";
 import { useSessionStore } from "@/store/use-session-store";
 
 const RANGE_FETCH_DEBOUNCE_MS = 300;
+type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
+const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
+const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
+const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
+const LINEARITY_INTENSITY_OPTIONS = [
+  LINEARITY_INTENSITY_SAMP44,
+  LINEARITY_INTENSITY_DIFF44,
+  LINEARITY_INTENSITY_MISMATCH44,
+] as const;
+const LINEARITY_INTENSITY_OPTION_LABELS: Record<(typeof LINEARITY_INTENSITY_OPTIONS)[number], string> = {
+  [LINEARITY_INTENSITY_SAMP44]: "Sample intensity",
+  [LINEARITY_INTENSITY_DIFF44]: "Intensity diff",
+  [LINEARITY_INTENSITY_MISMATCH44]: "Pressure-adjusted int diff",
+};
 type ColorScaleBounds = {
   min: number;
   max: number;
@@ -18,6 +33,82 @@ type FigureShape = Record<string, unknown> & {
   data: Array<Record<string, unknown>>;
   layout: Record<string, unknown>;
 };
+
+function getLinearityIntensityOptionLabel(value: string): string {
+  if (value in LINEARITY_INTENSITY_OPTION_LABELS) {
+    return LINEARITY_INTENSITY_OPTION_LABELS[value as (typeof LINEARITY_INTENSITY_OPTIONS)[number]];
+  }
+  return value;
+}
+
+function getLinearityCoefficientLabel(
+  isotope: "d13C" | "d18O",
+  intensityCol: string,
+  quadratic: boolean,
+): string {
+  const prefix = isotope === "d13C" ? "d13C" : "d18O";
+  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
+    return quadratic
+      ? `${prefix} pressure-weighted mismatch coefficient per (10V)^2`
+      : `${prefix} pressure-weighted mismatch coefficient`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
+    return quadratic ? `${prefix} intensity-diff coefficient per (10V)^2` : `${prefix} intensity-diff coefficient per 10V`;
+  }
+  return quadratic ? `${prefix} coefficient per (10V)^2` : `${prefix} coefficient per 10V`;
+}
+
+function linearityOffsetWithFallback(value: number | null | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function readLinearityOffsetValue(linearity: CalibrationConfig["linearity"], field: LinearityOffsetField): number {
+  if (field === "line_1_offset_d13") {
+    return linearityOffsetWithFallback(linearity.line_1_offset_d13, linearityOffsetWithFallback(linearity.line_1_offset, 0));
+  }
+  if (field === "line_1_offset_d18") {
+    return linearityOffsetWithFallback(linearity.line_1_offset_d18, linearityOffsetWithFallback(linearity.line_1_offset, 0));
+  }
+  if (field === "line_2_offset_d13") {
+    return linearityOffsetWithFallback(linearity.line_2_offset_d13, linearityOffsetWithFallback(linearity.line_2_offset, 0));
+  }
+  return linearityOffsetWithFallback(linearity.line_2_offset_d18, linearityOffsetWithFallback(linearity.line_2_offset, 0));
+}
+
+function normalizeLinearityConfigForCompare(linearity: CalibrationConfig["linearity"] | null | undefined) {
+  if (!linearity) {
+    return null;
+  }
+  return {
+    ...linearity,
+    max_sample_intensity: linearity.max_sample_intensity ?? null,
+    line_1_offset_d13: linearity.line_1_offset_d13 ?? null,
+    line_1_offset_d18: linearity.line_1_offset_d18 ?? null,
+    line_2_offset_d13: linearity.line_2_offset_d13 ?? null,
+    line_2_offset_d18: linearity.line_2_offset_d18 ?? null,
+  };
+}
+
+function linearityConfigEquals(
+  left: CalibrationConfig["linearity"] | null | undefined,
+  right: CalibrationConfig["linearity"] | null | undefined,
+): boolean {
+  return JSON.stringify(normalizeLinearityConfigForCompare(left)) === JSON.stringify(normalizeLinearityConfigForCompare(right));
+}
+
+function formatPrecisionMetric(value?: number | null): string {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "N/A";
+  }
+  return `${value.toFixed(3)} permil`;
+}
+
+function formatCoefficient(value?: number | null): string {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "N/A";
+  }
+  return value.toFixed(3);
+}
 
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
@@ -406,6 +497,7 @@ function RangeSliderControl({
 
 export default function DiagnosticsPage() {
   const sessionId = useSessionStore((state) => state.sessionId);
+  const queryClient = useQueryClient();
   const [colorParam, setColorParam] = useState("Date");
   const [identifierFilter, setIdentifierFilter] = useState<string[]>([]);
   const [d13Range, setD13Range] = useState<[number, number] | null>(null);
@@ -414,6 +506,7 @@ export default function DiagnosticsPage() {
   const [appliedD18Range, setAppliedD18Range] = useState<[number, number] | null>(null);
   const [colorScaleRange, setColorScaleRange] = useState<[number, number] | null>(null);
   const [colorScaleRangeParam, setColorScaleRangeParam] = useState<string | null>(null);
+  const [sharedLinearityConfig, setSharedLinearityConfig] = useState<CalibrationConfig["linearity"] | null>(null);
 
   const { data, error } = useQuery({
     queryKey: [
@@ -432,6 +525,24 @@ export default function DiagnosticsPage() {
         d18_range: appliedD18Range,
       }),
     enabled: Boolean(sessionId),
+  });
+  const calibrationWorkspaceQuery = useQuery({
+    queryKey: ["calibration-workspace", sessionId],
+    queryFn: () => api.getCalibrationWorkspace(sessionId!),
+    enabled: Boolean(sessionId),
+  });
+  const saveSharedLinearityMutation = useMutation({
+    mutationFn: (nextLinearity: CalibrationConfig["linearity"]) =>
+      api.setCalibrationLinearity(
+        sessionId!,
+        nextLinearity,
+        calibrationWorkspaceQuery.data?.config?.selected_standards ?? [],
+      ),
+    onSuccess: async (workspace) => {
+      queryClient.setQueryData(["calibration-workspace", sessionId], workspace);
+      setSharedLinearityConfig(workspace.config.linearity);
+      await queryClient.invalidateQueries({ queryKey: ["diagnostics", sessionId] });
+    },
   });
 
   const summary = useMemo(() => (data?.summary ?? {}) as Record<string, unknown>, [data?.summary]);
@@ -454,6 +565,26 @@ export default function DiagnosticsPage() {
     [diagnosticsFigure, effectiveColorScaleRange],
   );
   const diagnosticsMatrixHeight = useMemo(() => resolveFigureHeight(data?.figures?.diagnostics, 2600), [data?.figures?.diagnostics]);
+  const activeLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config?.linearity ?? null;
+  const selectedLinearityIntensityCol = activeLinearity
+    ? LINEARITY_INTENSITY_OPTIONS.includes(activeLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
+      ? activeLinearity.intensity_col
+      : activeLinearity.use_diff_intensity
+        ? LINEARITY_INTENSITY_DIFF44
+        : LINEARITY_INTENSITY_SAMP44
+    : LINEARITY_INTENSITY_SAMP44;
+  const selectedLinearityBasisLabel = getLinearityIntensityOptionLabel(selectedLinearityIntensityCol);
+  const d13Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d13C ?? {}) as Record<string, unknown>;
+  const d18Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d18O ?? {}) as Record<string, unknown>;
+  const d13FitSlope = toFiniteNumber(d13Fit.slope);
+  const d18FitSlope = toFiniteNumber(d18Fit.slope);
+  const d13FitQuad = toFiniteNumber(d13Fit.quad);
+  const d18FitQuad = toFiniteNumber(d18Fit.quad);
+  const selectedStandards = calibrationWorkspaceQuery.data?.config.selected_standards ?? [];
+  const standardPrecisionRows = (calibrationWorkspaceQuery.data?.precision_summaries ?? [])
+    .filter((item: CalibrationPrecisionSummary) => selectedStandards.includes(item.standard))
+    .sort((left: CalibrationPrecisionSummary, right: CalibrationPrecisionSummary) => left.standard.localeCompare(right.standard));
+  const coefficientOffsetEnabled = Boolean(activeLinearity?.manual_override_enabled);
 
   useEffect(() => {
     if (availableColorParams.length && !availableColorParams.includes(colorParam)) {
@@ -462,11 +593,45 @@ export default function DiagnosticsPage() {
   }, [availableColorParams, colorParam]);
 
   useEffect(() => {
-    const bounds = colorScaleBounds ?? { min: 0, max: 1 };
+    if (calibrationWorkspaceQuery.data?.config?.linearity) {
+      setSharedLinearityConfig(calibrationWorkspaceQuery.data.config.linearity);
+    }
+  }, [calibrationWorkspaceQuery.data]);
+
+  useEffect(() => {
+    if (
+      !sessionId ||
+      !sharedLinearityConfig ||
+      !calibrationWorkspaceQuery.data ||
+      saveSharedLinearityMutation.isPending
+    ) {
+      return;
+    }
+    if (linearityConfigEquals(sharedLinearityConfig, calibrationWorkspaceQuery.data.config.linearity)) {
+      return;
+    }
+    saveSharedLinearityMutation.mutate(sharedLinearityConfig);
+  }, [
+    calibrationWorkspaceQuery.data,
+    saveSharedLinearityMutation,
+    saveSharedLinearityMutation.isPending,
+    sessionId,
+    sharedLinearityConfig,
+  ]);
+
+  useEffect(() => {
+    if (!colorScaleBounds) {
+      return;
+    }
+    const bounds = colorScaleBounds;
     const parameterChanged = colorScaleRangeParam !== colorParam;
     const fullRange: [number, number] = [bounds.min, bounds.max];
     setColorScaleRange((current) => {
       if (!current || parameterChanged) {
+        return fullRange;
+      }
+      const isOutsideBounds = current[1] < bounds.min || current[0] > bounds.max;
+      if (isOutsideBounds) {
         return fullRange;
       }
       const normalized = normalizeColorScaleRange(current, bounds);
@@ -536,6 +701,67 @@ export default function DiagnosticsPage() {
     }
   }, [d18Bounds, d18Range]);
 
+  function updateSharedLinearity(
+    key: keyof CalibrationConfig["linearity"],
+    value: boolean | number | string | null,
+  ) {
+    setSharedLinearityConfig((current) =>
+      current
+        ? {
+            ...current,
+            [key]: value,
+          }
+        : current,
+    );
+  }
+
+  function updateSharedLinearityIntensityCol(intensityCol: string) {
+    setSharedLinearityConfig((current) =>
+      current
+        ? {
+            ...current,
+            intensity_col: intensityCol,
+            use_diff_intensity: intensityCol === LINEARITY_INTENSITY_DIFF44,
+          }
+        : current,
+    );
+  }
+
+  function updateLinearityCoefficientOffset(isotopeKey: "d13C" | "d18O", value: number) {
+    setSharedLinearityConfig((current) => {
+      if (!current) {
+        return current;
+      }
+      const next = { ...current };
+      if (next.quadratic) {
+        if (isotopeKey === "d13C") {
+          next.manual_d13_per_10v2 = value;
+        } else {
+          next.manual_d18_per_10v2 = value;
+        }
+      } else if (isotopeKey === "d13C") {
+        next.manual_d13_per_10v = value;
+      } else {
+        next.manual_d18_per_10v = value;
+      }
+      const d13Offset = next.quadratic ? Number(next.manual_d13_per_10v2 ?? 0) : Number(next.manual_d13_per_10v ?? 0);
+      const d18Offset = next.quadratic ? Number(next.manual_d18_per_10v2 ?? 0) : Number(next.manual_d18_per_10v ?? 0);
+      const hasOffset = Math.abs(d13Offset) > 1e-12 || Math.abs(d18Offset) > 1e-12;
+      next.manual_override_enabled = hasOffset;
+      return next;
+    });
+  }
+
+  function handleLinearityOffsetChange(field: LinearityOffsetField, rawValue: string) {
+    const trimmed = rawValue.trim();
+    if (trimmed === "") {
+      updateSharedLinearity(field, null);
+      return;
+    }
+    const parsed = Number(trimmed);
+    updateSharedLinearity(field, Number.isFinite(parsed) ? parsed : 0);
+  }
+
   if (!sessionId) {
     return (
       <Card>
@@ -550,13 +776,13 @@ export default function DiagnosticsPage() {
   return (
     <div className="space-y-6">
       <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
-        <aside className="space-y-6 xl:sticky xl:top-6 xl:self-start">
+        <aside className="space-y-6 xl:sticky xl:top-6 xl:max-h-[calc(100vh-2rem)] xl:self-start xl:overflow-y-auto xl:pr-1">
           <Card>
             <CardHeader>
               <CardTitle>Diagnostics Controls</CardTitle>
               <CardDescription>Configure filters and visual encoding for the diagnostics charts.</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-6 xl:max-h-[calc(100vh-12rem)] xl:overflow-y-auto xl:pr-2">
+            <CardContent className="space-y-6">
               <div className="space-y-3">
                 <div className="form-section-title">Parameter Selection</div>
                 <label className="form-field">
@@ -609,6 +835,194 @@ export default function DiagnosticsPage() {
               <div className="text-xs font-medium tracking-[0.01em] text-stone-500">
                 Rows in scope: {Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}
               </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>Linearity (Shared with Processing and Calibration)</CardTitle>
+              <CardDescription>Edits here update the same shared calibration linearity configuration.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="rounded-full bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                {saveSharedLinearityMutation.isPending ? <span className="text-xs text-stone-500">Saving...</span> : null}
+              </div>
+              {activeLinearity ? (
+                <>
+                  <label className="flex items-start gap-2 text-sm text-stone-700">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 rounded border-stone-300 text-stone-900"
+                      checked={activeLinearity.apply}
+                      onChange={(event) => updateSharedLinearity("apply", event.target.checked)}
+                    />
+                    <span>Enable linearity correction</span>
+                  </label>
+                  <label className="flex items-start gap-2 text-sm text-stone-700">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 rounded border-stone-300 text-stone-900"
+                      checked={Boolean(activeLinearity.quadratic)}
+                      onChange={(event) => updateSharedLinearity("quadratic", event.target.checked)}
+                    />
+                    <span>Use quadratic linearity relationship</span>
+                  </label>
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">Linearity basis</span>
+                    <select
+                      value={selectedLinearityIntensityCol}
+                      onChange={(event) => updateSharedLinearityIntensityCol(event.target.value)}
+                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                    >
+                      {LINEARITY_INTENSITY_OPTIONS.map((option) => (
+                        <option key={option} value={option}>
+                          {getLinearityIntensityOptionLabel(option)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">Max sample intensity</span>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min={0}
+                        value={activeLinearity.max_sample_intensity ?? ""}
+                        onChange={(event) => {
+                          const rawValue = event.target.value.trim();
+                          if (rawValue === "") {
+                            updateSharedLinearity("max_sample_intensity", null);
+                            return;
+                          }
+                          const parsed = Number(rawValue);
+                          updateSharedLinearity("max_sample_intensity", Number.isFinite(parsed) ? parsed : null);
+                        }}
+                        className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                      />
+                    </label>
+                  ) : null}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-lg border border-stone-200 p-3 text-sm">
+                      <div className="text-xs uppercase tracking-wide text-stone-500">d13C fitted coefficient</div>
+                      <div className="mt-1 font-semibold text-stone-900">
+                        {activeLinearity.quadratic
+                          ? `${formatCoefficient(d13FitSlope)} (linear), ${formatCoefficient(d13FitQuad)} (quadratic)`
+                          : formatCoefficient(d13FitSlope)}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-stone-200 p-3 text-sm">
+                      <div className="text-xs uppercase tracking-wide text-stone-500">d18O fitted coefficient</div>
+                      <div className="mt-1 font-semibold text-stone-900">
+                        {activeLinearity.quadratic
+                          ? `${formatCoefficient(d18FitSlope)} (linear), ${formatCoefficient(d18FitQuad)} (quadratic)`
+                          : formatCoefficient(d18FitSlope)}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">
+                        {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, Boolean(activeLinearity.quadratic))}
+                      </span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={activeLinearity.quadratic ? (activeLinearity.manual_d13_per_10v2 ?? 0) : (activeLinearity.manual_d13_per_10v ?? 0)}
+                        onChange={(event) => updateLinearityCoefficientOffset("d13C", Number(event.target.value))}
+                        className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                      />
+                    </label>
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">
+                        {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, Boolean(activeLinearity.quadratic))}
+                      </span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={activeLinearity.quadratic ? (activeLinearity.manual_d18_per_10v2 ?? 0) : (activeLinearity.manual_d18_per_10v ?? 0)}
+                        onChange={(event) => updateLinearityCoefficientOffset("d18O", Number(event.target.value))}
+                        className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                      />
+                    </label>
+                  </div>
+                  <div className="text-xs text-stone-500">
+                    Coefficient offset active: {coefficientOffsetEnabled ? "Yes" : "No"}
+                  </div>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-3">
+                      <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="text-sm">
+                          <span className="mb-1 block text-stone-700">d13C</span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={readLinearityOffsetValue(activeLinearity, "line_1_offset_d13")}
+                            onChange={(event) => handleLinearityOffsetChange("line_1_offset_d13", event.target.value)}
+                            className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                          />
+                        </label>
+                        <label className="text-sm">
+                          <span className="mb-1 block text-stone-700">d18O</span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={readLinearityOffsetValue(activeLinearity, "line_1_offset_d18")}
+                            onChange={(event) => handleLinearityOffsetChange("line_1_offset_d18", event.target.value)}
+                            className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                          />
+                        </label>
+                      </div>
+                    </div>
+                    <div className="space-y-3">
+                      <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="text-sm">
+                          <span className="mb-1 block text-stone-700">d13C</span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={readLinearityOffsetValue(activeLinearity, "line_2_offset_d13")}
+                            onChange={(event) => handleLinearityOffsetChange("line_2_offset_d13", event.target.value)}
+                            className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                          />
+                        </label>
+                        <label className="text-sm">
+                          <span className="mb-1 block text-stone-700">d18O</span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={readLinearityOffsetValue(activeLinearity, "line_2_offset_d18")}
+                            onChange={(event) => handleLinearityOffsetChange("line_2_offset_d18", event.target.value)}
+                            className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                  {activeLinearity.apply ? (
+                    <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
+                      <div className="text-sm font-medium text-stone-800">Linearity-corrected standard precision</div>
+                      {standardPrecisionRows.length ? (
+                        standardPrecisionRows.map((item: CalibrationPrecisionSummary) => (
+                          <div key={item.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
+                            <span className="font-medium text-stone-800">{item.standard}</span>
+                            <span>d13C: {formatPrecisionMetric(item.d13_linearity_corrected_precision)}</span>
+                            <span>d18O: {formatPrecisionMetric(item.d18_linearity_corrected_precision)}</span>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="text-xs text-stone-500">No selected standards available for precision.</div>
+                      )}
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">
+                  Load calibration workspace to edit shared linearity parameters.
+                </div>
+              )}
             </CardContent>
           </Card>
         </aside>

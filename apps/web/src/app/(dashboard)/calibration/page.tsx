@@ -546,6 +546,10 @@ function asBoolean(value: unknown): boolean {
   return false;
 }
 
+function isPartiallySaturatedCollectorStatus(value: unknown): boolean {
+  return String(value ?? "").trim().toLowerCase() === "partially saturated collectors";
+}
+
 function isDeltaColumnLabel(label: string): boolean {
   const normalized = label.trim().toLowerCase();
   return normalized.includes("d13") || normalized.includes("d18");
@@ -572,6 +576,14 @@ function hasSampleCollectorTrace(trace: Record<string, unknown>, mass: 44 | 45 |
 function hasReferenceCollectorTrace(trace: Record<string, unknown>, mass: 44 | 45 | 46): boolean {
   const traceName = String(trace.name ?? "").toLowerCase();
   return traceName.includes(String(mass)) && (traceName.includes("ref") || traceName.includes("std") || traceName.includes("reference"));
+}
+
+function getSetValueCycleNumber(tableRows: Array<Record<string, unknown>>): number | null {
+  const selectedRow = tableRows.find((row) => asBoolean(row["Set Value Cycle"]));
+  if (!selectedRow) {
+    return null;
+  }
+  return toFiniteNumber(selectedRow["Cycle"]);
 }
 
 function ensureCollectorIntensityTraces(
@@ -654,12 +666,86 @@ function ensureCollectorIntensityTraces(
     }
   }
 
-  if (traces.length === existingTraceCount) {
+  let hasChanges = traces.length !== existingTraceCount;
+  let nextLayout: Record<string, unknown> = cloned.layout;
+  const setValueCycle = getSetValueCycleNumber(tableRows);
+  if (setValueCycle != null) {
+    const highlightX: number[] = [];
+    const highlightY: number[] = [];
+    for (const trace of traces) {
+      const xVals = coerceVector(trace.x);
+      const yVals = coerceVector(trace.y);
+      if (!xVals || !yVals || xVals.length !== yVals.length) {
+        continue;
+      }
+      for (let index = 0; index < xVals.length; index += 1) {
+        const x = toFiniteNumber(xVals[index]);
+        const y = toFiniteNumber(yVals[index]);
+        if (x == null || y == null) {
+          continue;
+        }
+        if (Math.abs(x - setValueCycle) > 0.0001) {
+          continue;
+        }
+        highlightX.push(x);
+        highlightY.push(y);
+      }
+    }
+    if (highlightX.length) {
+      traces.push({
+        type: "scatter",
+        mode: "markers",
+        name: "Set-value cycle",
+        x: highlightX,
+        y: highlightY,
+        marker: {
+          size: 11,
+          color: "#7C3AED",
+          symbol: "diamond-open",
+          line: { color: "#7C3AED", width: 2 },
+        },
+      });
+      hasChanges = true;
+    }
+    const existingShapes = Array.isArray(cloned.layout.shapes) ? [...(cloned.layout.shapes as Array<Record<string, unknown>>)] : [];
+    existingShapes.push({
+      type: "line",
+      x0: setValueCycle,
+      x1: setValueCycle,
+      y0: 0,
+      y1: 1,
+      xref: "x",
+      yref: "paper",
+      line: { color: "#7C3AED", width: 2, dash: "dot" },
+    });
+    const existingAnnotations = Array.isArray(cloned.layout.annotations)
+      ? [...(cloned.layout.annotations as Array<Record<string, unknown>>)]
+      : [];
+    existingAnnotations.push({
+      x: setValueCycle,
+      y: 1,
+      xref: "x",
+      yref: "paper",
+      yanchor: "bottom",
+      showarrow: false,
+      text: "Set value cycle",
+      font: { color: "#5B21B6", size: 11 },
+    });
+    nextLayout = {
+      ...cloned.layout,
+      shapes: existingShapes,
+      annotations: existingAnnotations,
+    };
+    hasChanges = true;
+  }
+
+  if (!hasChanges) {
     return cloned;
   }
   return {
     ...cloned,
     data: traces,
+    layout: nextLayout,
   };
 }
 
@@ -1184,15 +1270,18 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
     const excludedD13 = asBoolean(row["Excluded d13C"]);
     const excludedD18 = asBoolean(row["Excluded d18O"]);
     const excludedAny = asBoolean(row["Excluded (Saturation)"]) || excludedD13 || excludedD18;
+    const setValueCycle = asBoolean(row["Set Value Cycle"]);
     return {
       ...row,
       "Cycle status": excludedAny ? "Saturated" : "Successful",
+      "Set Value Cycle": setValueCycle,
     };
   });
 
   const preferredColumns = [
     "Cycle",
     "Cycle status",
+    "Set Value Cycle",
     "SMP Int m/z 44 (V)",
     "REF Int m/z 44 (V)",
     "SMP Int m/z 45 (V)",
@@ -1236,6 +1325,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className="rounded-full bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
         <span className="rounded-full bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
         <span className="rounded-full bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
       </div>
@@ -1253,17 +1343,25 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
           <tbody className="divide-y divide-stone-100">
             {statusRows.slice(0, 25).map((row, rowIndex) => {
               const saturated = String(row["Cycle status"]) === "Saturated";
+              const setValueCycle = asBoolean(row["Set Value Cycle"]);
               return (
-                <tr key={rowIndex} className={cn(saturated ? "bg-rose-50/80" : "bg-emerald-50/70")}>
+                <tr key={rowIndex} className={cn(setValueCycle ? "bg-violet-100/90" : saturated ? "bg-rose-50/80" : "bg-emerald-50/70")}>
                   {columns.map((column) => {
                     const cellValue = row[column];
                     const flaggedColumn = column.startsWith("Excluded");
                     const flaggedValue = flaggedColumn ? asBoolean(cellValue) : false;
+                    const setValueColumn = column === "Set Value Cycle";
+                    const setValueColumnValue = setValueColumn ? asBoolean(cellValue) : false;
                     return (
                       <td
                         key={column}
                         className={cn(
                           "px-3 py-2",
+                          setValueColumn
+                            ? setValueColumnValue
+                              ? "font-semibold text-violet-800"
+                              : "font-medium text-stone-500"
+                            : "",
                           flaggedColumn
                             ? flaggedValue
                               ? "font-medium text-rose-700"
@@ -1318,7 +1416,9 @@ function DiagnosticsPanel({
 }) {
   const cycleMean = diagnostics?.cycle_mean ?? {};
   const validMean = asNumber(cycleMean.valid_mean);
-  const finalMean = asNumber(cycleMean.mean);
+  const firstValidCycle = asNumber(cycleMean.selected_value) ?? asNumber(cycleMean.mean);
+  const collectorStatus = asString((diagnostics?.target ?? {})["collector_status"]);
+  const isPartiallySaturated = isPartiallySaturatedCollectorStatus(collectorStatus);
   const targetIntensity = asNumber(cycleMean.linearity_target_intensity);
   const prediction = asNumber(cycleMean.linearity_prediction);
   const prevNeighbor = cycleMean.prev_neighbor as Record<string, unknown> | undefined;
@@ -1331,10 +1431,11 @@ function DiagnosticsPanel({
     typeof linearityEnabled === "boolean" &&
     typeof onLinearityEnabledChange === "function" &&
     typeof linearityTargetIntensity === "number" &&
-    typeof onLinearityTargetIntensityChange === "function";
+    typeof onLinearityTargetIntensityChange === "function" &&
+    !isPartiallySaturated;
   const shouldRenderLinearityPreview = showLinearityChart || Boolean(linearityEnabled);
   const canPickValidMean = typeof onPickDeltaValue === "function" && validMean != null;
-  const canPickFinalMean = typeof onPickDeltaValue === "function" && finalMean != null;
+  const canPickFinalMean = typeof onPickDeltaValue === "function" && firstValidCycle != null;
 
   return (
     <Card className="border-stone-300">
@@ -1361,14 +1462,14 @@ function DiagnosticsPanel({
                   canPickValidMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">Valid Cycle Mean</div>
+                <div className="text-xs uppercase tracking-wide text-stone-500">Cycle Mean</div>
                 <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMean)}</div>
               </button>
               <button
                 type="button"
                 onClick={() => {
                   if (canPickFinalMean) {
-                    onPickDeltaValue(finalMean);
+                    onPickDeltaValue(firstValidCycle);
                   }
                 }}
                 disabled={!canPickFinalMean}
@@ -1377,8 +1478,8 @@ function DiagnosticsPanel({
                   canPickFinalMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">Final Mean</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(finalMean)}</div>
+                <div className="text-xs uppercase tracking-wide text-stone-500">First valid cycle</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(firstValidCycle)}</div>
               </button>
               <div className="rounded-lg border border-stone-200 p-3">
                 <div className="text-xs uppercase tracking-wide text-stone-500">Method</div>
@@ -1843,26 +1944,46 @@ export default function CalibrationPage() {
     if (!activeIsotopeTarget) {
       return;
     }
+    const collectorStatus = asString(singleDiagnosticsQuery.data?.target?.collector_status);
+    const selectedCycleValue = asNumber(singleDiagnosticsQuery.data?.cycle_mean?.selected_value);
     const diagnosticsCurrentValue = asNumber(singleDiagnosticsQuery.data?.target?.current_value);
+    const seedValue =
+      isPartiallySaturatedCollectorStatus(collectorStatus) && selectedCycleValue != null
+        ? selectedCycleValue
+        : diagnosticsCurrentValue;
     setSingleValue(
-      diagnosticsCurrentValue != null ? roundDeltaValue(diagnosticsCurrentValue) : roundDeltaValue(activeIsotopeTarget.currentValue ?? 0),
+      seedValue != null ? roundDeltaValue(seedValue) : roundDeltaValue(activeIsotopeTarget.currentValue ?? 0),
     );
-  }, [activeIsotopeTarget, singleDiagnosticsQuery.data?.target]);
+  }, [activeIsotopeTarget, singleDiagnosticsQuery.data?.cycle_mean, singleDiagnosticsQuery.data?.target]);
 
   useEffect(() => {
     if (activeCrossTarget) {
+      const d13CollectorStatus = asString(crossD13DiagnosticsQuery.data?.target?.collector_status);
+      const d18CollectorStatus = asString(crossD18DiagnosticsQuery.data?.target?.collector_status);
+      const d13SelectedCycleValue = asNumber(crossD13DiagnosticsQuery.data?.cycle_mean?.selected_value);
+      const d18SelectedCycleValue = asNumber(crossD18DiagnosticsQuery.data?.cycle_mean?.selected_value);
       const nextD13 =
-        typeof crossD13DiagnosticsQuery.data?.target?.current_value === "number"
-          ? roundDeltaValue(crossD13DiagnosticsQuery.data.target.current_value as number)
+        isPartiallySaturatedCollectorStatus(d13CollectorStatus) && d13SelectedCycleValue != null
+          ? roundDeltaValue(d13SelectedCycleValue)
+          : typeof crossD13DiagnosticsQuery.data?.target?.current_value === "number"
+            ? roundDeltaValue(crossD13DiagnosticsQuery.data.target.current_value as number)
           : roundDeltaValue(activeCrossTarget.currentD13 ?? 0);
       const nextD18 =
-        typeof crossD18DiagnosticsQuery.data?.target?.current_value === "number"
-          ? roundDeltaValue(crossD18DiagnosticsQuery.data.target.current_value as number)
+        isPartiallySaturatedCollectorStatus(d18CollectorStatus) && d18SelectedCycleValue != null
+          ? roundDeltaValue(d18SelectedCycleValue)
+          : typeof crossD18DiagnosticsQuery.data?.target?.current_value === "number"
+            ? roundDeltaValue(crossD18DiagnosticsQuery.data.target.current_value as number)
           : roundDeltaValue(activeCrossTarget.currentD18 ?? 0);
       setCrossD13Value(nextD13);
       setCrossD18Value(nextD18);
     }
-  }, [activeCrossTarget, crossD13DiagnosticsQuery.data?.target, crossD18DiagnosticsQuery.data?.target]);
+  }, [
+    activeCrossTarget,
+    crossD13DiagnosticsQuery.data?.cycle_mean,
+    crossD13DiagnosticsQuery.data?.target,
+    crossD18DiagnosticsQuery.data?.cycle_mean,
+    crossD18DiagnosticsQuery.data?.target,
+  ]);
 
   useEffect(() => {
     setConfig(null);
@@ -1990,14 +2111,18 @@ export default function CalibrationPage() {
   }, [workspaceForColorScale]);
 
   useEffect(() => {
-    if (!activeColorParam) {
+    if (!activeColorParam || !colorScaleBounds) {
       return;
     }
-    const bounds = colorScaleBounds ?? { min: 0, max: 1 };
+    const bounds = colorScaleBounds;
     const fullRange: [number, number] = [bounds.min, bounds.max];
     const parameterChanged = colorScaleRangeParam !== activeColorParam;
     setColorScaleRange((current) => {
       if (!current || parameterChanged) {
+        return fullRange;
+      }
+      const isOutsideBounds = current[1] < bounds.min || current[0] > bounds.max;
+      if (isOutsideBounds) {
         return fullRange;
       }
       const normalized = normalizeColorScaleRange(current, bounds);
@@ -2230,6 +2355,72 @@ export default function CalibrationPage() {
       setLinearityOffsetEditing((current) => (current === field ? null : current));
       event.currentTarget.blur();
     }
+  }
+
+  function coerceSequenceNeighbor(
+    value: unknown,
+    isotopeKey: "d13C" | "d18O",
+  ): { rowLabel: string; identifier2: string; value: number | null; isotopeKey: "d13C" | "d18O" } | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+    const payload = value as Record<string, unknown>;
+    const rowLabel = asString(payload.row_label ?? payload.rowLabel).trim();
+    if (!rowLabel) {
+      return null;
+    }
+    return {
+      rowLabel,
+      identifier2: asString(payload.identifier_2 ?? payload.identifier2).trim(),
+      value: asNumber(payload.value),
+      isotopeKey,
+    };
+  }
+
+  const isotopeCycleMean = (singleDiagnosticsQuery.data?.cycle_mean ?? null) as Record<string, unknown> | null;
+  const crossD13CycleMean = (crossD13DiagnosticsQuery.data?.cycle_mean ?? null) as Record<string, unknown> | null;
+  const crossD18CycleMean = (crossD18DiagnosticsQuery.data?.cycle_mean ?? null) as Record<string, unknown> | null;
+  const prevSequenceNeighbor = activeCrossTarget
+    ? coerceSequenceNeighbor(crossD13CycleMean?.prev_neighbor, "d13C") ??
+      coerceSequenceNeighbor(crossD18CycleMean?.prev_neighbor, "d18O")
+    : activeIsotopeTarget
+      ? coerceSequenceNeighbor(isotopeCycleMean?.prev_neighbor, activeIsotopeTarget.isotopeKey as "d13C" | "d18O")
+      : null;
+  const nextSequenceNeighbor = activeCrossTarget
+    ? coerceSequenceNeighbor(crossD13CycleMean?.next_neighbor, "d13C") ??
+      coerceSequenceNeighbor(crossD18CycleMean?.next_neighbor, "d18O")
+    : activeIsotopeTarget
+      ? coerceSequenceNeighbor(isotopeCycleMean?.next_neighbor, activeIsotopeTarget.isotopeKey as "d13C" | "d18O")
+      : null;
+  const useSelectionIndexNavigation = selectedTargets.length > 1;
+  const canMoveToPrevTarget = useSelectionIndexNavigation ? activeTargetIndex > 0 : Boolean(prevSequenceNeighbor);
+  const canMoveToNextTarget = useSelectionIndexNavigation ? activeTargetIndex < selectedTargets.length - 1 : Boolean(nextSequenceNeighbor);
+
+  function moveSelectionTarget(direction: "prev" | "next") {
+    if (useSelectionIndexNavigation) {
+      setActiveTargetIndex((index) =>
+        direction === "prev" ? Math.max(0, index - 1) : Math.min(selectedTargets.length - 1, index + 1),
+      );
+      return;
+    }
+    if (!activeTarget) {
+      return;
+    }
+    const neighbor = direction === "prev" ? prevSequenceNeighbor : nextSequenceNeighbor;
+    if (!neighbor) {
+      return;
+    }
+    const nextTarget: SelectedTarget = {
+      ...activeTarget,
+      rowLabel: neighbor.rowLabel,
+      identifier2: neighbor.identifier2 || activeTarget.identifier2,
+      currentValue: activeTarget.isotopeKey === "cross" ? null : neighbor.value,
+      currentD13:
+        activeTarget.isotopeKey === "cross" ? (neighbor.isotopeKey === "d13C" ? neighbor.value : null) : activeTarget.currentD13,
+      currentD18:
+        activeTarget.isotopeKey === "cross" ? (neighbor.isotopeKey === "d18O" ? neighbor.value : null) : activeTarget.currentD18,
+    };
+    setTargets([nextTarget]);
   }
 
   function setTargets(nextTargets: SelectedTarget[]) {
@@ -2940,14 +3131,14 @@ export default function CalibrationPage() {
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <Button variant="outline" size="sm" onClick={() => setActiveTargetIndex((index) => Math.max(0, index - 1))} disabled={activeTargetIndex === 0}>
+                        <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>
                           Prev
                         </Button>
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() => setActiveTargetIndex((index) => Math.min(selectedTargets.length - 1, index + 1))}
-                          disabled={activeTargetIndex >= selectedTargets.length - 1}
+                          onClick={() => moveSelectionTarget("next")}
+                          disabled={!canMoveToNextTarget}
                         >
                           Next
                         </Button>
@@ -2991,21 +3182,6 @@ export default function CalibrationPage() {
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap gap-2">
-                    <Button variant="outline" onClick={resetSelected} disabled={busy}>
-                      Reset selected
-                    </Button>
-                    <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>
-                      Clear selection
-                    </Button>
-                    <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
-                      Force outlier
-                    </Button>
-                    <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
-                      Force keep
-                    </Button>
-                  </div>
-
                   {activeIsotopeTarget ? (
                     <div className="space-y-4">
                       <div className="grid gap-3 sm:grid-cols-2">
@@ -3044,6 +3220,18 @@ export default function CalibrationPage() {
                         </Button>
                         <Button variant="outline" onClick={applySingleInterpolate} disabled={busy}>
                           Interpolate {activeIsotopeTarget.isotopeKey}
+                        </Button>
+                        <Button variant="outline" onClick={resetSelected} disabled={busy}>
+                          Reset selected
+                        </Button>
+                        <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>
+                          Clear selection
+                        </Button>
+                        <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
+                          Force outlier
+                        </Button>
+                        <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
+                          Force keep
                         </Button>
                       </div>
                       <DiagnosticsPanel
@@ -3091,6 +3279,18 @@ export default function CalibrationPage() {
                         <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>
                           Interpolate both isotopes
                         </Button>
+                        <Button variant="outline" onClick={resetSelected} disabled={busy}>
+                          Reset selected
+                        </Button>
+                        <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>
+                          Clear selection
+                        </Button>
+                        <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
+                          Force outlier
+                        </Button>
+                        <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
+                          Force keep
+                        </Button>
                       </div>
                       <div className="grid gap-3 md:grid-cols-2">
                         <div className="rounded-lg border border-stone-200 p-3">
@@ -3103,9 +3303,9 @@ export default function CalibrationPage() {
                           </div>
                           <div className="text-sm text-stone-700">
                             Cycle mean:{" "}
-                            {asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]) == null
+                            {asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]) == null
                               ? "N/A"
-                              : formatDeltaValue(asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]))}
+                              : formatDeltaValue(asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]))}
                           </div>
                           <div className="text-xs text-stone-500">
                             Method: {asString((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
@@ -3121,9 +3321,9 @@ export default function CalibrationPage() {
                           </div>
                           <div className="text-sm text-stone-700">
                             Cycle mean:{" "}
-                            {asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]) == null
+                            {asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]) == null
                               ? "N/A"
-                              : formatDeltaValue(asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]))}
+                              : formatDeltaValue(asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]))}
                           </div>
                           <div className="text-xs text-stone-500">
                             Method: {asString((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}

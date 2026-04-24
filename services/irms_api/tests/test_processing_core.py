@@ -1971,7 +1971,7 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(len(payload.table), 2)
         self.assertEqual(payload.cycle_mean["valid_cycles"], 2)
 
-    def test_build_cycle_diagnostics_payload_applies_linearity_for_partially_saturated_target(self) -> None:
+    def test_build_cycle_diagnostics_payload_uses_first_valid_cycle_for_partially_saturated_target(self) -> None:
         df = sample_processing_df().copy()
         df.loc[0, "Collector Status"] = "Partially Saturated Collectors"
         cycles_df = sample_cycles_df()
@@ -1989,10 +1989,64 @@ class ProcessingCoreTests(unittest.TestCase):
             target_intensity=14.0,
         )
 
-        self.assertEqual(payload.cycle_mean["method"], "linearity_extrapolated_to_target_intensity")
-        self.assertTrue(bool(payload.cycle_mean["linearity_applied"]))
+        self.assertEqual(payload.cycle_mean["method"], "first_valid_cycle")
+        self.assertFalse(bool(payload.cycle_mean["linearity_applied"]))
+        self.assertEqual(payload.cycle_mean["reason"], "partially_saturated_use_first_valid_cycle")
+        self.assertEqual(int(payload.cycle_mean["selected_cycle"]), 1)
+        self.assertAlmostEqual(float(payload.cycle_mean["selected_value"]), 0.9, places=6)
         self.assertAlmostEqual(float(payload.cycle_mean["valid_mean"]), 1.0, places=6)
-        self.assertAlmostEqual(float(payload.cycle_mean["mean"]), 2.0, places=6)
+        self.assertAlmostEqual(float(payload.cycle_mean["mean"]), 0.9, places=6)
+        selected_rows = [row for row in payload.table if bool(row.get("Set Value Cycle"))]
+        self.assertEqual(len(selected_rows), 1)
+        self.assertEqual(int(selected_rows[0]["Cycle"]), 1)
+
+    def test_build_cycle_diagnostics_payload_uses_first_valid_cycle_for_partially_saturated_target_even_with_many_valid_cycles(self) -> None:
+        df = sample_processing_df().copy()
+        df.loc[0, "Collector Status"] = "Partially Saturated Collectors"
+        cycles_df = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", "1", "2", "3", "4", "5", "6"],
+                "Identifier 1": ["SampleA"] * 7,
+                "Identifier 2": ["1"] * 7,
+                "Species": ["Coral"] * 7,
+                "Excel File": ["run1.xlsx"] * 7,
+                "Run ID": ["run-1"] * 7,
+                "Date": ["2025-01-01"] * 7,
+                "d 13C/12C  Mean": [1.0, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6],
+                "d 18O/16O  Mean": [2.0, 2.0, 2.05, 2.1, 2.15, 2.2, 2.25],
+                "Cycle Intensity Samp 44": [15.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+                "Cycle Intensity Ref 44": [10.0, 9.8, 9.8, 9.8, 9.8, 9.8, 9.8],
+                "Cycle Intensity Samp 45": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+                "Cycle Intensity Ref 45": [0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4],
+                "Cycle Intensity Samp 46": [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+                "Cycle Intensity Ref 46": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+            }
+        )
+        target = build_target_info(df, 0, "d13C", {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}})
+        self.assertIsNotNone(target)
+
+        payload = build_cycle_diagnostics_payload(
+            session_id="session-1",
+            df=df,
+            cycles_df=cycles_df,
+            target=target,
+            config=RangeConfig(),
+            edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            correct_linearity=False,
+            target_intensity=14.0,
+        )
+
+        self.assertEqual(int(payload.cycle_mean["valid_cycles"]), 6)
+        self.assertEqual(payload.cycle_mean["method"], "first_valid_cycle")
+        self.assertFalse(bool(payload.cycle_mean["linearity_applied"]))
+        self.assertEqual(payload.cycle_mean["reason"], "partially_saturated_use_first_valid_cycle")
+        self.assertEqual(int(payload.cycle_mean["selected_cycle"]), 1)
+        self.assertAlmostEqual(float(payload.cycle_mean["selected_value"]), 0.6, places=6)
+        self.assertAlmostEqual(float(payload.cycle_mean["valid_mean"]), 1.1, places=6)
+        self.assertAlmostEqual(float(payload.cycle_mean["mean"]), 0.6, places=6)
+        selected_rows = [row for row in payload.table if bool(row.get("Set Value Cycle"))]
+        self.assertEqual(len(selected_rows), 1)
+        self.assertEqual(int(selected_rows[0]["Cycle"]), 1)
 
     def test_build_cycle_diagnostics_payload_uses_column_order_for_unlabeled_duplicate_masses(self) -> None:
         df = sample_processing_df()

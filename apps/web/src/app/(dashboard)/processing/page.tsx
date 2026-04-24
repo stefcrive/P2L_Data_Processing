@@ -334,6 +334,15 @@ function highlightSelectionSourceFigure(
   const cloned = cloneFigure(figure);
   const highlightTraces: Array<Record<string, unknown>> = [];
   const traces = Array.isArray(cloned.data) ? cloned.data : [];
+  const matchedTraces: Array<{
+    trace: Record<string, unknown>;
+    indexes: number[];
+    customdata: unknown[];
+    x: unknown[];
+    y: unknown[];
+    z: unknown[] | null;
+    preferred: boolean;
+  }> = [];
   for (const trace of traces) {
     const customdata = coerceVector(trace.customdata);
     const x = coerceVector(trace.x);
@@ -352,6 +361,22 @@ function highlightSelectionSourceFigure(
     if (!indexes.length) {
       continue;
     }
+    const traceName = String(trace.name ?? "").trim().toLowerCase();
+    const preferred =
+      target.isotopeKey === "cross"
+        ? !traceName.startsWith("calibrated")
+        : traceName.startsWith("raw ");
+    matchedTraces.push({ trace, indexes, customdata, x, y, z, preferred });
+  }
+  const preferredMatches = matchedTraces.filter((item) => item.preferred);
+  const highlightSources =
+    preferredMatches.length
+      ? preferredMatches
+      : target.isotopeKey === "cross"
+        ? matchedTraces
+        : [];
+  for (const source of highlightSources) {
+    const { trace, indexes, customdata, x, y, z } = source;
     const traceType = String(trace.type ?? "scatter");
     const is3dTrace = traceType.includes("3d");
     const highlightColor = "#FF00FF";
@@ -422,6 +447,17 @@ function toFiniteNumber(value: unknown): number | null {
   return null;
 }
 
+function computeReferenceGasCup44Mean(tableRows: Array<Record<string, unknown>>): number | null {
+  const values = tableRows
+    .map((row) => toFiniteNumber(row["REF Int m/z 44 (V)"]))
+    .filter((value): value is number => value != null);
+  if (!values.length) {
+    return null;
+  }
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return Number.isFinite(mean) ? mean : null;
+}
+
 function hasSampleCollectorTrace(trace: Record<string, unknown>, mass: 44 | 45 | 46): boolean {
   const traceName = String(trace.name ?? "").toLowerCase();
   return traceName.includes(String(mass)) && (traceName.includes("smp") || traceName.includes("sample"));
@@ -430,6 +466,14 @@ function hasSampleCollectorTrace(trace: Record<string, unknown>, mass: 44 | 45 |
 function hasReferenceCollectorTrace(trace: Record<string, unknown>, mass: 44 | 45 | 46): boolean {
   const traceName = String(trace.name ?? "").toLowerCase();
   return traceName.includes(String(mass)) && (traceName.includes("ref") || traceName.includes("std") || traceName.includes("reference"));
+}
+
+function getSetValueCycleNumber(tableRows: Array<Record<string, unknown>>): number | null {
+  const selectedRow = tableRows.find((row) => asBoolean(row["Set Value Cycle"]));
+  if (!selectedRow) {
+    return null;
+  }
+  return toFiniteNumber(selectedRow["Cycle"]);
 }
 
 function ensureCollectorIntensityTraces(
@@ -512,12 +556,86 @@ function ensureCollectorIntensityTraces(
     }
   }
 
-  if (traces.length === existingTraceCount) {
+  let hasChanges = traces.length !== existingTraceCount;
+  let nextLayout: Record<string, unknown> = cloned.layout;
+  const setValueCycle = getSetValueCycleNumber(tableRows);
+  if (setValueCycle != null) {
+    const highlightX: number[] = [];
+    const highlightY: number[] = [];
+    for (const trace of traces) {
+      const xVals = coerceVector(trace.x);
+      const yVals = coerceVector(trace.y);
+      if (!xVals || !yVals || xVals.length !== yVals.length) {
+        continue;
+      }
+      for (let index = 0; index < xVals.length; index += 1) {
+        const x = toFiniteNumber(xVals[index]);
+        const y = toFiniteNumber(yVals[index]);
+        if (x == null || y == null) {
+          continue;
+        }
+        if (Math.abs(x - setValueCycle) > 0.0001) {
+          continue;
+        }
+        highlightX.push(x);
+        highlightY.push(y);
+      }
+    }
+    if (highlightX.length) {
+      traces.push({
+        type: "scatter",
+        mode: "markers",
+        name: "Set-value cycle",
+        x: highlightX,
+        y: highlightY,
+        marker: {
+          size: 11,
+          color: "#7C3AED",
+          symbol: "diamond-open",
+          line: { color: "#7C3AED", width: 2 },
+        },
+      });
+      hasChanges = true;
+    }
+    const existingShapes = Array.isArray(cloned.layout.shapes) ? [...(cloned.layout.shapes as Array<Record<string, unknown>>)] : [];
+    existingShapes.push({
+      type: "line",
+      x0: setValueCycle,
+      x1: setValueCycle,
+      y0: 0,
+      y1: 1,
+      xref: "x",
+      yref: "paper",
+      line: { color: "#7C3AED", width: 2, dash: "dot" },
+    });
+    const existingAnnotations = Array.isArray(cloned.layout.annotations)
+      ? [...(cloned.layout.annotations as Array<Record<string, unknown>>)]
+      : [];
+    existingAnnotations.push({
+      x: setValueCycle,
+      y: 1,
+      xref: "x",
+      yref: "paper",
+      yanchor: "bottom",
+      showarrow: false,
+      text: "Set value cycle",
+      font: { color: "#5B21B6", size: 11 },
+    });
+    nextLayout = {
+      ...cloned.layout,
+      shapes: existingShapes,
+      annotations: existingAnnotations,
+    };
+    hasChanges = true;
+  }
+
+  if (!hasChanges) {
     return cloned;
   }
   return {
     ...cloned,
     data: traces,
+    layout: nextLayout,
   };
 }
 
@@ -598,7 +716,7 @@ function buildLinearityPreviewFigure(
     traces.push({
       type: "scatter",
       mode: "markers",
-      name: "Target prediction",
+      name: "Reference-gas prediction",
       x: [targetIntensity],
       y: [prediction],
       marker: { color: "#B91C1C", size: 10, symbol: "diamond" },
@@ -709,6 +827,12 @@ function extractPointCustomData(point: PlotlyPoint): unknown {
   return traceCustomdata[pointNumber];
 }
 
+function pointTraceName(point: PlotlyPoint): string {
+  const payload = point as unknown as Record<string, unknown>;
+  const dataCandidate = (payload.data ?? payload.fullData) as Record<string, unknown> | undefined;
+  return String(dataCandidate?.name ?? "").trim();
+}
+
 function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): SelectedTarget[] {
   const seen = new Set<string>();
   const targets: SelectedTarget[] = [];
@@ -739,6 +863,8 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
     if (!rowLabel || !isotopeKey) {
       continue;
     }
+    const traceName = pointTraceName(point).toLowerCase();
+    const primaryIsotopeTracePoint = isotopeKey !== "cross" && traceName.startsWith("raw ");
     const token = `${isotopeKey}|${rowLabel}`;
     if (seen.has(token)) {
       continue;
@@ -749,7 +875,7 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
       isotopeKey,
       identifier1,
       identifier2,
-      currentValue: typeof point.y === "number" ? point.y : null,
+      currentValue: primaryIsotopeTracePoint && typeof point.y === "number" ? point.y : null,
       currentD13: isotopeKey === "cross" && typeof point.y === "number" ? point.y : null,
       currentD18: isotopeKey === "cross" && typeof point.x === "number" ? point.x : null,
       chartKey,
@@ -1492,15 +1618,18 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
     const excludedD13 = asBoolean(row["Excluded d13C"]);
     const excludedD18 = asBoolean(row["Excluded d18O"]);
     const excludedAny = asBoolean(row["Excluded (Saturation)"]) || excludedD13 || excludedD18;
+    const setValueCycle = asBoolean(row["Set Value Cycle"]);
     return {
       ...row,
       "Cycle status": excludedAny ? "Saturated" : "Successful",
+      "Set Value Cycle": setValueCycle,
     };
   });
 
   const preferredColumns = [
     "Cycle",
     "Cycle status",
+    "Set Value Cycle",
     "SMP Int m/z 44 (V)",
     "REF Int m/z 44 (V)",
     "SMP Int m/z 45 (V)",
@@ -1544,6 +1673,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className="rounded-full bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
         <span className="rounded-full bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
         <span className="rounded-full bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
       </div>
@@ -1561,17 +1691,25 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
           <tbody className="divide-y divide-stone-100">
             {statusRows.slice(0, 25).map((row, rowIndex) => {
               const saturated = String(row["Cycle status"]) === "Saturated";
+              const setValueCycle = asBoolean(row["Set Value Cycle"]);
               return (
-                <tr key={rowIndex} className={cn(saturated ? "bg-rose-50/80" : "bg-emerald-50/70")}>
+                <tr key={rowIndex} className={cn(setValueCycle ? "bg-violet-100/90" : saturated ? "bg-rose-50/80" : "bg-emerald-50/70")}>
                   {columns.map((column) => {
                     const cellValue = row[column];
                     const flaggedColumn = column.startsWith("Excluded");
                     const flaggedValue = flaggedColumn ? asBoolean(cellValue) : false;
+                    const setValueColumn = column === "Set Value Cycle";
+                    const setValueColumnValue = setValueColumn ? asBoolean(cellValue) : false;
                     return (
                       <td
                         key={column}
                         className={cn(
                           "px-3 py-2",
+                          setValueColumn
+                            ? setValueColumnValue
+                              ? "font-semibold text-violet-800"
+                              : "font-medium text-stone-500"
+                            : "",
                           flaggedColumn
                             ? flaggedValue
                               ? "font-medium text-rose-700"
@@ -1747,7 +1885,6 @@ function DiagnosticsPanel({
   linearityEnabled,
   onLinearityEnabledChange,
   linearityTargetIntensity,
-  onLinearityTargetIntensityChange,
   displayDelta = 0,
   onPickDeltaValue,
 }: {
@@ -1758,23 +1895,24 @@ function DiagnosticsPanel({
   linearityEnabled?: boolean;
   onLinearityEnabledChange?: (value: boolean) => void;
   linearityTargetIntensity?: number;
-  onLinearityTargetIntensityChange?: (value: number) => void;
   displayDelta?: number;
   onPickDeltaValue?: (value: number, valueSpace?: "raw" | "display") => void;
 }) {
   const cycleMean = diagnostics?.cycle_mean ?? {};
   const validMean = asNumber(cycleMean.valid_mean);
-  const finalMean = asNumber(cycleMean.mean);
+  const firstValidCycleRaw = asNumber(cycleMean.selected_value) ?? asNumber(cycleMean.mean);
   const collectorStatus = asString((diagnostics?.target ?? {})["collector_status"]);
   const isPartiallySaturated = isPartiallySaturatedCollectorStatus(collectorStatus);
   const validMeanDisplay = validMean == null ? null : validMean + displayDelta;
+  const validMeanCardValue = isPartiallySaturated ? validMean : validMeanDisplay;
   const targetIntensity = asNumber(cycleMean.linearity_target_intensity);
   const prediction = asNumber(cycleMean.linearity_prediction);
-  const finalMeanPreferredRaw = prediction ?? finalMean;
-  const finalMeanDisplay = finalMean == null ? null : finalMean + displayDelta;
-  const finalMeanCardValue = isPartiallySaturated ? finalMeanPreferredRaw : finalMeanDisplay;
+  const firstValidCycleDisplay = firstValidCycleRaw == null ? null : firstValidCycleRaw + displayDelta;
+  const firstValidCycleCardValue = isPartiallySaturated ? firstValidCycleRaw : firstValidCycleDisplay;
   const predictionDisplay = prediction == null ? null : prediction + displayDelta;
   const predictionCardValue = isPartiallySaturated ? prediction : predictionDisplay;
+  const referenceGasCup44Mean = computeReferenceGasCup44Mean(diagnostics?.table ?? []);
+  const referenceGasIntensity = referenceGasCup44Mean ?? linearityTargetIntensity ?? targetIntensity;
   const prevNeighbor = cycleMean.prev_neighbor as Record<string, unknown> | undefined;
   const nextNeighbor = cycleMean.next_neighbor as Record<string, unknown> | undefined;
   const reason = asString(cycleMean.reason);
@@ -1785,10 +1923,10 @@ function DiagnosticsPanel({
     typeof linearityEnabled === "boolean" &&
     typeof onLinearityEnabledChange === "function" &&
     typeof linearityTargetIntensity === "number" &&
-    typeof onLinearityTargetIntensityChange === "function";
+    !isPartiallySaturated;
   const shouldRenderLinearityPreview = showLinearityChart || Boolean(linearityEnabled);
-  const canPickValidMean = typeof onPickDeltaValue === "function" && validMeanDisplay != null;
-  const canPickFinalMean = typeof onPickDeltaValue === "function" && finalMeanCardValue != null;
+  const canPickValidMean = typeof onPickDeltaValue === "function" && validMeanCardValue != null;
+  const canPickFinalMean = typeof onPickDeltaValue === "function" && firstValidCycleCardValue != null;
 
   return (
     <Card className="border-stone-300">
@@ -1806,7 +1944,7 @@ function DiagnosticsPanel({
                 type="button"
                 onClick={() => {
                   if (canPickValidMean) {
-                    onPickDeltaValue(validMeanDisplay, "display");
+                    onPickDeltaValue(validMeanCardValue, "raw");
                   }
                 }}
                 disabled={!canPickValidMean}
@@ -1815,14 +1953,14 @@ function DiagnosticsPanel({
                   canPickValidMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">Valid Cycle Mean</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMeanDisplay)}</div>
+                <div className="text-xs uppercase tracking-wide text-stone-500">Cycle Mean</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMeanCardValue)}</div>
               </button>
               <button
                 type="button"
                 onClick={() => {
                   if (canPickFinalMean) {
-                    onPickDeltaValue(finalMeanCardValue, isPartiallySaturated ? "raw" : "display");
+                    onPickDeltaValue(firstValidCycleCardValue, "raw");
                   }
                 }}
                 disabled={!canPickFinalMean}
@@ -1831,8 +1969,8 @@ function DiagnosticsPanel({
                   canPickFinalMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">Final Mean</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(finalMeanCardValue)}</div>
+                <div className="text-xs uppercase tracking-wide text-stone-500">First valid cycle</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(firstValidCycleCardValue)}</div>
               </button>
               <div className="rounded-lg border border-stone-200 p-3">
                 <div className="text-xs uppercase tracking-wide text-stone-500">Method</div>
@@ -1848,16 +1986,15 @@ function DiagnosticsPanel({
                     label="Preview linearity-corrected cycle mean"
                     onChange={(checked) => onLinearityEnabledChange(checked)}
                   />
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">Target intensity (V)</span>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={linearityTargetIntensity}
-                      onChange={(event) => onLinearityTargetIntensityChange(Number(event.target.value))}
-                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
+                  <div className="rounded-lg border border-stone-200 bg-stone-50/60 px-3 py-2.5">
+                    <div className="text-xs uppercase tracking-wide text-stone-500">Reference Gas Cup 44 Avg Signal</div>
+                    <div className="mt-1 text-base font-semibold text-stone-900">
+                      {referenceGasIntensity == null ? "N/A" : `${referenceGasIntensity.toFixed(2)} V`}
+                    </div>
+                  </div>
+                </div>
+                <div className="text-xs text-stone-500">
+                  Uses the active sample REF m/z 44 average signal to set the per-sample preview before the main dataset linearity correction.
                 </div>
               </div>
             ) : null}
@@ -1872,11 +2009,11 @@ function DiagnosticsPanel({
               )
             ) : null}
 
-            {prediction != null || targetIntensity != null ? (
+            {prediction != null || referenceGasIntensity != null ? (
               <div className="grid gap-3 md:grid-cols-2">
                 <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
-                  <div className="font-medium text-stone-800">Linearity Target Intensity</div>
-                  <div>{targetIntensity == null ? "N/A" : `${targetIntensity.toFixed(2)} V`}</div>
+                  <div className="font-medium text-stone-800">Reference Gas Cup 44 Avg Signal</div>
+                  <div>{referenceGasIntensity == null ? "N/A" : `${referenceGasIntensity.toFixed(2)} V`}</div>
                 </div>
                 <div className="rounded-lg border border-stone-200 p-3 text-sm text-stone-700">
                   <div className="font-medium text-stone-800">Linearity Prediction</div>
@@ -1970,8 +2107,8 @@ export default function ProcessingPage() {
   const [selectionEditorTab, setSelectionEditorTab] = useState<IsotopeKey>("d13C");
   const [singleValues, setSingleValues] = useState<IsotopeNumericMap>({ d13C: 0, d18O: 0 });
   const [singleValueSpaces, setSingleValueSpaces] = useState<Record<IsotopeKey, "raw" | "display">>({
-    d13C: "display",
-    d18O: "display",
+    d13C: "raw",
+    d18O: "raw",
   });
   const [singleOffsets, setSingleOffsets] = useState<IsotopeNumericMap>({
     d13C: SELECTION_EDITOR_DEFAULT_OFFSET,
@@ -1980,7 +2117,6 @@ export default function ProcessingPage() {
   const [multiOffsetD13, setMultiOffsetD13] = useState(0);
   const [multiOffsetD18, setMultiOffsetD18] = useState(0);
   const [linearityEnabled, setLinearityEnabled] = useState(false);
-  const [linearityManuallySet, setLinearityManuallySet] = useState(false);
   const [linearityTargetIntensity, setLinearityTargetIntensity] = useState(15);
   const [linearityOffsetDrafts, setLinearityOffsetDrafts] = useState<LinearityOffsetDraftState>({
     line_1_offset_d13: "0",
@@ -2240,9 +2376,30 @@ export default function ProcessingPage() {
         ...diagnosticsTargetPayload(activeSampleTarget!, "d18O"),
         correct_linearity: linearityEnabled,
         target_intensity: linearityEnabled ? linearityTargetIntensity : null,
-      }),
+    }),
     enabled: Boolean(sessionId && activeSampleTarget),
   });
+
+  const d13ReferenceGasCup44Mean = computeReferenceGasCup44Mean(sampleD13DiagnosticsQuery.data?.table ?? []);
+  const d18ReferenceGasCup44Mean = computeReferenceGasCup44Mean(sampleD18DiagnosticsQuery.data?.table ?? []);
+  const activeReferenceGasCup44Mean =
+    selectionEditorTab === "d13C"
+      ? (d13ReferenceGasCup44Mean ?? d18ReferenceGasCup44Mean)
+      : (d18ReferenceGasCup44Mean ?? d13ReferenceGasCup44Mean);
+
+  useEffect(() => {
+    if (!activeSampleTarget || activeReferenceGasCup44Mean == null) {
+      return;
+    }
+    if (Math.abs(linearityTargetIntensity - activeReferenceGasCup44Mean) <= 0.0001) {
+      return;
+    }
+    setLinearityTargetIntensity(activeReferenceGasCup44Mean);
+  }, [
+    activeReferenceGasCup44Mean,
+    activeSampleTarget?.rowLabel,
+    linearityTargetIntensity,
+  ]);
 
   useEffect(() => {
     if (!activeSampleTarget) {
@@ -2250,38 +2407,9 @@ export default function ProcessingPage() {
     }
     setSelectionEditorTab(activeSampleTarget.isotopeKey === "d18O" ? "d18O" : "d13C");
     setSingleOffsets({ d13C: SELECTION_EDITOR_DEFAULT_OFFSET, d18O: SELECTION_EDITOR_DEFAULT_OFFSET });
-    setSingleValueSpaces({ d13C: "display", d18O: "display" });
-    setLinearityManuallySet(false);
+    setSingleValueSpaces({ d13C: "raw", d18O: "raw" });
     setLinearityEnabled(false);
   }, [activeSampleTarget?.rowLabel, activeSampleTarget?.isotopeKey]);
-
-  useEffect(() => {
-    if (!activeSampleTarget || linearityManuallySet) {
-      return;
-    }
-    const d13Target = sampleD13DiagnosticsQuery.data?.target ?? {};
-    const d18Target = sampleD18DiagnosticsQuery.data?.target ?? {};
-    const activeRowLabel = String(activeSampleTarget.rowLabel).trim();
-    const d13Status =
-      asString(d13Target["row_label"]).trim() === activeRowLabel
-        ? asString(d13Target["collector_status"]).trim()
-        : "";
-    const d18Status =
-      asString(d18Target["row_label"]).trim() === activeRowLabel
-        ? asString(d18Target["collector_status"]).trim()
-        : "";
-    if (!d13Status && !d18Status) {
-      return;
-    }
-    const shouldEnableLinearity =
-      isPartiallySaturatedCollectorStatus(d13Status) || isPartiallySaturatedCollectorStatus(d18Status);
-    setLinearityEnabled(shouldEnableLinearity);
-  }, [
-    activeSampleTarget,
-    linearityManuallySet,
-    sampleD13DiagnosticsQuery.data?.target,
-    sampleD18DiagnosticsQuery.data?.target,
-  ]);
 
   useEffect(() => {
     if (!activeSampleTarget) {
@@ -2298,38 +2426,24 @@ export default function ProcessingPage() {
     const d18Status = d18MatchesActiveRow ? asString(d18Target["collector_status"]).trim() : "";
     const d13Current = d13MatchesActiveRow ? asNumber(d13Target["current_value"]) : null;
     const d18Current = d18MatchesActiveRow ? asNumber(d18Target["current_value"]) : null;
-    const d13CycleMean = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-    const d18CycleMean = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-    const d13Prediction = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["linearity_prediction"]);
-    const d18Prediction = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["linearity_prediction"]);
-    const useD13LinearityDefault =
-      isPartiallySaturatedCollectorStatus(d13Status) && (d13Prediction != null || d13CycleMean != null);
-    const useD18LinearityDefault =
-      isPartiallySaturatedCollectorStatus(d18Status) && (d18Prediction != null || d18CycleMean != null);
-    const d13DisplayToRawDelta = selectedD13 != null && d13Current != null ? selectedD13 - d13Current : 0;
-    const d18DisplayToRawDelta = selectedD18 != null && d18Current != null ? selectedD18 - d18Current : 0;
-    const d13SeedRawValue = useD13LinearityDefault ? (d13Prediction ?? d13CycleMean) : d13Current;
-    const d18SeedRawValue = useD18LinearityDefault ? (d18Prediction ?? d18CycleMean) : d18Current;
-    const d13ValueSpace: "raw" | "display" = useD13LinearityDefault ? "raw" : "display";
-    const d18ValueSpace: "raw" | "display" = useD18LinearityDefault ? "raw" : "display";
+    const d13SelectedCycleValue = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]);
+    const d18SelectedCycleValue = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]);
+    const useD13SelectedCycleDefault =
+      isPartiallySaturatedCollectorStatus(d13Status) && d13SelectedCycleValue != null;
+    const useD18SelectedCycleDefault =
+      isPartiallySaturatedCollectorStatus(d18Status) && d18SelectedCycleValue != null;
+    const d13SeedRawValue = useD13SelectedCycleDefault ? d13SelectedCycleValue : d13Current;
+    const d18SeedRawValue = useD18SelectedCycleDefault ? d18SelectedCycleValue : d18Current;
     const nextValues: IsotopeNumericMap = {
       d13C: roundDeltaValue(
-        d13SeedRawValue != null
-          ? d13ValueSpace === "raw"
-            ? d13SeedRawValue
-            : d13SeedRawValue + d13DisplayToRawDelta
-          : selectedD13 ?? fallbackTargetValue(activeSampleTarget, "d13C"),
+        d13SeedRawValue != null ? d13SeedRawValue : selectedD13 ?? fallbackTargetValue(activeSampleTarget, "d13C"),
       ),
       d18O: roundDeltaValue(
-        d18SeedRawValue != null
-          ? d18ValueSpace === "raw"
-            ? d18SeedRawValue
-            : d18SeedRawValue + d18DisplayToRawDelta
-          : selectedD18 ?? fallbackTargetValue(activeSampleTarget, "d18O"),
+        d18SeedRawValue != null ? d18SeedRawValue : selectedD18 ?? fallbackTargetValue(activeSampleTarget, "d18O"),
       ),
     };
     setSingleValues(nextValues);
-    setSingleValueSpaces({ d13C: d13ValueSpace, d18O: d18ValueSpace });
+    setSingleValueSpaces({ d13C: "raw", d18O: "raw" });
   }, [
     activeSampleTarget,
     linearityEnabled,
@@ -2360,15 +2474,19 @@ export default function ProcessingPage() {
   }, [workspace]);
 
   useEffect(() => {
-    if (!activeConfig) {
+    if (!activeConfig || !colorScaleBounds) {
       return;
     }
-    const bounds = colorScaleBounds ?? { min: 0, max: 1 };
+    const bounds = colorScaleBounds;
     const param = activeConfig.color_param;
     const fullRange: [number, number] = [bounds.min, bounds.max];
     const parameterChanged = colorScaleRangeParam !== param;
     setColorScaleRange((current) => {
       if (!current || parameterChanged) {
+        return fullRange;
+      }
+      const isOutsideBounds = current[1] < bounds.min || current[0] > bounds.max;
+      if (isOutsideBounds) {
         return fullRange;
       }
       const normalized = normalizeColorScaleRange(current, bounds);
@@ -2411,6 +2529,77 @@ export default function ProcessingPage() {
       // Ignore invalid payloads and continue loading the page.
     }
   }, [sessionId, workspaceQuery.data]);
+
+  function coerceSequenceNeighbor(
+    value: unknown,
+    isotopeKey: IsotopeKey,
+  ): { rowLabel: string; identifier2: string; value: number | null; isotopeKey: IsotopeKey } | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+    const payload = value as Record<string, unknown>;
+    const rowLabel = asString(payload.row_label ?? payload.rowLabel).trim();
+    if (!rowLabel) {
+      return null;
+    }
+    return {
+      rowLabel,
+      identifier2: asString(payload.identifier_2 ?? payload.identifier2).trim(),
+      value: asNumber(payload.value),
+      isotopeKey,
+    };
+  }
+
+  const sequenceNavigationIsotopeKey: IsotopeKey | null =
+    activeTarget?.isotopeKey === "d13C" || activeTarget?.isotopeKey === "d18O" ? activeTarget.isotopeKey : activeTarget ? selectionEditorTab : null;
+  const sequenceNavigationCycleMean =
+    sequenceNavigationIsotopeKey == null
+      ? null
+      : ((sequenceNavigationIsotopeKey === "d13C" ? sampleD13DiagnosticsQuery.data?.cycle_mean : sampleD18DiagnosticsQuery.data?.cycle_mean) ?? null);
+  const prevSequenceNeighbor =
+    sequenceNavigationIsotopeKey == null
+      ? null
+      : coerceSequenceNeighbor(
+          (sequenceNavigationCycleMean as Record<string, unknown> | null | undefined)?.prev_neighbor,
+          sequenceNavigationIsotopeKey,
+        );
+  const nextSequenceNeighbor =
+    sequenceNavigationIsotopeKey == null
+      ? null
+      : coerceSequenceNeighbor(
+          (sequenceNavigationCycleMean as Record<string, unknown> | null | undefined)?.next_neighbor,
+          sequenceNavigationIsotopeKey,
+        );
+  const useSelectionIndexNavigation = selectedTargets.length > 1;
+  const canMoveToPrevTarget = useSelectionIndexNavigation ? activeTargetIndex > 0 : Boolean(prevSequenceNeighbor);
+  const canMoveToNextTarget = useSelectionIndexNavigation ? activeTargetIndex < selectedTargets.length - 1 : Boolean(nextSequenceNeighbor);
+
+  function moveSelectionTarget(direction: "prev" | "next") {
+    if (useSelectionIndexNavigation) {
+      setActiveTargetIndex((index) =>
+        direction === "prev" ? Math.max(0, index - 1) : Math.min(selectedTargets.length - 1, index + 1),
+      );
+      return;
+    }
+    if (!activeTarget) {
+      return;
+    }
+    const neighbor = direction === "prev" ? prevSequenceNeighbor : nextSequenceNeighbor;
+    if (!neighbor) {
+      return;
+    }
+    const nextTarget: SelectedTarget = {
+      ...activeTarget,
+      rowLabel: neighbor.rowLabel,
+      identifier2: neighbor.identifier2 || activeTarget.identifier2,
+      currentValue: activeTarget.isotopeKey === "cross" ? null : neighbor.value,
+      currentD13:
+        activeTarget.isotopeKey === "cross" ? (neighbor.isotopeKey === "d13C" ? neighbor.value : null) : activeTarget.currentD13,
+      currentD18:
+        activeTarget.isotopeKey === "cross" ? (neighbor.isotopeKey === "d18O" ? neighbor.value : null) : activeTarget.currentD18,
+    };
+    setTargets([nextTarget]);
+  }
 
   function setTargets(nextTargets: SelectedTarget[]) {
     const shouldOpen = nextTargets.length > 0;
@@ -2590,18 +2779,9 @@ export default function ProcessingPage() {
     requestedValue: number,
     valueSpace: "raw" | "display",
   ): number {
-    if (valueSpace === "raw") {
-      return requestedValue;
-    }
-    const selectedDisplayValue = selectedTargetPointValue(activeSampleTarget, isotopeKey);
-    const diagnosticsCurrentValue =
-      isotopeKey === "d13C"
-        ? asNumber((sampleD13DiagnosticsQuery.data?.target ?? {})["current_value"])
-        : asNumber((sampleD18DiagnosticsQuery.data?.target ?? {})["current_value"]);
-    if (selectedDisplayValue == null || diagnosticsCurrentValue == null) {
-      return requestedValue;
-    }
-    return requestedValue - rawToDisplayDelta(isotopeKey);
+    void isotopeKey;
+    void valueSpace;
+    return requestedValue;
   }
 
   function handleChartClick(chartKey: string, points: PlotlyPoint[]) {
@@ -2994,6 +3174,7 @@ export default function ProcessingPage() {
   const activeTargetDiagnostics = (sampleD18DiagnosticsQuery.data ?? sampleD13DiagnosticsQuery.data) ?? null;
   const activeTargetInlineSummary = activeTargetDiagnostics?.inline_summary;
   const activeTargetSourceExcel = asString(activeTargetDiagnostics?.target?.source_excel).trim() || "Unknown";
+  const activeRowLabel = activeSampleTarget ? String(activeSampleTarget.rowLabel).trim() : "";
   const parsedActiveTargetInlineItems = parseInlineDiagnosticsSummary(activeTargetInlineSummary);
   const hasInlineExcelProvenance = parsedActiveTargetInlineItems.some((item) => {
     const normalized = normalizeInlineLabel(item.label);
@@ -3008,10 +3189,21 @@ export default function ProcessingPage() {
     const normalizedLabel = normalizeInlineLabel(item.label);
     const settableIsotope: IsotopeKey | null =
       normalizedLabel === "d13c values" ? "d13C" : normalizedLabel === "d18o values" ? "d18O" : null;
+    const isotopeTargetPayload =
+      settableIsotope === "d13C"
+        ? (sampleD13DiagnosticsQuery.data?.target as Record<string, unknown> | undefined)
+        : settableIsotope === "d18O"
+          ? (sampleD18DiagnosticsQuery.data?.target as Record<string, unknown> | undefined)
+          : undefined;
+    const diagnosticsCurrentValue =
+      settableIsotope != null &&
+      isotopeTargetPayload != null &&
+      asString(isotopeTargetPayload["row_label"]).trim() === activeRowLabel
+        ? asNumber(isotopeTargetPayload["current_value"])
+        : null;
     const selectedPointValue =
       normalizedLabel === "d13c values" ? selectedPointD13 : normalizedLabel === "d18o values" ? selectedPointD18 : null;
-    const convertedNumericValue = numericValue == null || settableIsotope == null ? numericValue : numericValue + rawToDisplayDelta(settableIsotope);
-    const resolvedNumericValue = selectedPointValue ?? convertedNumericValue;
+    const resolvedNumericValue = diagnosticsCurrentValue ?? numericValue ?? selectedPointValue;
     const canSetSingleValue = Boolean(activeSampleTarget) && settableIsotope != null && resolvedNumericValue != null;
     return {
       ...item,
@@ -3022,7 +3214,6 @@ export default function ProcessingPage() {
       settableIsotope,
     };
   });
-  const activeRowLabel = activeSampleTarget ? String(activeSampleTarget.rowLabel).trim() : "";
   const d13TargetPayload = sampleD13DiagnosticsQuery.data?.target ?? {};
   const d18TargetPayload = sampleD18DiagnosticsQuery.data?.target ?? {};
   const d13ActiveStatus =
@@ -3037,10 +3228,24 @@ export default function ProcessingPage() {
   const d18IsPartiallySaturated = isPartiallySaturatedCollectorStatus(d18ActiveStatus);
   const d13CurrentRawValue = asNumber(d13TargetPayload["current_value"]);
   const d18CurrentRawValue = asNumber(d18TargetPayload["current_value"]);
-  const d13CycleMeanRawValue = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-  const d18CycleMeanRawValue = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-  const d13PredictionRawValue = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["linearity_prediction"]);
-  const d18PredictionRawValue = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["linearity_prediction"]);
+  const d13CycleMeanRawValue = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]);
+  const d18CycleMeanRawValue = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]);
+  const d13FirstValidCycleRawValue =
+    asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]) ??
+    asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
+  const d18FirstValidCycleRawValue =
+    asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]) ??
+    asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
+  const d13LinearityCorrectedRawValue = asNumber(d13TargetPayload["linearity_corrected_value"]);
+  const d18LinearityCorrectedRawValue = asNumber(d18TargetPayload["linearity_corrected_value"]);
+  const d13Method = asString((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A";
+  const d18Method = asString((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A";
+  const detailsDisplayValue = (value: number | null, isotopeKey: IsotopeKey, isPartiallySaturated: boolean): number | null => {
+    if (value == null) {
+      return null;
+    }
+    return isPartiallySaturated ? value : value + rawToDisplayDelta(isotopeKey);
+  };
   const d13CurrentDisplayValue = d13IsPartiallySaturated
     ? (d13CurrentRawValue ?? selectedPointD13)
     : d13CurrentRawValue == null
@@ -3052,15 +3257,23 @@ export default function ProcessingPage() {
       ? selectedPointD18
       : d18CurrentRawValue + rawToDisplayDelta("d18O");
   const d13CycleMeanDisplayValue = d13IsPartiallySaturated
-    ? (d13PredictionRawValue ?? d13CycleMeanRawValue)
-    : d13CycleMeanRawValue == null
-      ? null
-      : d13CycleMeanRawValue + rawToDisplayDelta("d13C");
+    ? d13CycleMeanRawValue
+    : detailsDisplayValue(d13CycleMeanRawValue, "d13C", d13IsPartiallySaturated);
   const d18CycleMeanDisplayValue = d18IsPartiallySaturated
-    ? (d18PredictionRawValue ?? d18CycleMeanRawValue)
-    : d18CycleMeanRawValue == null
-      ? null
-      : d18CycleMeanRawValue + rawToDisplayDelta("d18O");
+    ? d18CycleMeanRawValue
+    : detailsDisplayValue(d18CycleMeanRawValue, "d18O", d18IsPartiallySaturated);
+  const d13FirstValidCycleDisplayValue = detailsDisplayValue(d13FirstValidCycleRawValue, "d13C", d13IsPartiallySaturated);
+  const d18FirstValidCycleDisplayValue = detailsDisplayValue(d18FirstValidCycleRawValue, "d18O", d18IsPartiallySaturated);
+  const d13LinearityCorrectedDisplayValue = detailsDisplayValue(
+    d13LinearityCorrectedRawValue,
+    "d13C",
+    d13IsPartiallySaturated,
+  );
+  const d18LinearityCorrectedDisplayValue = detailsDisplayValue(
+    d18LinearityCorrectedRawValue,
+    "d18O",
+    d18IsPartiallySaturated,
+  );
   const effectiveOutlier =
     typeof sampleD18DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
       ? (sampleD18DiagnosticsQuery.data.target.effective_outlier as boolean)
@@ -3919,14 +4132,14 @@ export default function ProcessingPage() {
                             </div>
                           </div>
                           <div className="flex gap-2">
-                            <Button variant="outline" size="sm" onClick={() => setActiveTargetIndex((index) => Math.max(0, index - 1))} disabled={activeTargetIndex === 0}>
+                            <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>
                               Prev
                             </Button>
                             <Button
                               variant="outline"
                               size="sm"
-                              onClick={() => setActiveTargetIndex((index) => Math.min(selectedTargets.length - 1, index + 1))}
-                              disabled={activeTargetIndex >= selectedTargets.length - 1}
+                              onClick={() => moveSelectionTarget("next")}
+                              disabled={!canMoveToNextTarget}
                             >
                               Next
                             </Button>
@@ -3939,7 +4152,7 @@ export default function ProcessingPage() {
                                 key={`${item.label}:${item.value}:${index}`}
                                 onClick={() => {
                                   if (item.canSetSingleValue && item.setValue != null && item.settableIsotope) {
-                                    setSingleValueFromSuggestion(item.settableIsotope, item.setValue, "display");
+                                    setSingleValueFromSuggestion(item.settableIsotope, item.setValue, "raw");
                                   }
                                 }}
                                 className={cn(
@@ -3971,35 +4184,77 @@ export default function ProcessingPage() {
                         </div>
                       </div>
 
-                      <div className="flex flex-wrap gap-2">
-                        <Button variant="outline" onClick={resetSelected} disabled={busy}>
-                          Reset selected
-                        </Button>
-                        <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>
-                          Clear selection
-                        </Button>
-                        <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
-                          Force outlier
-                        </Button>
-                        <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
-                          Force keep
-                        </Button>
-                      </div>
-
                       {activeTarget ? (
                         <div className="space-y-4">
-                          <div className="flex flex-wrap gap-2">
-                            {ISOTOPE_KEYS.map((isotopeKey) => (
-                              <Button
-                                key={isotopeKey}
-                                variant={selectionEditorTab === isotopeKey ? "secondary" : "outline"}
-                                size="sm"
-                                onClick={() => setSelectionEditorTab(isotopeKey)}
-                                disabled={busy}
-                              >
-                                {isotopeKey}
-                              </Button>
-                            ))}
+                          <div className="inline-flex rounded-xl border border-stone-300 bg-white p-1 shadow-sm">
+                            {ISOTOPE_KEYS.map((isotopeKey) => {
+                              const isActive = selectionEditorTab === isotopeKey;
+                              return (
+                                <button
+                                  key={isotopeKey}
+                                  type="button"
+                                  aria-pressed={isActive}
+                                  onClick={() => setSelectionEditorTab(isotopeKey)}
+                                  disabled={busy}
+                                  className={cn(
+                                    "min-w-[92px] rounded-lg px-4 py-2 text-sm font-semibold transition",
+                                    isActive ? "bg-stone-900 text-white shadow-sm" : "text-stone-700 hover:bg-stone-100",
+                                  )}
+                                >
+                                  {isotopeKey}
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">Details</div>
+                            <div className="grid gap-3 md:grid-cols-2">
+                              <div className="rounded-xl border border-stone-200 bg-stone-50/50 p-4">
+                                <div className="text-xs font-semibold uppercase tracking-wide text-stone-600">d13C</div>
+                                <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
+                                  <div className="text-stone-500">Current</div>
+                                  <div className="text-right font-medium text-stone-900">
+                                    {d13CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d13CurrentDisplayValue)}
+                                  </div>
+                                  <div className="text-stone-500">Linearity corrected</div>
+                                  <div className="text-right font-medium text-stone-900">
+                                    {d13LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d13LinearityCorrectedDisplayValue)}
+                                  </div>
+                                  <div className="text-stone-500">Cycle mean</div>
+                                  <div className="text-right font-medium text-stone-900">
+                                    {d13CycleMeanDisplayValue == null ? "N/A" : formatDeltaValue(d13CycleMeanDisplayValue)}
+                                  </div>
+                                  <div className="text-stone-500">First valid cycle</div>
+                                  <div className="text-right font-medium text-stone-900">
+                                    {d13FirstValidCycleDisplayValue == null ? "N/A" : formatDeltaValue(d13FirstValidCycleDisplayValue)}
+                                  </div>
+                                </div>
+                                <div className="mt-3 text-xs text-stone-500">Method: {d13Method}</div>
+                              </div>
+                              <div className="rounded-xl border border-stone-200 bg-stone-50/50 p-4">
+                                <div className="text-xs font-semibold uppercase tracking-wide text-stone-600">d18O</div>
+                                <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
+                                  <div className="text-stone-500">Current</div>
+                                  <div className="text-right font-medium text-stone-900">
+                                    {d18CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d18CurrentDisplayValue)}
+                                  </div>
+                                  <div className="text-stone-500">Linearity corrected</div>
+                                  <div className="text-right font-medium text-stone-900">
+                                    {d18LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d18LinearityCorrectedDisplayValue)}
+                                  </div>
+                                  <div className="text-stone-500">Cycle mean</div>
+                                  <div className="text-right font-medium text-stone-900">
+                                    {d18CycleMeanDisplayValue == null ? "N/A" : formatDeltaValue(d18CycleMeanDisplayValue)}
+                                  </div>
+                                  <div className="text-stone-500">First valid cycle</div>
+                                  <div className="text-right font-medium text-stone-900">
+                                    {d18FirstValidCycleDisplayValue == null ? "N/A" : formatDeltaValue(d18FirstValidCycleDisplayValue)}
+                                  </div>
+                                </div>
+                                <div className="mt-3 text-xs text-stone-500">Method: {d18Method}</div>
+                              </div>
+                            </div>
                           </div>
 
                           <div className="grid gap-3 sm:grid-cols-2">
@@ -4044,37 +4299,18 @@ export default function ProcessingPage() {
                             <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
                               {singleInterpolateLabel}
                             </Button>
-                          </div>
-
-                          <div className="grid gap-3 md:grid-cols-2">
-                            <div className="rounded-lg border border-stone-200 p-3">
-                              <div className="text-xs uppercase tracking-wide text-stone-500">d13C details</div>
-                              <div className="mt-1 text-sm text-stone-800">
-                                Current:{" "}
-                                {d13CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d13CurrentDisplayValue)}
-                              </div>
-                              <div className="text-sm text-stone-700">
-                                Cycle mean:{" "}
-                                {d13CycleMeanDisplayValue == null ? "N/A" : formatDeltaValue(d13CycleMeanDisplayValue)}
-                              </div>
-                              <div className="text-xs text-stone-500">
-                                Method: {asString((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
-                              </div>
-                            </div>
-                            <div className="rounded-lg border border-stone-200 p-3">
-                              <div className="text-xs uppercase tracking-wide text-stone-500">d18O details</div>
-                              <div className="mt-1 text-sm text-stone-800">
-                                Current:{" "}
-                                {d18CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d18CurrentDisplayValue)}
-                              </div>
-                              <div className="text-sm text-stone-700">
-                                Cycle mean:{" "}
-                                {d18CycleMeanDisplayValue == null ? "N/A" : formatDeltaValue(d18CycleMeanDisplayValue)}
-                              </div>
-                              <div className="text-xs text-stone-500">
-                                Method: {asString((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
-                              </div>
-                            </div>
+                            <Button variant="outline" onClick={resetSelected} disabled={busy}>
+                              Reset selected
+                            </Button>
+                            <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>
+                              Clear selection
+                            </Button>
+                            <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
+                              Force outlier
+                            </Button>
+                            <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
+                              Force keep
+                            </Button>
                           </div>
 
                           <DiagnosticsPanel
@@ -4084,11 +4320,9 @@ export default function ProcessingPage() {
                             showLinearityChart={linearityEnabled}
                             linearityEnabled={linearityEnabled}
                             onLinearityEnabledChange={(value) => {
-                              setLinearityManuallySet(true);
                               setLinearityEnabled(value);
                             }}
                             linearityTargetIntensity={linearityTargetIntensity}
-                            onLinearityTargetIntensityChange={setLinearityTargetIntensity}
                             displayDelta={rawToDisplayDelta(selectionEditorTab)}
                             onPickDeltaValue={(value, valueSpace = "raw") =>
                               setSingleValueFromSuggestion(selectionEditorTab, value, valueSpace)

@@ -185,6 +185,96 @@ def _processing_calibration_meta(metadata: dict[str, Any]) -> dict[str, Any]:
     return calibration_meta if isinstance(calibration_meta, dict) else {}
 
 
+def _processing_target_linearity_corrected_value(
+    df: pd.DataFrame,
+    target: dict[str, Any],
+    calibration_meta: dict[str, Any] | None,
+) -> float | None:
+    if df is None or df.empty or not isinstance(target, dict):
+        return None
+    calibration = calibration_meta if isinstance(calibration_meta, dict) else {}
+    linearity_cfg = calibration.get("config", {}).get("linearity", {}) if isinstance(calibration.get("config"), dict) else {}
+    if not isinstance(linearity_cfg, dict) or not bool(linearity_cfg.get("apply")):
+        return None
+    fits = calibration.get("linearity_fits", {})
+    if not isinstance(fits, dict) or not fits:
+        return None
+    row_label = target.get("row_label")
+    isotope_key = str(target.get("isotope_key", "")).strip()
+    if row_label not in df.index:
+        return None
+    if isotope_key == "d13C":
+        corrected_col = "d13C_linearity_corrected"
+    elif isotope_key == "d18O":
+        corrected_col = "d18O_linearity_corrected"
+    else:
+        return None
+    row_df = _apply_isotope_line_offsets(
+        df.loc[[row_label]].copy(),
+        line_1_offset_d13=linearity_cfg.get("line_1_offset_d13"),
+        line_1_offset_d18=linearity_cfg.get("line_1_offset_d18"),
+        line_2_offset_d13=linearity_cfg.get("line_2_offset_d13"),
+        line_2_offset_d18=linearity_cfg.get("line_2_offset_d18"),
+    )
+    use_diff_intensity = bool(linearity_cfg.get("use_diff_intensity", False))
+    intensity_col = _resolve_selected_linearity_intensity_column(
+        df=row_df,
+        use_diff_intensity=use_diff_intensity,
+        selected_intensity_col=linearity_cfg.get("intensity_col"),
+    )
+    row_df, d13_offset_intensity_col, d18_offset_intensity_col = _with_isotope_linearity_intensity_columns(
+        row_df,
+        intensity_col,
+        line_1_offset=float(linearity_cfg.get("line_1_offset", 0.0) or 0.0),
+        line_2_offset=float(linearity_cfg.get("line_2_offset", 0.0) or 0.0),
+    )
+    override_scope = (
+        sorted(
+            {
+                str(value).strip()
+                for value in row_df.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist()
+                if str(value).strip() != ""
+            }
+        )
+        if "Identifier 1" in row_df.columns
+        else []
+    )
+    override_intensity_col = (
+        d13_offset_intensity_col if d13_offset_intensity_col == d18_offset_intensity_col else intensity_col
+    )
+    row_df = _apply_manual_linearity_override_to_standards(
+        row_df,
+        override_scope,
+        enabled=bool(linearity_cfg.get("manual_override_enabled", False)),
+        d13_per_10v=float(linearity_cfg.get("manual_d13_per_10v", 0.0) or 0.0),
+        d18_per_10v=float(linearity_cfg.get("manual_d18_per_10v", 0.0) or 0.0),
+        d13_per_10v2=float(linearity_cfg.get("manual_d13_per_10v2", 0.0) or 0.0),
+        d18_per_10v2=float(linearity_cfg.get("manual_d18_per_10v2", 0.0) or 0.0),
+        quadratic=bool(linearity_cfg.get("quadratic", False)),
+        use_diff_intensity=use_diff_intensity,
+        selected_intensity_col=override_intensity_col,
+    )
+    fit_payload = _apply_manual_linearity_offsets_to_fits(
+        fits,
+        enabled=bool(linearity_cfg.get("manual_override_enabled", False)),
+        quadratic=bool(linearity_cfg.get("quadratic", False)),
+        d13_per_10v=float(linearity_cfg.get("manual_d13_per_10v", 0.0) or 0.0),
+        d18_per_10v=float(linearity_cfg.get("manual_d18_per_10v", 0.0) or 0.0),
+        d13_per_10v2=float(linearity_cfg.get("manual_d13_per_10v2", 0.0) or 0.0),
+        d18_per_10v2=float(linearity_cfg.get("manual_d18_per_10v2", 0.0) or 0.0),
+    )
+    fit_payload = dict(fit_payload or {})
+    fit_payload.setdefault("d13_intensity_col", d13_offset_intensity_col)
+    fit_payload.setdefault("d18_intensity_col", d18_offset_intensity_col)
+    corrected = _apply_linearity_correction(row_df, intensity_col, fit_payload)
+    if corrected_col not in corrected.columns:
+        return None
+    corrected_raw = pd.to_numeric(pd.Series([corrected.at[row_label, corrected_col]]), errors="coerce").iloc[0]
+    if pd.notna(corrected_raw) and np.isfinite(corrected_raw):
+        return float(corrected_raw)
+    return None
+
+
 def _processing_subset(df: pd.DataFrame, config: ProcessingConfig) -> pd.DataFrame:
     subset = df.copy()
     if config.selected_identifier != "All" and "Identifier 1" in subset.columns:
@@ -836,8 +926,16 @@ def diagnostics(
 ) -> ChartBundle:
     _session_exists_or_404(session_id)
     df = store.load_frame(session_id)
-    available_color_params = _candidate_diagnostics_color_columns(df)
-    available_z_axes = _candidate_diagnostics_z_columns(df)
+    metadata = store.load_metadata(session_id)
+    processing_config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
+    diagnostics_df = _derive_working_frame(
+        df,
+        processing_config,
+        calibration_meta=metadata.get("calibration", {}),
+        edit_state=metadata.get("edit_state", {}),
+    )
+    available_color_params = _candidate_diagnostics_color_columns(diagnostics_df)
+    available_z_axes = _candidate_diagnostics_z_columns(diagnostics_df)
     if available_color_params and color_param not in available_color_params:
         color_param = available_color_params[0]
     if z_axis not in available_z_axes:
@@ -849,10 +947,10 @@ def diagnostics(
             z_axis = available_z_axes[0]
         else:
             z_axis = "1  Cycle Int  Samp  44"
-    filtered_df = _apply_diagnostics_filters(df, identifier_filter, d13_min, d13_max, d18_min, d18_max)
+    filtered_df = _apply_diagnostics_filters(diagnostics_df, identifier_filter, d13_min, d13_max, d18_min, d18_max)
     fig = create_diagnostic_plots(filtered_df, color_param)
     fig_3d, _ = _build_isotope_3d_scatter(
-        df,
+        diagnostics_df,
         z_col=z_axis,
         z_label=z_axis,
         color_col=color_param,
@@ -861,8 +959,14 @@ def diagnostics(
         open_circle_identifier="SHP2L",
     )
     identifiers = (
-        sorted({str(value) for value in df.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist() if str(value).strip()})
-        if "Identifier 1" in df.columns
+        sorted(
+            {
+                str(value)
+                for value in diagnostics_df.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist()
+                if str(value).strip()
+            }
+        )
+        if "Identifier 1" in diagnostics_df.columns
         else []
     )
     return ChartBundle(
@@ -872,8 +976,8 @@ def diagnostics(
             "available_color_params": available_color_params,
             "available_z_axis_options": available_z_axes,
             "available_identifiers": identifiers,
-            "d13_bounds": _column_bounds(df, "d 13C/12C  Mean"),
-            "d18_bounds": _column_bounds(df, "d 18O/16O  Mean"),
+            "d13_bounds": _column_bounds(diagnostics_df, "d 13C/12C  Mean"),
+            "d18_bounds": _column_bounds(diagnostics_df, "d 18O/16O  Mean"),
             "active_filters": {
                 "color_param": color_param,
                 "z_axis": z_axis,
@@ -883,7 +987,7 @@ def diagnostics(
                 "d18_min": d18_min,
                 "d18_max": d18_max,
             },
-            "row_count_before": int(len(df)),
+            "row_count_before": int(len(diagnostics_df)),
             "row_count_after": int(len(filtered_df)),
         },
     )
@@ -1502,11 +1606,13 @@ def processing_cycle_diagnostics(session_id: str, request: CycleDiagnosticsReque
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
     cycles_df = store.load_cycles_frame(session_id)
+    calibration = _processing_calibration_meta(metadata)
     config = _load_processing_config(metadata)
     row_label = _coerce_row_label(request.target.row_label, df)
     target = build_target_info(df, row_label, request.target.isotope_key, metadata.get("edit_state", {}))
     if target is None:
         raise HTTPException(status_code=404, detail="Unknown processing target")
+    target["linearity_corrected_value"] = _processing_target_linearity_corrected_value(df, target, calibration)
     return build_cycle_diagnostics_payload(
         session_id=session_id,
         df=df,
