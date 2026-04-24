@@ -55,6 +55,7 @@ const INCLUSION_PASS_THRESHOLD = 80;
 const OFFICIAL_VALUE_TYPE_D13 = "VPDB(13C)";
 const OFFICIAL_VALUE_TYPE_D18 = "VSMOW(18O)";
 const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
+const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
@@ -772,10 +773,13 @@ function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefin
     hovermode: "closest",
     height: 460,
   };
-  return {
-    ...cloned,
-    layout: nextLayout,
-  };
+  return ensureFigureUiRevision(
+    {
+      ...cloned,
+      layout: nextLayout,
+    },
+    "calibration:hover-preview",
+  );
 }
 
 const INLINE_DIAGNOSTIC_UNITS: Record<string, string> = {
@@ -826,6 +830,51 @@ function parseDecimalInput(value: string): number | null {
 
 function formatDecimalInput(value: number | null | undefined): string {
   return typeof value === "number" && Number.isFinite(value) ? String(value) : "0";
+}
+
+function figureTitleText(layout: Record<string, unknown>): string {
+  const title = layout.title;
+  if (typeof title === "string") {
+    return title;
+  }
+  if (title && typeof title === "object") {
+    const text = (title as { text?: unknown }).text;
+    if (typeof text === "string") {
+      return text;
+    }
+  }
+  return "";
+}
+
+function ensureFigureUiRevision(
+  figure: Record<string, unknown> | undefined,
+  revisionScope: string,
+): Record<string, unknown> | undefined {
+  if (!figure) {
+    return figure;
+  }
+  const sourceLayout =
+    typeof (figure as FigureShape).layout === "object" && (figure as FigureShape).layout
+      ? ((figure as FigureShape).layout as Record<string, unknown>)
+      : {};
+  if (typeof sourceLayout.uirevision !== "undefined") {
+    return figure;
+  }
+  const traceTokens = Array.isArray((figure as FigureShape).data)
+    ? ((figure as FigureShape).data as Array<Record<string, unknown>>).map((trace, index) => {
+        const traceType = typeof trace.type === "string" ? trace.type : `trace${index}`;
+        const traceName = typeof trace.name === "string" ? trace.name : "";
+        return `${traceType}:${traceName}`;
+      })
+    : ["no-data"];
+  const title = figureTitleText(sourceLayout);
+  return {
+    ...(figure as FigureShape),
+    layout: {
+      ...sourceLayout,
+      uirevision: [revisionScope, title, ...traceTokens].join("|"),
+    },
+  };
 }
 
 function readLinearityOffsetValue(linearity: CalibrationConfig["linearity"], field: LinearityOffsetField): number {
@@ -1204,9 +1253,10 @@ function sliderStep(bounds: ColorScaleBounds): number {
 function applyColorScaleRangeToFigure(
   figure: Record<string, unknown> | undefined,
   range: [number, number] | null,
+  revisionScope = "calibration:chart",
 ): Record<string, unknown> | undefined {
   if (!figure || !range) {
-    return figure;
+    return ensureFigureUiRevision(figure, revisionScope);
   }
   const [cmin, cmax] = [Math.min(range[0], range[1]), Math.max(range[0], range[1])];
   const cloned = cloneFigure(figure);
@@ -1254,13 +1304,16 @@ function applyColorScaleRangeToFigure(
     };
   }
   if (!hasColorMapping) {
-    return figure;
+    return ensureFigureUiRevision(figure, revisionScope);
   }
-  return {
-    ...cloned,
-    data: nextData,
-    layout: nextLayout,
-  };
+  return ensureFigureUiRevision(
+    {
+      ...cloned,
+      data: nextData,
+      layout: nextLayout,
+    },
+    revisionScope,
+  );
 }
 
 function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> }) {
@@ -1467,7 +1520,10 @@ function DiagnosticsPanel({
             {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
 
             <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
-              <PlotlyChart figure={diagnosticsFigure} className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]" />
+              <PlotlyChart
+                figure={ensureFigureUiRevision(diagnosticsFigure, "calibration:selection-cycle")}
+                className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
+              />
               <div className="min-w-0">
                 <CycleDiagnosticsTable rows={diagnostics.table ?? []} />
               </div>
@@ -1771,6 +1827,8 @@ export default function CalibrationPage() {
   const [linearityOffsetEditing, setLinearityOffsetEditing] = useState<LinearityOffsetField | null>(null);
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
   const colorScaledFigureCacheRef = useRef<WeakMap<Record<string, unknown>, Record<string, unknown>>>(new WeakMap());
   const colorScaleSignatureRef = useRef<string>("");
   const draftStorageKey = sessionId ? `calibration-config:${sessionId}` : null;
@@ -1806,11 +1864,23 @@ export default function CalibrationPage() {
       if (hoverPreviewHideTimerRef.current != null) {
         clearTimeout(hoverPreviewHideTimerRef.current);
       }
+      if (hoverPreviewShowTimerRef.current != null) {
+        clearTimeout(hoverPreviewShowTimerRef.current);
+      }
     };
   }, []);
 
   useEffect(() => {
     if (isSelectionEditorOpen || isOfficialValuesModalOpen) {
+      if (hoverPreviewHideTimerRef.current != null) {
+        clearTimeout(hoverPreviewHideTimerRef.current);
+        hoverPreviewHideTimerRef.current = null;
+      }
+      if (hoverPreviewShowTimerRef.current != null) {
+        clearTimeout(hoverPreviewShowTimerRef.current);
+        hoverPreviewShowTimerRef.current = null;
+      }
+      pendingHoverPreviewRef.current = null;
       setHoverPreview(null);
     }
   }, [isOfficialValuesModalOpen, isSelectionEditorOpen]);
@@ -2399,7 +2469,16 @@ export default function CalibrationPage() {
     }
   }
 
+  function clearHoverPreviewShowTimer() {
+    if (hoverPreviewShowTimerRef.current != null) {
+      clearTimeout(hoverPreviewShowTimerRef.current);
+      hoverPreviewShowTimerRef.current = null;
+    }
+  }
+
   function scheduleHoverPreviewHide() {
+    clearHoverPreviewShowTimer();
+    pendingHoverPreviewRef.current = null;
     clearHoverPreviewHideTimer();
     hoverPreviewHideTimerRef.current = setTimeout(() => {
       setHoverPreview(null);
@@ -2412,6 +2491,8 @@ export default function CalibrationPage() {
     }
     const targets = parseSelectedTargets(payload.points, chartKey);
     if (!targets.length) {
+      clearHoverPreviewShowTimer();
+      pendingHoverPreviewRef.current = null;
       setHoverPreview(null);
       return;
     }
@@ -2424,21 +2505,29 @@ export default function CalibrationPage() {
             isotopeKey: "d13C",
           } as SelectedTarget)
         : firstTarget;
-    setHoverPreview((current) => {
-      if (
-        current &&
-        current.target.rowLabel === normalizedTarget.rowLabel &&
-        current.target.isotopeKey === normalizedTarget.isotopeKey &&
-        current.target.chartKey === normalizedTarget.chartKey
-      ) {
-        return current;
+    pendingHoverPreviewRef.current = {
+      target: normalizedTarget,
+      clientX: payload.clientX,
+      clientY: payload.clientY,
+    };
+    clearHoverPreviewShowTimer();
+    hoverPreviewShowTimerRef.current = setTimeout(() => {
+      const pending = pendingHoverPreviewRef.current;
+      if (!pending) {
+        return;
       }
-      return {
-        target: normalizedTarget,
-        clientX: payload.clientX,
-        clientY: payload.clientY,
-      };
-    });
+      setHoverPreview((current) => {
+        if (
+          current &&
+          current.target.rowLabel === pending.target.rowLabel &&
+          current.target.isotopeKey === pending.target.isotopeKey &&
+          current.target.chartKey === pending.target.chartKey
+        ) {
+          return current;
+        }
+        return pending;
+      });
+    }, HOVER_PREVIEW_SHOW_DELAY_MS);
   }
 
   function chartHoverProps(chartKey: string) {

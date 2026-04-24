@@ -39,6 +39,7 @@ type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_
 type LinearityOffsetDraftState = Record<LinearityOffsetField, string>;
 const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const RESTORE_STDEV_DEFAULT_CAP = 0.04;
+const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
@@ -1094,6 +1095,16 @@ function parseFinite(value: string, fallback: number) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseNumericDraft(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const normalized = trimmed.replace(",", ".");
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function computeHoverPreviewPosition(
   clientX: number,
   clientY: number,
@@ -1101,21 +1112,30 @@ function computeHoverPreviewPosition(
   tooltipHeight = 340,
 ): { left: number; top: number } {
   if (typeof window === "undefined") {
-    return { left: clientX + 14, top: clientY + 14 };
+    return { left: clientX + 220, top: clientY - 24 };
   }
-  const offset = 14;
+  // Keep the diagnostics card to the right of Plotly's native hover label.
+  const horizontalOffset = 220;
+  const fallbackLeftOffset = 24;
+  const verticalOffset = -24;
   const edgePadding = 10;
   const viewportWidth = window.innerWidth;
   const viewportHeight = window.innerHeight;
 
-  let left = clientX + offset;
+  let left = clientX + horizontalOffset;
   if (left + tooltipWidth > viewportWidth - edgePadding) {
-    left = Math.max(edgePadding, clientX - tooltipWidth - offset);
+    left = clientX - tooltipWidth - fallbackLeftOffset;
+  }
+  if (left < edgePadding) {
+    left = edgePadding;
   }
 
-  let top = clientY + offset;
+  let top = clientY + verticalOffset;
   if (top + tooltipHeight > viewportHeight - edgePadding) {
-    top = Math.max(edgePadding, viewportHeight - tooltipHeight - edgePadding);
+    top = viewportHeight - tooltipHeight - edgePadding;
+  }
+  if (top < edgePadding) {
+    top = edgePadding;
   }
 
   return { left, top };
@@ -1134,9 +1154,10 @@ function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefin
       xanchor: "center",
       font: { size: 14 },
     },
-    margin: { l: 42, r: 12, t: 46, b: 66 },
+    margin: { l: 42, r: 12, t: 46, b: 126 },
     legend: { orientation: "h", yanchor: "top", y: -0.28, x: 0, xanchor: "left", font: { size: 10 } },
     hovermode: "closest",
+    height: 460,
   };
   return {
     ...cloned,
@@ -1188,6 +1209,7 @@ function RangeSliderField({
   max,
   step = 0.1,
   precision = 2,
+  showManualInputs = false,
   onChange,
 }: {
   label: string;
@@ -1196,12 +1218,43 @@ function RangeSliderField({
   max: number;
   step?: number;
   precision?: number;
+  showManualInputs?: boolean;
   onChange: (next: [number, number]) => void;
 }) {
   const resolvedMin = Math.min(min, max);
   const resolvedMax = Math.max(min, max);
   const low = clampNumber(Math.min(value[0], value[1]), resolvedMin, resolvedMax);
   const high = clampNumber(Math.max(value[0], value[1]), resolvedMin, resolvedMax);
+  const [lowDraft, setLowDraft] = useState(low.toFixed(precision));
+  const [highDraft, setHighDraft] = useState(high.toFixed(precision));
+
+  useEffect(() => {
+    setLowDraft(low.toFixed(precision));
+  }, [low, precision]);
+
+  useEffect(() => {
+    setHighDraft(high.toFixed(precision));
+  }, [high, precision]);
+
+  const commitLowDraft = () => {
+    const parsed = parseNumericDraft(lowDraft);
+    if (parsed == null) {
+      setLowDraft(low.toFixed(precision));
+      return;
+    }
+    const nextLow = clampNumber(parsed, resolvedMin, high);
+    onChange([nextLow, high]);
+  };
+
+  const commitHighDraft = () => {
+    const parsed = parseNumericDraft(highDraft);
+    if (parsed == null) {
+      setHighDraft(high.toFixed(precision));
+      return;
+    }
+    const nextHigh = clampNumber(parsed, low, resolvedMax);
+    onChange([low, nextHigh]);
+  };
 
   return (
     <div className="rounded-lg border border-stone-200 bg-white p-3 text-sm">
@@ -1214,33 +1267,73 @@ function RangeSliderField({
       <div className="mt-3 space-y-2">
         <label className="block text-xs text-stone-600">
           Min
-          <input
-            type="range"
-            min={resolvedMin}
-            max={resolvedMax}
-            step={step}
-            value={low}
-            onInput={(event) => {
-              const nextLow = parseFinite(event.currentTarget.value, low);
-              onChange([Math.min(nextLow, high), high]);
-            }}
-            className="mt-1 w-full accent-stone-700"
-          />
+          <div className={cn("mt-1", showManualInputs ? "flex items-center gap-2" : "block")}>
+            <input
+              type="range"
+              min={resolvedMin}
+              max={resolvedMax}
+              step={step}
+              value={low}
+              onInput={(event) => {
+                const nextLow = parseFinite(event.currentTarget.value, low);
+                onChange([Math.min(nextLow, high), high]);
+              }}
+              className="w-full accent-stone-700"
+            />
+            {showManualInputs ? (
+              <input
+                type="number"
+                min={resolvedMin}
+                max={high}
+                step={step}
+                value={lowDraft}
+                onChange={(event) => setLowDraft(event.currentTarget.value)}
+                onBlur={commitLowDraft}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.currentTarget.blur();
+                  }
+                }}
+                className="w-20 rounded border border-stone-300 px-2 py-1 text-right text-xs text-stone-700"
+                aria-label={`${label} minimum value`}
+              />
+            ) : null}
+          </div>
         </label>
         <label className="block text-xs text-stone-600">
           Max
-          <input
-            type="range"
-            min={resolvedMin}
-            max={resolvedMax}
-            step={step}
-            value={high}
-            onInput={(event) => {
-              const nextHigh = parseFinite(event.currentTarget.value, high);
-              onChange([low, Math.max(nextHigh, low)]);
-            }}
-            className="mt-1 w-full accent-stone-700"
-          />
+          <div className={cn("mt-1", showManualInputs ? "flex items-center gap-2" : "block")}>
+            <input
+              type="range"
+              min={resolvedMin}
+              max={resolvedMax}
+              step={step}
+              value={high}
+              onInput={(event) => {
+                const nextHigh = parseFinite(event.currentTarget.value, high);
+                onChange([low, Math.max(nextHigh, low)]);
+              }}
+              className="w-full accent-stone-700"
+            />
+            {showManualInputs ? (
+              <input
+                type="number"
+                min={low}
+                max={resolvedMax}
+                step={step}
+                value={highDraft}
+                onChange={(event) => setHighDraft(event.currentTarget.value)}
+                onBlur={commitHighDraft}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.currentTarget.blur();
+                  }
+                }}
+                className="w-20 rounded border border-stone-300 px-2 py-1 text-right text-xs text-stone-700"
+                aria-label={`${label} maximum value`}
+              />
+            ) : null}
+          </div>
         </label>
       </div>
       <div className="mt-2 flex items-center justify-between text-[11px] text-stone-400">
@@ -2041,6 +2134,8 @@ export default function ProcessingPage() {
   const [colorScaleRangeParam, setColorScaleRangeParam] = useState<string | null>(null);
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
 
   const workspaceQuery = useQuery({
     queryKey: ["processing-workspace", sessionId],
@@ -2206,11 +2301,23 @@ export default function ProcessingPage() {
       if (hoverPreviewHideTimerRef.current != null) {
         clearTimeout(hoverPreviewHideTimerRef.current);
       }
+      if (hoverPreviewShowTimerRef.current != null) {
+        clearTimeout(hoverPreviewShowTimerRef.current);
+      }
     };
   }, []);
 
   useEffect(() => {
     if (isSelectionEditorOpen || isExportModalOpen) {
+      if (hoverPreviewHideTimerRef.current != null) {
+        clearTimeout(hoverPreviewHideTimerRef.current);
+        hoverPreviewHideTimerRef.current = null;
+      }
+      if (hoverPreviewShowTimerRef.current != null) {
+        clearTimeout(hoverPreviewShowTimerRef.current);
+        hoverPreviewShowTimerRef.current = null;
+      }
+      pendingHoverPreviewRef.current = null;
       setHoverPreview(null);
     }
   }, [isExportModalOpen, isSelectionEditorOpen]);
@@ -2697,7 +2804,16 @@ export default function ProcessingPage() {
     }
   }
 
+  function clearHoverPreviewShowTimer() {
+    if (hoverPreviewShowTimerRef.current != null) {
+      clearTimeout(hoverPreviewShowTimerRef.current);
+      hoverPreviewShowTimerRef.current = null;
+    }
+  }
+
   function scheduleHoverPreviewHide() {
+    clearHoverPreviewShowTimer();
+    pendingHoverPreviewRef.current = null;
     clearHoverPreviewHideTimer();
     hoverPreviewHideTimerRef.current = setTimeout(() => {
       setHoverPreview(null);
@@ -2710,6 +2826,8 @@ export default function ProcessingPage() {
     }
     const targets = parseSelectedTargets(payload.points, chartKey);
     if (!targets.length) {
+      clearHoverPreviewShowTimer();
+      pendingHoverPreviewRef.current = null;
       setHoverPreview(null);
       return;
     }
@@ -2722,11 +2840,29 @@ export default function ProcessingPage() {
             isotopeKey: "d13C",
           } as SelectedTarget)
         : firstTarget;
-    setHoverPreview({
+    pendingHoverPreviewRef.current = {
       target: normalizedTarget,
       clientX: payload.clientX,
       clientY: payload.clientY,
-    });
+    };
+    clearHoverPreviewShowTimer();
+    hoverPreviewShowTimerRef.current = setTimeout(() => {
+      const pending = pendingHoverPreviewRef.current;
+      if (!pending) {
+        return;
+      }
+      setHoverPreview((current) => {
+        if (
+          current &&
+          current.target.rowLabel === pending.target.rowLabel &&
+          current.target.isotopeKey === pending.target.isotopeKey &&
+          current.target.chartKey === pending.target.chartKey
+        ) {
+          return current;
+        }
+        return pending;
+      });
+    }, HOVER_PREVIEW_SHOW_DELAY_MS);
   }
 
   function chartHoverProps(chartKey: string) {
@@ -3114,9 +3250,7 @@ export default function ProcessingPage() {
   };
   const manualOverrideCount = Object.keys(workspace.edit_state.manual_outlier_overrides ?? {}).length;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
-  const hoverPreviewPosition = hoverPreview
-    ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 440, 340)
-    : null;
+  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
     ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
   );
@@ -3500,6 +3634,7 @@ export default function ProcessingPage() {
                     max={Math.max(100, activeConfig.signal_range[0], activeConfig.signal_range[1])}
                     step={0.1}
                     precision={2}
+                    showManualInputs
                     onChange={(nextRange) => updateConfig("signal_range", nextRange)}
                   />
                   <RangeSliderField
@@ -3509,6 +3644,7 @@ export default function ProcessingPage() {
                     max={Math.max(2000, activeConfig.leak_range[0], activeConfig.leak_range[1])}
                     step={1}
                     precision={1}
+                    showManualInputs
                     onChange={(nextRange) => updateConfig("leak_range", nextRange)}
                   />
                   <RangeSliderField
@@ -3518,6 +3654,7 @@ export default function ProcessingPage() {
                     max={Math.max(50, activeConfig.d13c_range[0], activeConfig.d13c_range[1])}
                     step={0.001}
                     precision={3}
+                    showManualInputs
                     onChange={(nextRange) => updateConfig("d13c_range", nextRange)}
                   />
                   <RangeSliderField
@@ -3527,6 +3664,7 @@ export default function ProcessingPage() {
                     max={Math.max(50, activeConfig.d18o_range[0], activeConfig.d18o_range[1])}
                     step={0.001}
                     precision={3}
+                    showManualInputs
                     onChange={(nextRange) => updateConfig("d18o_range", nextRange)}
                   />
                 </div>
@@ -4513,7 +4651,7 @@ export default function ProcessingPage() {
       </div>
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="pointer-events-none fixed z-[80] w-[440px] rounded-xl border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          className="pointer-events-none fixed z-[80] w-[560px] rounded-xl border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
         >
           <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
@@ -4527,7 +4665,7 @@ export default function ProcessingPage() {
           {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
             <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
           ) : hasHoverDiagnosticsFigureData ? (
-            <PlotlyChart figure={hoverDiagnosticsFigure} className="h-[280px] w-full" />
+            <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
           ) : (
             <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
               Cycle-intensity preview unavailable for this point.

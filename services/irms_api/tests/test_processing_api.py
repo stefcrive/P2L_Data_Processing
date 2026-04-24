@@ -10,7 +10,9 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from services.irms_api.api import main as api_main
+from services.irms_api.domain.constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL
 from services.irms_api.domain.contracts import CycleDiagnosticsRequest, EditAction, ExportRequest
+from services.irms_api.domain.shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column
 from services.irms_api.session_store import FileSessionStore
 
 
@@ -493,6 +495,10 @@ class ProcessingApiTests(unittest.TestCase):
         diagnostics_figure = bundle.figures.get("diagnostics", {})
         traces = diagnostics_figure.get("data", [])
         expected_x = pd.to_numeric(df["1  Cycle Int  Diff Samp-Ref  44"], errors="coerce").tolist()
+        expected_pressure_adjusted_x = pd.to_numeric(
+            _ensure_cycle1_pressure_weighted_mismatch_column(df.copy())[CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL],
+            errors="coerce",
+        ).tolist()
         expected_d18 = pd.to_numeric(df["d 18O/16O  Mean"], errors="coerce").tolist()
         expected_d13 = pd.to_numeric(df["d 13C/12C  Mean"], errors="coerce").tolist()
 
@@ -517,13 +523,17 @@ class ProcessingApiTests(unittest.TestCase):
                     return []
             return []
 
-        def _trace_matches(trace: dict[str, object], expected_y: list[float]) -> bool:
+        def _trace_matches(trace: dict[str, object], expected_x_values: list[float], expected_y: list[float]) -> bool:
             x_values = _parse_numeric_vector(trace.get("x", []))
             y_values = _parse_numeric_vector(trace.get("y", []))
-            return x_values == expected_x and y_values == expected_y
+            return x_values == expected_x_values and y_values == expected_y
 
-        self.assertTrue(any(_trace_matches(trace, expected_d18) for trace in traces))
-        self.assertTrue(any(_trace_matches(trace, expected_d13) for trace in traces))
+        self.assertTrue(any(_trace_matches(trace, expected_x, expected_d18) for trace in traces))
+        self.assertTrue(any(_trace_matches(trace, expected_x, expected_d13) for trace in traces))
+        self.assertTrue(any(_trace_matches(trace, expected_pressure_adjusted_x, expected_d18) for trace in traces))
+        self.assertTrue(any(_trace_matches(trace, expected_pressure_adjusted_x, expected_d13) for trace in traces))
+
+        self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, bundle.summary.get("available_color_params", []))
 
         annotations = diagnostics_figure.get("layout", {}).get("annotations", [])
         subplot_titles = {
@@ -531,8 +541,85 @@ class ProcessingApiTests(unittest.TestCase):
             for annotation in annotations
             if isinstance(annotation, dict)
         }
+        ordered_annotation_text = [
+            str(annotation.get("text", "")).strip()
+            for annotation in annotations
+            if isinstance(annotation, dict) and str(annotation.get("text", "")).strip()
+        ]
+
+        def _idx(title: str) -> int:
+            return ordered_annotation_text.index(title)
+
         self.assertIn("d18O vs Diff Signal Intensity", subplot_titles)
         self.assertIn("d13C vs Diff Signal Intensity", subplot_titles)
+        self.assertIn("d18O vs Pressure-Adjusted Signal Intensity Diff", subplot_titles)
+        self.assertIn("d13C vs Pressure-Adjusted Signal Intensity Diff", subplot_titles)
+        self.assertLess(_idx("Signal Intensity vs d18O"), _idx("d18O vs Diff Signal Intensity"))
+        self.assertLess(_idx("d18O vs Diff Signal Intensity"), _idx("d13C vs Diff Signal Intensity"))
+        self.assertLess(_idx("d13C vs Diff Signal Intensity"), _idx("d18O vs Pressure-Adjusted Signal Intensity Diff"))
+        self.assertLess(_idx("d18O vs Pressure-Adjusted Signal Intensity Diff"), _idx("d13C vs Pressure-Adjusted Signal Intensity Diff"))
+
+    def test_diagnostics_endpoint_marks_partially_saturated_collectors_with_orange_diamond_outline(self) -> None:
+        df = sample_processing_df().copy()
+        df["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
+        df["total_co2"] = [1.0, 1.1, 1.2, 1.3]
+        df["p_gases"] = [201.0, 202.0, 203.0, 204.0]
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        bundle = api_main.diagnostics(
+            self.session_id,
+            color_param="Date",
+            identifier_filter=[],
+            d13_min=None,
+            d13_max=None,
+            d18_min=None,
+            d18_max=None,
+        )
+
+        traces = bundle.figures.get("diagnostics", {}).get("data", [])
+
+        def _parse_numeric_vector(payload: object) -> list[float]:
+            if isinstance(payload, list):
+                values: list[float] = []
+                for item in payload:
+                    try:
+                        values.append(float(item))
+                    except (TypeError, ValueError):
+                        continue
+                return values
+            if isinstance(payload, dict) and "bdata" in payload:
+                dtype_name = str(payload.get("dtype", "f8"))
+                encoded = str(payload.get("bdata", ""))
+                if not encoded:
+                    return []
+                try:
+                    decoded = base64.b64decode(encoded)
+                    return np.frombuffer(decoded, dtype=np.dtype(dtype_name)).astype(float).tolist()
+                except Exception:
+                    return []
+            return []
+
+        partial_marker_traces = []
+        for trace in traces:
+            if not isinstance(trace, dict):
+                continue
+            marker = trace.get("marker", {})
+            if not isinstance(marker, dict):
+                continue
+            if str(marker.get("symbol", "")).strip() != "diamond-open":
+                continue
+            if str(marker.get("color", "")).strip().lower() != "#ff7f0e":
+                continue
+            partial_marker_traces.append(trace)
+
+        self.assertTrue(partial_marker_traces)
+        self.assertTrue(
+            any(
+                _parse_numeric_vector(trace.get("x", [])) == [5.0]
+                and _parse_numeric_vector(trace.get("y", [])) == [2.0]
+                for trace in partial_marker_traces
+            )
+        )
 
     def test_client_output_precision_uses_full_working_frame(self) -> None:
         df = sample_processing_df()

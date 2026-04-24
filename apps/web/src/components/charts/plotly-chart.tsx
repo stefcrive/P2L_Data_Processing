@@ -94,6 +94,57 @@ function applyD18AxisInversion(layout: Record<string, unknown>) {
   }
 }
 
+function collectAxisTitleTokens(layout: Record<string, unknown>): string[] {
+  const tokens: string[] = [];
+  const sortedEntries = Object.entries(layout).sort(([a], [b]) => a.localeCompare(b));
+  for (const [key, value] of sortedEntries) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    if (/^[xy]axis\d*$/.test(key)) {
+      const axis = value as Record<string, unknown>;
+      const label = titleText(axis.title);
+      if (label) {
+        tokens.push(`${key}:${label}`);
+      }
+      continue;
+    }
+    if (!/^scene\d*$/.test(key)) {
+      continue;
+    }
+    const scene = value as Record<string, unknown>;
+    for (const axisKey of ["xaxis", "yaxis", "zaxis"]) {
+      const axisValue = scene[axisKey];
+      if (!axisValue || typeof axisValue !== "object") {
+        continue;
+      }
+      const axis = axisValue as Record<string, unknown>;
+      const label = titleText(axis.title);
+      if (label) {
+        tokens.push(`${key}.${axisKey}:${label}`);
+      }
+    }
+  }
+  return tokens;
+}
+
+function buildDefaultUiRevision(data: unknown, layout: Record<string, unknown>): string {
+  const traceTokens = Array.isArray(data)
+    ? data.map((trace, index) => {
+        if (trace && typeof trace === "object") {
+          const traceType = (trace as { type?: unknown }).type;
+          if (typeof traceType === "string" && traceType) {
+            return traceType;
+          }
+        }
+        return `trace${index}`;
+      })
+    : ["no-data"];
+  const axisTokens = collectAxisTitleTokens(layout);
+  const plotTitle = titleText(layout.title);
+  return ["persist-ui", plotTitle, ...axisTokens, ...traceTokens].join("|");
+}
+
 export function PlotlyChart({ figure, className, onPointClick, onSelection, onPointHover, onHoverEnd }: PlotlyChartProps) {
   const preparedFigure = useMemo(() => {
     if (!figure || Object.keys(figure).length === 0) {
@@ -110,6 +161,9 @@ export function PlotlyChart({ figure, className, onPointClick, onSelection, onPo
     if (!hasExplicitWidth && !hasExplicitHeight && typeof (layout as { autosize?: unknown }).autosize !== "boolean") {
       layout.autosize = true;
     }
+    if (typeof (layout as { uirevision?: unknown }).uirevision === "undefined") {
+      layout.uirevision = buildDefaultUiRevision(safeFigure.data, layout);
+    }
     return {
       data: (safeFigure.data as never[]) ?? [],
       layout: layout as never,
@@ -121,6 +175,34 @@ export function PlotlyChart({ figure, className, onPointClick, onSelection, onPo
     return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">No chart data yet.</div>;
   }
   const shouldUseContainerHeight = preparedFigure.useResizeHandler;
+  const hoverHandlers =
+    onPointHover || onHoverEnd
+      ? {
+          onHover: (
+            event:
+              | {
+                  points?: PlotlyPoint[];
+                  event?: { clientX?: number; clientY?: number; x?: number; y?: number };
+                }
+              | undefined,
+          ) => {
+            if (!onPointHover) {
+              return;
+            }
+            const points = event?.points ?? [];
+            if (!points.length) {
+              return;
+            }
+            const clientX = event?.event?.clientX ?? event?.event?.x;
+            const clientY = event?.event?.clientY ?? event?.event?.y;
+            if (typeof clientX !== "number" || typeof clientY !== "number") {
+              return;
+            }
+            onPointHover({ points, clientX, clientY });
+          },
+          onUnhover: () => onHoverEnd?.(),
+        }
+      : {};
   return (
     <div className={cn("min-w-0 w-full", className)}>
       <Plot
@@ -132,29 +214,7 @@ export function PlotlyChart({ figure, className, onPointClick, onSelection, onPo
         style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%" }}
         onClick={(event: { points?: PlotlyPoint[] }) => onPointClick?.(event.points ?? [])}
         onSelected={(event: { points?: PlotlyPoint[] } | undefined) => onSelection?.(event?.points ?? [])}
-        onHover={(
-          event:
-            | {
-                points?: PlotlyPoint[];
-                event?: { clientX?: number; clientY?: number; x?: number; y?: number };
-              }
-            | undefined,
-        ) => {
-          if (!onPointHover) {
-            return;
-          }
-          const points = event?.points ?? [];
-          if (!points.length) {
-            return;
-          }
-          const clientX = event?.event?.clientX ?? event?.event?.x;
-          const clientY = event?.event?.clientY ?? event?.event?.y;
-          if (typeof clientX !== "number" || typeof clientY !== "number") {
-            return;
-          }
-          onPointHover({ points, clientX, clientY });
-        }}
-        onUnhover={() => onHoverEnd?.()}
+        {...hoverHandlers}
       />
     </div>
   );

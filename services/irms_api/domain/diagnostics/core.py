@@ -19,6 +19,7 @@ from ..shared.plotting import (
     _prefer_datetime_color_values,
     _prepare_color_values,
 )
+from ..constants import CYCLE1_SIGNAL_DIFF44_COL, CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL
 
 
 def _color_param_label(color_param: str) -> str:
@@ -46,6 +47,12 @@ def _resolve_species_labels(df: pd.DataFrame) -> pd.Series:
     labels = labels.where(labels != "", "Unknown")
     return labels
 
+
+def _partially_saturated_mask(df: pd.DataFrame) -> pd.Series:
+    status_series = df.get("Collector Status", df.get("collector_status", pd.Series(index=df.index, dtype=object)))
+    normalized = pd.Series(status_series, index=df.index).fillna("").astype(str).str.strip().str.lower()
+    return normalized.eq("partially saturated collectors")
+
 def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     """
     Create diagnostic plots for analysis with the option to color points by a selected parameter.
@@ -62,28 +69,32 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         raise ValueError(f"Error loading standards from {standards_file}: {e}")
 
 
-    diff_signal_col = '1  Cycle Int  Diff Samp-Ref  44'
+    diff_signal_col = CYCLE1_SIGNAL_DIFF44_COL
+    pressure_adjusted_diff_col = CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL
 
-    # Create a subplot with 7 rows and 3 columns
+    # Create a subplot with 8 rows and 3 columns.
+    # Keep diff-intensity diagnostics grouped immediately after "Signal Intensity vs d18O".
     fig = make_subplots(
-        rows=7, cols=3,
+        rows=8, cols=3,
         subplot_titles=(
             'Leak Rate vs d13C', 'P no Acid vs d13C', 'Total CO2 vs d13C',
             'Leak Rate vs d18O', 'P no Acid vs d18O', 'Total CO2 vs d18O',
             'Leak Rate vs Line', 'Signal Intensity vs pCO2', 'Signal Intensity vs d13C',
-            'Signal Intensity vs d18O', 'd13C vs Line', 'd18O vs Line',
-            'Leak Rate vs pCO2', 'd13C vs d18O', 'Total CO2 vs Line',
-            'Leak Rate vs Signal Intensity', 'P no Acid vs Leak Rate', 'P Gasses vs Leak Rate',
-            'PCA: Principal Components', 'd18O vs Diff Signal Intensity', 'd13C vs Diff Signal Intensity',
+            'Signal Intensity vs d18O', 'd18O vs Diff Signal Intensity', 'd13C vs Diff Signal Intensity',
+            'd18O vs Pressure-Adjusted Signal Intensity Diff', 'd13C vs Pressure-Adjusted Signal Intensity Diff', 'd13C vs Line',
+            'd18O vs Line', 'Leak Rate vs pCO2', 'd13C vs d18O',
+            'Total CO2 vs Line', 'Leak Rate vs Signal Intensity', 'P no Acid vs Leak Rate',
+            'P Gasses vs Leak Rate', 'PCA: Principal Components',
         ),
         vertical_spacing=0.03,
         specs=[[{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}],
                [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}],
                [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'box'}],
-               [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'box'}],
                [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}],
                [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}],
-               [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}]]
+               [{'type': 'box'}, {'type': 'scatter'}, {'type': 'scatter'}],
+               [{'type': 'box'}, {'type': 'scatter'}, {'type': 'scatter'}],
+               [{'type': 'scatter'}, {'type': 'scatter'}, None]]
     )
 
     # Ensure the required columns are present in the DataFrame
@@ -117,6 +128,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
     # Set marker styles based on whether Identifier 1 is in the standards list
     marker_symbols = ['circle-open' if id in standards_list else 'circle' for id in df['Identifier 1']]
     hover_text = df['Identifier 2']
+    partial_df = df.loc[_partially_saturated_mask(df)]
 
     # Build colorbar configuration for the first trace (readable dates if needed)
     is_date_color = _is_date_color_column(color_param)
@@ -210,14 +222,14 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
 
     fig.add_trace(go.Scatter(x=df['1  Cycle Int  Samp  44'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=4, col=1)
-    fig.add_trace(go.Box(x=df['Line'], y=df['d 13C/12C  Mean']), row=4, col=2)
-    fig.add_trace(go.Box(x=df['Line'], y=df['d 18O/16O  Mean']), row=4, col=3)
+    fig.add_trace(go.Box(x=df['Line'], y=df['d 13C/12C  Mean']), row=5, col=3)
+    fig.add_trace(go.Box(x=df['Line'], y=df['d 18O/16O  Mean']), row=6, col=1)
 
     fig.add_trace(go.Scatter(x=df['leak_rate'], y=df['total_co2'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
-        hoverinfo='text+x+y'), row=5, col=1)
+        hoverinfo='text+x+y'), row=6, col=2)
     fig.add_trace(go.Scatter(x=df['d 13C/12C  Mean'], y=df['d 18O/16O  Mean'], mode='markers', marker=dict(color=color_values, symbol=marker_symbols, colorscale='Viridis', showscale=False), text=hover_text,
-        hoverinfo='text+x+y'), row=5, col=2)
-    fig.add_trace(go.Box(x=df['Line'], y=df['total_co2']), row=5, col=3)
+        hoverinfo='text+x+y'), row=6, col=3)
+    fig.add_trace(go.Box(x=df['Line'], y=df['total_co2']), row=7, col=1)
 
 
 
@@ -226,19 +238,19 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         x=df['leak_rate'], y=df['1  Cycle Int  Samp  44'], mode='markers',
         marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'
-    ), row=6, col=1)
+    ), row=7, col=2)
 
     fig.add_trace(go.Scatter(
         x=df['p_no_acid'], y=df['leak_rate'], mode='markers',
         marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'
-    ), row=6, col=2)
+    ), row=7, col=3)
 
     fig.add_trace(go.Scatter(
         x=df['p_gases'], y=df['leak_rate'], mode='markers',
         marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'
-    ), row=6, col=3)
+    ), row=8, col=1)
 
     if diff_signal_col in df.columns:
         fig.add_trace(
@@ -250,7 +262,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
                 text=hover_text,
                 hoverinfo='text+x+y',
             ),
-            row=7,
+            row=4,
             col=2,
         )
         fig.add_trace(
@@ -262,9 +274,99 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
                 text=hover_text,
                 hoverinfo='text+x+y',
             ),
-            row=7,
+            row=4,
             col=3,
         )
+    if pressure_adjusted_diff_col in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df[pressure_adjusted_diff_col],
+                y=df['d 18O/16O  Mean'],
+                mode='markers',
+                marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False),
+                text=hover_text,
+                hoverinfo='text+x+y',
+            ),
+            row=5,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df[pressure_adjusted_diff_col],
+                y=df['d 13C/12C  Mean'],
+                mode='markers',
+                marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False),
+                text=hover_text,
+                hoverinfo='text+x+y',
+            ),
+            row=5,
+            col=2,
+        )
+
+    def _add_partial_overlay(x_col: str, y_col: str, *, row: int, col: int) -> None:
+        if partial_df.empty or x_col not in partial_df.columns or y_col not in partial_df.columns:
+            return
+        x_values = pd.to_numeric(partial_df.get(x_col), errors="coerce")
+        y_values = pd.to_numeric(partial_df.get(y_col), errors="coerce")
+        valid = np.isfinite(x_values) & np.isfinite(y_values)
+        overlay_rows = partial_df.loc[valid]
+        if overlay_rows.empty:
+            return
+        overlay_index = overlay_rows.index
+        fig.add_trace(
+            go.Scatter(
+                x=x_values.loc[overlay_index],
+                y=y_values.loc[overlay_index],
+                mode="markers",
+                name="Partially Saturated Collectors",
+                showlegend=False,
+                marker=dict(
+                    color="#ff7f0e",
+                    symbol="diamond-open",
+                    size=13,
+                    opacity=1.0,
+                    line=dict(width=2, color="#ff7f0e"),
+                ),
+                text=hover_text.loc[overlay_index],
+                hoverinfo="text+x+y",
+                customdata=_build_customdata_for_index(overlay_index),
+            ),
+            row=row,
+            col=col,
+        )
+
+    partial_overlay_axes = [
+        ("leak_rate", "d 13C/12C  Mean", 1, 1),
+        ("p_no_acid", "d 13C/12C  Mean", 1, 2),
+        ("total_co2", "d 13C/12C  Mean", 1, 3),
+        ("leak_rate", "d 18O/16O  Mean", 2, 1),
+        ("p_no_acid", "d 18O/16O  Mean", 2, 2),
+        ("total_co2", "d 18O/16O  Mean", 2, 3),
+        ("1  Cycle Int  Samp  44", "total_co2", 3, 2),
+        ("1  Cycle Int  Samp  44", "d 13C/12C  Mean", 3, 3),
+        ("1  Cycle Int  Samp  44", "d 18O/16O  Mean", 4, 1),
+        ("leak_rate", "total_co2", 6, 2),
+        ("d 13C/12C  Mean", "d 18O/16O  Mean", 6, 3),
+        ("leak_rate", "1  Cycle Int  Samp  44", 7, 2),
+        ("p_no_acid", "leak_rate", 7, 3),
+        ("p_gases", "leak_rate", 8, 1),
+    ]
+    if diff_signal_col in df.columns:
+        partial_overlay_axes.extend(
+            [
+                (diff_signal_col, "d 18O/16O  Mean", 4, 2),
+                (diff_signal_col, "d 13C/12C  Mean", 4, 3),
+            ]
+        )
+    if pressure_adjusted_diff_col in df.columns:
+        partial_overlay_axes.extend(
+            [
+                (pressure_adjusted_diff_col, "d 18O/16O  Mean", 5, 1),
+                (pressure_adjusted_diff_col, "d 13C/12C  Mean", 5, 2),
+            ]
+        )
+    for x_col, y_col, row, col in partial_overlay_axes:
+        _add_partial_overlay(x_col, y_col, row=row, col=col)
 
     # Perform PCA
     features = ['leak_rate', 'd 13C/12C  Mean', 'p_no_acid', 'total_co2', 'd 18O/16O  Mean', 'Line',
@@ -303,7 +405,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
             x=components[:, 0], y=components[:, 1], mode='markers',
             marker=dict(color=pca_color, colorscale='Viridis', symbol=marker_symbols, showscale=False),
             text=pca_hover, hoverinfo='text+x+y'
-        ), row=7, col=1)
+        ), row=8, col=2)
 
         # Add loadings as annotations
         for i, feature in enumerate(features):
@@ -317,7 +419,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
                 arrowhead=2,  # Set arrowhead style
                 xanchor="right",  # Anchor the x-axis to the right side
                 yanchor="top",  # Anchor the y-axis to the top side
-                row=7, col=1
+                row=8, col=2
             )
             fig.add_annotation(
                 x=loadings[i, 0],  # Loading for the first component (x)
@@ -326,7 +428,7 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
                 yanchor="bottom",  # Bottom-align the y-axis label
                 text=feature,  # The feature name as annotation text
                 yshift=5,  # Adjust the y-position to avoid overlap
-                row=7, col=1
+                row=8, col=2
             )
 
     # # Position the color scale only on the first subplot, adjusting its height to match one row
@@ -343,17 +445,19 @@ def create_diagnostic_plots(df, color_param, standards_file='standards.csv'):
         (3, 2): ("Signal Intensity (Cycle 1 m/z 44)", "Total CO2"),
         (3, 3): ("Signal Intensity (Cycle 1 m/z 44)", "d13C/12C Mean"),
         (4, 1): ("Signal Intensity (Cycle 1 m/z 44)", "d18O/16O Mean"),
-        (4, 2): ("Line", "d13C/12C Mean"),
-        (4, 3): ("Line", "d18O/16O Mean"),
-        (5, 1): ("Leak Rate", "Total CO2"),
-        (5, 2): ("d13C/12C Mean", "d18O/16O Mean"),
-        (5, 3): ("Line", "Total CO2"),
-        (6, 1): ("Leak Rate", "Signal Intensity (Cycle 1 m/z 44)"),
-        (6, 2): ("P no Acid", "Leak Rate"),
-        (6, 3): ("P Gasses", "Leak Rate"),
-        (7, 1): ("Principal Component 1", "Principal Component 2"),
-        (7, 2): ("Diff Signal Intensity (Cycle 1 m/z 44)", "d18O/16O Mean"),
-        (7, 3): ("Diff Signal Intensity (Cycle 1 m/z 44)", "d13C/12C Mean"),
+        (4, 2): ("Diff Signal Intensity (Cycle 1 m/z 44)", "d18O/16O Mean"),
+        (4, 3): ("Diff Signal Intensity (Cycle 1 m/z 44)", "d13C/12C Mean"),
+        (5, 1): ("Pressure-Adjusted Signal Intensity Diff (Cycle 1 m/z 44)", "d18O/16O Mean"),
+        (5, 2): ("Pressure-Adjusted Signal Intensity Diff (Cycle 1 m/z 44)", "d13C/12C Mean"),
+        (5, 3): ("Line", "d13C/12C Mean"),
+        (6, 1): ("Line", "d18O/16O Mean"),
+        (6, 2): ("Leak Rate", "Total CO2"),
+        (6, 3): ("d13C/12C Mean", "d18O/16O Mean"),
+        (7, 1): ("Line", "Total CO2"),
+        (7, 2): ("Leak Rate", "Signal Intensity (Cycle 1 m/z 44)"),
+        (7, 3): ("P no Acid", "Leak Rate"),
+        (8, 1): ("P Gasses", "Leak Rate"),
+        (8, 2): ("Principal Component 1", "Principal Component 2"),
     }
     for (row, col), (x_title, y_title) in axis_titles.items():
         fig.update_xaxes(title_text=x_title, row=row, col=col)

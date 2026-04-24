@@ -12,6 +12,7 @@ import type { CalibrationConfig, CalibrationPrecisionSummary, CycleDiagnosticsPa
 import { useSessionStore } from "@/store/use-session-store";
 
 const RANGE_FETCH_DEBOUNCE_MS = 300;
+const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
@@ -175,24 +176,78 @@ function computeHoverPreviewPosition(
   tooltipHeight = 340,
 ): { left: number; top: number } {
   if (typeof window === "undefined") {
-    return { left: clientX + 14, top: clientY + 14 };
+    return { left: clientX + 220, top: clientY - 24 };
   }
-  const offset = 14;
+  // Keep the diagnostics card to the right of Plotly's native hover label.
+  const horizontalOffset = 220;
+  const fallbackLeftOffset = 24;
+  const verticalOffset = -24;
   const edgePadding = 10;
   const viewportWidth = window.innerWidth;
   const viewportHeight = window.innerHeight;
 
-  let left = clientX + offset;
+  let left = clientX + horizontalOffset;
   if (left + tooltipWidth > viewportWidth - edgePadding) {
-    left = Math.max(edgePadding, clientX - tooltipWidth - offset);
+    left = clientX - tooltipWidth - fallbackLeftOffset;
+  }
+  if (left < edgePadding) {
+    left = edgePadding;
   }
 
-  let top = clientY + offset;
+  let top = clientY + verticalOffset;
   if (top + tooltipHeight > viewportHeight - edgePadding) {
-    top = Math.max(edgePadding, viewportHeight - tooltipHeight - edgePadding);
+    top = viewportHeight - tooltipHeight - edgePadding;
+  }
+  if (top < edgePadding) {
+    top = edgePadding;
   }
 
   return { left, top };
+}
+
+function figureTitleText(layout: Record<string, unknown>): string {
+  const title = layout.title;
+  if (typeof title === "string") {
+    return title;
+  }
+  if (title && typeof title === "object") {
+    const text = (title as { text?: unknown }).text;
+    if (typeof text === "string") {
+      return text;
+    }
+  }
+  return "";
+}
+
+function ensureFigureUiRevision(
+  figure: Record<string, unknown> | undefined,
+  revisionScope: string,
+): Record<string, unknown> | undefined {
+  if (!figure) {
+    return figure;
+  }
+  const sourceLayout =
+    typeof (figure as FigureShape).layout === "object" && (figure as FigureShape).layout
+      ? ((figure as FigureShape).layout as Record<string, unknown>)
+      : {};
+  if (typeof sourceLayout.uirevision !== "undefined") {
+    return figure;
+  }
+  const traceTokens = Array.isArray((figure as FigureShape).data)
+    ? ((figure as FigureShape).data as Array<Record<string, unknown>>).map((trace, index) => {
+        const traceType = typeof trace.type === "string" ? trace.type : `trace${index}`;
+        const traceName = typeof trace.name === "string" ? trace.name : "";
+        return `${traceType}:${traceName}`;
+      })
+    : ["no-data"];
+  const title = figureTitleText(sourceLayout);
+  return {
+    ...(figure as FigureShape),
+    layout: {
+      ...sourceLayout,
+      uirevision: [revisionScope, title, ...traceTokens].join("|"),
+    },
+  };
 }
 
 function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
@@ -217,11 +272,12 @@ function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefin
       xanchor: "center",
       font: { size: 14 },
     },
-    margin: { l: 42, r: 12, t: 46, b: 66 },
+    margin: { l: 42, r: 12, t: 46, b: 126 },
     legend: { orientation: "h", yanchor: "top", y: -0.28, x: 0, xanchor: "left", font: { size: 10 } },
     hovermode: "closest",
+    height: 460,
   };
-  return cloned;
+  return ensureFigureUiRevision(cloned, "diagnostics:hover-preview");
 }
 
 function toFiniteNumber(value: unknown): number | null {
@@ -574,6 +630,7 @@ function sliderStep(bounds: ColorScaleBounds): number {
 function applyColorScaleRangeToFigure(
   figure: Record<string, unknown> | undefined,
   range: [number, number],
+  revisionScope = "diagnostics:matrix",
 ): Record<string, unknown> | undefined {
   if (!figure) {
     return figure;
@@ -627,7 +684,7 @@ function applyColorScaleRangeToFigure(
       cmax,
     };
   }
-  return hasColorMapping ? cloned : figure;
+  return ensureFigureUiRevision(hasColorMapping ? cloned : figure, revisionScope);
 }
 
 function resolveFigureHeight(figure: unknown, fallback: number): number {
@@ -734,6 +791,8 @@ export default function DiagnosticsPage() {
   const [singleOffsets, setSingleOffsets] = useState<IsotopeNumericMap>({ d13C: 0, d18O: 0 });
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
   const hoverPreviewTarget = hoverPreview?.target ?? null;
   const hoverPreviewDiagnosticsTarget =
     hoverPreviewTarget == null
@@ -845,7 +904,7 @@ export default function DiagnosticsPage() {
     colorSliderBounds,
   );
   const displayedDiagnosticsFigure = useMemo(
-    () => applyColorScaleRangeToFigure(diagnosticsFigure, effectiveColorScaleRange),
+    () => applyColorScaleRangeToFigure(diagnosticsFigure, effectiveColorScaleRange, "diagnostics:matrix"),
     [diagnosticsFigure, effectiveColorScaleRange],
   );
   const diagnosticsMatrixHeight = useMemo(() => resolveFigureHeight(data?.figures?.diagnostics, 2600), [data?.figures?.diagnostics]);
@@ -882,9 +941,7 @@ export default function DiagnosticsPage() {
     ? (activeSelectionTargetPayload.effective_outlier as boolean)
     : false;
   const busy = saveSharedLinearityMutation.isPending || editMutation.isPending;
-  const hoverPreviewPosition = hoverPreview
-    ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 440, 340)
-    : null;
+  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(hoverDiagnosticsQuery.data?.figure);
   const hasHoverDiagnosticsFigureData = Boolean(
     hoverDiagnosticsFigure &&
@@ -957,11 +1014,23 @@ export default function DiagnosticsPage() {
       if (hoverPreviewHideTimerRef.current != null) {
         clearTimeout(hoverPreviewHideTimerRef.current);
       }
+      if (hoverPreviewShowTimerRef.current != null) {
+        clearTimeout(hoverPreviewShowTimerRef.current);
+      }
     };
   }, []);
 
   useEffect(() => {
     if (isSelectionEditorOpen) {
+      if (hoverPreviewHideTimerRef.current != null) {
+        clearTimeout(hoverPreviewHideTimerRef.current);
+        hoverPreviewHideTimerRef.current = null;
+      }
+      if (hoverPreviewShowTimerRef.current != null) {
+        clearTimeout(hoverPreviewShowTimerRef.current);
+        hoverPreviewShowTimerRef.current = null;
+      }
+      pendingHoverPreviewRef.current = null;
       setHoverPreview(null);
     }
   }, [isSelectionEditorOpen]);
@@ -1180,7 +1249,16 @@ export default function DiagnosticsPage() {
     }
   }
 
+  function clearHoverPreviewShowTimer() {
+    if (hoverPreviewShowTimerRef.current != null) {
+      clearTimeout(hoverPreviewShowTimerRef.current);
+      hoverPreviewShowTimerRef.current = null;
+    }
+  }
+
   function scheduleHoverPreviewHide() {
+    clearHoverPreviewShowTimer();
+    pendingHoverPreviewRef.current = null;
     clearHoverPreviewHideTimer();
     hoverPreviewHideTimerRef.current = setTimeout(() => {
       setHoverPreview(null);
@@ -1193,19 +1271,39 @@ export default function DiagnosticsPage() {
     }
     const targets = parseDiagnosticsSelectedTargets(payload.points);
     if (!targets.length) {
+      clearHoverPreviewShowTimer();
+      pendingHoverPreviewRef.current = null;
       setHoverPreview(null);
       return;
     }
     clearHoverPreviewHideTimer();
     const target = targets[0];
-    setHoverPreview({
+    pendingHoverPreviewRef.current = {
       target: {
         ...target,
         isotopeKey: target.isotopeKey === "cross" ? "d13C" : target.isotopeKey,
       },
       clientX: payload.clientX,
       clientY: payload.clientY,
-    });
+    };
+    clearHoverPreviewShowTimer();
+    hoverPreviewShowTimerRef.current = setTimeout(() => {
+      const pending = pendingHoverPreviewRef.current;
+      if (!pending) {
+        return;
+      }
+      setHoverPreview((current) => {
+        if (
+          current &&
+          current.target.rowLabel === pending.target.rowLabel &&
+          current.target.isotopeKey === pending.target.isotopeKey &&
+          current.target.chartKey === pending.target.chartKey
+        ) {
+          return current;
+        }
+        return pending;
+      });
+    }, HOVER_PREVIEW_SHOW_DELAY_MS);
   }
 
   function handleDiagnosticsPointClick(points: PlotlyPoint[]) {
@@ -1639,7 +1737,10 @@ export default function DiagnosticsPage() {
                       {activeSelectionLoading ? <div className="text-sm text-stone-500">Loading cycle diagnostics...</div> : null}
                       {activeSelectionDiagnostics ? (
                         <>
-                          <PlotlyChart figure={activeSelectionDiagnostics.figure} className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]" />
+                          <PlotlyChart
+                            figure={ensureFigureUiRevision(activeSelectionDiagnostics.figure, "diagnostics:selection-cycle")}
+                            className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
+                          />
                           <CycleDiagnosticsMiniTable rows={activeSelectionDiagnostics.table ?? []} />
                         </>
                       ) : (
@@ -1661,7 +1762,7 @@ export default function DiagnosticsPage() {
       ) : null}
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="pointer-events-none fixed z-[80] w-[440px] rounded-xl border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          className="pointer-events-none fixed z-[80] w-[560px] rounded-xl border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
         >
           <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
@@ -1675,7 +1776,7 @@ export default function DiagnosticsPage() {
           {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
             <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
           ) : hasHoverDiagnosticsFigureData ? (
-            <PlotlyChart figure={hoverDiagnosticsFigure} className="h-[280px] w-full" />
+            <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
           ) : (
             <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
               Cycle-intensity preview unavailable for this point.

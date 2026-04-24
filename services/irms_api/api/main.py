@@ -49,7 +49,11 @@ from ..domain.contracts import (
     ProcessingWorkspace,
     SessionSnapshot,
 )
-from ..domain.constants import CYCLE1_SIGNAL_SAMP44_COL
+from ..domain.constants import (
+    CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+    CYCLE1_SIGNAL_SAMP44_COL,
+)
 from ..domain.diagnostics.core import create_diagnostic_plots
 from ..domain.calibration.workspace import build_calibration_workspace, normalize_calibration_config
 from ..domain.import_session import (
@@ -366,8 +370,9 @@ def _candidate_diagnostics_color_columns(df: pd.DataFrame) -> list[str]:
         "Species",
         "Comment",
         "Label",
-        "1  Cycle Int  Samp  44",
-        "1  Cycle Int  Diff Samp-Ref  44",
+        CYCLE1_SIGNAL_SAMP44_COL,
+        CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
         "leak_rate",
         "Line",
         "d 13C/12C  Mean",
@@ -378,8 +383,9 @@ def _candidate_diagnostics_color_columns(df: pd.DataFrame) -> list[str]:
 
 def _candidate_diagnostics_z_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
-        "1  Cycle Int  Diff Samp-Ref  44",
-        "1  Cycle Int  Samp  44",
+        CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SAMP44_COL,
         "total_co2",
         "p_no_acid",
         "p_gases",
