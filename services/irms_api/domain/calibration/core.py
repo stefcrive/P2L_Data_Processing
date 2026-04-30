@@ -44,6 +44,12 @@ from ..shared.plotting import (
 )
 from ..standards import StandardsRepository
 
+CARBONATE_REFERENCE_MATERIAL = "calcite"
+CARBONATE_ACID_FRACTIONATION_FACTORS: dict[str, float] = {
+    "calcite": 1.0087,
+    "aragonite": 1.0091,
+}
+
 
 def identify_outliers(data: pd.DataFrame, column: str, sigma_level: float) -> pd.Series:
     if column not in data.columns:
@@ -95,6 +101,60 @@ def get_true_value(
 ) -> float:
     repo = repository or StandardsRepository.default()
     return repo.get_true_value(standard_name, isotopic_type)
+
+
+def convert_d18o_carbonate_material(
+    value: float,
+    *,
+    source_material: str = CARBONATE_REFERENCE_MATERIAL,
+    target_material: str = CARBONATE_REFERENCE_MATERIAL,
+) -> float:
+    """Convert d18O VPDB values between carbonate minerals by acid fractionation factor."""
+    source_key = str(source_material or CARBONATE_REFERENCE_MATERIAL).strip().lower()
+    target_key = str(target_material or CARBONATE_REFERENCE_MATERIAL).strip().lower()
+    source_alpha = CARBONATE_ACID_FRACTIONATION_FACTORS.get(source_key)
+    target_alpha = CARBONATE_ACID_FRACTIONATION_FACTORS.get(target_key)
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if source_alpha is None or target_alpha is None or not np.isfinite(numeric):
+        return float(numeric)
+    return ((source_alpha / target_alpha) * ((float(numeric) / 1000.0) + 1.0) - 1.0) * 1000.0
+
+
+def _carbonate_adjusted_true_value(
+    value: float,
+    isotopic_type: str,
+    carbonate_material: str = CARBONATE_REFERENCE_MATERIAL,
+) -> float:
+    if isotopic_type != ISOTYPE_D18O:
+        return value
+    return convert_d18o_carbonate_material(value, target_material=carbonate_material)
+
+
+def carbonate_adjusted_standards_reference(
+    standards_reference: pd.DataFrame,
+    carbonate_material: str = CARBONATE_REFERENCE_MATERIAL,
+) -> pd.DataFrame:
+    material_key = str(carbonate_material).strip().lower()
+    if (
+        standards_reference is None
+        or standards_reference.empty
+        or material_key == CARBONATE_REFERENCE_MATERIAL
+    ):
+        return standards_reference
+    if (
+        "Isotopic_Value_Type" not in standards_reference.columns
+        or "Value" not in standards_reference.columns
+    ):
+        return standards_reference
+    work = standards_reference.copy()
+    d18_mask = work["Isotopic_Value_Type"].astype(str).eq(ISOTYPE_D18O)
+    values = pd.to_numeric(work.loc[d18_mask, "Value"], errors="coerce")
+    work.loc[d18_mask, "Value"] = values.map(
+        lambda item: convert_d18o_carbonate_material(item, target_material=carbonate_material)
+        if pd.notna(item)
+        else np.nan
+    )
+    return work
 
 
 def single_point_calibration(raw_sample: float, raw_std: float, true_std: float) -> float:
@@ -823,6 +883,7 @@ def _compute_calibration_coefficients(
     standards_df: pd.DataFrame,
     selected_standards: list[str],
     repository: StandardsRepository | None = None,
+    carbonate_material: str = CARBONATE_REFERENCE_MATERIAL,
 ) -> dict[str, dict[str, float]]:
     repo = repository or StandardsRepository.default()
     coeffs: dict[str, dict[str, float]] = {}
@@ -843,7 +904,11 @@ def _compute_calibration_coefficients(
                 standards_df.loc[standards_df["Identifier 1"] == standard, raw_col],
                 errors="coerce",
             ).mean()
-            true_std = repo.get_true_value(standard, iso_type_name)
+            true_std = _carbonate_adjusted_true_value(
+                repo.get_true_value(standard, iso_type_name),
+                iso_type_name,
+                carbonate_material,
+            )
             if np.isfinite(raw_std) and np.isfinite(true_std) and abs(raw_std + 1000.0) > 1e-12:
                 slope = (true_std + 1000.0) / (raw_std + 1000.0)
                 intercept = (1000.0 * slope) - 1000.0
@@ -857,8 +922,16 @@ def _compute_calibration_coefficients(
                 standards_df.loc[standards_df["Identifier 1"] == standard2, raw_col],
                 errors="coerce",
             ).mean()
-            true_rm1 = repo.get_true_value(standard1, iso_type_name)
-            true_rm2 = repo.get_true_value(standard2, iso_type_name)
+            true_rm1 = _carbonate_adjusted_true_value(
+                repo.get_true_value(standard1, iso_type_name),
+                iso_type_name,
+                carbonate_material,
+            )
+            true_rm2 = _carbonate_adjusted_true_value(
+                repo.get_true_value(standard2, iso_type_name),
+                iso_type_name,
+                carbonate_material,
+            )
             denom = raw_rm1 - raw_rm2
             if np.isfinite(raw_rm1) and np.isfinite(raw_rm2) and np.isfinite(denom) and abs(denom) > 1e-12:
                 slope = (true_rm1 - true_rm2) / denom
@@ -873,6 +946,7 @@ def calibrate_results(
     full_df: pd.DataFrame,
     selected_standards: list[str],
     repository: StandardsRepository | None = None,
+    carbonate_material: str = CARBONATE_REFERENCE_MATERIAL,
 ) -> pd.DataFrame:
     repo = repository or StandardsRepository.default()
     calibrated_df = full_df.copy()
@@ -886,7 +960,11 @@ def calibrate_results(
         if len(selected_standards) == 1:
             standard = selected_standards[0]
             raw_std = standards_df.loc[standards_df["Identifier 1"] == standard, raw_column].mean()
-            true_std = repo.get_true_value(standard, isotopic_type)
+            true_std = _carbonate_adjusted_true_value(
+                repo.get_true_value(standard, isotopic_type),
+                isotopic_type,
+                carbonate_material,
+            )
             calibrated_df[calibrated_column] = pd.to_numeric(
                 calibrated_df[raw_column], errors="coerce"
             ).apply(
@@ -898,8 +976,16 @@ def calibrate_results(
             standard1, standard2 = selected_standards
             raw_rm1 = standards_df.loc[standards_df["Identifier 1"] == standard1, raw_column].mean()
             raw_rm2 = standards_df.loc[standards_df["Identifier 1"] == standard2, raw_column].mean()
-            true_rm1 = repo.get_true_value(standard1, isotopic_type)
-            true_rm2 = repo.get_true_value(standard2, isotopic_type)
+            true_rm1 = _carbonate_adjusted_true_value(
+                repo.get_true_value(standard1, isotopic_type),
+                isotopic_type,
+                carbonate_material,
+            )
+            true_rm2 = _carbonate_adjusted_true_value(
+                repo.get_true_value(standard2, isotopic_type),
+                isotopic_type,
+                carbonate_material,
+            )
             calibrated_df[calibrated_column] = pd.to_numeric(
                 calibrated_df[raw_column], errors="coerce"
             ).apply(

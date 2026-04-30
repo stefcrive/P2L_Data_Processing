@@ -1159,6 +1159,7 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         calibration_source,
         config.selected_standards,
         standards_repo,
+        carbonate_material=config.carbonate_material,
     )
     for calibrated_col, corrected_col in (
         ("d13C_calibrated", "d13C_calibrated_linearity_corrected"),
@@ -1201,7 +1202,12 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
 
     metadata["calibration"] = {
         "config": config.model_dump(),
-        "coefficients": _compute_calibration_coefficients(standards_source, config.selected_standards, standards_repo),
+        "coefficients": _compute_calibration_coefficients(
+            standards_source,
+            config.selected_standards,
+            standards_repo,
+            carbonate_material=config.carbonate_material,
+        ),
         "linearity_fits": fits,
         "selected_standards": config.selected_standards,
     }
@@ -1416,7 +1422,12 @@ def _compute_preview_coefficients_for_calibration_linearity(
                 effective_fits,
             )
         )
-    return _compute_calibration_coefficients(standards_source, config.selected_standards, standards_repo)
+    return _compute_calibration_coefficients(
+        standards_source,
+        config.selected_standards,
+        standards_repo,
+        carbonate_material=config.carbonate_material,
+    )
 
 
 @app.post("/sessions/{session_id}/calibration/linearity", response_model=CalibrationWorkspace)

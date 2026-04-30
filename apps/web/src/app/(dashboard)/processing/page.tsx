@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
+import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api } from "@/lib/api";
@@ -2033,7 +2034,7 @@ function DiagnosticsPanel({
             <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
               <PlotlyChart figure={diagnosticsFigure} className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]" />
               <div className="min-w-0">
-                <CycleDiagnosticsTable rows={diagnostics.table ?? []} />
+                <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
               </div>
             </div>
           </>

@@ -50,6 +50,8 @@ from .core import (
     _resolve_linearity_intensity_column_for_fits,
     _resolve_selected_linearity_intensity_column,
     _with_isotope_linearity_intensity_columns,
+    carbonate_adjusted_standards_reference,
+    convert_d18o_carbonate_material,
     create_calibration_plots,
     identify_outliers,
     identify_outliers_iqr,
@@ -817,7 +819,10 @@ def build_calibration_workspace(
         line_2_offset_d18=getattr(config.linearity, "line_2_offset_d18", None),
     )
     standards_repo = StandardsRepository.default()
-    standards_reference = standards_repo.frame
+    standards_reference = carbonate_adjusted_standards_reference(
+        standards_repo.frame,
+        config.carbonate_material,
+    )
     selected_standards = list(config.selected_standards)
     selected_standard_official_values = [
         CalibrationOfficialValue.model_validate(item)
@@ -1139,8 +1144,19 @@ def build_calibration_workspace(
             )
         )
         out13, out18 = _standard_outlier_masks(std_df, config, outlier_reference_df=std_outlier_ref_df)
-        true_d13 = standards_repo.get_true_value(standard, ISOTYPE_D13C) if standard in standards_repo.standards_list() else None
-        true_d18 = standards_repo.get_true_value(standard, ISOTYPE_D18O) if standard in standards_repo.standards_list() else None
+        true_d13 = (
+            standards_repo.get_true_value(standard, ISOTYPE_D13C)
+            if standard in standards_repo.standards_list()
+            else None
+        )
+        true_d18 = (
+            convert_d18o_carbonate_material(
+                standards_repo.get_true_value(standard, ISOTYPE_D18O),
+                target_material=config.carbonate_material,
+            )
+            if standard in standards_repo.standards_list()
+            else None
+        )
         standard_sections.append(
             CalibrationStandardSection(
                 standard=standard,

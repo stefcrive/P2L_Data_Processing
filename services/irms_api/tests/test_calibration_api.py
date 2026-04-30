@@ -11,6 +11,7 @@ import pandas as pd
 from fastapi import HTTPException
 
 from services.irms_api.api import main as api_main
+from services.irms_api.domain.calibration.core import convert_d18o_carbonate_material
 from services.irms_api.domain.constants import ISOTYPE_D13C
 from services.irms_api.domain.contracts import CalibrationConfig, CalibrationOfficialValueUpsertRequest, LinearityConfig
 from services.irms_api.session_store import FileSessionStore
@@ -594,6 +595,64 @@ class CalibrationApiTests(unittest.TestCase):
         self.assertEqual(workspace.config.selected_standards, ["SHP2L", "NBS19"])
         self.assertIn("d13_raw", workspace.linearity_figures)
         self.assertGreaterEqual(len(workspace.precision_summaries), 2)
+
+    def test_run_calibration_applies_selected_carbonate_material_to_d18o(self) -> None:
+        calcite_session = api_main.store.create_session()
+        aragonite_session = api_main.store.create_session()
+        api_main.store.save_frames(calcite_session, sample_calibration_df(), pd.DataFrame())
+        api_main.store.save_frames(aragonite_session, sample_calibration_df(), pd.DataFrame())
+
+        base_config = {
+            "selected_standards": ["SHP2L", "NBS19"],
+            "calibration_type": "IQR",
+            "sigma_level": 1.0,
+            "iqr_multiplier": 1.5,
+            "independent_isotope_outliers": True,
+            "color_param": "Date_ordinal",
+            "z_axis": "1  Cycle Int  Samp  44",
+        }
+        api_main.run_calibration(
+            calcite_session,
+            CalibrationConfig(**base_config, carbonate_material="calcite"),
+        )
+        api_main.run_calibration(
+            aragonite_session,
+            CalibrationConfig(**base_config, carbonate_material="aragonite"),
+        )
+
+        calcite_df = api_main.store.load_frame(calcite_session)
+        aragonite_df = api_main.store.load_frame(aragonite_session)
+        sample_mask = calcite_df["Identifier 1"].astype(str).eq("SampleA")
+        calcite_d18 = pd.to_numeric(
+            calcite_df.loc[sample_mask, "d18O_calibrated"],
+            errors="coerce",
+        )
+        aragonite_d18 = pd.to_numeric(
+            aragonite_df.loc[sample_mask, "d18O_calibrated"],
+            errors="coerce",
+        )
+        expected_d18 = calcite_d18.map(
+            lambda value: convert_d18o_carbonate_material(value, target_material="aragonite")
+        )
+        pd.testing.assert_series_equal(
+            aragonite_d18.reset_index(drop=True),
+            expected_d18.reset_index(drop=True),
+        )
+
+        calcite_d13 = pd.to_numeric(
+            calcite_df.loc[sample_mask, "d13C_calibrated"],
+            errors="coerce",
+        )
+        aragonite_d13 = pd.to_numeric(
+            aragonite_df.loc[sample_mask, "d13C_calibrated"],
+            errors="coerce",
+        )
+        pd.testing.assert_series_equal(
+            aragonite_d13.reset_index(drop=True),
+            calcite_d13.reset_index(drop=True),
+        )
+        metadata = api_main.store.load_metadata(aragonite_session)
+        self.assertEqual(metadata["calibration"]["config"]["carbonate_material"], "aragonite")
 
     def test_run_calibration_honors_selected_linearity_basis(self) -> None:
         baseline_session = api_main.store.create_session()

@@ -4,11 +4,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
+import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
 import { api } from "@/lib/api";
 import type { CalibrationConfig, CalibrationPrecisionSummary, CycleDiagnosticsPayload, EditAction } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
 
 const RANGE_FETCH_DEBOUNCE_MS = 300;
@@ -141,6 +143,19 @@ function asString(value: unknown): string {
   return value == null ? "" : String(value);
 }
 
+function titleText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value && typeof value === "object") {
+    const text = (value as { text?: unknown }).text;
+    if (typeof text === "string") {
+      return text;
+    }
+  }
+  return "";
+}
+
 function asRange(value: unknown): [number, number] | null {
   if (!Array.isArray(value) || value.length !== 2) {
     return null;
@@ -158,6 +173,29 @@ function formatDeltaValue(value?: number | null): string {
     return "N/A";
   }
   return value.toFixed(3);
+}
+
+function roundDeltaValue(value: number, precision = 3): number {
+  return Number(value.toFixed(precision));
+}
+
+function asBoolean(value: unknown): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "true" || normalized === "1" || normalized === "yes";
+  }
+  return false;
+}
+
+function isDeltaColumnLabel(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  return normalized.includes("d13") || normalized.includes("d18");
 }
 
 function clampNumber(value: number, min: number, max: number) {
@@ -250,6 +288,29 @@ function ensureFigureUiRevision(
   };
 }
 
+function cloneFigure(figure?: Record<string, unknown>): FigureShape {
+  if (!figure) {
+    return { data: [], layout: {} };
+  }
+  if (typeof structuredClone === "function") {
+    try {
+      const cloned = structuredClone(figure) as FigureShape;
+      return {
+        ...cloned,
+        data: Array.isArray(cloned.data) ? cloned.data : [],
+        layout: typeof cloned.layout === "object" && cloned.layout ? cloned.layout : {},
+      };
+    } catch {
+      // Fall back to shallow copy below.
+    }
+  }
+  return {
+    ...figure,
+    data: Array.isArray(figure.data) ? (figure.data as Array<Record<string, unknown>>).map((trace) => ({ ...trace })) : [],
+    layout: typeof figure.layout === "object" && figure.layout ? { ...(figure.layout as Record<string, unknown>) } : {},
+  };
+}
+
 function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   if (!figure) {
     return figure;
@@ -291,6 +352,188 @@ function toFiniteNumber(value: unknown): number | null {
     }
   }
   return null;
+}
+
+function isPartiallySaturatedCollectorStatus(value: unknown): boolean {
+  return String(value ?? "").trim().toLowerCase() === "partially saturated collectors";
+}
+
+function hasSampleCollectorTrace(trace: Record<string, unknown>, mass: 44 | 45 | 46): boolean {
+  const traceName = String(trace.name ?? "").toLowerCase();
+  return traceName.includes(String(mass)) && (traceName.includes("smp") || traceName.includes("sample"));
+}
+
+function hasReferenceCollectorTrace(trace: Record<string, unknown>, mass: 44 | 45 | 46): boolean {
+  const traceName = String(trace.name ?? "").toLowerCase();
+  return traceName.includes(String(mass)) && (traceName.includes("ref") || traceName.includes("std") || traceName.includes("reference"));
+}
+
+function getSetValueCycleNumber(tableRows: Array<Record<string, unknown>>): number | null {
+  const selectedRow = tableRows.find((row) => asBoolean(row["Set Value Cycle"]));
+  if (!selectedRow) {
+    return null;
+  }
+  return toFiniteNumber(selectedRow["Cycle"]);
+}
+
+function ensureCollectorIntensityTraces(
+  figure: Record<string, unknown> | undefined,
+  tableRows: Array<Record<string, unknown>>,
+) {
+  const cloned = cloneFigure(figure);
+  const existingTraceCount = cloned.data.length;
+  const traces = [...cloned.data];
+  const massColors: Record<44 | 45 | 46, string> = {
+    44: "#E67E22",
+    45: "#1E7D2B",
+    46: "#D4A017",
+  };
+
+  for (const mass of [44, 45, 46] as const) {
+    const sampleMissing = !traces.some((trace) => hasSampleCollectorTrace(trace, mass));
+    const refMissing = !traces.some((trace) => hasReferenceCollectorTrace(trace, mass));
+    if (!sampleMissing && !refMissing) {
+      continue;
+    }
+    if (sampleMissing) {
+      const intensityCol = `SMP Int m/z ${mass} (V)`;
+      const x: number[] = [];
+      const y: number[] = [];
+      for (const row of tableRows) {
+        const cycle = toFiniteNumber(row["Cycle"]);
+        const intensity = toFiniteNumber(row[intensityCol]);
+        if (cycle == null || intensity == null) {
+          continue;
+        }
+        x.push(cycle);
+        y.push(intensity);
+      }
+      if (x.length) {
+        traces.push({
+          type: "scatter",
+          mode: "lines+markers",
+          x,
+          y,
+          name: `${mass.toFixed(2)} m/z SMP`,
+          line: {
+            color: massColors[mass],
+            width: 2,
+            dash: "solid",
+          },
+          marker: { size: 6 },
+        });
+      }
+    }
+    if (refMissing) {
+      const intensityCol = `REF Int m/z ${mass} (V)`;
+      const legacyStdCol = `STD Int m/z ${mass} (V)`;
+      const x: number[] = [];
+      const y: number[] = [];
+      for (const row of tableRows) {
+        const cycle = toFiniteNumber(row["Cycle"]);
+        const intensity = toFiniteNumber(row[intensityCol] ?? row[legacyStdCol]);
+        if (cycle == null || intensity == null) {
+          continue;
+        }
+        x.push(cycle);
+        y.push(intensity);
+      }
+      if (x.length) {
+        traces.push({
+          type: "scatter",
+          mode: "lines+markers",
+          x,
+          y,
+          name: `${mass.toFixed(2)} m/z REF`,
+          line: {
+            color: massColors[mass],
+            width: 2,
+            dash: "dash",
+          },
+          marker: { size: 6 },
+        });
+      }
+    }
+  }
+
+  let hasChanges = traces.length !== existingTraceCount;
+  let nextLayout: Record<string, unknown> = cloned.layout;
+  const setValueCycle = getSetValueCycleNumber(tableRows);
+  if (setValueCycle != null) {
+    const highlightX: number[] = [];
+    const highlightY: number[] = [];
+    for (const trace of traces) {
+      const xVals = coerceVector(trace.x);
+      const yVals = coerceVector(trace.y);
+      if (!xVals || !yVals || xVals.length !== yVals.length) {
+        continue;
+      }
+      for (let index = 0; index < xVals.length; index += 1) {
+        const x = toFiniteNumber(xVals[index]);
+        const y = toFiniteNumber(yVals[index]);
+        if (x == null || y == null || Math.abs(x - setValueCycle) > 0.0001) {
+          continue;
+        }
+        highlightX.push(x);
+        highlightY.push(y);
+      }
+    }
+    if (highlightX.length) {
+      traces.push({
+        type: "scatter",
+        mode: "markers",
+        name: "Set-value cycle",
+        x: highlightX,
+        y: highlightY,
+        marker: {
+          size: 11,
+          color: "#7C3AED",
+          symbol: "diamond-open",
+          line: { color: "#7C3AED", width: 2 },
+        },
+      });
+      hasChanges = true;
+    }
+    const existingShapes = Array.isArray(cloned.layout.shapes) ? [...(cloned.layout.shapes as Array<Record<string, unknown>>)] : [];
+    existingShapes.push({
+      type: "line",
+      x0: setValueCycle,
+      x1: setValueCycle,
+      y0: 0,
+      y1: 1,
+      xref: "x",
+      yref: "paper",
+      line: { color: "#7C3AED", width: 2, dash: "dot" },
+    });
+    const existingAnnotations = Array.isArray(cloned.layout.annotations)
+      ? [...(cloned.layout.annotations as Array<Record<string, unknown>>)]
+      : [];
+    existingAnnotations.push({
+      x: setValueCycle,
+      y: 1,
+      xref: "x",
+      yref: "paper",
+      yanchor: "bottom",
+      showarrow: false,
+      text: "Set value cycle",
+      font: { color: "#5B21B6", size: 11 },
+    });
+    nextLayout = {
+      ...cloned.layout,
+      shapes: existingShapes,
+      annotations: existingAnnotations,
+    };
+    hasChanges = true;
+  }
+
+  if (!hasChanges) {
+    return cloned;
+  }
+  return {
+    ...cloned,
+    data: traces,
+    layout: nextLayout,
+  };
 }
 
 function formatCycleCell(value: unknown): string {
@@ -392,40 +635,268 @@ function decodeBinaryVector(dtype: string, bdata: string): number[] | null {
   return null;
 }
 
-function CycleDiagnosticsMiniTable({ rows }: { rows: Array<Record<string, unknown>> }) {
+function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> }) {
   if (!rows.length) {
-    return <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">No cycle rows.</div>;
+    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">No cycle rows returned for this point.</div>;
   }
-  const columns = Object.keys(rows[0]).filter((key) => !key.startsWith("__")).slice(0, 8);
-  const visibleRows = rows.slice(0, 12);
+
+  const statusRows: Array<Record<string, unknown>> = rows.map((row) => {
+    const excludedD13 = asBoolean(row["Excluded d13C"]);
+    const excludedD18 = asBoolean(row["Excluded d18O"]);
+    const excludedAny = asBoolean(row["Excluded (Saturation)"]) || excludedD13 || excludedD18;
+    const setValueCycle = asBoolean(row["Set Value Cycle"]);
+    return {
+      ...row,
+      "Cycle status": excludedAny ? "Saturated" : "Successful",
+      "Set Value Cycle": setValueCycle,
+    };
+  });
+
+  const preferredColumns = [
+    "Cycle",
+    "Cycle status",
+    "Set Value Cycle",
+    "SMP Int m/z 44 (V)",
+    "REF Int m/z 44 (V)",
+    "SMP Int m/z 45 (V)",
+    "REF Int m/z 45 (V)",
+    "SMP Int m/z 46 (V)",
+    "REF Int m/z 46 (V)",
+    "d13C",
+    "d18O",
+    "Excluded d13C",
+    "Excluded d18O",
+    "Excluded (Saturation)",
+  ];
+  const discoveredColumns = Object.keys(statusRows[0] ?? {});
+  const columns = [
+    ...preferredColumns.filter((column) => discoveredColumns.includes(column)),
+    ...discoveredColumns.filter((column) => !preferredColumns.includes(column)),
+  ];
+
+  function formatCell(value: unknown, column: string): string {
+    if (value == null || value === "") {
+      return "None";
+    }
+    if (column === "Cycle status") {
+      return String(value);
+    }
+    if (typeof value === "boolean") {
+      return value ? "Yes" : "No";
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      if (Number.isInteger(value)) {
+        return String(value);
+      }
+      if (isDeltaColumnLabel(column)) {
+        return formatDeltaValue(value);
+      }
+      return value.toFixed(6);
+    }
+    return String(value);
+  }
+
   return (
-    <div className="overflow-x-auto rounded-lg border border-stone-200">
-      <table className="w-full min-w-[720px] border-collapse text-xs">
-        <thead className="bg-stone-100">
-          <tr>
-            {columns.map((column) => (
-              <th key={column} className="border-b border-stone-200 px-2 py-1.5 text-left font-semibold text-stone-700">
-                {column}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {visibleRows.map((row, index) => (
-            <tr key={index} className={index % 2 ? "bg-stone-50/50" : "bg-white"}>
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className="rounded-full bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
+        <span className="rounded-full bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
+        <span className="rounded-full bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
+      </div>
+      <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
+        <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
+          <thead className="bg-stone-50">
+            <tr>
               {columns.map((column) => (
-                <td key={`${index}-${column}`} className="border-b border-stone-100 px-2 py-1.5 text-stone-700">
-                  {formatCycleCell(row[column])}
-                </td>
+                <th key={column} className="px-3 py-2 font-medium text-stone-700">
+                  {column}
+                </th>
               ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
-      {rows.length > visibleRows.length ? (
-        <div className="border-t border-stone-200 px-2 py-1.5 text-xs text-stone-500">Showing {visibleRows.length} of {rows.length} cycle rows.</div>
-      ) : null}
+          </thead>
+          <tbody className="divide-y divide-stone-100">
+            {statusRows.slice(0, 25).map((row, rowIndex) => {
+              const saturated = String(row["Cycle status"]) === "Saturated";
+              const setValueCycle = asBoolean(row["Set Value Cycle"]);
+              return (
+                <tr key={rowIndex} className={cn(setValueCycle ? "bg-violet-100/90" : saturated ? "bg-rose-50/80" : "bg-emerald-50/70")}>
+                  {columns.map((column) => {
+                    const cellValue = row[column];
+                    const flaggedColumn = column.startsWith("Excluded");
+                    const flaggedValue = flaggedColumn ? asBoolean(cellValue) : false;
+                    const setValueColumn = column === "Set Value Cycle";
+                    const setValueColumnValue = setValueColumn ? asBoolean(cellValue) : false;
+                    return (
+                      <td
+                        key={column}
+                        className={cn(
+                          "px-3 py-2",
+                          setValueColumn
+                            ? setValueColumnValue
+                              ? "font-semibold text-violet-800"
+                              : "font-medium text-stone-500"
+                            : "",
+                          flaggedColumn
+                            ? flaggedValue
+                              ? "font-medium text-rose-700"
+                              : "font-medium text-emerald-700"
+                            : "text-stone-700",
+                        )}
+                      >
+                        {formatCell(cellValue, column)}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">Showing first 25 of {rows.length} rows.</div> : null}
+      </div>
     </div>
+  );
+}
+
+const INLINE_DIAGNOSTIC_UNITS: Record<string, string> = {
+  line: "index",
+  "signal intensity": "V",
+  "d18o values": "per mil VPDB",
+  "d13c values": "per mil VPDB",
+  "leak rate": "instrument units",
+  "total co2": "instrument units",
+  "p gasses": "mbar",
+  "p no acid": "mbar",
+};
+
+function normalizeInlineLabel(label: string): string {
+  return label.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function unitForInlineLabel(label: string): string {
+  return INLINE_DIAGNOSTIC_UNITS[normalizeInlineLabel(label)] ?? "";
+}
+
+function isDeltaInlineLabel(label: string): boolean {
+  const normalized = normalizeInlineLabel(label);
+  return normalized === "d13c values" || normalized === "d18o values";
+}
+
+function parseStrictNumber(value: string): number | null {
+  const normalized = value.trim().replace(/,/g, "");
+  if (!/^[-+]?\d+(\.\d+)?$/.test(normalized)) {
+    return null;
+  }
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ label: string; value: string }> {
+  if (!summary || !summary.trim()) {
+    return [];
+  }
+  const cleanToken = (token: string) => token.replace(/\*\*/g, "").replace(/`/g, "").trim();
+  return summary
+    .split(/\s+\|\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const markdownMatch = part.match(/^\*\*(.+?)\*\*\s*:\s*`([^`]*)`$/);
+      if (markdownMatch) {
+        return { label: cleanToken(markdownMatch[1]), value: cleanToken(markdownMatch[2]) };
+      }
+      const genericMatch = part.match(/^([^:]+)\s*:\s*(.+)$/);
+      if (genericMatch) {
+        return { label: cleanToken(genericMatch[1]), value: cleanToken(genericMatch[2]) };
+      }
+      return null;
+    })
+    .filter((item): item is { label: string; value: string } => item != null);
+}
+
+function DiagnosticsPanel({
+  title,
+  diagnostics,
+  loading,
+  onPickDeltaValue,
+}: {
+  title: string;
+  diagnostics?: CycleDiagnosticsPayload;
+  loading: boolean;
+  onPickDeltaValue?: (value: number) => void;
+}) {
+  const cycleMean = diagnostics?.cycle_mean ?? {};
+  const validMean = toFiniteNumber(cycleMean.valid_mean);
+  const firstValidCycle = toFiniteNumber(cycleMean.selected_value) ?? toFiniteNumber(cycleMean.mean);
+  const reason = asString(cycleMean.reason);
+  const diagnosticsFigure = ensureCollectorIntensityTraces(diagnostics?.figure, diagnostics?.table ?? []);
+  const canPickValidMean = typeof onPickDeltaValue === "function" && validMean != null;
+  const canPickFinalMean = typeof onPickDeltaValue === "function" && firstValidCycle != null;
+
+  return (
+    <Card className="border-stone-300">
+      <CardHeader>
+        <CardTitle className="text-base">{title}</CardTitle>
+        <CardDescription>Cycle-level intensity and exclusion diagnostics for the active sample.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {loading ? <div className="text-sm text-stone-500">Loading cycle diagnostics...</div> : null}
+
+        {diagnostics ? (
+          <>
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              <button
+                type="button"
+                onClick={() => {
+                  if (canPickValidMean && validMean != null) {
+                    onPickDeltaValue(validMean);
+                  }
+                }}
+                disabled={!canPickValidMean}
+                className={cn(
+                  "rounded-lg border border-stone-200 p-3 text-left transition",
+                  canPickValidMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
+                )}
+              >
+                <div className="text-xs uppercase tracking-wide text-stone-500">Cycle Mean</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMean)}</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (canPickFinalMean && firstValidCycle != null) {
+                    onPickDeltaValue(firstValidCycle);
+                  }
+                }}
+                disabled={!canPickFinalMean}
+                className={cn(
+                  "rounded-lg border border-stone-200 p-3 text-left transition",
+                  canPickFinalMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
+                )}
+              >
+                <div className="text-xs uppercase tracking-wide text-stone-500">First valid cycle</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(firstValidCycle)}</div>
+              </button>
+              <div className="rounded-lg border border-stone-200 p-3">
+                <div className="text-xs uppercase tracking-wide text-stone-500">Method</div>
+                <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
+              </div>
+            </div>
+
+            {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
+
+            <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
+              <PlotlyChart figure={diagnosticsFigure} className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]" />
+              <div className="min-w-0">
+                <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
+              </div>
+            </div>
+          </>
+        ) : loading ? null : (
+          <div className="text-sm text-stone-500">Cycle diagnostics appear here once a point is selected.</div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -486,6 +957,58 @@ function extractPointCustomData(point: PlotlyPoint): unknown {
   return traceCustomdata[pointNumber];
 }
 
+function traceAxisLayoutKey(axisRef: unknown, axis: "x" | "y"): string {
+  const ref = String(axisRef ?? axis).trim().toLowerCase();
+  if (ref === axis || ref === "") {
+    return `${axis}axis`;
+  }
+  const suffix = ref.replace(axis, "");
+  return `${axis}axis${suffix}`;
+}
+
+function isotopeKeyFromAxisTitle(value: unknown): IsotopeKey | null {
+  const label = titleText(value).toLowerCase();
+  if (label.includes("d18") || label.includes("18o")) {
+    return "d18O";
+  }
+  if (label.includes("d13") || label.includes("13c")) {
+    return "d13C";
+  }
+  return null;
+}
+
+function inferDiagnosticsIsotopeFromPoint(
+  point: PlotlyPoint | undefined,
+  figure: Record<string, unknown> | undefined,
+): IsotopeKey {
+  if (!point || !figure) {
+    return "d13C";
+  }
+  const traces = Array.isArray((figure as FigureShape).data) ? ((figure as FigureShape).data as Array<Record<string, unknown>>) : [];
+  const traceIndex = typeof point.curveNumber === "number" ? point.curveNumber : -1;
+  const trace = traceIndex >= 0 && traceIndex < traces.length ? traces[traceIndex] : null;
+  const layout =
+    typeof (figure as FigureShape).layout === "object" && (figure as FigureShape).layout
+      ? ((figure as FigureShape).layout as Record<string, unknown>)
+      : {};
+  if (trace) {
+    const yAxisKey = traceAxisLayoutKey(trace.yaxis, "y");
+    const yAxis = layout[yAxisKey];
+    const yIsotope = yAxis && typeof yAxis === "object" ? isotopeKeyFromAxisTitle((yAxis as Record<string, unknown>).title) : null;
+    if (yIsotope) {
+      return yIsotope;
+    }
+
+    const xAxisKey = traceAxisLayoutKey(trace.xaxis, "x");
+    const xAxis = layout[xAxisKey];
+    const xIsotope = xAxis && typeof xAxis === "object" ? isotopeKeyFromAxisTitle((xAxis as Record<string, unknown>).title) : null;
+    if (xIsotope) {
+      return xIsotope;
+    }
+  }
+  return "d13C";
+}
+
 function parseDiagnosticsSelectedTargets(points: PlotlyPoint[]): StoredSelectedTarget[] {
   const targets: StoredSelectedTarget[] = [];
   const seen = new Set<string>();
@@ -508,7 +1031,7 @@ function parseDiagnosticsSelectedTargets(points: PlotlyPoint[]): StoredSelectedT
       currentValue: null,
       currentD13: null,
       currentD18: null,
-      chartKey: "crossplot",
+      chartKey: "diagnostics",
     });
   }
   return targets;
@@ -934,6 +1457,7 @@ export default function DiagnosticsPage() {
   const activeSelectionCycleMean = (activeSelectionDiagnostics?.cycle_mean ?? {}) as Record<string, unknown>;
   const activeSelectionCurrentValue = toFiniteNumber(activeSelectionTargetPayload.current_value);
   const activeSelectionCycleMeanValue = toFiniteNumber(activeSelectionCycleMean.valid_mean);
+  const activeSelectionFirstValidCycleValue = toFiniteNumber(activeSelectionCycleMean.selected_value) ?? toFiniteNumber(activeSelectionCycleMean.mean);
   const activeSelectionMethod = asString(activeSelectionCycleMean.method) || "N/A";
   const activeSelectionStatus = asString(activeSelectionTargetPayload.collector_status) || "N/A";
   const activeSelectionLoading = selectionEditorTab === "d13C" ? sampleD13DiagnosticsQuery.isLoading : sampleD18DiagnosticsQuery.isLoading;
@@ -942,13 +1466,42 @@ export default function DiagnosticsPage() {
     : false;
   const busy = saveSharedLinearityMutation.isPending || editMutation.isPending;
   const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
-  const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(hoverDiagnosticsQuery.data?.figure);
+  const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
+    ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
+  );
   const hasHoverDiagnosticsFigureData = Boolean(
     hoverDiagnosticsFigure &&
       Array.isArray((hoverDiagnosticsFigure as FigureShape).data) &&
       ((hoverDiagnosticsFigure as FigureShape).data as Array<Record<string, unknown>>).length > 0,
   );
   const shouldShowHoverPreview = Boolean(hoverPreview) && !isSelectionEditorOpen && hoverPreviewPosition != null;
+  const activeTargetDiagnostics = (sampleD18DiagnosticsQuery.data ?? sampleD13DiagnosticsQuery.data) ?? null;
+  const activeTargetInlineSummary = activeTargetDiagnostics?.inline_summary;
+  const activeTargetSourceExcel = asString(activeTargetDiagnostics?.target?.source_excel).trim() || "Unknown";
+  const activeTargetInlineRawItems = parseInlineDiagnosticsSummary(activeTargetInlineSummary);
+  const hasInlineExcelProvenance = activeTargetInlineRawItems.some((item) => {
+    const normalized = normalizeInlineLabel(item.label);
+    return normalized === "excel file" || normalized === "original excel file" || normalized === "source excel";
+  });
+  const activeTargetInlineItems = hasInlineExcelProvenance
+    ? activeTargetInlineRawItems
+    : [...activeTargetInlineRawItems, { label: "Original Excel File", value: activeTargetSourceExcel }];
+  const activeTargetInlineDisplayItems = activeTargetInlineItems.map((item) => {
+    const numericValue = parseStrictNumber(item.value);
+    const isDelta = isDeltaInlineLabel(item.label);
+    const normalizedLabel = normalizeInlineLabel(item.label);
+    const settableIsotope: IsotopeKey | null =
+      normalizedLabel === "d13c values" ? "d13C" : normalizedLabel === "d18o values" ? "d18O" : null;
+    const canSetSingleValue = Boolean(selectionTarget) && settableIsotope != null && numericValue != null;
+    return {
+      ...item,
+      unit: unitForInlineLabel(item.label),
+      value: isDelta && numericValue != null ? formatDeltaValue(numericValue) : item.value,
+      canSetSingleValue,
+      setValue: canSetSingleValue && numericValue != null ? roundDeltaValue(numericValue) : null,
+      settableIsotope,
+    };
+  });
 
   useEffect(() => {
     if (availableColorParams.length && !availableColorParams.includes(colorParam)) {
@@ -1103,16 +1656,28 @@ export default function DiagnosticsPage() {
     if (!selectionTarget) {
       return;
     }
-    const d13Current = toFiniteNumber((sampleD13DiagnosticsQuery.data?.target ?? {}).current_value);
-    const d18Current = toFiniteNumber((sampleD18DiagnosticsQuery.data?.target ?? {}).current_value);
+    const d13Target = (sampleD13DiagnosticsQuery.data?.target ?? {}) as Record<string, unknown>;
+    const d18Target = (sampleD18DiagnosticsQuery.data?.target ?? {}) as Record<string, unknown>;
+    const d13Status = asString(d13Target.collector_status).trim();
+    const d18Status = asString(d18Target.collector_status).trim();
+    const d13Current = toFiniteNumber(d13Target.current_value);
+    const d18Current = toFiniteNumber(d18Target.current_value);
+    const d13SelectedCycleValue = toFiniteNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]);
+    const d18SelectedCycleValue = toFiniteNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]);
+    const d13SeedValue =
+      isPartiallySaturatedCollectorStatus(d13Status) && d13SelectedCycleValue != null ? d13SelectedCycleValue : d13Current;
+    const d18SeedValue =
+      isPartiallySaturatedCollectorStatus(d18Status) && d18SelectedCycleValue != null ? d18SelectedCycleValue : d18Current;
     setSingleValues({
-      d13C: d13Current ?? 0,
-      d18O: d18Current ?? 0,
+      d13C: roundDeltaValue(d13SeedValue ?? 0),
+      d18O: roundDeltaValue(d18SeedValue ?? 0),
     });
   }, [
     selectionTarget,
     sampleD13DiagnosticsQuery.data?.target,
+    sampleD13DiagnosticsQuery.data?.cycle_mean,
     sampleD18DiagnosticsQuery.data?.target,
+    sampleD18DiagnosticsQuery.data?.cycle_mean,
   ]);
 
   function updateSharedLinearity(
@@ -1277,12 +1842,13 @@ export default function DiagnosticsPage() {
       return;
     }
     clearHoverPreviewHideTimer();
-    const target = targets[0];
+    const inferredIsotope = inferDiagnosticsIsotopeFromPoint(payload.points[0], displayedDiagnosticsFigure);
+    const target = {
+      ...targets[0],
+      isotopeKey: inferredIsotope,
+    };
     pendingHoverPreviewRef.current = {
-      target: {
-        ...target,
-        isotopeKey: target.isotopeKey === "cross" ? "d13C" : target.isotopeKey,
-      },
+      target,
       clientX: payload.clientX,
       clientY: payload.clientY,
     };
@@ -1608,13 +2174,13 @@ export default function DiagnosticsPage() {
       {isSelectionEditorOpen ? (
         <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setSelectionEditorOpen(false)}>
           <div
-            className="flex max-h-[calc(100vh-2rem)] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-stone-300 bg-white shadow-2xl"
+            className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-xl border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
               <div>
                 <div className="text-base font-semibold text-stone-900">Selection Editor</div>
-                <div className="text-sm text-stone-500">Simple editor for the selected diagnostics sample.</div>
+                <div className="text-sm text-stone-500">Click a point for sample editing and cycle-level diagnostics.</div>
               </div>
               <Button variant="outline" size="sm" onClick={() => setSelectionEditorOpen(false)}>
                 Close
@@ -1630,6 +2196,31 @@ export default function DiagnosticsPage() {
                       {(selectionTarget.identifier1 || "No Identifier 1").trim()} | {(selectionTarget.identifier2 || "No Identifier 2").trim()} |{" "}
                       {selectionTarget.rowLabel}
                     </div>
+                    {activeTargetInlineDisplayItems.length ? (
+                      <div className="mt-4 grid gap-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
+                        {activeTargetInlineDisplayItems.map((item, index) => (
+                          <div
+                            key={`${item.label}:${item.value}:${index}`}
+                            onClick={() => {
+                              if (item.canSetSingleValue && item.setValue != null && item.settableIsotope) {
+                                setSelectionEditorTab(item.settableIsotope);
+                                setSingleValues((current) => ({ ...current, [item.settableIsotope!]: item.setValue! }));
+                              }
+                            }}
+                            className={cn(
+                              "min-h-[88px] rounded-lg border border-stone-200 bg-white px-3 py-2.5",
+                              item.canSetSingleValue ? "cursor-pointer hover:border-fuchsia-300 hover:bg-fuchsia-50/50" : "",
+                            )}
+                          >
+                            <div className="text-[11px] font-semibold uppercase tracking-wide text-stone-500">
+                              {item.label}
+                              {item.unit ? ` (${item.unit})` : ""}
+                            </div>
+                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{item.value}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
 
                   <div className="inline-flex rounded-xl border border-stone-300 bg-white p-1 shadow-sm">
@@ -1654,19 +2245,23 @@ export default function DiagnosticsPage() {
                     })}
                   </div>
 
-                  <div className="grid gap-3 sm:grid-cols-3">
-                    <div className="rounded-lg border border-stone-200 p-3">
-                      <div className="text-xs uppercase tracking-wide text-stone-500">Current</div>
-                      <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(activeSelectionCurrentValue)}</div>
-                    </div>
-                    <div className="rounded-lg border border-stone-200 p-3">
-                      <div className="text-xs uppercase tracking-wide text-stone-500">Cycle mean</div>
-                      <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(activeSelectionCycleMeanValue)}</div>
-                    </div>
-                    <div className="rounded-lg border border-stone-200 p-3">
-                      <div className="text-xs uppercase tracking-wide text-stone-500">Method / status</div>
-                      <div className="mt-1 text-sm font-medium text-stone-900">{activeSelectionMethod}</div>
-                      <div className="text-xs text-stone-500">{activeSelectionStatus}</div>
+                  <div className="space-y-2">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">Details</div>
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div className="rounded-xl border border-stone-200 bg-stone-50/50 p-4">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-stone-600">{selectionEditorTab}</div>
+                        <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
+                          <div className="text-stone-500">Current</div>
+                          <div className="text-right font-medium text-stone-900">{formatDeltaValue(activeSelectionCurrentValue)}</div>
+                          <div className="text-stone-500">Cycle mean</div>
+                          <div className="text-right font-medium text-stone-900">{formatDeltaValue(activeSelectionCycleMeanValue)}</div>
+                          <div className="text-stone-500">First valid cycle</div>
+                          <div className="text-right font-medium text-stone-900">{formatDeltaValue(activeSelectionFirstValidCycleValue)}</div>
+                          <div className="text-stone-500">Status</div>
+                          <div className="text-right font-medium text-stone-900">{activeSelectionStatus}</div>
+                        </div>
+                        <div className="mt-3 text-xs text-stone-500">Method: {activeSelectionMethod}</div>
+                      </div>
                     </div>
                   </div>
 
@@ -1728,28 +2323,14 @@ export default function DiagnosticsPage() {
                     </Button>
                   </div>
 
-                  <Card className="border-stone-300">
-                    <CardHeader>
-                      <CardTitle className="text-base">{selectionEditorTab} cycle diagnostics</CardTitle>
-                      <CardDescription>Cycle-level diagnostics for the selected sample and isotope.</CardDescription>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                      {activeSelectionLoading ? <div className="text-sm text-stone-500">Loading cycle diagnostics...</div> : null}
-                      {activeSelectionDiagnostics ? (
-                        <>
-                          <PlotlyChart
-                            figure={ensureFigureUiRevision(activeSelectionDiagnostics.figure, "diagnostics:selection-cycle")}
-                            className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
-                          />
-                          <CycleDiagnosticsMiniTable rows={activeSelectionDiagnostics.table ?? []} />
-                        </>
-                      ) : (
-                        <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">
-                          No diagnostics payload for the current selection.
-                        </div>
-                      )}
-                    </CardContent>
-                  </Card>
+                  <DiagnosticsPanel
+                    title={`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`}
+                    diagnostics={activeSelectionDiagnostics}
+                    loading={activeSelectionLoading}
+                    onPickDeltaValue={(value) => {
+                      setSingleValues((current) => ({ ...current, [selectionEditorTab]: roundDeltaValue(value) }));
+                    }}
+                  />
                 </>
               ) : (
                 <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">

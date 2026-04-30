@@ -61,6 +61,7 @@ class CalibrationLinearityUpdateRequest(BaseModel):
 class CalibrationConfig(BaseModel):
     selected_standards: list[str] = Field(default_factory=list)
     calibration_type: Literal["Z-Score", "IQR"] = "IQR"
+    carbonate_material: Literal["calcite", "aragonite"] = "calcite"
     sigma_level: float = 1.0
     iqr_multiplier: float = 1.5
     independent_isotope_outliers: bool = True

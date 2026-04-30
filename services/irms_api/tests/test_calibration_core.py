@@ -12,6 +12,8 @@ from services.irms_api.domain.calibration.core import (
     _compute_linearity_fit,
     _filter_linearity_fit_input_by_max_intensity,
     _with_isotope_linearity_intensity_columns,
+    calibrate_results,
+    convert_d18o_carbonate_material,
     create_calibration_plots,
     identify_outliers_iqr,
     single_point_calibration,
@@ -23,6 +25,7 @@ from services.irms_api.domain.constants import (
     ISOTYPE_D13C,
     ISOTYPE_D18O,
 )
+from services.irms_api.domain.standards import StandardsRepository
 
 
 class CalibrationCoreTests(unittest.TestCase):
@@ -30,6 +33,48 @@ class CalibrationCoreTests(unittest.TestCase):
         calibrated = single_point_calibration(-1.0, -2.0, -0.5)
         self.assertIsInstance(calibrated, float)
         self.assertNotEqual(calibrated, -1.0)
+
+    def test_d18o_carbonate_material_conversion_uses_alpha_ratio(self) -> None:
+        converted = convert_d18o_carbonate_material(
+            -2.2,
+            source_material="calcite",
+            target_material="aragonite",
+        )
+        expected = ((1.0087 / 1.0091) * ((-2.2 / 1000.0) + 1.0) - 1.0) * 1000.0
+        self.assertAlmostEqual(converted, expected, places=9)
+
+    def test_calibrate_results_applies_carbonate_material_to_d18o_only(self) -> None:
+        repository = StandardsRepository(
+            pd.DataFrame(
+                {
+                    "Standard": ["STD", "STD"],
+                    "Isotopic_Value_Type": [ISOTYPE_D13C, ISOTYPE_D18O],
+                    "Value": [-1.0, -2.0],
+                }
+            )
+        )
+        full_df = pd.DataFrame(
+            {
+                "Identifier 1": ["STD", "SAMPLE"],
+                "d 13C/12C  Mean": [-1.0, 0.0],
+                "d 18O/16O  Mean": [-2.0, -3.0],
+            }
+        )
+
+        calibrated = calibrate_results(
+            full_df.iloc[[0]].copy(),
+            full_df,
+            ["STD"],
+            repository,
+            carbonate_material="aragonite",
+        )
+
+        self.assertAlmostEqual(float(calibrated.loc[1, "d13C_calibrated"]), 0.0, places=6)
+        self.assertAlmostEqual(
+            float(calibrated.loc[1, "d18O_calibrated"]),
+            convert_d18o_carbonate_material(-3.0, target_material="aragonite"),
+            places=6,
+        )
 
     def test_compute_linearity_fit_returns_expected_keys(self) -> None:
         df = pd.DataFrame({"intensity": [10.0, 15.0, 20.0], "value": [1.0, 2.0, 3.0]})

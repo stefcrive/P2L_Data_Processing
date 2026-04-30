@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
+import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
@@ -69,6 +70,10 @@ const LINEARITY_INTENSITY_OPTION_LABELS: Record<(typeof LINEARITY_INTENSITY_OPTI
   [LINEARITY_INTENSITY_DIFF44]: "Intensity diff",
   [LINEARITY_INTENSITY_MISMATCH44]: "Pressure-adjusted int diff",
 };
+const CARBONATE_MATERIAL_OPTIONS = [
+  { value: "calcite", label: "Calcite" },
+  { value: "aragonite", label: "Aragonite" },
+] as const;
 
 function getLinearityIntensityOptionLabel(value: string): string {
   if (value in LINEARITY_INTENSITY_OPTION_LABELS) {
@@ -1525,7 +1530,7 @@ function DiagnosticsPanel({
                 className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
               />
               <div className="min-w-0">
-                <CycleDiagnosticsTable rows={diagnostics.table ?? []} />
+                <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
               </div>
             </div>
           </>
@@ -3526,6 +3531,26 @@ export default function CalibrationPage() {
                 onChange={(next) => updateConfig("selected_standards", next)}
                 placeholder="Select standards"
               />
+
+              <label className="form-field">
+                <span className="form-label">Carbonate material</span>
+                <select
+                  value={activeConfig.carbonate_material ?? "calcite"}
+                  onChange={(event) =>
+                    updateConfig(
+                      "carbonate_material",
+                      event.target.value as CalibrationConfig["carbonate_material"],
+                    )
+                  }
+                  className="form-control"
+                >
+                  {CARBONATE_MATERIAL_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
               <div className="grid gap-4">
                 <label className="form-field">
