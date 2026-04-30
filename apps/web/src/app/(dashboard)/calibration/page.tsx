@@ -1,6 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Database, X } from "lucide-react";
 import { useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
@@ -495,7 +496,7 @@ function formatDeltaValue(value: number | null | undefined, precision = 3): stri
 }
 
 function formatOfficialValue(value: number | null | undefined): string {
-  return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(3)} ‰` : "Not set";
+  return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(3)} permil` : "Not set";
 }
 
 type OfficialValuesRow = {
@@ -1385,9 +1386,9 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-full bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
-        <span className="rounded-full bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
-        <span className="rounded-full bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
+        <span className="rounded-md bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
+        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
+        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -1497,7 +1498,7 @@ function DiagnosticsPanel({
                   canPickValidMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">Cycle Mean</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">Cycle Mean</div>
                 <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMean)}</div>
               </button>
               <button
@@ -1513,11 +1514,11 @@ function DiagnosticsPanel({
                   canPickFinalMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">First valid cycle</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">First valid cycle</div>
                 <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(firstValidCycle)}</div>
               </button>
               <div className="rounded-lg border border-stone-200 p-3">
-                <div className="text-xs uppercase tracking-wide text-stone-500">Method</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">Method</div>
                 <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
               </div>
             </div>
@@ -1551,7 +1552,7 @@ function formatMetric(value?: number | null, digits = 3) {
 
 function formatMetricWithUnit(value?: number | null, digits = 3) {
   const formatted = formatMetric(value, digits);
-  return formatted === "N/A" ? formatted : `${formatted} ‰`;
+  return formatted === "N/A" ? formatted : `${formatted} permil`;
 }
 
 function classifyPrecision(value?: number | null) {
@@ -1626,8 +1627,8 @@ function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>;
 function SummaryChip({ label, value, hint, tone = "neutral" }: { label: string; value: string; hint?: string; tone?: "pass" | "fail" | "neutral" }) {
   const styles = toneClasses(tone);
   return (
-    <div className={`min-w-[140px] rounded-xl border px-3 py-2 text-left shadow-sm ${styles.shell}`}>
-      <div className="text-[11px] uppercase tracking-[0.14em] text-stone-500">{label}</div>
+    <div className={`min-w-[140px] rounded-lg border px-3 py-2 text-left shadow-sm ${styles.shell}`}>
+      <div className="text-[11px] uppercase tracking-normal text-stone-500">{label}</div>
       <div className={`mt-1 text-base font-semibold tabular-nums ${styles.value}`}>{value}</div>
       {hint ? <div className={`mt-0.5 text-xs ${styles.subtle}`}>{hint}</div> : null}
     </div>
@@ -1647,8 +1648,8 @@ function PrecisionMetricPanel({
 }) {
   const styles = toneClasses(disabled ? "neutral" : classifyPrecision(value));
   return (
-    <div className={`rounded-xl border px-3 py-3 ${styles.shell}`}>
-      <div className="text-[11px] uppercase tracking-[0.14em] text-stone-500">{label}</div>
+    <div className={`rounded-lg border px-3 py-3 ${styles.shell}`}>
+      <div className="text-[11px] uppercase tracking-normal text-stone-500">{label}</div>
       <div className={`mt-2 text-2xl font-semibold leading-none ${disabled ? "" : "tabular-nums"} ${styles.value}`}>
         {disabled ? disabledText : formatMetricWithUnit(value)}
       </div>
@@ -1670,8 +1671,8 @@ function IsotopeSummaryTile({
   linearityEnabled: boolean;
 }) {
   return (
-    <div className="rounded-xl border border-stone-200 bg-stone-50/80 p-4">
-      <div className="text-xs uppercase tracking-[0.14em] text-stone-500">{label} precision</div>
+    <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-4">
+      <div className="text-xs uppercase tracking-normal text-stone-500">{label} precision</div>
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
         <PrecisionMetricPanel label="Normal" value={precision} />
         <PrecisionMetricPanel label="Linearity corrected" value={correctedPrecision} disabled={!linearityEnabled} />
@@ -1698,24 +1699,24 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
 
   return (
     <Card className="w-full overflow-hidden border-stone-300">
-      <CardHeader className="gap-4 border-b border-stone-200 bg-gradient-to-r from-stone-50 via-white to-stone-50 pb-5">
+      <CardHeader className="gap-4 border-b border-stone-200 bg-stone-50 pb-5">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div className="space-y-1">
-            <CardTitle className="text-2xl tracking-tight">{summary.standard}</CardTitle>
+            <CardTitle className="text-2xl tracking-normal">{summary.standard}</CardTitle>
             <CardDescription>
-              Calibration quality snapshot across included standards and isotope precision metrics. Green marks precision &lt; 0.07 ‰ and inclusion &gt; 80%.
+              Calibration quality snapshot across included standards and isotope precision metrics. Green marks precision &lt; 0.07 permil and inclusion &gt; 80%.
             </CardDescription>
           </div>
           <div className="grid gap-2 sm:grid-cols-3">
             <SummaryChip label="Measurements" value={String(summary.total_rows)} />
             <SummaryChip
-              label="δ13C included"
+              label="d13C included"
               value={`${summary.included_d13}/${summary.total_rows}`}
               hint={`${summary.included_pct_d13.toFixed(1)}% retained`}
               tone={classifyInclusion(summary.included_pct_d13)}
             />
             <SummaryChip
-              label="δ18O included"
+              label="d18O included"
               value={`${summary.included_d18}/${summary.total_rows}`}
               hint={`${summary.included_pct_d18.toFixed(1)}% retained`}
               tone={classifyInclusion(summary.included_pct_d18)}
@@ -1726,14 +1727,14 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
       <CardContent className="space-y-5 p-6">
         <div className="grid gap-4 md:grid-cols-2">
           <IsotopeSummaryTile
-            label="δ13C (‰)"
+            label="d13C (permil)"
             precision={summary.d13_precision}
             average={summary.d13_average}
             correctedPrecision={summary.d13_linearity_corrected_precision}
             linearityEnabled={linearityEnabled}
           />
           <IsotopeSummaryTile
-            label="δ18O (‰)"
+            label="d18O (permil)"
             precision={summary.d18_precision}
             average={summary.d18_average}
             correctedPrecision={summary.d18_linearity_corrected_precision}
@@ -1741,18 +1742,18 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
           />
         </div>
         {linePrecisionEntries.length ? (
-          <div className="rounded-xl border border-stone-200 p-4">
+          <div className="rounded-lg border border-stone-200 p-4">
             <div className="mb-3 flex items-center justify-between">
-              <div className="text-xs uppercase tracking-[0.14em] text-stone-500">Line precision breakdown</div>
+              <div className="text-xs uppercase tracking-normal text-stone-500">Line precision breakdown</div>
               <div className="text-xs text-stone-500">{linePrecisionEntries.length} lines</div>
             </div>
             <div className="overflow-x-auto rounded-lg border border-stone-200">
-              <div className="grid min-w-[760px] grid-cols-[100px_repeat(4,minmax(0,1fr))] bg-stone-100 px-3 py-2 text-xs font-medium uppercase tracking-wide text-stone-600">
+              <div className="grid min-w-[760px] grid-cols-[100px_repeat(4,minmax(0,1fr))] bg-stone-100 px-3 py-2 text-xs font-medium uppercase tracking-normal text-stone-600">
                 <span>Line</span>
-                <span className="normal-case">δ13C raw (‰)</span>
-                <span className="normal-case">δ13C linearity corr (‰)</span>
-                <span className="normal-case">δ18O raw (‰)</span>
-                <span className="normal-case">δ18O linearity corr (‰)</span>
+                <span className="normal-case">d13C raw (permil)</span>
+                <span className="normal-case">d13C linearity corr (permil)</span>
+                <span className="normal-case">d18O raw (permil)</span>
+                <span className="normal-case">d18O linearity corr (permil)</span>
               </div>
               {linePrecisionEntries.map(([line, values], index) => {
                 const d13Tone = toneClasses(classifyPrecision(values.d13_precision));
@@ -3012,12 +3013,12 @@ export default function CalibrationPage() {
             </CardDescription>
           </div>
           <div className="flex flex-wrap gap-2 text-sm text-stone-600">
-            <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Standards: {selectedStandards.length}</span>
-            <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Method: {activeConfig.calibration_type}</span>
-            <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
+            <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Standards: {selectedStandards.length}</span>
+            <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Method: {activeConfig.calibration_type}</span>
+            <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
               Linearity basis: {getLinearityIntensityOptionLabel(lineIntensityBasis)}
             </span>
-            <span className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
+            <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
               {previewQuery.isFetching ? "Refreshing preview..." : hasUnsavedPreview ? "Preview mode" : "Saved config"}
             </span>
           </div>
@@ -3034,7 +3035,7 @@ export default function CalibrationPage() {
           }}
         >
           <div
-            className="w-full max-w-5xl rounded-xl border border-stone-300 bg-white shadow-2xl"
+            className="w-full max-w-5xl rounded-lg border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
@@ -3062,6 +3063,7 @@ export default function CalibrationPage() {
                     setOfficialValuesError(null);
                   }}
                 >
+                  <X className="h-4 w-4" />
                   Close
                 </Button>
               </div>
@@ -3075,7 +3077,7 @@ export default function CalibrationPage() {
                 <>
                   <div className="overflow-x-auto rounded-lg border border-stone-200">
                     <table className="min-w-full border-collapse text-sm">
-                      <thead className="bg-stone-50 text-left text-xs uppercase tracking-wide text-stone-500">
+                      <thead className="bg-stone-50 text-left text-xs uppercase tracking-normal text-stone-500">
                         <tr>
                           <th className="px-3 py-2.5 font-semibold">Standard</th>
                           <th className="px-3 py-2.5 font-semibold">d13C ({OFFICIAL_VALUE_TYPE_D13})</th>
@@ -3093,7 +3095,7 @@ export default function CalibrationPage() {
                               <div className="flex items-center gap-2">
                                 <span>{row.standard}</span>
                                 {selectedStandardsSet.has(row.standard) ? (
-                                  <span className="rounded-full bg-stone-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">
+                                  <span className="rounded-md bg-stone-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-normal text-white">
                                     selected
                                   </span>
                                 ) : null}
@@ -3163,7 +3165,7 @@ export default function CalibrationPage() {
               {officialValuesError ? <div className="text-sm text-red-600">{officialValuesError}</div> : null}
 
               {isOfficialValuesEditMode ? (
-                <div className="space-y-3 rounded-xl border border-stone-200 bg-stone-50/60 p-3">
+                <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/60 p-3">
                   <div className="text-sm font-semibold text-stone-800">Add Standard</div>
                   <div className="grid gap-3 md:grid-cols-4">
                     <label className="form-field">
@@ -3214,15 +3216,16 @@ export default function CalibrationPage() {
       {isSelectionEditorOpen ? (
         <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setSelectionEditorOpen(false)}>
           <div
-            className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-xl border border-stone-300 bg-white shadow-2xl"
+            className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
               <div>
                 <div className="text-base font-semibold text-stone-900">Selection Editor</div>
-                <div className="text-sm text-stone-500">Click a point for single-point editing or box-select multiple points for multi-point actions.</div>
+                <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
               </div>
               <Button variant="outline" size="sm" onClick={() => setSelectionEditorOpen(false)}>
+                <X className="h-4 w-4" />
                 Close
               </Button>
             </div>
@@ -3235,10 +3238,11 @@ export default function CalibrationPage() {
                       {selectionSourceChart.title} {selectionSourceChart.description}
                     </CardDescription>
                   </CardHeader>
-                  <CardContent>
+                  <CardContent className="min-w-0 overflow-hidden">
                     <PlotlyChart
                       figure={selectionSourceChart.figure}
                       className="h-[360px] w-full"
+                      fitContainer
                       {...chartHoverProps(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "")}
                       onPointClick={(points) =>
                         openProcessingSelectionEditor(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "", points, false)
@@ -3253,7 +3257,7 @@ export default function CalibrationPage() {
 
               {selectedTargets.length ? (
                 <>
-                  <div className="space-y-3 rounded-xl border border-stone-200 bg-stone-50/50 p-4">
+                  <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/50 p-4">
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="space-y-1">
                         <div className="text-sm font-semibold text-stone-700">
@@ -3293,7 +3297,7 @@ export default function CalibrationPage() {
                               item.canSetSingleValue ? "cursor-pointer hover:border-fuchsia-300 hover:bg-fuchsia-50/50" : "",
                             )}
                           >
-                            <div className="text-[11px] font-semibold uppercase tracking-wide text-stone-500">
+                            <div className="text-[11px] font-semibold uppercase tracking-normal text-stone-500">
                               {item.label}
                               {item.unit ? ` (${item.unit})` : ""}
                             </div>
@@ -3306,7 +3310,7 @@ export default function CalibrationPage() {
                       {selectedRowLabels.map((label) => (
                         <span
                           key={label}
-                          className={`rounded-full px-3 py-1 text-xs ring-1 ring-stone-200 ${
+                          className={`rounded-md px-3 py-1 text-xs ring-1 ring-stone-200 ${
                             label === `${activeTarget?.rowLabel}:${activeTarget?.isotopeKey}` ? "bg-stone-900 text-white" : "bg-white text-stone-700"
                           }`}
                         >
@@ -3423,7 +3427,7 @@ export default function CalibrationPage() {
                       </div>
                       <div className="grid gap-3 md:grid-cols-2">
                         <div className="rounded-lg border border-stone-200 p-3">
-                          <div className="text-xs uppercase tracking-wide text-stone-500">d13C details</div>
+                          <div className="text-xs uppercase tracking-normal text-stone-500">d13C details</div>
                           <div className="mt-1 text-sm text-stone-800">
                             Current:{" "}
                             {asNumber((crossD13DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
@@ -3441,7 +3445,7 @@ export default function CalibrationPage() {
                           </div>
                         </div>
                         <div className="rounded-lg border border-stone-200 p-3">
-                          <div className="text-xs uppercase tracking-wide text-stone-500">d18O details</div>
+                          <div className="text-xs uppercase tracking-normal text-stone-500">d18O details</div>
                           <div className="mt-1 text-sm text-stone-800">
                             Current:{" "}
                             {asNumber((crossD18DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
@@ -3508,7 +3512,7 @@ export default function CalibrationPage() {
                 </>
               ) : (
                 <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                  No active selection. Click any chart point or use a plot selection tool to populate the editor.
+                  No active selection.
                 </div>
               )}
             </div>
@@ -3596,10 +3600,10 @@ export default function CalibrationPage() {
                 </div>
               </div>
 
-              <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">
+              <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-sm font-medium text-stone-800">Linearity (shared with processing)</div>
-                  <span className="rounded-full bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                  <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
                 </div>
                 <CheckboxField
                   checked={activeConfig.linearity.apply}
@@ -3650,7 +3654,7 @@ export default function CalibrationPage() {
                 ) : null}
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                    <div className="text-xs uppercase tracking-wide text-stone-500">d13C fitted coefficient</div>
+                    <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficient</div>
                     <div className="mt-1 font-semibold text-stone-900">
                       {activeConfig.linearity.quadratic
                         ? `${formatDeltaValue(d13FitSlope, 6)} (linear), ${formatDeltaValue(d13FitQuad, 8)} (quadratic)`
@@ -3658,7 +3662,7 @@ export default function CalibrationPage() {
                     </div>
                   </div>
                   <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                    <div className="text-xs uppercase tracking-wide text-stone-500">d18O fitted coefficient</div>
+                    <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficient</div>
                     <div className="mt-1 font-semibold text-stone-900">
                       {activeConfig.linearity.quadratic
                         ? `${formatDeltaValue(d18FitSlope, 6)} (linear), ${formatDeltaValue(d18FitQuad, 8)} (quadratic)`
@@ -3777,7 +3781,7 @@ export default function CalibrationPage() {
                 ) : null}
               </div>
 
-              <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">
+              <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="form-section-title">Outlier detection</div>
                 <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-2">
                   <label className="form-field">
@@ -3818,7 +3822,7 @@ export default function CalibrationPage() {
                   </select>
                 </label>
 
-                <label className="flex items-start gap-3 rounded-xl border border-stone-200 bg-white/80 p-4">
+                <label className="flex items-start gap-3 rounded-lg border border-stone-200 bg-white/80 p-4">
                   <input
                     type="checkbox"
                     checked={activeConfig.independent_isotope_outliers}
@@ -3826,7 +3830,7 @@ export default function CalibrationPage() {
                     className="mt-1 h-4 w-4 accent-stone-900"
                   />
                   <span>
-                    <span className="block text-sm font-semibold tracking-[0.01em] text-stone-800">Independent isotope outliers</span>
+                    <span className="block text-sm font-semibold tracking-normal text-stone-800">Independent isotope outliers</span>
                     <span className="mt-1 block text-xs leading-relaxed text-stone-500">
                       d13C and d18O outlier filtering stays independent per standard row.
                     </span>
@@ -3834,7 +3838,7 @@ export default function CalibrationPage() {
                 </label>
               </div>
 
-              <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">
+              <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="form-section-title">Precision date range</div>
                 <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
                   <label className="form-field">
@@ -3866,13 +3870,14 @@ export default function CalibrationPage() {
                 </div>
               </div>
 
-              <div className="flex items-center justify-between rounded-xl border border-stone-200 bg-white/80 p-3">
+              <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-white/80 p-3">
                 <div className="pr-3">
-                  <div className="text-sm font-semibold tracking-[0.01em] text-stone-800">Official standard values</div>
+                  <div className="text-sm font-semibold tracking-normal text-stone-800">Official standard values</div>
                   <div className="text-xs text-stone-500">Open database values used in calibration equations.</div>
                 </div>
                 <Button variant="outline" size="sm" onClick={() => setOfficialValuesModalOpen(true)}>
-                  View
+                  <Database className="h-4 w-4" />
+                  Values
                 </Button>
               </div>
 
@@ -3902,15 +3907,15 @@ export default function CalibrationPage() {
         <div className="space-y-6">
           {precisionSummaries.length ? (
             <div className="space-y-4">
-              <Card className="border-stone-200 bg-gradient-to-r from-stone-50 via-white to-stone-50">
+              <Card className="border-stone-200 bg-stone-50">
                 <CardHeader className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                   <div>
                     <CardTitle>Calibration Summary</CardTitle>
                     <CardDescription>Included standards, isotope precision, and per-line precision for the current preview configuration.</CardDescription>
                   </div>
                   <div className="flex flex-wrap gap-2 text-sm text-stone-600">
-                    <span className="rounded-full bg-white px-3 py-1 ring-1 ring-stone-200">Standards summarized: {precisionSummaries.length}</span>
-                    <span className="rounded-full bg-white px-3 py-1 ring-1 ring-stone-200">Line entries: {linePrecisionCount}</span>
+                    <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Standards summarized: {precisionSummaries.length}</span>
+                    <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Line entries: {linePrecisionCount}</span>
                   </div>
                 </CardHeader>
               </Card>
@@ -3999,7 +4004,7 @@ export default function CalibrationPage() {
                 <CardHeader className="gap-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <CardTitle>Linearity Correction</CardTitle>
-                    <span className="rounded-full bg-stone-50 px-3 py-1.5 text-sm text-stone-700 ring-1 ring-stone-200">
+                    <span className="rounded-md bg-stone-50 px-3 py-1.5 text-sm text-stone-700 ring-1 ring-stone-200">
                       Basis: {selectedLinearityBasisLabel}
                     </span>
                   </div>
@@ -4041,7 +4046,7 @@ export default function CalibrationPage() {
 
               <div className="space-y-6">
                 {displayedWorkspace.standard_sections.map((section) => (
-                  <details key={section.standard} className="rounded-xl border border-stone-200 bg-white shadow-sm" open>
+                  <details key={section.standard} className="rounded-lg border border-stone-200 bg-white shadow-sm" open>
                     <summary className="cursor-pointer px-6 py-4 text-lg font-semibold text-stone-900">{section.standard}</summary>
                     <div className="space-y-6 p-6 pt-0">
                       <div className="grid gap-6">
@@ -4075,7 +4080,7 @@ export default function CalibrationPage() {
                         </Card>
                       </div>
                       <div className="grid gap-6 2xl:grid-cols-2">
-                        <details className="rounded-xl border border-stone-200 bg-white shadow-sm">
+                        <details className="rounded-lg border border-stone-200 bg-white shadow-sm">
                           <summary className="cursor-pointer px-6 py-4 text-base font-semibold text-stone-900">
                             d13C Outliers ({section.d13_outliers.length})
                           </summary>
@@ -4083,7 +4088,7 @@ export default function CalibrationPage() {
                             <DataTable rows={section.d13_outliers} emptyLabel="No d13C outliers for this standard." />
                           </div>
                         </details>
-                        <details className="rounded-xl border border-stone-200 bg-white shadow-sm">
+                        <details className="rounded-lg border border-stone-200 bg-white shadow-sm">
                           <summary className="cursor-pointer px-6 py-4 text-base font-semibold text-stone-900">
                             d18O Outliers ({section.d18_outliers.length})
                           </summary>
@@ -4109,14 +4114,14 @@ export default function CalibrationPage() {
       </div>
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="pointer-events-none fixed z-[80] w-[560px] rounded-xl border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          className="pointer-events-none fixed z-[80] w-[min(560px,calc(100vw-20px))] rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
         >
           <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
             <span className="font-medium text-stone-800">
               {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
             </span>
-            <span className="rounded-full bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-wide text-stone-700">
+            <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
               {hoverPreview.target.isotopeKey}
             </span>
           </div>

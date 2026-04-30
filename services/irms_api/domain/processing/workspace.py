@@ -397,14 +397,32 @@ def _derive_working_frame(
             d18_per_10v2=float(linearity_cfg.get("manual_d18_per_10v2", 0.0) or 0.0),
         )
         corrected = _apply_linearity_correction(work, calibration_intensity_col, fit_payload)
+        apply_to_partial = bool(getattr(config, "apply_shared_linearity_to_partially_saturated", True))
+        partial_masks = _partial_saturation_isotope_masks(corrected) if not apply_to_partial else {}
         if "d13C_linearity_corrected" in corrected.columns:
             corrected_values = pd.to_numeric(corrected["d13C_linearity_corrected"], errors="coerce")
-            if corrected_values.notna().any():
-                corrected["d 13C/12C  Mean"] = corrected_values
+            apply_mask = corrected_values.notna()
+            if not apply_to_partial:
+                apply_mask = apply_mask & ~partial_masks.get(
+                    "d13C",
+                    pd.Series(False, index=corrected.index, dtype=bool),
+                ).reindex(corrected.index, fill_value=False).astype(bool)
+            if bool(apply_mask.any()):
+                raw_values = pd.to_numeric(corrected["d 13C/12C  Mean"], errors="coerce")
+                raw_values.loc[apply_mask] = corrected_values.loc[apply_mask]
+                corrected["d 13C/12C  Mean"] = raw_values
         if "d18O_linearity_corrected" in corrected.columns:
             corrected_values = pd.to_numeric(corrected["d18O_linearity_corrected"], errors="coerce")
-            if corrected_values.notna().any():
-                corrected["d 18O/16O  Mean"] = corrected_values
+            apply_mask = corrected_values.notna()
+            if not apply_to_partial:
+                apply_mask = apply_mask & ~partial_masks.get(
+                    "d18O",
+                    pd.Series(False, index=corrected.index, dtype=bool),
+                ).reindex(corrected.index, fill_value=False).astype(bool)
+            if bool(apply_mask.any()):
+                raw_values = pd.to_numeric(corrected["d 18O/16O  Mean"], errors="coerce")
+                raw_values.loc[apply_mask] = corrected_values.loc[apply_mask]
+                corrected["d 18O/16O  Mean"] = raw_values
         work = corrected
     work = _recompute_calibration_after_modifications(
         work,

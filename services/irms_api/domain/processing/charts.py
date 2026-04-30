@@ -1012,12 +1012,14 @@ def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
         break
 
     layout_updates: dict[str, Any] = {
-        "scene": {"domain": {"x": [0.0, 1.0], "y": [0.0, 1.0]}, "aspectmode": "cube"},
+        "autosize": True,
+        "height": None,
+        "scene": {"domain": {"x": [0.0, 1.0], "y": [0.14, 1.0]}, "aspectmode": "cube"},
         "title": {"x": 0.0, "xanchor": "left", "y": 0.99, "yanchor": "top"},
         "legend": {
             "orientation": "h",
-            "yanchor": "top",
-            "y": -0.16,
+            "yanchor": "bottom",
+            "y": 0.0,
             "x": 0.0,
             "xanchor": "left",
             "entrywidthmode": "pixels",
@@ -1025,7 +1027,7 @@ def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
             "itemsizing": "constant",
             "tracegroupgap": 6,
         },
-        "margin": {"l": 12, "r": 92 if colorbar_updated else 28, "t": 64, "b": 162},
+        "margin": {"l": 12, "r": 92 if colorbar_updated else 28, "t": 64, "b": 24},
     }
     fig.update_layout(**layout_updates)
 

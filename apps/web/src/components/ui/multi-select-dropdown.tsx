@@ -1,5 +1,6 @@
 "use client";
 
+import { ChevronDown } from "lucide-react";
 import { useMemo } from "react";
 
 type MultiSelectDropdownProps = {
@@ -35,11 +36,10 @@ export function MultiSelectDropdown({
         <summary className="form-control list-none cursor-pointer">
           <div className="flex items-center justify-between gap-3">
             <span className="truncate">{summaryLabel}</span>
-            <span className="text-xs font-medium text-stone-500 group-open:hidden">Open</span>
-            <span className="hidden text-xs font-medium text-stone-500 group-open:inline">Close</span>
+            <ChevronDown className="h-4 w-4 shrink-0 text-stone-500 transition-transform group-open:rotate-180" aria-hidden="true" />
           </div>
         </summary>
-        <div className="absolute z-20 mt-2 w-full rounded-xl border border-stone-200 bg-white p-3 shadow-lg">
+        <div className="absolute z-20 mt-2 w-full rounded-lg border border-stone-200 bg-white p-3 shadow-lg">
           <div className="mb-2 flex items-center justify-between gap-2 border-b border-stone-200 pb-2 text-xs">
             <button type="button" className="text-stone-700 hover:text-stone-900" onClick={() => onChange(options)}>
               Select all

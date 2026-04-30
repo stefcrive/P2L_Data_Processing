@@ -92,9 +92,9 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-full bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
-        <span className="rounded-full bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
-        <span className="rounded-full bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
+        <span className="rounded-md bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
+        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
+        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">

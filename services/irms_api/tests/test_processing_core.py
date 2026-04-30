@@ -1229,6 +1229,65 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertTrue(pd.isna(work.loc[2, "d13C_calibrated"]))
         self.assertTrue(pd.isna(work.loc[2, "d13C_calibrated_linearity_corrected"]))
 
+    def test_derive_working_frame_can_skip_shared_linearity_for_partially_saturated_samples(self) -> None:
+        df = sample_processing_df().copy()
+        config = normalize_processing_config(
+            {
+                "apply_shared_linearity_to_partially_saturated": False,
+                "manual_linearity_override": {
+                    "enabled": False,
+                    "use_diff_intensity": False,
+                    "d13_per_10v": 0.0,
+                    "d18_per_10v": 0.0,
+                },
+            }
+        )
+        calibration_meta = {
+            "config": {"linearity": {"apply": True, "use_diff_intensity": False}},
+            "linearity_fits": {
+                "d13C": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 3},
+                "d18O": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 3},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+            "coefficients": {
+                "d13C": {"slope": 2.0, "intercept": 0.0},
+                "d18O": {"slope": 2.0, "intercept": 0.0},
+            },
+            "selected_standards": [],
+        }
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
+
+        self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 2.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 18O/16O  Mean"]), 2.4, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d13C_calibrated"]), 4.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d18O_calibrated"]), 4.8, places=6)
+
+    def test_derive_working_frame_applies_shared_linearity_to_partially_saturated_samples_by_default(self) -> None:
+        df = sample_processing_df().copy()
+        config = normalize_processing_config({})
+        calibration_meta = {
+            "config": {"linearity": {"apply": True, "use_diff_intensity": False}},
+            "linearity_fits": {
+                "d13C": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 3},
+                "d18O": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 3},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+            "coefficients": {
+                "d13C": {"slope": 2.0, "intercept": 0.0},
+                "d18O": {"slope": 2.0, "intercept": 0.0},
+            },
+            "selected_standards": [],
+        }
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta)
+
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 18O/16O  Mean"]), 1.4, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d13C_calibrated"]), 2.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d18O_calibrated"]), 2.8, places=6)
+
     def test_derive_working_frame_preserves_edited_raw_values_in_working_view(self) -> None:
         df = pd.DataFrame(
             {

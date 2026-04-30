@@ -141,6 +141,40 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertEqual(float(updated_df.loc[0, "d 13C/12C  Mean"]), 8.0)
         self.assertEqual(float(updated_df.loc[0, "d13C_calibrated"]), 9.0)
 
+    def test_cycle_diagnostics_linearity_corrected_value_matches_processing_working_frame(self) -> None:
+        metadata = api_main.store.load_metadata(self.session_id)
+        metadata["calibration"] = {
+            "selected_standards": [],
+            "coefficients": {
+                "d13C": {"slope": 1.0, "intercept": 0.0},
+                "d18O": {"slope": 1.0, "intercept": 0.0},
+            },
+            "config": {"linearity": {"apply": True, "use_diff_intensity": False}},
+            "linearity_fits": {
+                "d13C": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 3},
+                "d18O": {"slope": 0.0, "intercept": 0.0, "x_ref": 15.0, "n": 3},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+        }
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        config = api_main._load_processing_config(metadata)
+        working_df = api_main._derive_working_frame(
+            api_main.store.load_frame(self.session_id),
+            config,
+            calibration_meta=metadata["calibration"],
+            edit_state=metadata.get("edit_state", {}),
+        )
+        working_value = float(working_df.loc[2, "d 13C/12C  Mean"])
+
+        payload = api_main.processing_cycle_diagnostics(
+            self.session_id,
+            CycleDiagnosticsRequest(target={"row_label": "2", "isotope_key": "d13C"}),
+        )
+
+        self.assertAlmostEqual(float(payload.target["current_value"]), 2.0, places=6)
+        self.assertAlmostEqual(float(payload.target["linearity_corrected_value"]), working_value, places=6)
+
     def test_calibrated_traces_include_point_customdata_for_selection_editing(self) -> None:
         workspace = api_main.processing_workspace(self.session_id)
 

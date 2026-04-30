@@ -1,12 +1,14 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Download, SearchCheck, X } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { SegmentedControl } from "@/components/ui/segmented-control";
 import { api } from "@/lib/api";
 import type {
   CalibrationConfig,
@@ -207,6 +209,39 @@ function applyDisplayState(
     traces = traces.filter((trace) => !String(trace.name ?? "").startsWith("Calibrated"));
   }
   return { ...cloned, data: traces };
+}
+
+function displayModeFromState(state: { rawOnly: boolean; hideCalibrated: boolean }): string {
+  if (state.rawOnly) {
+    return "raw";
+  }
+  if (state.hideCalibrated) {
+    return "hide-calibrated";
+  }
+  return "all";
+}
+
+function TraceModeControl({
+  state,
+  hasCalibrated,
+  onChange,
+}: {
+  state: { rawOnly: boolean; hideCalibrated: boolean };
+  hasCalibrated: boolean;
+  onChange: (mode: string) => void;
+}) {
+  return (
+    <SegmentedControl
+      label="Trace display"
+      value={displayModeFromState(state)}
+      onChange={onChange}
+      items={[
+        { value: "all", label: "All" },
+        { value: "raw", label: "Raw" },
+        { value: "hide-calibrated", label: "No calibrated", disabled: !hasCalibrated },
+      ]}
+    />
+  );
 }
 
 function figureHasTracePrefix(figure: Record<string, unknown> | undefined, prefix: string): boolean {
@@ -1279,7 +1314,7 @@ function RangeSliderField({
                 const nextLow = parseFinite(event.currentTarget.value, low);
                 onChange([Math.min(nextLow, high), high]);
               }}
-              className="w-full accent-stone-700"
+              className={cn("w-full accent-stone-700", showManualInputs ? "min-w-0 flex-1" : "")}
             />
             {showManualInputs ? (
               <input
@@ -1295,7 +1330,7 @@ function RangeSliderField({
                     event.currentTarget.blur();
                   }
                 }}
-                className="w-20 rounded border border-stone-300 px-2 py-1 text-right text-xs text-stone-700"
+                className="w-20 shrink-0 rounded border border-stone-300 px-2 py-1 text-right text-xs text-stone-700"
                 aria-label={`${label} minimum value`}
               />
             ) : null}
@@ -1314,7 +1349,7 @@ function RangeSliderField({
                 const nextHigh = parseFinite(event.currentTarget.value, high);
                 onChange([low, Math.max(nextHigh, low)]);
               }}
-              className="w-full accent-stone-700"
+              className={cn("w-full accent-stone-700", showManualInputs ? "min-w-0 flex-1" : "")}
             />
             {showManualInputs ? (
               <input
@@ -1330,7 +1365,7 @@ function RangeSliderField({
                     event.currentTarget.blur();
                   }
                 }}
-                className="w-20 rounded border border-stone-300 px-2 py-1 text-right text-xs text-stone-700"
+                className="w-20 shrink-0 rounded border border-stone-300 px-2 py-1 text-right text-xs text-stone-700"
                 aria-label={`${label} maximum value`}
               />
             ) : null}
@@ -1748,9 +1783,9 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-full bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
-        <span className="rounded-full bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
-        <span className="rounded-full bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
+        <span className="rounded-md bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
+        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
+        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -1931,7 +1966,7 @@ function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }
         </div>
         <div className="flex flex-wrap gap-2 text-sm text-stone-600">
           {summaryBadges.map((badge) => (
-            <span key={badge.label} className="rounded-full bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
+            <span key={badge.label} className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
               {badge.label}: {String(badge.value)}
             </span>
           ))}
@@ -1941,7 +1976,7 @@ function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {workspace.summary.metrics.map((metric) => (
             <div key={metric.metric} className="rounded-lg border border-stone-200 bg-stone-50/70 px-4 py-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">{metric.metric}</div>
+              <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">{metric.metric}</div>
               <div className="mt-1 text-2xl font-semibold text-stone-900">{String(metric.value)}</div>
               <div className="mt-1 text-xs text-stone-600">{metric.details}</div>
             </div>
@@ -2004,7 +2039,7 @@ function DiagnosticsPanel({
                   canPickValidMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">Cycle Mean</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">Cycle Mean</div>
                 <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMeanCardValue)}</div>
               </button>
               <button
@@ -2020,11 +2055,11 @@ function DiagnosticsPanel({
                   canPickFinalMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">First valid cycle</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">First valid cycle</div>
                 <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(firstValidCycleCardValue)}</div>
               </button>
               <div className="rounded-lg border border-stone-200 p-3">
-                <div className="text-xs uppercase tracking-wide text-stone-500">Method</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">Method</div>
                 <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
               </div>
             </div>
@@ -2754,13 +2789,12 @@ export default function ProcessingPage() {
     );
   }
 
-  function toggleDisplayState(key: string, field: "rawOnly" | "hideCalibrated") {
+  function setDisplayMode(key: string, mode: string) {
     setDisplayState((current) => ({
       ...current,
       [key]: {
-        rawOnly: current[key]?.rawOnly ?? false,
-        hideCalibrated: current[key]?.hideCalibrated ?? false,
-        [field]: !(current[key]?.[field] ?? false),
+        rawOnly: mode === "raw",
+        hideCalibrated: mode === "hide-calibrated",
       },
     }));
   }
@@ -3349,16 +3383,8 @@ export default function ProcessingPage() {
     }
     return isPartiallySaturated ? value : value + rawToDisplayDelta(isotopeKey);
   };
-  const d13CurrentDisplayValue = d13IsPartiallySaturated
-    ? (d13CurrentRawValue ?? selectedPointD13)
-    : d13CurrentRawValue == null
-      ? selectedPointD13
-      : d13CurrentRawValue + rawToDisplayDelta("d13C");
-  const d18CurrentDisplayValue = d18IsPartiallySaturated
-    ? (d18CurrentRawValue ?? selectedPointD18)
-    : d18CurrentRawValue == null
-      ? selectedPointD18
-      : d18CurrentRawValue + rawToDisplayDelta("d18O");
+  const d13CurrentDisplayValue = d13CurrentRawValue ?? selectedPointD13;
+  const d18CurrentDisplayValue = d18CurrentRawValue ?? selectedPointD18;
   const d13CycleMeanDisplayValue = d13IsPartiallySaturated
     ? d13CycleMeanRawValue
     : detailsDisplayValue(d13CycleMeanRawValue, "d13C", d13IsPartiallySaturated);
@@ -3367,16 +3393,8 @@ export default function ProcessingPage() {
     : detailsDisplayValue(d18CycleMeanRawValue, "d18O", d18IsPartiallySaturated);
   const d13FirstValidCycleDisplayValue = detailsDisplayValue(d13FirstValidCycleRawValue, "d13C", d13IsPartiallySaturated);
   const d18FirstValidCycleDisplayValue = detailsDisplayValue(d18FirstValidCycleRawValue, "d18O", d18IsPartiallySaturated);
-  const d13LinearityCorrectedDisplayValue = detailsDisplayValue(
-    d13LinearityCorrectedRawValue,
-    "d13C",
-    d13IsPartiallySaturated,
-  );
-  const d18LinearityCorrectedDisplayValue = detailsDisplayValue(
-    d18LinearityCorrectedRawValue,
-    "d18O",
-    d18IsPartiallySaturated,
-  );
+  const d13LinearityCorrectedDisplayValue = d13LinearityCorrectedRawValue;
+  const d18LinearityCorrectedDisplayValue = d18LinearityCorrectedRawValue;
   const effectiveOutlier =
     typeof sampleD18DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
       ? (sampleD18DiagnosticsQuery.data.target.effective_outlier as boolean)
@@ -3536,13 +3554,14 @@ export default function ProcessingPage() {
             </CardDescription>
           </div>
           <div className="flex flex-wrap items-center gap-2 text-sm text-stone-600">
-            <span className="rounded-full bg-white px-3 py-1 ring-1 ring-stone-200">Edited rows: {workspace.edit_state.edited_rows.length}</span>
-            <span className="rounded-full bg-white px-3 py-1 ring-1 ring-stone-200">
+            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Edited rows: {workspace.edit_state.edited_rows.length}</span>
+            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">
               Manual overrides: {manualOverrideCount}
             </span>
-            <span className="rounded-full bg-white px-3 py-1 ring-1 ring-stone-200">Selection: {selectedTargets.length}</span>
+            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Selection: {selectedTargets.length}</span>
             <Button variant="secondary" size="sm" onClick={() => setExportModalOpen(true)} disabled={busy}>
-              Data Export
+              <Download className="h-4 w-4" />
+              Data export
             </Button>
           </div>
         </CardHeader>
@@ -3555,7 +3574,7 @@ export default function ProcessingPage() {
               <CardTitle>Processing Controls</CardTitle>
               <CardDescription>Filters, outliers, and shared linearity controls synced with Calibration.</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-6 xl:max-h-[calc(100vh-12rem)] xl:overflow-y-auto xl:pr-2">
+            <CardContent className="space-y-6 xl:max-h-[calc(100vh-12rem)] xl:overflow-y-auto xl:pr-4 [scrollbar-gutter:stable]">
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
                 <label className="text-sm">
                   <span className="mb-1 block font-medium text-stone-700">Identifier scope</span>
@@ -3727,10 +3746,10 @@ export default function ProcessingPage() {
                 </Button>
               </div>
 
-              <div className="space-y-4 rounded-xl border border-stone-200 bg-white/80 p-4">
+              <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-sm font-medium text-stone-800">Linearity (shared with calibration)</div>
-                  <span className="rounded-full bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                  <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
                 </div>
                 {activeLinearity ? (
                   <>
@@ -3739,6 +3758,12 @@ export default function ProcessingPage() {
                       label="Enable linearity correction"
                       description="Uses the same basis, fits, and offsets as Calibration."
                       onChange={(checked) => updateSharedLinearity("apply", checked)}
+                    />
+                    <CheckboxField
+                      checked={activeConfig.apply_shared_linearity_to_partially_saturated}
+                      label="Apply to partially saturated samples"
+                      description="Also corrects recovered partially saturated values with the shared linearity fit."
+                      onChange={(checked) => updateConfig("apply_shared_linearity_to_partially_saturated", checked)}
                     />
                     <CheckboxField
                       checked={Boolean(activeLinearity.quadratic)}
@@ -3783,7 +3808,7 @@ export default function ProcessingPage() {
                     ) : null}
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                        <div className="text-xs uppercase tracking-wide text-stone-500">d13C fitted coefficient</div>
+                        <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficient</div>
                         <div className="mt-1 font-semibold text-stone-900">
                           {activeLinearity.quadratic
                             ? `${formatDeltaValue(d13FitSlope, 6)} (linear), ${formatDeltaValue(d13FitQuad, 8)} (quadratic)`
@@ -3791,7 +3816,7 @@ export default function ProcessingPage() {
                         </div>
                       </div>
                       <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                        <div className="text-xs uppercase tracking-wide text-stone-500">d18O fitted coefficient</div>
+                        <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficient</div>
                         <div className="mt-1 font-semibold text-stone-900">
                           {activeLinearity.quadratic
                             ? `${formatDeltaValue(d18FitSlope, 6)} (linear), ${formatDeltaValue(d18FitQuad, 8)} (quadratic)`
@@ -3975,7 +4000,7 @@ export default function ProcessingPage() {
           {isExportModalOpen ? (
             <div className="fixed inset-0 z-40 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setExportModalOpen(false)}>
               <div
-                className="flex max-h-[calc(100vh-2rem)] w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-stone-300 bg-white shadow-2xl"
+                className="flex max-h-[calc(100vh-2rem)] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
                 onClick={(event) => event.stopPropagation()}
               >
                 <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
@@ -3984,6 +4009,7 @@ export default function ProcessingPage() {
                     <div className="text-sm text-stone-500">Configure export options, then download either the entire dataset or client output.</div>
                   </div>
                   <Button variant="outline" size="sm" onClick={() => setExportModalOpen(false)}>
+                    <X className="h-4 w-4" />
                     Close
                   </Button>
                 </div>
@@ -4065,6 +4091,7 @@ export default function ProcessingPage() {
                             <div className="flex items-center justify-between gap-2">
                               <span className="text-sm font-medium text-stone-800">Duplicate check</span>
                               <Button type="button" variant="outline" size="sm" onClick={() => void handleDuplicateCheck()} disabled={busy}>
+                                <SearchCheck className="h-4 w-4" />
                                 {duplicateCheckMutation.isPending ? "Checking..." : "Check for duplicates"}
                               </Button>
                             </div>
@@ -4161,6 +4188,7 @@ export default function ProcessingPage() {
                     Cancel
                   </Button>
                   <Button onClick={() => handleExport(exportOutputType)} disabled={busy}>
+                    <Download className="h-4 w-4" />
                     {exportOutputType === "client_output" ? "Download client output" : "Download dataset"}
                   </Button>
                 </div>
@@ -4171,15 +4199,16 @@ export default function ProcessingPage() {
           {isSelectionEditorOpen ? (
             <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setSelectionEditorOpen(false)}>
               <div
-                className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-xl border border-stone-300 bg-white shadow-2xl"
+                className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
                 onClick={(event) => event.stopPropagation()}
               >
                 <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
                   <div>
                     <div className="text-base font-semibold text-stone-900">Selection Editor</div>
-                    <div className="text-sm text-stone-500">Click a point for single-point editing or box-select multiple points for multi-point actions.</div>
+                    <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
                   </div>
                   <Button variant="outline" size="sm" onClick={() => setSelectionEditorOpen(false)}>
+                    <X className="h-4 w-4" />
                     Close
                   </Button>
                 </div>
@@ -4229,7 +4258,7 @@ export default function ProcessingPage() {
 
                   {selectedTargets.length ? (
                     <>
-                      <div className="space-y-3 rounded-xl border border-stone-200 bg-stone-50/50 p-4">
+                      <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/50 p-4">
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="space-y-1">
                             <div className="text-sm font-semibold text-stone-700">
@@ -4269,7 +4298,7 @@ export default function ProcessingPage() {
                                   item.canSetSingleValue ? "cursor-pointer hover:border-fuchsia-300 hover:bg-fuchsia-50/50" : "",
                                 )}
                               >
-                                <div className="text-[11px] font-semibold uppercase tracking-wide text-stone-500">
+                                <div className="text-[11px] font-semibold uppercase tracking-normal text-stone-500">
                                   {item.label}
                                   {item.unit ? ` (${item.unit})` : ""}
                                 </div>
@@ -4283,7 +4312,7 @@ export default function ProcessingPage() {
                             <span
                               key={label}
                               className={cn(
-                                "rounded-full px-3 py-1 text-xs ring-1 ring-stone-200",
+                                "rounded-md px-3 py-1 text-xs ring-1 ring-stone-200",
                                 label === `${activeTarget?.rowLabel}:${activeTarget?.isotopeKey}` ? "bg-stone-900 text-white" : "bg-white text-stone-700",
                               )}
                             >
@@ -4295,32 +4324,11 @@ export default function ProcessingPage() {
 
                       {activeTarget ? (
                         <div className="space-y-4">
-                          <div className="inline-flex rounded-xl border border-stone-300 bg-white p-1 shadow-sm">
-                            {ISOTOPE_KEYS.map((isotopeKey) => {
-                              const isActive = selectionEditorTab === isotopeKey;
-                              return (
-                                <button
-                                  key={isotopeKey}
-                                  type="button"
-                                  aria-pressed={isActive}
-                                  onClick={() => setSelectionEditorTab(isotopeKey)}
-                                  disabled={busy}
-                                  className={cn(
-                                    "min-w-[92px] rounded-lg px-4 py-2 text-sm font-semibold transition",
-                                    isActive ? "bg-stone-900 text-white shadow-sm" : "text-stone-700 hover:bg-stone-100",
-                                  )}
-                                >
-                                  {isotopeKey}
-                                </button>
-                              );
-                            })}
-                          </div>
-
                           <div className="space-y-2">
-                            <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">Details</div>
+                            <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Details</div>
                             <div className="grid gap-3 md:grid-cols-2">
-                              <div className="rounded-xl border border-stone-200 bg-stone-50/50 p-4">
-                                <div className="text-xs font-semibold uppercase tracking-wide text-stone-600">d13C</div>
+                              <div className="rounded-lg border border-stone-200 bg-stone-50/50 p-4">
+                                <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">d13C</div>
                                 <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
                                   <div className="text-stone-500">Current</div>
                                   <div className="text-right font-medium text-stone-900">
@@ -4341,8 +4349,8 @@ export default function ProcessingPage() {
                                 </div>
                                 <div className="mt-3 text-xs text-stone-500">Method: {d13Method}</div>
                               </div>
-                              <div className="rounded-xl border border-stone-200 bg-stone-50/50 p-4">
-                                <div className="text-xs font-semibold uppercase tracking-wide text-stone-600">d18O</div>
+                              <div className="rounded-lg border border-stone-200 bg-stone-50/50 p-4">
+                                <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">d18O</div>
                                 <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
                                   <div className="text-stone-500">Current</div>
                                   <div className="text-right font-medium text-stone-900">
@@ -4364,6 +4372,27 @@ export default function ProcessingPage() {
                                 <div className="mt-3 text-xs text-stone-500">Method: {d18Method}</div>
                               </div>
                             </div>
+                          </div>
+
+                          <div className="inline-flex rounded-lg border border-stone-300 bg-white p-1 shadow-sm">
+                            {ISOTOPE_KEYS.map((isotopeKey) => {
+                              const isActive = selectionEditorTab === isotopeKey;
+                              return (
+                                <button
+                                  key={isotopeKey}
+                                  type="button"
+                                  aria-pressed={isActive}
+                                  onClick={() => setSelectionEditorTab(isotopeKey)}
+                                  disabled={busy}
+                                  className={cn(
+                                    "min-w-[92px] rounded-lg px-4 py-2 text-sm font-semibold transition",
+                                    isActive ? "bg-stone-900 text-white shadow-sm" : "text-stone-700 hover:bg-stone-100",
+                                  )}
+                                >
+                                  {isotopeKey}
+                                </button>
+                              );
+                            })}
                           </div>
 
                           <div className="grid gap-3 sm:grid-cols-2">
@@ -4475,7 +4504,7 @@ export default function ProcessingPage() {
                     </>
                   ) : (
                     <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                      No active selection. Click any chart point or use a plot selection tool to populate the editor.
+                      No active selection.
                     </div>
                   )}
                 </div>
@@ -4490,23 +4519,11 @@ export default function ProcessingPage() {
               description={overviewCards.d13Summary.description}
               figure={d13SummaryFigure}
               headerActions={
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    variant={d13SummaryState.rawOnly ? "secondary" : "outline"}
-                    size="sm"
-                    onClick={() => toggleDisplayState(overviewCards.d13Summary.key, "rawOnly")}
-                  >
-                    Raw only
-                  </Button>
-                  <Button
-                    variant={d13SummaryState.hideCalibrated ? "secondary" : "outline"}
-                    size="sm"
-                    onClick={() => toggleDisplayState(overviewCards.d13Summary.key, "hideCalibrated")}
-                    disabled={!d13SummaryHasCalibrated}
-                  >
-                    Hide calibrated
-                  </Button>
-                </div>
+                <TraceModeControl
+                  state={d13SummaryState}
+                  hasCalibrated={d13SummaryHasCalibrated}
+                  onChange={(mode) => setDisplayMode(overviewCards.d13Summary.key, mode)}
+                />
               }
               chartClassName="h-[460px] w-full"
               {...chartHoverProps(overviewCards.d13Summary.key)}
@@ -4519,23 +4536,11 @@ export default function ProcessingPage() {
               description={overviewCards.d18Summary.description}
               figure={d18SummaryFigure}
               headerActions={
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    variant={d18SummaryState.rawOnly ? "secondary" : "outline"}
-                    size="sm"
-                    onClick={() => toggleDisplayState(overviewCards.d18Summary.key, "rawOnly")}
-                  >
-                    Raw only
-                  </Button>
-                  <Button
-                    variant={d18SummaryState.hideCalibrated ? "secondary" : "outline"}
-                    size="sm"
-                    onClick={() => toggleDisplayState(overviewCards.d18Summary.key, "hideCalibrated")}
-                    disabled={!d18SummaryHasCalibrated}
-                  >
-                    Hide calibrated
-                  </Button>
-                </div>
+                <TraceModeControl
+                  state={d18SummaryState}
+                  hasCalibrated={d18SummaryHasCalibrated}
+                  onChange={(mode) => setDisplayMode(overviewCards.d18Summary.key, mode)}
+                />
               }
               chartClassName="h-[460px] w-full"
               {...chartHoverProps(overviewCards.d18Summary.key)}
@@ -4552,7 +4557,7 @@ export default function ProcessingPage() {
 
           <div className="space-y-6">
             {workspace.species_sections.map((section) => (
-              <details key={section.species} className="rounded-xl border border-stone-200 bg-white shadow-sm" open>
+              <details key={section.species} className="rounded-lg border border-stone-200 bg-white shadow-sm" open>
                 <summary className="cursor-pointer px-6 py-4 text-lg font-semibold text-stone-900">
                   {section.species} ({section.identifier_figures.length} identifiers)
                 </summary>
@@ -4566,9 +4571,6 @@ export default function ProcessingPage() {
                       <Card key={`${section.species}-${figureSet.identifier}`} className="border-stone-300">
                         <CardHeader>
                           <CardTitle>{figureSet.identifier}</CardTitle>
-                          <CardDescription>
-                            Species section with per-isotope charts, calibrated/raw display toggles, and chart-driven editing.
-                          </CardDescription>
                         </CardHeader>
                         <CardContent className="space-y-4">
                           <div className="space-y-6">
@@ -4576,21 +4578,12 @@ export default function ProcessingPage() {
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
                                   <div className="text-sm font-medium text-stone-800">d13C chart</div>
-                                  <div className="text-xs text-stone-500">Click for single edit. Box-select for multi-point edits.</div>
                                 </div>
-                                <div className="flex flex-wrap gap-2">
-                                  <Button variant={d13State.rawOnly ? "secondary" : "outline"} size="sm" onClick={() => toggleDisplayState(d13Key, "rawOnly")}>
-                                    Raw only
-                                  </Button>
-                                  <Button
-                                    variant={d13State.hideCalibrated ? "secondary" : "outline"}
-                                    size="sm"
-                                    onClick={() => toggleDisplayState(d13Key, "hideCalibrated")}
-                                    disabled={!figureSet.has_calibrated_d13c}
-                                  >
-                                    Hide calibrated
-                                  </Button>
-                                </div>
+                                <TraceModeControl
+                                  state={d13State}
+                                  hasCalibrated={figureSet.has_calibrated_d13c}
+                                  onChange={(mode) => setDisplayMode(d13Key, mode)}
+                                />
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
@@ -4607,21 +4600,12 @@ export default function ProcessingPage() {
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
                                   <div className="text-sm font-medium text-stone-800">d18O chart</div>
-                                  <div className="text-xs text-stone-500">Same selection semantics, backed by the processing workspace.</div>
                                 </div>
-                                <div className="flex flex-wrap gap-2">
-                                  <Button variant={d18State.rawOnly ? "secondary" : "outline"} size="sm" onClick={() => toggleDisplayState(d18Key, "rawOnly")}>
-                                    Raw only
-                                  </Button>
-                                  <Button
-                                    variant={d18State.hideCalibrated ? "secondary" : "outline"}
-                                    size="sm"
-                                    onClick={() => toggleDisplayState(d18Key, "hideCalibrated")}
-                                    disabled={!figureSet.has_calibrated_d18o}
-                                  >
-                                    Hide calibrated
-                                  </Button>
-                                </div>
+                                <TraceModeControl
+                                  state={d18State}
+                                  hasCalibrated={figureSet.has_calibrated_d18o}
+                                  onChange={(mode) => setDisplayMode(d18Key, mode)}
+                                />
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
@@ -4652,14 +4636,14 @@ export default function ProcessingPage() {
       </div>
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="pointer-events-none fixed z-[80] w-[560px] rounded-xl border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          className="pointer-events-none fixed z-[80] w-[min(560px,calc(100vw-20px))] rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
         >
           <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
             <span className="font-medium text-stone-800">
               {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
             </span>
-            <span className="rounded-full bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-wide text-stone-700">
+            <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
               {hoverPreview.target.isotopeKey}
             </span>
           </div>

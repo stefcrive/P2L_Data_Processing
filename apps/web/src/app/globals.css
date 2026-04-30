@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 :root {
-  --background: 210 38% 96%;
+  --background: 210 18% 96%;
   --foreground: 218 24% 12%;
 }
 
@@ -11,14 +11,11 @@ body {
   @apply text-stone-900 antialiased;
   font-family: var(--font-sans), "Trebuchet MS", sans-serif;
   background-color: hsl(var(--background));
-  background-image:
-    radial-gradient(circle at 5% 0%, rgba(56, 189, 248, 0.18), transparent 35%),
-    radial-gradient(circle at 100% 0%, rgba(59, 130, 246, 0.14), transparent 33%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.68), rgba(241, 247, 255, 0.94));
 }
 
 * {
   @apply border-stone-200;
+  letter-spacing: 0;
 }
 
 h1,
@@ -35,14 +32,14 @@ h4,
   }
 
   .form-label {
-    @apply block text-xs font-semibold tracking-[0.06em] text-stone-600;
+    @apply block text-xs font-semibold tracking-normal text-stone-600;
   }
 
   .form-control {
-    @apply w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-[15px] text-slate-900 shadow-sm transition duration-150 placeholder:text-slate-400 focus:border-sky-400 focus:outline-none focus:ring-4 focus:ring-sky-100;
+    @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm transition duration-150 placeholder:text-slate-400 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-100;
   }
 
   .form-section-title {
-    @apply text-sm font-semibold tracking-[0.01em] text-stone-800;
+    @apply text-sm font-semibold tracking-normal text-stone-800;
   }
 }

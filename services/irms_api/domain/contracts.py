@@ -168,6 +168,7 @@ class ProcessingWorkspaceConfig(BaseModel):
     x_axis_option: Literal["By Identifier 2", "By Sequence"] = "By Identifier 2"
     color_param: str = "Date"
     z_axis: str = "1  Cycle Int  Samp  44"
+    apply_shared_linearity_to_partially_saturated: bool = True
     signal_range: tuple[float, float] = (0.0, 50.0)
     leak_range: tuple[float, float] = (0.0, 1000.0)
     d13c_range: tuple[float, float] = (-10.0, 10.0)

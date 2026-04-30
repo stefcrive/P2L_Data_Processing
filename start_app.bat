@@ -251,6 +251,6 @@ goto :find_free_port_loop
 :is_port_in_use
 setlocal
 set "IRMS_CHECK_PORT=%~1"
-powershell -NoLogo -NoProfile -Command "$port=[int]$env:IRMS_CHECK_PORT; $listener=$null; try { $listener=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port); $listener.Start(); exit 1 } catch { exit 0 } finally { if ($listener -ne $null) { $listener.Stop() } }" >nul 2>&1
+powershell -NoLogo -NoProfile -Command "$port=[int]$env:IRMS_CHECK_PORT; $existing=@(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue); if ($existing.Count -gt 0) { exit 0 }; foreach ($addr in @([System.Net.IPAddress]::Loopback, [System.Net.IPAddress]::IPv6Loopback)) { $listener=$null; try { $listener=[System.Net.Sockets.TcpListener]::new($addr, $port); $listener.Start() } catch { exit 0 } finally { if ($listener -ne $null) { $listener.Stop() } } }; exit 1" >nul 2>&1
 set "PS_EXIT=%ERRORLEVEL%"
 endlocal & exit /b %PS_EXIT%

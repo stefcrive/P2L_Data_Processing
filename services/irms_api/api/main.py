@@ -193,6 +193,8 @@ def _processing_target_linearity_corrected_value(
     df: pd.DataFrame,
     target: dict[str, Any],
     calibration_meta: dict[str, Any] | None,
+    config: ProcessingConfig | None = None,
+    edit_state: dict[str, Any] | None = None,
 ) -> float | None:
     if df is None or df.empty or not isinstance(target, dict):
         return None
@@ -208,72 +210,29 @@ def _processing_target_linearity_corrected_value(
     if row_label not in df.index:
         return None
     if isotope_key == "d13C":
-        corrected_col = "d13C_linearity_corrected"
+        working_col = "d 13C/12C  Mean"
     elif isotope_key == "d18O":
-        corrected_col = "d18O_linearity_corrected"
+        working_col = "d 18O/16O  Mean"
     else:
         return None
-    row_df = _apply_isotope_line_offsets(
-        df.loc[[row_label]].copy(),
-        line_1_offset_d13=linearity_cfg.get("line_1_offset_d13"),
-        line_1_offset_d18=linearity_cfg.get("line_1_offset_d18"),
-        line_2_offset_d13=linearity_cfg.get("line_2_offset_d13"),
-        line_2_offset_d18=linearity_cfg.get("line_2_offset_d18"),
-    )
-    use_diff_intensity = bool(linearity_cfg.get("use_diff_intensity", False))
-    intensity_col = _resolve_selected_linearity_intensity_column(
-        df=row_df,
-        use_diff_intensity=use_diff_intensity,
-        selected_intensity_col=linearity_cfg.get("intensity_col"),
-    )
-    row_df, d13_offset_intensity_col, d18_offset_intensity_col = _with_isotope_linearity_intensity_columns(
-        row_df,
-        intensity_col,
-        line_1_offset=float(linearity_cfg.get("line_1_offset", 0.0) or 0.0),
-        line_2_offset=float(linearity_cfg.get("line_2_offset", 0.0) or 0.0),
-    )
-    override_scope = (
-        sorted(
-            {
-                str(value).strip()
-                for value in row_df.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist()
-                if str(value).strip() != ""
-            }
-        )
-        if "Identifier 1" in row_df.columns
-        else []
-    )
-    override_intensity_col = (
-        d13_offset_intensity_col if d13_offset_intensity_col == d18_offset_intensity_col else intensity_col
-    )
-    row_df = _apply_manual_linearity_override_to_standards(
-        row_df,
-        override_scope,
-        enabled=bool(linearity_cfg.get("manual_override_enabled", False)),
-        d13_per_10v=float(linearity_cfg.get("manual_d13_per_10v", 0.0) or 0.0),
-        d18_per_10v=float(linearity_cfg.get("manual_d18_per_10v", 0.0) or 0.0),
-        d13_per_10v2=float(linearity_cfg.get("manual_d13_per_10v2", 0.0) or 0.0),
-        d18_per_10v2=float(linearity_cfg.get("manual_d18_per_10v2", 0.0) or 0.0),
-        quadratic=bool(linearity_cfg.get("quadratic", False)),
-        use_diff_intensity=use_diff_intensity,
-        selected_intensity_col=override_intensity_col,
-    )
-    fit_payload = _apply_manual_linearity_offsets_to_fits(
-        fits,
-        enabled=bool(linearity_cfg.get("manual_override_enabled", False)),
-        quadratic=bool(linearity_cfg.get("quadratic", False)),
-        d13_per_10v=float(linearity_cfg.get("manual_d13_per_10v", 0.0) or 0.0),
-        d18_per_10v=float(linearity_cfg.get("manual_d18_per_10v", 0.0) or 0.0),
-        d13_per_10v2=float(linearity_cfg.get("manual_d13_per_10v2", 0.0) or 0.0),
-        d18_per_10v2=float(linearity_cfg.get("manual_d18_per_10v2", 0.0) or 0.0),
-    )
-    fit_payload = dict(fit_payload or {})
-    fit_payload.setdefault("d13_intensity_col", d13_offset_intensity_col)
-    fit_payload.setdefault("d18_intensity_col", d18_offset_intensity_col)
-    corrected = _apply_linearity_correction(row_df, intensity_col, fit_payload)
-    if corrected_col not in corrected.columns:
+    if config is not None and not bool(getattr(config, "apply_shared_linearity_to_partially_saturated", True)):
+        sat_masks = _partial_saturation_isotope_masks(df.loc[[row_label]])
+        isotope_mask = sat_masks.get(isotope_key, sat_masks.get("any", pd.Series(False, index=[row_label], dtype=bool)))
+        if bool(isotope_mask.reindex([row_label], fill_value=False).astype(bool).iloc[0]):
+            return None
+
+    if config is None:
         return None
-    corrected_raw = pd.to_numeric(pd.Series([corrected.at[row_label, corrected_col]]), errors="coerce").iloc[0]
+
+    working_df = _derive_working_frame(
+        df,
+        config,
+        calibration_meta=calibration,
+        edit_state=edit_state,
+    )
+    if row_label not in working_df.index or working_col not in working_df.columns:
+        return None
+    corrected_raw = pd.to_numeric(pd.Series([working_df.at[row_label, working_col]]), errors="coerce").iloc[0]
     if pd.notna(corrected_raw) and np.isfinite(corrected_raw):
         return float(corrected_raw)
     return None
@@ -1631,7 +1590,13 @@ def processing_cycle_diagnostics(session_id: str, request: CycleDiagnosticsReque
     target = build_target_info(df, row_label, request.target.isotope_key, metadata.get("edit_state", {}))
     if target is None:
         raise HTTPException(status_code=404, detail="Unknown processing target")
-    target["linearity_corrected_value"] = _processing_target_linearity_corrected_value(df, target, calibration)
+    target["linearity_corrected_value"] = _processing_target_linearity_corrected_value(
+        df,
+        target,
+        calibration,
+        config,
+        metadata.get("edit_state", {}),
+    )
     return build_cycle_diagnostics_payload(
         session_id=session_id,
         df=df,

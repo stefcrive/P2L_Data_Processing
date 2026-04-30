@@ -25,6 +25,7 @@ export type PlotlyHoverPayload = {
 type PlotlyChartProps = {
   figure?: Record<string, unknown>;
   className?: string;
+  fitContainer?: boolean;
   onPointClick?: (points: PlotlyPoint[]) => void;
   onSelection?: (points: PlotlyPoint[]) => void;
   onPointHover?: (payload: PlotlyHoverPayload) => void;
@@ -145,7 +146,7 @@ function buildDefaultUiRevision(data: unknown, layout: Record<string, unknown>):
   return ["persist-ui", plotTitle, ...axisTokens, ...traceTokens].join("|");
 }
 
-export function PlotlyChart({ figure, className, onPointClick, onSelection, onPointHover, onHoverEnd }: PlotlyChartProps) {
+export function PlotlyChart({ figure, className, fitContainer = false, onPointClick, onSelection, onPointHover, onHoverEnd }: PlotlyChartProps) {
   const preparedFigure = useMemo(() => {
     if (!figure || Object.keys(figure).length === 0) {
       return null;
@@ -158,7 +159,11 @@ export function PlotlyChart({ figure, className, onPointClick, onSelection, onPo
     layout.hoverlabel = hoverLabel;
     const hasExplicitWidth = typeof (layout as { width?: unknown }).width === "number";
     const hasExplicitHeight = typeof (layout as { height?: unknown }).height === "number";
-    if (!hasExplicitWidth && !hasExplicitHeight && typeof (layout as { autosize?: unknown }).autosize !== "boolean") {
+    if (fitContainer) {
+      delete (layout as { width?: unknown }).width;
+      delete (layout as { height?: unknown }).height;
+      layout.autosize = true;
+    } else if (!hasExplicitWidth && !hasExplicitHeight && typeof (layout as { autosize?: unknown }).autosize !== "boolean") {
       layout.autosize = true;
     }
     if (typeof (layout as { uirevision?: unknown }).uirevision === "undefined") {
@@ -167,9 +172,9 @@ export function PlotlyChart({ figure, className, onPointClick, onSelection, onPo
     return {
       data: (safeFigure.data as never[]) ?? [],
       layout: layout as never,
-      useResizeHandler: !hasExplicitHeight,
+      useResizeHandler: fitContainer || !hasExplicitHeight,
     };
-  }, [figure]);
+  }, [figure, fitContainer]);
 
   if (!preparedFigure) {
     return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">No chart data yet.</div>;

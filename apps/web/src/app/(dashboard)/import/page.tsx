@@ -1,6 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FolderOpen, Plus, RefreshCw, Upload } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -285,14 +286,16 @@ export default function ImportPage() {
           />
           <div className="flex flex-wrap gap-3">
             <Button onClick={() => importMutation.mutate()} disabled={files.length === 0 || importMutation.isPending}>
-              {importMutation.isPending ? "Importing..." : "Create Session (Open)"}
+              <Upload className="h-4 w-4" />
+              {importMutation.isPending ? "Importing..." : "Create session"}
             </Button>
             <Button
               variant="outline"
               onClick={() => appendMutation.mutate()}
               disabled={!sessionId || files.length === 0 || appendMutation.isPending}
             >
-              {appendMutation.isPending ? "Adding..." : "Add Selected Files to Session"}
+              <Plus className="h-4 w-4" />
+              {appendMutation.isPending ? "Adding..." : "Add files"}
             </Button>
           </div>
           {files.length > 0 ? (
@@ -300,7 +303,7 @@ export default function ImportPage() {
               {files.length} file(s) selected: {files.map((file) => file.name).join(", ")}
             </div>
           ) : null}
-          <div className="space-y-2 rounded-xl border border-stone-200 p-4">
+          <div className="space-y-2 rounded-lg border border-stone-200 p-4">
             <div className="form-section-title">Current Session Files</div>
             {!sessionId ? (
               <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-600">No open session.</div>
@@ -324,14 +327,16 @@ export default function ImportPage() {
             </div>
           )}
 
-          <div className="space-y-3 rounded-xl border border-stone-200 p-4">
+          <div className="space-y-3 rounded-lg border border-stone-200 p-4">
             <div className="form-section-title">Recent Sessions</div>
             <div className="flex flex-wrap gap-3">
               <Button variant="outline" onClick={handleBrowseFolderClick} disabled={openMutation.isPending}>
-                Browse Folder...
+                <FolderOpen className="h-4 w-4" />
+                Browse folder
               </Button>
               <Button variant="secondary" onClick={() => sessionsQuery.refetch()} disabled={sessionsQuery.isFetching}>
-                {sessionsQuery.isFetching ? "Refreshing..." : "Refresh List"}
+                <RefreshCw className="h-4 w-4" />
+                {sessionsQuery.isFetching ? "Refreshing..." : "Refresh"}
               </Button>
             </div>
             <input ref={folderInputRef} type="file" multiple onChange={handleFolderSelected} className="hidden" />
@@ -374,11 +379,11 @@ export default function ImportPage() {
         <CardContent className="space-y-4 text-sm text-stone-600">
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="rounded-lg border border-stone-200 bg-stone-50 p-3">
-              <div className="text-xs font-semibold uppercase tracking-[0.16em] text-stone-500">Active Session</div>
+              <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Active Session</div>
               <div className="mt-1 break-all font-mono text-xs text-stone-800">{sessionId ?? "none"}</div>
             </div>
             <div className="rounded-lg border border-stone-200 bg-stone-50 p-3">
-              <div className="text-xs font-semibold uppercase tracking-[0.16em] text-stone-500">Autosave Status</div>
+              <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Autosave Status</div>
               <div className="mt-2 flex flex-wrap gap-2">
                 <Badge>{autosaveEventCount} events</Badge>
                 <Badge>{autosaveResumed ? "Resumed" : "New session"}</Badge>
@@ -386,7 +391,7 @@ export default function ImportPage() {
             </div>
           </div>
           <div className="rounded-lg border border-stone-200 bg-white p-3">
-            <div className="text-xs font-semibold uppercase tracking-[0.16em] text-stone-500">Session Record Folder</div>
+            <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Session Record Folder</div>
             <div className="mt-1 break-all font-mono text-xs text-stone-800">{autosaveSaveDir ?? "n/a"}</div>
           </div>
           <div className="space-y-2">

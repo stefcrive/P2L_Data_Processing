@@ -1,6 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
@@ -699,9 +700,9 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-full bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
-        <span className="rounded-full bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
-        <span className="rounded-full bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
+        <span className="rounded-md bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
+        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
+        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -858,7 +859,7 @@ function DiagnosticsPanel({
                   canPickValidMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">Cycle Mean</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">Cycle Mean</div>
                 <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMean)}</div>
               </button>
               <button
@@ -874,11 +875,11 @@ function DiagnosticsPanel({
                   canPickFinalMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                 )}
               >
-                <div className="text-xs uppercase tracking-wide text-stone-500">First valid cycle</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">First valid cycle</div>
                 <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(firstValidCycle)}</div>
               </button>
               <div className="rounded-lg border border-stone-200 p-3">
-                <div className="text-xs uppercase tracking-wide text-stone-500">Method</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">Method</div>
                 <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
               </div>
             </div>
@@ -1247,9 +1248,9 @@ function RangeSliderControl({
   const high = clampNumber(Math.max(value?.[0] ?? minBound, value?.[1] ?? maxBound), minBound, maxBound);
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white/80 p-4">
+    <div className="rounded-lg border border-stone-200 bg-white/80 p-4">
       <div className="flex items-center justify-between gap-2">
-        <div className="text-sm font-medium tracking-[0.01em] text-stone-700">{label}</div>
+        <div className="text-sm font-medium tracking-normal text-stone-700">{label}</div>
         <div className="text-xs text-stone-500">
           {low.toFixed(precision)} to {high.toFixed(precision)}
         </div>
@@ -1954,7 +1955,7 @@ export default function DiagnosticsPage() {
                 />
               </div>
 
-              <div className="text-xs font-medium tracking-[0.01em] text-stone-500">
+              <div className="text-xs font-medium tracking-normal text-stone-500">
                 Rows in scope: {Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}
               </div>
             </CardContent>
@@ -1966,7 +1967,7 @@ export default function DiagnosticsPage() {
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="rounded-full bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
                 {saveSharedLinearityMutation.isPending ? <span className="text-xs text-stone-500">Saving...</span> : null}
               </div>
               {activeLinearity ? (
@@ -2026,7 +2027,7 @@ export default function DiagnosticsPage() {
                   ) : null}
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                      <div className="text-xs uppercase tracking-wide text-stone-500">d13C fitted coefficient</div>
+                      <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficient</div>
                       <div className="mt-1 font-semibold text-stone-900">
                         {activeLinearity.quadratic
                           ? `${formatCoefficient(d13FitSlope)} (linear), ${formatCoefficient(d13FitQuad)} (quadratic)`
@@ -2034,7 +2035,7 @@ export default function DiagnosticsPage() {
                       </div>
                     </div>
                     <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                      <div className="text-xs uppercase tracking-wide text-stone-500">d18O fitted coefficient</div>
+                      <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficient</div>
                       <div className="mt-1 font-semibold text-stone-900">
                         {activeLinearity.quadratic
                           ? `${formatCoefficient(d18FitSlope)} (linear), ${formatCoefficient(d18FitQuad)} (quadratic)`
@@ -2174,15 +2175,16 @@ export default function DiagnosticsPage() {
       {isSelectionEditorOpen ? (
         <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setSelectionEditorOpen(false)}>
           <div
-            className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-xl border border-stone-300 bg-white shadow-2xl"
+            className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
               <div>
                 <div className="text-base font-semibold text-stone-900">Selection Editor</div>
-                <div className="text-sm text-stone-500">Click a point for sample editing and cycle-level diagnostics.</div>
+                <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
               </div>
               <Button variant="outline" size="sm" onClick={() => setSelectionEditorOpen(false)}>
+                <X className="h-4 w-4" />
                 Close
               </Button>
             </div>
@@ -2190,7 +2192,7 @@ export default function DiagnosticsPage() {
             <div className="min-h-0 space-y-4 overflow-y-auto p-4">
               {selectionTarget ? (
                 <>
-                  <div className="rounded-xl border border-stone-200 bg-stone-50/60 p-4">
+                  <div className="rounded-lg border border-stone-200 bg-stone-50/60 p-4">
                     <div className="text-sm font-semibold text-stone-700">Active sample</div>
                     <div className="mt-1 text-lg font-semibold text-stone-900">
                       {(selectionTarget.identifier1 || "No Identifier 1").trim()} | {(selectionTarget.identifier2 || "No Identifier 2").trim()} |{" "}
@@ -2212,7 +2214,7 @@ export default function DiagnosticsPage() {
                               item.canSetSingleValue ? "cursor-pointer hover:border-fuchsia-300 hover:bg-fuchsia-50/50" : "",
                             )}
                           >
-                            <div className="text-[11px] font-semibold uppercase tracking-wide text-stone-500">
+                            <div className="text-[11px] font-semibold uppercase tracking-normal text-stone-500">
                               {item.label}
                               {item.unit ? ` (${item.unit})` : ""}
                             </div>
@@ -2223,7 +2225,7 @@ export default function DiagnosticsPage() {
                     ) : null}
                   </div>
 
-                  <div className="inline-flex rounded-xl border border-stone-300 bg-white p-1 shadow-sm">
+                  <div className="inline-flex rounded-lg border border-stone-300 bg-white p-1 shadow-sm">
                     {ISOTOPE_KEYS.map((isotopeKey) => {
                       const isActive = selectionEditorTab === isotopeKey;
                       return (
@@ -2246,10 +2248,10 @@ export default function DiagnosticsPage() {
                   </div>
 
                   <div className="space-y-2">
-                    <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">Details</div>
+                    <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Details</div>
                     <div className="grid gap-3 md:grid-cols-2">
-                      <div className="rounded-xl border border-stone-200 bg-stone-50/50 p-4">
-                        <div className="text-xs font-semibold uppercase tracking-wide text-stone-600">{selectionEditorTab}</div>
+                      <div className="rounded-lg border border-stone-200 bg-stone-50/50 p-4">
+                        <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">{selectionEditorTab}</div>
                         <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
                           <div className="text-stone-500">Current</div>
                           <div className="text-right font-medium text-stone-900">{formatDeltaValue(activeSelectionCurrentValue)}</div>
@@ -2334,7 +2336,7 @@ export default function DiagnosticsPage() {
                 </>
               ) : (
                 <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                  No active selection. Click a diagnostics point to populate the editor.
+                  No active selection.
                 </div>
               )}
             </div>
@@ -2343,14 +2345,14 @@ export default function DiagnosticsPage() {
       ) : null}
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="pointer-events-none fixed z-[80] w-[560px] rounded-xl border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          className="pointer-events-none fixed z-[80] w-[min(560px,calc(100vw-20px))] rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
         >
           <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
             <span className="font-medium text-stone-800">
               {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
             </span>
-            <span className="rounded-full bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-wide text-stone-700">
+            <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
               {hoverPreview.target.isotopeKey}
             </span>
           </div>
