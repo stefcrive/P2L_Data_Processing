@@ -34,6 +34,31 @@ class SessionStoreTests(unittest.TestCase):
             self.assertIsInstance(loaded, pd.DataFrame)
             self.assertTrue(loaded.empty)
 
+    def test_load_frame_uses_isolated_cached_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = FileSessionStore(temp_dir)
+            session_id = store.create_session()
+            store.save_frames(session_id, pd.DataFrame({"a": [1, 2, 3]}))
+
+            first = store.load_frame(session_id)
+            first.loc[0, "a"] = 99
+            second = store.load_frame(session_id)
+
+            self.assertEqual(second.loc[0, "a"], 1)
+
+    def test_load_frame_refreshes_cache_when_snapshot_changes_on_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = FileSessionStore(temp_dir)
+            session_id = store.create_session()
+            store.save_frames(session_id, pd.DataFrame({"a": [1, 2, 3]}))
+            self.assertEqual(len(store.load_frame(session_id)), 3)
+
+            paths = store._paths(session_id)
+            paths.snapshot_path.write_text("a\n10\n20\n30\n40\n", encoding="utf-8")
+            loaded = store.load_frame(session_id)
+
+            self.assertEqual(loaded["a"].tolist(), [10, 20, 30, 40])
+
     def test_list_sessions_returns_recent_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = FileSessionStore(temp_dir)

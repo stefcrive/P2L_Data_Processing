@@ -29,11 +29,15 @@ from ..constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
     CYCLE1_SIGNAL_DIFF45_COL,
     CYCLE1_SIGNAL_DIFF46_COL,
+    CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_REF44_COL,
+    CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
+    CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
     ISOTYPE_D13C,
     ISOTYPE_D18O,
+    LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44,
 )
 from ..shared.dataframe import _find_column
 from ..shared.plotting import (
@@ -216,17 +220,65 @@ def _compute_linearity_fit(
     y_col: str,
     x_col: str,
     quadratic: bool = False,
-) -> dict[str, float | int]:
-    result: dict[str, float | int] = {
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "slope": float("nan"),
         "intercept": float("nan"),
         "quad": 0.0,
         "degree": 1,
         "r2": float("nan"),
         "x_ref": float("nan"),
+        "secondary_x_ref": float("nan"),
         "n": 0,
     }
     if clean_df is None or clean_df.empty or x_col not in clean_df.columns or y_col not in clean_df.columns:
+        if x_col != LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44:
+            return result
+        if (
+            clean_df is None
+            or clean_df.empty
+            or y_col not in clean_df.columns
+            or CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL not in clean_df.columns
+            or CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL not in clean_df.columns
+        ):
+            return result
+    if x_col == LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44:
+        x1 = pd.to_numeric(clean_df[CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL], errors="coerce")
+        x2 = pd.to_numeric(clean_df[CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL], errors="coerce")
+        y = pd.to_numeric(clean_df[y_col], errors="coerce")
+        mask = np.isfinite(x1) & np.isfinite(x2) & np.isfinite(y)
+        x1 = x1[mask]
+        x2 = x2[mask]
+        y = y[mask]
+        if len(y) < 3:
+            return result
+        x1_values = np.asarray(x1.values, dtype=float)
+        x2_values = np.asarray(x2.values, dtype=float)
+        y_values = np.asarray(y.values, dtype=float)
+        design = np.column_stack([x1_values, x2_values, np.ones_like(y_values)])
+        try:
+            coeffs, *_ = np.linalg.lstsq(design, y_values, rcond=None)
+            b1, b2, intercept = coeffs
+            y_pred = design @ coeffs
+            ss_res = float(np.sum((y_values - y_pred) ** 2))
+            ss_tot = float(np.sum((y_values - np.mean(y_values)) ** 2))
+            result.update(
+                {
+                    "slope": float(b1),
+                    "quad": float(b2),
+                    "intercept": float(intercept),
+                    "degree": 1,
+                    "r2": float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else float("nan"),
+                    "x_ref": float(np.median(x1.values)),
+                    "secondary_x_ref": float(np.median(x2.values)),
+                    "n": int(len(y)),
+                    "model": "two_term",
+                    "primary_col": CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+                    "secondary_col": CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+                }
+            )
+        except Exception:
+            pass
         return result
     x = pd.to_numeric(clean_df[x_col], errors="coerce")
     y = pd.to_numeric(clean_df[y_col], errors="coerce")
@@ -309,11 +361,37 @@ def _resolve_linearity_fit_degree(fit: dict[str, Any] | None) -> int:
     return 1
 
 
-def _linearity_correction_delta(intensity: pd.Series, fit: dict[str, Any]) -> pd.Series:
+def _linearity_primary_offset_scale(intensity_col: str | None) -> float:
+    if intensity_col in (CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL, CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL):
+        return 1.0
+    return 10.0
+
+
+def _linearity_secondary_offset_scale(intensity_col: str | None) -> float:
+    if intensity_col in (CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL, CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL):
+        return 1.0
+    if intensity_col == LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44:
+        return 1.0
+    return 100.0
+
+
+def _linearity_correction_delta(
+    intensity: pd.Series,
+    fit: dict[str, Any],
+    secondary_intensity: pd.Series | None = None,
+) -> pd.Series:
     slope = pd.to_numeric(pd.Series([fit.get("slope")]), errors="coerce").iloc[0]
     x_ref = pd.to_numeric(pd.Series([fit.get("x_ref")]), errors="coerce").iloc[0]
     if not (np.isfinite(slope) and np.isfinite(x_ref)):
         return pd.Series(np.nan, index=intensity.index, dtype=float)
+    if str(fit.get("model", "")).strip() == "two_term":
+        secondary_ref = pd.to_numeric(pd.Series([fit.get("secondary_x_ref")]), errors="coerce").iloc[0]
+        secondary_slope = pd.to_numeric(pd.Series([fit.get("quad")]), errors="coerce").iloc[0]
+        if secondary_intensity is None or not (np.isfinite(secondary_ref) and np.isfinite(secondary_slope)):
+            return pd.Series(np.nan, index=intensity.index, dtype=float)
+        delta = float(slope) * (intensity - float(x_ref))
+        delta = delta + float(secondary_slope) * (secondary_intensity - float(secondary_ref))
+        return pd.to_numeric(delta, errors="coerce")
     delta = float(slope) * (intensity - float(x_ref))
     if _resolve_linearity_fit_degree(fit) >= 2:
         quad = pd.to_numeric(pd.Series([fit.get("quad")]), errors="coerce").iloc[0]
@@ -342,6 +420,7 @@ def _apply_manual_linearity_offsets_to_fits(
     adjusted: dict[str, Any] = dict(fits)
     if not bool(enabled):
         return adjusted
+    basis_col = str(adjusted.get("intensity_col") or "")
 
     config_by_isotope = {
         "d13C": {"linear": d13_per_10v, "quadratic": d13_per_10v2},
@@ -352,13 +431,43 @@ def _apply_manual_linearity_offsets_to_fits(
         fit = dict(fit_payload) if isinstance(fit_payload, dict) else {}
         x_ref_num = pd.to_numeric(pd.Series([fit.get("x_ref")]), errors="coerce").iloc[0]
         x_ref = float(x_ref_num) if np.isfinite(x_ref_num) else 0.0
+        if str(fit.get("model", "")).strip() == "two_term":
+            slope_offset_raw = pd.to_numeric(pd.Series([coeffs["linear"]]), errors="coerce").iloc[0]
+            secondary_offset_raw = pd.to_numeric(pd.Series([coeffs["quadratic"]]), errors="coerce").iloc[0]
+            intercept_shift = 0.0
+            if np.isfinite(slope_offset_raw) and abs(float(slope_offset_raw)) > 1e-15:
+                slope_offset = float(slope_offset_raw) / _linearity_primary_offset_scale(LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44)
+                base_slope = pd.to_numeric(pd.Series([fit.get("slope")]), errors="coerce").iloc[0]
+                fit["slope"] = (float(base_slope) if np.isfinite(base_slope) else 0.0) + slope_offset
+                intercept_shift += slope_offset * x_ref
+            if np.isfinite(secondary_offset_raw) and abs(float(secondary_offset_raw)) > 1e-15:
+                secondary_offset = float(secondary_offset_raw) / _linearity_secondary_offset_scale(LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44)
+                base_secondary = pd.to_numeric(pd.Series([fit.get("quad")]), errors="coerce").iloc[0]
+                fit["quad"] = (float(base_secondary) if np.isfinite(base_secondary) else 0.0) + secondary_offset
+                secondary_ref = pd.to_numeric(pd.Series([fit.get("secondary_x_ref")]), errors="coerce").iloc[0]
+                if np.isfinite(secondary_ref):
+                    intercept_shift += secondary_offset * float(secondary_ref)
+            base_intercept = pd.to_numeric(pd.Series([fit.get("intercept")]), errors="coerce").iloc[0]
+            if np.isfinite(base_intercept) and abs(intercept_shift) > 1e-15:
+                fit["intercept"] = float(base_intercept) - intercept_shift
+            adjusted[isotope_key] = fit
+            continue
 
         if bool(quadratic):
-            offset_raw = pd.to_numeric(pd.Series([coeffs["quadratic"]]), errors="coerce").iloc[0]
-            if not np.isfinite(offset_raw):
-                offset_raw = pd.to_numeric(pd.Series([coeffs["linear"]]), errors="coerce").iloc[0]
-            if np.isfinite(offset_raw):
-                quad_offset = float(offset_raw) / 100.0
+            slope_offset_raw = pd.to_numeric(pd.Series([coeffs["linear"]]), errors="coerce").iloc[0]
+            if np.isfinite(slope_offset_raw) and abs(float(slope_offset_raw)) > 1e-15:
+                slope_offset = float(slope_offset_raw) / _linearity_primary_offset_scale(basis_col)
+                base_slope = pd.to_numeric(pd.Series([fit.get("slope")]), errors="coerce").iloc[0]
+                base_slope_value = float(base_slope) if np.isfinite(base_slope) else 0.0
+                fit["slope"] = base_slope_value + slope_offset
+                base_intercept = pd.to_numeric(pd.Series([fit.get("intercept")]), errors="coerce").iloc[0]
+                if np.isfinite(base_intercept):
+                    # Keep the reference-intensity anchor stable after offsetting slope.
+                    fit["intercept"] = float(base_intercept) - slope_offset * x_ref
+
+            quad_offset_raw = pd.to_numeric(pd.Series([coeffs["quadratic"]]), errors="coerce").iloc[0]
+            if np.isfinite(quad_offset_raw) and abs(float(quad_offset_raw)) > 1e-15:
+                quad_offset = float(quad_offset_raw) / _linearity_secondary_offset_scale(basis_col)
                 base_quad = pd.to_numeric(pd.Series([fit.get("quad")]), errors="coerce").iloc[0]
                 base_quad_value = float(base_quad) if np.isfinite(base_quad) else 0.0
                 fit["quad"] = base_quad_value + quad_offset
@@ -370,7 +479,7 @@ def _apply_manual_linearity_offsets_to_fits(
         else:
             offset_raw = pd.to_numeric(pd.Series([coeffs["linear"]]), errors="coerce").iloc[0]
             if np.isfinite(offset_raw):
-                slope_offset = float(offset_raw) / 10.0
+                slope_offset = float(offset_raw) / _linearity_primary_offset_scale(basis_col)
                 base_slope = pd.to_numeric(pd.Series([fit.get("slope")]), errors="coerce").iloc[0]
                 base_slope_value = float(base_slope) if np.isfinite(base_slope) else 0.0
                 fit["slope"] = base_slope_value + slope_offset
@@ -603,8 +712,30 @@ def _apply_linearity_correction(
     )
     d13_fit = fits.get("d13C", {}) if isinstance(fits, dict) else {}
     d18_fit = fits.get("d18O", {}) if isinstance(fits, dict) else {}
-    d13_delta = _linearity_correction_delta(d13_intensity, d13_fit)
-    d18_delta = _linearity_correction_delta(d18_intensity, d18_fit)
+    if str(d13_fit.get("model", "")).strip() == "two_term":
+        d13_primary_col = str(d13_fit.get("primary_col") or CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL)
+        d13_secondary_col = str(d13_fit.get("secondary_col") or CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL)
+        d13_primary = pd.to_numeric(work[d13_primary_col], errors="coerce") if d13_primary_col in work.columns else d13_intensity
+        d13_secondary = (
+            pd.to_numeric(work[d13_secondary_col], errors="coerce")
+            if d13_secondary_col in work.columns
+            else pd.Series(np.nan, index=work.index, dtype=float)
+        )
+        d13_delta = _linearity_correction_delta(d13_primary, d13_fit, d13_secondary)
+    else:
+        d13_delta = _linearity_correction_delta(d13_intensity, d13_fit)
+    if str(d18_fit.get("model", "")).strip() == "two_term":
+        d18_primary_col = str(d18_fit.get("primary_col") or CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL)
+        d18_secondary_col = str(d18_fit.get("secondary_col") or CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL)
+        d18_primary = pd.to_numeric(work[d18_primary_col], errors="coerce") if d18_primary_col in work.columns else d18_intensity
+        d18_secondary = (
+            pd.to_numeric(work[d18_secondary_col], errors="coerce")
+            if d18_secondary_col in work.columns
+            else pd.Series(np.nan, index=work.index, dtype=float)
+        )
+        d18_delta = _linearity_correction_delta(d18_primary, d18_fit, d18_secondary)
+    else:
+        d18_delta = _linearity_correction_delta(d18_intensity, d18_fit)
     if "d 13C/12C  Mean" in work.columns and d13_delta.notna().any():
         values = pd.to_numeric(work["d 13C/12C  Mean"], errors="coerce")
         work["d13C_linearity_corrected"] = (values - d13_delta).where(np.isfinite(values) & np.isfinite(d13_delta))
@@ -668,7 +799,7 @@ def _resolve_manual_linearity_override_intensity(
 ) -> tuple[pd.Series, bool]:
     """Resolve manual-override intensity axis.
 
-    In Samp-Ref mode, use a pressure-weighted mismatch driver:
+    In legacy Samp-Ref mode, use an intensity-weighted mismatch driver:
     ``10 * (Samp-Ref) / Ref * (Samp / Samp_ref)`` where ``Samp_ref`` is the
     median sample intensity. This captures both mismatch and initial intensity
     while preserving per-10V coefficient scaling.
@@ -776,14 +907,15 @@ def _apply_manual_linearity_override_to_standards(
             )
         values = pd.to_numeric(work[column_name], errors="coerce")
         if bool(quadratic):
-            if np.isfinite(quad_num) and (abs(float(quad_num)) > 1e-15 or not np.isfinite(slope_num) or abs(float(slope_num)) <= 1e-15):
-                quad_coeff_num = quad_num
-            else:
-                quad_coeff_num = slope_num
-            quad_per_v2 = float(quad_coeff_num) / 100.0
-            delta = quad_per_v2 * (np.square(intensity) - float(x_ref) ** 2)
+            delta = pd.Series(0.0, index=work.index, dtype=float)
+            if np.isfinite(slope_num):
+                slope_per_v = float(slope_num) / _linearity_primary_offset_scale(intensity_col)
+                delta = delta + slope_per_v * (intensity - float(x_ref))
+            if np.isfinite(quad_num):
+                quad_per_v2 = float(quad_num) / _linearity_secondary_offset_scale(intensity_col)
+                delta = delta + quad_per_v2 * (np.square(intensity) - float(x_ref) ** 2)
         else:
-            slope_per_v = float(slope_num) / 10.0
+            slope_per_v = float(slope_num) / _linearity_primary_offset_scale(intensity_col)
             delta = slope_per_v * (intensity - float(x_ref))
         corrected = (values - delta).where(np.isfinite(values) & valid_intensity & np.isfinite(delta))
         work.loc[standards_mask, column_name] = corrected.loc[standards_mask]
@@ -804,18 +936,34 @@ def _resolve_selected_linearity_intensity_column(
         CYCLE1_SIGNAL_SAMP44_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44,
     }
     selected = str(selected_intensity_col or "").strip()
     preferred = selected if selected in valid_columns else (CYCLE1_SIGNAL_DIFF44_COL if use_diff_intensity else CYCLE1_SIGNAL_SAMP44_COL)
     fallback_candidates = [
         CYCLE1_SIGNAL_SAMP44_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+        LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44,
     ]
     candidate_order = [preferred, *[col for col in fallback_candidates if col != preferred]]
     if df is None:
         return preferred
+    if preferred == LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44:
+        if CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL in df.columns and CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL in df.columns:
+            mean_vals = pd.to_numeric(df[CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL], errors="coerce")
+            mismatch_vals = pd.to_numeric(df[CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL], errors="coerce")
+            if (mean_vals.notna() & mismatch_vals.notna()).any():
+                return preferred
     for candidate in candidate_order:
+        if candidate == LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44:
+            continue
         if candidate not in df.columns:
             continue
         vals = pd.to_numeric(df[candidate], errors="coerce")
@@ -839,9 +987,19 @@ def _resolve_linearity_intensity_column_for_fits(
             CYCLE1_SIGNAL_SAMP44_COL,
             CYCLE1_SIGNAL_DIFF44_COL,
             CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+            CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+            CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+            CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+            LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44,
         ):
             if df is None:
                 return str(stored_col)
+            if stored_col == LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44:
+                if CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL in df.columns and CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL in df.columns:
+                    mean_vals = pd.to_numeric(df[CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL], errors="coerce")
+                    mismatch_vals = pd.to_numeric(df[CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL], errors="coerce")
+                    if (mean_vals.notna() & mismatch_vals.notna()).any():
+                        return str(stored_col)
             if stored_col in df.columns:
                 vals = pd.to_numeric(df[stored_col], errors="coerce")
                 if vals.notna().any():

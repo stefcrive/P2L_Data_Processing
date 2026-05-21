@@ -10,13 +10,17 @@ from ..constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
     CYCLE1_SIGNAL_DIFF45_COL,
     CYCLE1_SIGNAL_DIFF46_COL,
+    CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_REF45_COL,
     CYCLE1_SIGNAL_REF46_COL,
+    CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SAMP45_COL,
     CYCLE1_SIGNAL_SAMP46_COL,
+    CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+    VALID_CYCLES_COL,
 )
 
 def extract_number(text):
@@ -100,6 +104,28 @@ def _normalize_signal_intensity(series):
     if pd.notna(max_val) and max_val > 1000:
         numeric = numeric / 1000.0
     return numeric
+
+def _ensure_valid_cycles_column(df):
+    """Ensure a per-sample valid-cycle count is available for color mapping."""
+    if df is None:
+        return df
+    source_cols = [col for col in ("d13C Cycles Used", "d18O Cycles Used") if col in df.columns]
+    if not source_cols:
+        return df
+
+    count_data = {}
+    for col in source_cols:
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        count_data[col] = numeric.where(numeric >= 0)
+    cycle_counts = pd.DataFrame(count_data, index=df.index)
+    values = cycle_counts.min(axis=1, skipna=True)
+    values = values.where(values.notna())
+    if VALID_CYCLES_COL in df.columns:
+        existing = pd.to_numeric(df[VALID_CYCLES_COL], errors="coerce")
+        df[VALID_CYCLES_COL] = values.where(values.notna(), existing)
+    else:
+        df[VALID_CYCLES_COL] = values
+    return df
 
 def _coalesce_duplicate_columns(df):
     """Resolve duplicate column names while preserving independent collector columns."""
@@ -732,6 +758,7 @@ def _apply_cycle_averages(df):
     result = pd.concat([pre_rows, other_rows], axis=0).sort_index()
     result = result.drop(columns=['_cycle_order', '_cycle_group'], errors='ignore')
     result = _ensure_cycle1_signal_difference_columns(result)
+    result = _ensure_valid_cycles_column(result)
     return result
 
 def _get_species_series(df):
@@ -1114,11 +1141,12 @@ def _ensure_cycle1_signal_difference_columns(df):
     _ensure_diff_column(CYCLE1_SIGNAL_SAMP46_COL, CYCLE1_SIGNAL_REF46_COL, CYCLE1_SIGNAL_DIFF46_COL)
 
     _ensure_cycle1_pressure_weighted_mismatch_column(df)
+    _ensure_valid_cycles_column(df)
     return df
 
 
 def _ensure_cycle1_pressure_weighted_mismatch_column(df):
-    """Ensure pressure-weighted mismatch column exists for cycle-1 m/z44.
+    """Ensure derived cycle-1 m/z44 linearity-basis columns exist.
 
     Formula:
     10 * (Samp-Ref) / Ref * (Samp / median(Samp))
@@ -1127,9 +1155,12 @@ def _ensure_cycle1_pressure_weighted_mismatch_column(df):
     if df is None:
         return df
 
-    samp_vals = pd.to_numeric(df.get(CYCLE1_SIGNAL_SAMP44_COL), errors='coerce')
-    ref_vals = pd.to_numeric(df.get(CYCLE1_SIGNAL_REF44_COL), errors='coerce')
-    diff_vals = pd.to_numeric(df.get(CYCLE1_SIGNAL_DIFF44_COL), errors='coerce')
+    samp_source = df[CYCLE1_SIGNAL_SAMP44_COL] if CYCLE1_SIGNAL_SAMP44_COL in df.columns else pd.Series(np.nan, index=df.index)
+    ref_source = df[CYCLE1_SIGNAL_REF44_COL] if CYCLE1_SIGNAL_REF44_COL in df.columns else pd.Series(np.nan, index=df.index)
+    diff_source = df[CYCLE1_SIGNAL_DIFF44_COL] if CYCLE1_SIGNAL_DIFF44_COL in df.columns else pd.Series(np.nan, index=df.index)
+    samp_vals = pd.to_numeric(samp_source, errors='coerce')
+    ref_vals = pd.to_numeric(ref_source, errors='coerce')
+    diff_vals = pd.to_numeric(diff_source, errors='coerce')
     if diff_vals.isna().all():
         valid_samp_ref = np.isfinite(samp_vals) & np.isfinite(ref_vals)
         diff_vals = (samp_vals - ref_vals).where(valid_samp_ref)
@@ -1137,8 +1168,16 @@ def _ensure_cycle1_pressure_weighted_mismatch_column(df):
     valid_ref = np.isfinite(ref_vals) & (np.abs(ref_vals) > 1e-12)
     valid_diff = np.isfinite(diff_vals)
     with np.errstate(divide='ignore', invalid='ignore'):
-        mismatch_10v = (diff_vals / ref_vals) * 10.0
+        relative_mismatch = diff_vals / ref_vals
+        mismatch_10v = relative_mismatch * 10.0
+    relative_mismatch = relative_mismatch.where(valid_ref & valid_diff)
     mismatch_10v = mismatch_10v.where(valid_ref & valid_diff)
+
+    mean_intensity = ((samp_vals + ref_vals) / 2.0).where(np.isfinite(samp_vals) & np.isfinite(ref_vals))
+    valid_mean = np.isfinite(mean_intensity) & (np.abs(mean_intensity) > 1e-12)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        symmetric_mismatch = diff_vals / mean_intensity
+    symmetric_mismatch = symmetric_mismatch.where(valid_mean & valid_diff)
 
     weighted = mismatch_10v
     finite_sample = samp_vals[np.isfinite(samp_vals)]
@@ -1154,6 +1193,22 @@ def _ensure_cycle1_pressure_weighted_mismatch_column(df):
         df[CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL] = weighted.where(np.isfinite(weighted), existing)
     else:
         df[CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL] = weighted
+    if CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL in df.columns:
+        existing = pd.to_numeric(df[CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL], errors='coerce')
+        df[CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL] = relative_mismatch.where(np.isfinite(relative_mismatch), existing)
+    else:
+        df[CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL] = relative_mismatch
+    if CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL in df.columns:
+        existing = pd.to_numeric(df[CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL], errors='coerce')
+        df[CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL] = symmetric_mismatch.where(np.isfinite(symmetric_mismatch), existing)
+    else:
+        df[CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL] = symmetric_mismatch
+    if CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL in df.columns:
+        existing = pd.to_numeric(df[CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL], errors='coerce')
+        df[CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL] = mean_intensity.where(np.isfinite(mean_intensity), existing)
+    else:
+        df[CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL] = mean_intensity
+    _ensure_valid_cycles_column(df)
     return df
 
 def _split_label_species(label):

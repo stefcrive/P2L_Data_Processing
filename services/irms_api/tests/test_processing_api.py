@@ -10,7 +10,7 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from services.irms_api.api import main as api_main
-from services.irms_api.domain.constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL
+from services.irms_api.domain.constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, VALID_CYCLES_COL
 from services.irms_api.domain.contracts import CycleDiagnosticsRequest, EditAction, ExportRequest
 from services.irms_api.domain.shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column
 from services.irms_api.session_store import FileSessionStore
@@ -568,6 +568,7 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertTrue(any(_trace_matches(trace, expected_pressure_adjusted_x, expected_d13) for trace in traces))
 
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, bundle.summary.get("available_color_params", []))
+        self.assertIn(VALID_CYCLES_COL, bundle.summary.get("available_color_params", []))
 
         annotations = diagnostics_figure.get("layout", {}).get("annotations", [])
         subplot_titles = {

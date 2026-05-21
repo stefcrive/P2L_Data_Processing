@@ -269,6 +269,10 @@ def _restored_crossplot_rows(edit_state: dict[str, Any] | None) -> set[str]:
     return restored_d13 & restored_d18
 
 
+def _edited_row_labels(edit_state: dict[str, Any] | None) -> set[str]:
+    return {str(row) for row in (edit_state or {}).get("edited_rows", [])}
+
+
 def _restored_index_mask(index: pd.Index, restored_rows: set[str]) -> pd.Series:
     if len(index) == 0:
         return pd.Series(dtype=bool)
@@ -581,6 +585,26 @@ def _add_processing_summary_overlays(
             )
         )
 
+    edited_rows_for_isotope = _edited_row_labels(edit_state) - restored_rows_for_isotope
+    if edited_rows_for_isotope:
+        edited_mask = pd.Series(
+            [str(idx) in edited_rows_for_isotope for idx in overlays.index],
+            index=overlays.index,
+            dtype=bool,
+        )
+        edited_rows = _finite_value_rows(_rows(edited_mask, include_restored=True))
+        if not edited_rows.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=edited_rows["x_axis"],
+                    y=pd.to_numeric(edited_rows.get(y_col), errors="coerce"),
+                    mode="markers",
+                    name="Edited Samples",
+                    marker=dict(color="#ff00ff", symbol="circle", size=13, opacity=1.0, line=dict(width=1.5, color="#ff00ff")),
+                    customdata=_build_processing_point_customdata(edited_rows, isotope_key),
+                )
+            )
+
 
 def _build_overview_outlier_context(
     unfiltered_df: pd.DataFrame,
@@ -698,6 +722,7 @@ def _add_processing_crossplot_overlays(
 
     restored_rows_all = _restored_crossplot_rows(edit_state)
     visible_restored_rows = {str(idx) for idx in restored_visible_index} if restored_visible_index is not None else None
+    edited_rows_all = _edited_row_labels(edit_state) - restored_rows_all
 
     def _rows(mask: pd.Series | None, include_restored: bool = False) -> pd.DataFrame:
         if mask is None:
@@ -818,6 +843,23 @@ def _add_processing_crossplot_overlays(
             )
         )
 
+    if edited_rows_all:
+        edited_rows = _rows(
+            pd.Series([str(idx) in edited_rows_all for idx in overlay_df.index], index=overlay_df.index, dtype=bool),
+            include_restored=True,
+        )
+        if not edited_rows.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=pd.to_numeric(edited_rows.get("d 18O/16O  Mean"), errors="coerce"),
+                    y=pd.to_numeric(edited_rows.get("d 13C/12C  Mean"), errors="coerce"),
+                    mode="markers",
+                    name="Edited Samples",
+                    marker=dict(size=14, symbol="circle", color="#ff00ff", line=dict(width=1.5, color="#ff00ff")),
+                    customdata=_build_processing_point_customdata(edited_rows, "cross"),
+                )
+            )
+
 
 def _add_processing_3d_overlays(
     fig: go.Figure,
@@ -842,6 +884,7 @@ def _add_processing_3d_overlays(
 
     restored_rows_all = _restored_crossplot_rows(edit_state)
     visible_restored_rows = {str(idx) for idx in restored_visible_index} if restored_visible_index is not None else None
+    edited_rows_all = _edited_row_labels(edit_state) - restored_rows_all
 
     def _rows(mask: pd.Series | None, include_restored: bool = False) -> pd.DataFrame:
         if mask is None:
@@ -987,6 +1030,25 @@ def _add_processing_3d_overlays(
                 hovertemplate=hover_template,
             )
         )
+
+    if edited_rows_all:
+        edited_rows = _rows(
+            pd.Series([str(idx) in edited_rows_all for idx in overlay_df.index], index=overlay_df.index, dtype=bool),
+            include_restored=True,
+        )
+        if not edited_rows.empty:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=pd.to_numeric(edited_rows.get("d 18O/16O  Mean"), errors="coerce"),
+                    y=pd.to_numeric(edited_rows.get("d 13C/12C  Mean"), errors="coerce"),
+                    z=pd.to_numeric(edited_rows.get(z_col), errors="coerce"),
+                    mode="markers",
+                    name="Edited Samples",
+                    marker=dict(size=9, symbol="circle", color="#ff00ff", line=dict(width=2, color="#ff00ff"), opacity=1.0),
+                    customdata=_build_processing_point_customdata(edited_rows, "cross"),
+                    hovertemplate=hover_template,
+                )
+            )
 
 
 def _apply_processing_3d_layout_tuning(fig: go.Figure) -> None:
@@ -1590,6 +1652,7 @@ def build_species_sections(
     unfiltered_df: pd.DataFrame,
     config: Any,
     edit_state: dict[str, Any] | None,
+    species_section_filter: set[str] | None = None,
 ) -> list[SpeciesSection]:
     if filtered_df is None or unfiltered_df is None:
         return []
@@ -1613,6 +1676,16 @@ def build_species_sections(
                 if str(value).strip() != ""
             }
         )
+        if species_section_filter is not None and str(species) not in species_section_filter:
+            sections.append(
+                SpeciesSection(
+                    species=str(species),
+                    identifier_count=len(identifiers),
+                    identifier_figures=[],
+                    outlier_tables=[],
+                )
+            )
+            continue
         for identifier in identifiers:
             d13_fig, has_cal_d13 = _build_identifier_figure(species_df, species_unfiltered, identifier, "d13C", config, edit_state)
             d18_fig, has_cal_d18 = _build_identifier_figure(species_df, species_unfiltered, identifier, "d18O", config, edit_state)
@@ -1644,6 +1717,7 @@ def build_species_sections(
         sections.append(
             SpeciesSection(
                 species=str(species),
+                identifier_count=len(identifiers),
                 identifier_figures=identifier_figures,
                 outlier_tables=outlier_tables,
             )

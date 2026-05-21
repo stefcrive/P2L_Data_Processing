@@ -14,9 +14,18 @@ from ..calibration.core import (
     _resolve_linearity_intensity_column_for_fits,
     _resolve_manual_linearity_override_intensity,
     _resolve_linearity_reference_intensity,
+    _linearity_primary_offset_scale,
+    _linearity_secondary_offset_scale,
     _with_isotope_linearity_intensity_columns,
 )
-from ..constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, CYCLE1_SIGNAL_SAMP44_COL
+from ..constants import (
+    CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+    CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+    CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+    CYCLE1_SIGNAL_SAMP44_COL,
+    CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+    VALID_CYCLES_COL,
+)
 from ..contracts import (
     ProcessingAvailableValues,
     ProcessingConfig,
@@ -29,9 +38,17 @@ from ..contracts import (
 )
 from ..shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column, _get_species_series, _parse_numeric_token
 from ..standards import StandardsRepository
+from .cycles import (
+    apply_run_level_linearity_basis_from_cycles,
+    build_target_info,
+    normalize_saturation_correction_method,
+    resolve_saturation_correction_value_for_target,
+    saturation_correction_method_for_isotope,
+)
 from .charts import build_overview_figures, build_species_sections
 from .outliers import (
     RangeConfig,
+    _is_row_edited,
     _partial_saturation_isotope_masks,
     _signal_in_range_mask,
     build_category_masks,
@@ -44,6 +61,16 @@ def normalize_processing_config(raw: dict[str, Any] | None) -> ProcessingWorkspa
     payload = dict(raw or {})
     if "iqr_multiplier_data" not in payload and "irq_multiplier_data" in payload:
         payload["iqr_multiplier_data"] = payload.pop("irq_multiplier_data")
+    legacy_saturation_method = normalize_saturation_correction_method(
+        payload.get("saturation_correction_method", "reference_gas_intensity")
+    )
+    payload["saturation_correction_method"] = legacy_saturation_method
+    payload["saturation_correction_method_d13"] = normalize_saturation_correction_method(
+        payload.get("saturation_correction_method_d13", legacy_saturation_method)
+    )
+    payload["saturation_correction_method_d18"] = normalize_saturation_correction_method(
+        payload.get("saturation_correction_method_d18", legacy_saturation_method)
+    )
     method_raw = str(payload.get("statistical_outlier_method", "")).strip().upper()
     if method_raw == "IRQ":
         payload["statistical_outlier_method"] = "IQR"
@@ -114,8 +141,12 @@ def _candidate_color_columns(df: pd.DataFrame) -> list[str]:
         "Species",
         "Comment",
         "Label",
+        VALID_CYCLES_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
         "1  Cycle Int  Diff Samp-Ref  44",
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
         "leak_rate",
         "d 13C/12C  Mean",
@@ -129,6 +160,9 @@ def _candidate_z_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         CYCLE1_SIGNAL_SAMP44_COL,
         "1  Cycle Int  Diff Samp-Ref  44",
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
         "leak_rate",
         "d 13C/12C  Mean",
@@ -153,6 +187,8 @@ def _restore_edited_raw_isotope_values(
     work: pd.DataFrame,
     source_df: pd.DataFrame,
     edit_state: dict[str, Any] | None,
+    *,
+    skip_partial_linearity_restore: bool = False,
 ) -> pd.DataFrame:
     if work is None or work.empty or source_df is None or source_df.empty:
         return work
@@ -163,12 +199,24 @@ def _restore_edited_raw_isotope_values(
     }
     if not edited_rows:
         return work
-    raw_cols = ("d 13C/12C  Mean", "d 18O/16O  Mean")
+    raw_cols = (("d13C", "d 13C/12C  Mean"), ("d18O", "d 18O/16O  Mean"))
+    partial_masks = (
+        _partial_saturation_isotope_masks(work)
+        if bool(skip_partial_linearity_restore)
+        else {}
+    )
     for row_label in work.index:
         if str(row_label) not in edited_rows or row_label not in source_df.index:
             continue
-        for col in raw_cols:
+        for isotope_key, col in raw_cols:
             if col in work.columns and col in source_df.columns:
+                if bool(skip_partial_linearity_restore):
+                    partial_mask = partial_masks.get(
+                        isotope_key,
+                        pd.Series(False, index=work.index, dtype=bool),
+                    ).reindex(work.index, fill_value=False).astype(bool)
+                    if bool(partial_mask.get(row_label, False)):
+                        continue
                 work.at[row_label, col] = source_df.at[row_label, col]
     return work
 
@@ -219,15 +267,16 @@ def _apply_manual_linearity_override(
             )
         values = pd.to_numeric(work[column_name], errors="coerce")
         if bool(override.quadratic):
-            # User coefficient is scaled per (10V)^2 in quadratic mode.
-            if np.isfinite(quad_num) and (abs(float(quad_num)) > 1e-15 or not np.isfinite(slope_num) or abs(float(slope_num)) <= 1e-15):
-                quad_coeff_num = quad_num
-            else:
-                quad_coeff_num = slope_num
-            quad_per_v2 = float(quad_coeff_num) / 100.0
-            delta = quad_per_v2 * (np.square(intensity_series) - float(x_ref) ** 2)
+            delta = pd.Series(0.0, index=work.index, dtype=float)
+            if np.isfinite(slope_num):
+                slope_per_v = float(slope_num) / _linearity_primary_offset_scale(intensity_col)
+                delta = delta + slope_per_v * (intensity_series - float(x_ref))
+            if np.isfinite(quad_num):
+                # Secondary coefficient scaling depends on the selected basis.
+                quad_per_v2 = float(quad_num) / _linearity_secondary_offset_scale(intensity_col)
+                delta = delta + quad_per_v2 * (np.square(intensity_series) - float(x_ref) ** 2)
         else:
-            slope_per_v = float(slope_num) / 10.0
+            slope_per_v = float(slope_num) / _linearity_primary_offset_scale(intensity_col)
             delta = slope_per_v * (intensity_series - float(x_ref))
         apply_mask = np.isfinite(values) & valid_intensity & np.isfinite(delta)
         corrected = values.copy()
@@ -322,11 +371,61 @@ def _recompute_calibration_after_modifications(
     return work
 
 
+def _apply_saturation_correction(
+    df: pd.DataFrame,
+    config: ProcessingWorkspaceConfig,
+    cycles_df: pd.DataFrame | None = None,
+    edit_state: dict[str, Any] | None = None,
+    row_labels: set[Any] | None = None,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    work = df.copy()
+    row_scope = {str(label) for label in row_labels} if row_labels is not None else None
+    enabled = bool(getattr(config, "enable_saturation_correction", False))
+    sat_masks = _partial_saturation_isotope_masks(work)
+    isotope_columns = {
+        "d13C": ("d 13C/12C  Mean", "d 13C/12C  Std Dev", "__d13C_current_method"),
+        "d18O": ("d 18O/16O  Mean", "d 18O/16O  Std Dev", "__d18O_current_method"),
+    }
+    for isotope_key, (raw_col, std_col, method_col) in isotope_columns.items():
+        if raw_col not in work.columns:
+            continue
+        if method_col not in work.columns:
+            work[method_col] = "imported"
+        partial_mask = sat_masks.get(isotope_key, pd.Series(False, index=work.index, dtype=bool)).reindex(
+            work.index,
+            fill_value=False,
+        ).astype(bool)
+        if row_scope is not None:
+            partial_mask = partial_mask & work.index.to_series().astype(str).isin(row_scope)
+        work.loc[partial_mask, method_col] = "first_valid_cycle"
+        for row_label in work.index[partial_mask]:
+            if _is_row_edited(row_label, edit_state):
+                work.at[row_label, method_col] = "edited"
+                continue
+            if not enabled or cycles_df is None or cycles_df.empty:
+                continue
+            target = build_target_info(work, row_label, isotope_key, edit_state)
+            if target is None:
+                continue
+            method = saturation_correction_method_for_isotope(config, isotope_key)
+            value, resolved_method, std_dev = resolve_saturation_correction_value_for_target(work, cycles_df, target, method)
+            if value is not None:
+                work.at[row_label, raw_col] = float(value)
+                work.at[row_label, method_col] = resolved_method
+                if std_dev is not None and std_col in work.columns:
+                    work.at[row_label, std_col] = float(std_dev)
+    return work
+
+
 def _derive_working_frame(
     df: pd.DataFrame,
     config: ProcessingWorkspaceConfig,
     calibration_meta: dict[str, Any] | None = None,
     edit_state: dict[str, Any] | None = None,
+    cycles_df: pd.DataFrame | None = None,
+    saturation_row_labels: set[Any] | None = None,
 ) -> pd.DataFrame:
     work = _ensure_cycle1_pressure_weighted_mismatch_column(df.copy())
     if "Identifier 2" in work.columns:
@@ -335,6 +434,20 @@ def _derive_working_frame(
     fits = calibration.get("linearity_fits", {})
     linearity_cfg = calibration.get("config", {}).get("linearity", {}) if isinstance(calibration.get("config"), dict) else {}
     linearity_enabled = bool(linearity_cfg.get("apply", False))
+    if linearity_enabled:
+        work = apply_run_level_linearity_basis_from_cycles(
+            work,
+            cycles_df,
+            row_labels=saturation_row_labels,
+            cycle_intensity_aggregation=linearity_cfg.get("cycle_intensity_aggregation", "run_median"),
+        )
+    work = _apply_saturation_correction(
+        work,
+        config,
+        cycles_df=cycles_df,
+        edit_state=edit_state,
+        row_labels=saturation_row_labels,
+    )
     work = _apply_isotope_line_offsets(
         work,
         line_1_offset_d13=linearity_cfg.get("line_1_offset_d13"),
@@ -432,7 +545,13 @@ def _derive_working_frame(
     )
     # Keep edited raw values stable in charts/tables even when calibration-side
     # linearity correction is enabled.
-    work = _restore_edited_raw_isotope_values(work, df, edit_state)
+    work = _restore_edited_raw_isotope_values(
+        work,
+        df,
+        edit_state,
+        skip_partial_linearity_restore=linearity_enabled
+        and bool(getattr(config, "apply_shared_linearity_to_partially_saturated", True)),
+    )
     work = _recompute_calibration_after_modifications(
         work,
         config,
@@ -517,8 +636,8 @@ def build_processing_workspace(
     df: pd.DataFrame,
     cycles_df: pd.DataFrame | None,
     metadata: dict[str, Any],
+    species_section_filter: set[str] | None = None,
 ) -> ProcessingWorkspace:
-    del cycles_df  # available for future workspace extensions; diagnostics use the dedicated endpoint
     config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
     edit_state = dict(
         metadata.get(
@@ -542,7 +661,13 @@ def build_processing_workspace(
     selected_standards = [str(item) for item in calibration.get("selected_standards", [])]
     all_standards = sorted(set(standards_repo.standards_list()) | set(selected_standards))
 
-    working_df = _derive_working_frame(df, config, calibration_meta=calibration_for_processing, edit_state=edit_state)
+    working_df = _derive_working_frame(
+        df,
+        config,
+        calibration_meta=calibration_for_processing,
+        edit_state=edit_state,
+        cycles_df=cycles_df,
+    )
     available_color_params = _candidate_color_columns(working_df)
     if available_color_params and config.color_param not in available_color_params:
         config.color_param = "Date" if "Date" in available_color_params else available_color_params[0]
@@ -597,7 +722,13 @@ def build_processing_workspace(
         config,
         edit_state=edit_state,
     )
-    species_sections = build_species_sections(filtered_df, unfiltered_df, config, edit_state)
+    species_sections = build_species_sections(
+        filtered_df,
+        unfiltered_df,
+        config,
+        edit_state,
+        species_section_filter=species_section_filter,
+    )
 
     identifiers = sorted(
         {

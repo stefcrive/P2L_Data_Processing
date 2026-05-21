@@ -51,8 +51,12 @@ from ..domain.contracts import (
 )
 from ..domain.constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+    CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
+    CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+    VALID_CYCLES_COL,
 )
 from ..domain.diagnostics.core import create_diagnostic_plots
 from ..domain.calibration.workspace import build_calibration_workspace, normalize_calibration_config
@@ -63,7 +67,13 @@ from ..domain.import_session import (
     _load_uploaded_workbooks,
 )
 from ..domain.processing.core import RangeConfig, _interpolate_outliers_by_identifier2
-from ..domain.processing.cycles import build_cycle_diagnostics_payload, build_target_info
+from ..domain.processing.cycles import (
+    apply_run_level_linearity_basis_from_cycles,
+    build_cycle_diagnostics_payload,
+    build_target_info,
+    resolve_saturation_correction_value_for_target,
+    saturation_correction_method_for_isotope,
+)
 from ..domain.processing.edits import apply_edit_action
 from ..domain.processing.export import (
     _build_client_output_frame,
@@ -73,6 +83,7 @@ from ..domain.processing.export import (
     summarize_client_output_duplicates,
 )
 from ..domain.processing.outliers import (
+    _is_row_edited,
     _partial_saturation_isotope_masks,
     _signal_in_range_mask,
     build_category_masks,
@@ -195,6 +206,7 @@ def _processing_target_linearity_corrected_value(
     calibration_meta: dict[str, Any] | None,
     config: ProcessingConfig | None = None,
     edit_state: dict[str, Any] | None = None,
+    cycles_df: pd.DataFrame | None = None,
 ) -> float | None:
     if df is None or df.empty or not isinstance(target, dict):
         return None
@@ -229,6 +241,8 @@ def _processing_target_linearity_corrected_value(
         config,
         calibration_meta=calibration,
         edit_state=edit_state,
+        cycles_df=cycles_df,
+        saturation_row_labels={row_label},
     )
     if row_label not in working_df.index or working_col not in working_df.columns:
         return None
@@ -236,6 +250,52 @@ def _processing_target_linearity_corrected_value(
     if pd.notna(corrected_raw) and np.isfinite(corrected_raw):
         return float(corrected_raw)
     return None
+
+
+def _processing_target_current_value_and_method(
+    df: pd.DataFrame,
+    target: dict[str, Any],
+    config: ProcessingConfig,
+    edit_state: dict[str, Any] | None = None,
+    cycles_df: pd.DataFrame | None = None,
+) -> tuple[float | None, str]:
+    isotope_key = str(target.get("isotope_key", "")).strip()
+    row_label = target.get("row_label")
+    if isotope_key == "d13C":
+        raw_col = "d 13C/12C  Mean"
+    elif isotope_key == "d18O":
+        raw_col = "d 18O/16O  Mean"
+    else:
+        return None, ""
+    if df is None or row_label not in df.index:
+        return None, ""
+    if raw_col not in df.columns:
+        return None, ""
+    value = pd.to_numeric(pd.Series([df.at[row_label, raw_col]]), errors="coerce").iloc[0]
+    method = "imported"
+    target_df = df.loc[[row_label]]
+    sat_masks = _partial_saturation_isotope_masks(target_df)
+    partial_mask = sat_masks.get(isotope_key, pd.Series(False, index=target_df.index, dtype=bool)).reindex(
+        target_df.index,
+        fill_value=False,
+    ).astype(bool)
+    is_partial = bool(partial_mask.iloc[0]) if not partial_mask.empty else False
+    if is_partial:
+        method = "first_valid_cycle"
+        if _is_row_edited(row_label, edit_state):
+            method = "edited"
+        elif bool(getattr(config, "enable_saturation_correction", False)) and cycles_df is not None and not cycles_df.empty:
+            selected_method = saturation_correction_method_for_isotope(config, isotope_key)
+            corrected_value, resolved_method, _ = resolve_saturation_correction_value_for_target(
+                df,
+                cycles_df,
+                target,
+                selected_method,
+            )
+            if corrected_value is not None:
+                value = corrected_value
+                method = resolved_method
+    return (float(value) if pd.notna(value) and np.isfinite(value) else None), method
 
 
 def _processing_subset(df: pd.DataFrame, config: ProcessingConfig) -> pd.DataFrame:
@@ -251,8 +311,15 @@ def _build_interpolation_source_frame(
     calibration_meta: dict[str, Any] | None,
     edit_state: dict[str, Any] | None,
     target_row_tokens: set[str],
+    cycles_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    working_df = _derive_working_frame(df, config, calibration_meta=calibration_meta, edit_state=edit_state)
+    working_df = _derive_working_frame(
+        df,
+        config,
+        calibration_meta=calibration_meta,
+        edit_state=edit_state,
+        cycles_df=cycles_df,
+    )
     if working_df.empty:
         return working_df
 
@@ -266,7 +333,13 @@ def _build_interpolation_source_frame(
         if bool(missing_raw.any()):
             probe_df = df.copy()
             probe_df.loc[missing_raw, raw_col] = 0.0
-            probe_working = _derive_working_frame(probe_df, config, calibration_meta=calibration_meta, edit_state=edit_state)
+            probe_working = _derive_working_frame(
+                probe_df,
+                config,
+                calibration_meta=calibration_meta,
+                edit_state=edit_state,
+                cycles_df=cycles_df,
+            )
             if raw_col in probe_working.columns:
                 probe_source = pd.to_numeric(probe_working[raw_col], errors="coerce").reindex(working_df.index)
                 offsets.loc[missing_raw] = probe_source.loc[missing_raw]
@@ -329,8 +402,12 @@ def _candidate_diagnostics_color_columns(df: pd.DataFrame) -> list[str]:
         "Species",
         "Comment",
         "Label",
+        VALID_CYCLES_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
         "leak_rate",
         "Line",
@@ -343,6 +420,9 @@ def _candidate_diagnostics_color_columns(df: pd.DataFrame) -> list[str]:
 def _candidate_diagnostics_z_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
         "total_co2",
@@ -891,6 +971,7 @@ def diagnostics(
 ) -> ChartBundle:
     _session_exists_or_404(session_id)
     df = store.load_frame(session_id)
+    cycles_df = store.load_cycles_frame(session_id)
     metadata = store.load_metadata(session_id)
     processing_config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
     diagnostics_df = _derive_working_frame(
@@ -898,6 +979,7 @@ def diagnostics(
         processing_config,
         calibration_meta=metadata.get("calibration", {}),
         edit_state=metadata.get("edit_state", {}),
+        cycles_df=cycles_df,
     )
     available_color_params = _candidate_diagnostics_color_columns(diagnostics_df)
     available_z_axes = _candidate_diagnostics_z_columns(diagnostics_df)
@@ -964,7 +1046,14 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
     config = normalize_calibration_config(config.model_dump())
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
+    cycles_df = store.load_cycles_frame(session_id)
     working_df = _ensure_cycle1_signal_difference_columns(df.copy())
+    if bool(config.linearity.apply):
+        working_df = apply_run_level_linearity_basis_from_cycles(
+            working_df,
+            cycles_df,
+            cycle_intensity_aggregation=getattr(config.linearity, "cycle_intensity_aggregation", "run_median"),
+        )
     working_df = _apply_isotope_line_offsets(
         working_df,
         line_1_offset_d13=getattr(config.linearity, "line_1_offset_d13", None),
@@ -1202,7 +1291,11 @@ def reset_calibration(session_id: str) -> SessionSnapshot:
 
 
 @app.post("/sessions/{session_id}/processing/calibration/remove", response_model=ProcessingWorkspace)
-def remove_processing_calibration(session_id: str) -> ProcessingWorkspace:
+def remove_processing_calibration(
+    session_id: str,
+    include_all_species_sections: bool = Query(True),
+    species_section: list[str] | None = Query(None),
+) -> ProcessingWorkspace:
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
@@ -1216,7 +1309,15 @@ def remove_processing_calibration(session_id: str) -> ProcessingWorkspace:
         df=cleaned_df,
         cycles_df=store.load_cycles_frame(session_id),
     )
-    return _build_processing_workspace_response(session_id, metadata=metadata, df=cleaned_df)
+    return _build_processing_workspace_response(
+        session_id,
+        metadata=metadata,
+        df=cleaned_df,
+        species_section_filter=_processing_species_section_filter(
+            include_all_species_sections,
+            species_section,
+        ),
+    )
 
 
 @app.get("/sessions/{session_id}/calibration/workspace", response_model=CalibrationWorkspace)
@@ -1227,6 +1328,7 @@ def calibration_workspace(session_id: str) -> CalibrationWorkspace:
         session_id=session_id,
         df=store.load_frame(session_id),
         metadata=store.load_metadata(session_id),
+        cycles_df=store.load_cycles_frame(session_id),
     )
 
 
@@ -1239,17 +1341,25 @@ def calibration_workspace_preview(session_id: str, config: CalibrationConfig) ->
         df=store.load_frame(session_id),
         metadata=store.load_metadata(session_id),
         config_override=config,
+        cycles_df=store.load_cycles_frame(session_id),
     )
 
 
 def _compute_preview_coefficients_for_calibration_linearity(
     df: pd.DataFrame,
     config: CalibrationConfig,
+    cycles_df: pd.DataFrame | None = None,
 ) -> dict[str, dict[str, float]]:
     if len(config.selected_standards) not in (1, 2):
         return {}
 
     working_df = _ensure_cycle1_signal_difference_columns(df.copy())
+    if bool(config.linearity.apply):
+        working_df = apply_run_level_linearity_basis_from_cycles(
+            working_df,
+            cycles_df,
+            cycle_intensity_aggregation=getattr(config.linearity, "cycle_intensity_aggregation", "run_median"),
+        )
     working_df = _apply_isotope_line_offsets(
         working_df,
         line_1_offset_d13=getattr(config.linearity, "line_1_offset_d13", None),
@@ -1393,10 +1503,12 @@ def _compute_preview_coefficients_for_calibration_linearity(
 def set_calibration_linearity_config(
     session_id: str,
     payload: CalibrationLinearityUpdateRequest | LinearityConfig,
+    summary_only: bool = Query(False),
 ) -> CalibrationWorkspace:
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
     source_df = store.load_frame(session_id)
+    cycles_df = store.load_cycles_frame(session_id)
     if isinstance(payload, CalibrationLinearityUpdateRequest):
         linearity = payload.linearity
         selected_standards_override = payload.selected_standards
@@ -1429,10 +1541,17 @@ def set_calibration_linearity_config(
         df=source_df,
         metadata=metadata,
         config_override=normalized_config,
+        cycles_df=cycles_df,
+        include_figures=not summary_only,
+        include_standard_sections=not summary_only,
     )
     calibration_meta["config"] = normalized_config.model_dump()
     calibration_meta["linearity_fits"] = to_json_compatible(preview_workspace.linearity_fits)
-    calibration_meta["coefficients"] = _compute_preview_coefficients_for_calibration_linearity(source_df, normalized_config)
+    calibration_meta["coefficients"] = _compute_preview_coefficients_for_calibration_linearity(
+        source_df,
+        normalized_config,
+        cycles_df=cycles_df,
+    )
     calibration_meta["selected_standards"] = list(normalized_config.selected_standards)
     _persist_session_update(
         session_id,
@@ -1443,11 +1562,7 @@ def set_calibration_linearity_config(
         },
         metadata=metadata,
     )
-    return build_calibration_workspace(
-        session_id=session_id,
-        df=source_df,
-        metadata=metadata,
-    )
+    return preview_workspace
 
 
 @app.get("/sessions/{session_id}/calibration/charts", response_model=ChartBundle)
@@ -1457,6 +1572,7 @@ def calibration_charts(session_id: str, color_param: str = Query("Date")) -> Cha
         session_id=session_id,
         df=store.load_frame(session_id),
         metadata=store.load_metadata(session_id),
+        cycles_df=store.load_cycles_frame(session_id),
     )
     payload = dict(workspace.figures)
     if color_param and color_param != workspace.config.color_param:
@@ -1468,6 +1584,7 @@ def calibration_charts(session_id: str, color_param: str = Query("Date")) -> Cha
             session_id=session_id,
             df=store.load_frame(session_id),
             metadata={"calibration": {**metadata.get("calibration", {}), "config": config_payload}},
+            cycles_df=store.load_cycles_frame(session_id),
         )
         payload = dict(workspace.figures)
     return ChartBundle(session_id=session_id, figures=payload)
@@ -1478,11 +1595,25 @@ def _build_processing_workspace_response(
     metadata: dict[str, Any] | None = None,
     df: pd.DataFrame | None = None,
     cycles_df: pd.DataFrame | None = None,
+    species_section_filter: set[str] | None = None,
 ) -> ProcessingWorkspace:
     meta = metadata if metadata is not None else store.load_metadata(session_id)
     frame = df if df is not None else store.load_frame(session_id)
     cycles_frame = cycles_df if cycles_df is not None else store.load_cycles_frame(session_id)
-    return build_processing_workspace(session_id, frame, cycles_frame, meta)
+    return build_processing_workspace(session_id, frame, cycles_frame, meta, species_section_filter=species_section_filter)
+
+
+def _processing_species_section_filter(
+    include_all_species_sections: bool,
+    species_section: list[str] | None,
+) -> set[str] | None:
+    if include_all_species_sections:
+        return None
+    return {
+        str(value).strip()
+        for value in (species_section or [])
+        if str(value).strip() != ""
+    }
 
 
 def _workspace_to_chart_bundle(workspace: ProcessingWorkspace) -> ChartBundle:
@@ -1498,14 +1629,29 @@ def _workspace_to_chart_bundle(workspace: ProcessingWorkspace) -> ChartBundle:
 
 
 @app.get("/sessions/{session_id}/processing/workspace", response_model=ProcessingWorkspace)
-def processing_workspace(session_id: str) -> ProcessingWorkspace:
+def processing_workspace(
+    session_id: str,
+    include_all_species_sections: bool = Query(True),
+    species_section: list[str] | None = Query(None),
+) -> ProcessingWorkspace:
     if not store.session_exists(session_id):
         raise HTTPException(status_code=404, detail="Unknown session")
-    return _build_processing_workspace_response(session_id)
+    return _build_processing_workspace_response(
+        session_id,
+        species_section_filter=_processing_species_section_filter(
+            include_all_species_sections,
+            species_section,
+        ),
+    )
 
 
 @app.post("/sessions/{session_id}/processing/config", response_model=ProcessingWorkspace)
-def set_processing_config(session_id: str, config: ProcessingConfig) -> ProcessingWorkspace:
+def set_processing_config(
+    session_id: str,
+    config: ProcessingConfig,
+    include_all_species_sections: bool = Query(True),
+    species_section: list[str] | None = Query(None),
+) -> ProcessingWorkspace:
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
     metadata.setdefault("processing", {})
@@ -1516,14 +1662,27 @@ def set_processing_config(session_id: str, config: ProcessingConfig) -> Processi
         payload=config.model_dump(),
         metadata=metadata,
     )
-    return _build_processing_workspace_response(session_id, metadata=metadata)
+    return _build_processing_workspace_response(
+        session_id,
+        metadata=metadata,
+        species_section_filter=_processing_species_section_filter(
+            include_all_species_sections,
+            species_section,
+        ),
+    )
 
 
 @app.post("/sessions/{session_id}/processing/edit", response_model=ProcessingWorkspace)
-def edit_processing(session_id: str, edit: EditAction) -> ProcessingWorkspace:
+def edit_processing(
+    session_id: str,
+    edit: EditAction,
+    include_all_species_sections: bool = Query(True),
+    species_section: list[str] | None = Query(None),
+) -> ProcessingWorkspace:
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
+    cycles_df = store.load_cycles_frame(session_id)
     config = _load_processing_config(metadata)
     edit_state = metadata.setdefault(
         "edit_state",
@@ -1548,6 +1707,7 @@ def edit_processing(session_id: str, edit: EditAction) -> ProcessingWorkspace:
             calibration_meta=calibration,
             edit_state=edit_state,
             target_row_tokens={str(target.row_label) for target in edit.targets},
+            cycles_df=cycles_df,
         )
         if edit.action == "interpolate"
         else None
@@ -1575,7 +1735,15 @@ def edit_processing(session_id: str, edit: EditAction) -> ProcessingWorkspace:
         df=updated_df,
         cycles_df=store.load_cycles_frame(session_id),
     )
-    return _build_processing_workspace_response(session_id, metadata=metadata, df=updated_df)
+    return _build_processing_workspace_response(
+        session_id,
+        metadata=metadata,
+        df=updated_df,
+        species_section_filter=_processing_species_section_filter(
+            include_all_species_sections,
+            species_section,
+        ),
+    )
 
 
 @app.post("/sessions/{session_id}/processing/cycle-diagnostics", response_model=CycleDiagnosticsPayload)
@@ -1590,12 +1758,23 @@ def processing_cycle_diagnostics(session_id: str, request: CycleDiagnosticsReque
     target = build_target_info(df, row_label, request.target.isotope_key, metadata.get("edit_state", {}))
     if target is None:
         raise HTTPException(status_code=404, detail="Unknown processing target")
+    current_value, current_method = _processing_target_current_value_and_method(
+        df,
+        target,
+        config,
+        metadata.get("edit_state", {}),
+        cycles_df,
+    )
+    if current_value is not None:
+        target["current_value"] = current_value
+    target["current_method"] = current_method
     target["linearity_corrected_value"] = _processing_target_linearity_corrected_value(
         df,
         target,
         calibration,
         config,
         metadata.get("edit_state", {}),
+        cycles_df,
     )
     return build_cycle_diagnostics_payload(
         session_id=session_id,
@@ -1628,13 +1807,20 @@ def check_client_output_duplicates(session_id: str, request: ExportRequest) -> C
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
+    cycles_df = store.load_cycles_frame(session_id)
     config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
     config.export = ProcessingExportConfig.model_validate(
         request.model_dump(exclude={"output_type", "restore_stdev", "restore_stdev_cap"})
     )
 
     calibration = _processing_calibration_meta(metadata)
-    working_df = _derive_working_frame(df, config, calibration_meta=calibration, edit_state=metadata.get("edit_state", {}))
+    working_df = _derive_working_frame(
+        df,
+        config,
+        calibration_meta=calibration,
+        edit_state=metadata.get("edit_state", {}),
+        cycles_df=cycles_df,
+    )
     data_to_process = _selected_processing_rows(working_df, list(config.export.selected_ids))
     range_config = RangeConfig(
         signal_range=config.signal_range,
@@ -1716,13 +1902,20 @@ def export_dataset(session_id: str, request: ExportRequest) -> Response:
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
+    cycles_df = store.load_cycles_frame(session_id)
     config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
     config.export = ProcessingExportConfig.model_validate(request.model_dump(exclude={"output_type"}))
     metadata.setdefault("processing", {})
     metadata["processing"]["config"] = config.model_dump()
 
     calibration = _processing_calibration_meta(metadata)
-    working_df = _derive_working_frame(df, config, calibration_meta=calibration, edit_state=metadata.get("edit_state", {}))
+    working_df = _derive_working_frame(
+        df,
+        config,
+        calibration_meta=calibration,
+        edit_state=metadata.get("edit_state", {}),
+        cycles_df=cycles_df,
+    )
     data_to_process = _selected_processing_rows(working_df, list(config.export.selected_ids))
     range_config = RangeConfig(
         signal_range=config.signal_range,

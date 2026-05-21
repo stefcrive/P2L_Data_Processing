@@ -6,13 +6,22 @@ import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, us
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
+import {
+  SATURATION_COLOR_AXIS_OPTIONS,
+  SaturationAxisHelpTooltip,
+  SaturationSharedColorbar,
+  SaturationFigureCard,
+  type SaturationAxisKey,
+  type SaturationColorAxisKey,
+} from "@/components/diagnostics/saturation-figure-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { SegmentedControl } from "@/components/ui/segmented-control";
+import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type {
   CalibrationConfig,
   CalibrationPrecisionSummary,
+  CalibrationWorkspace,
   ClientOutputDuplicateCheckResponse,
   CycleDiagnosticsPayload,
   EditAction,
@@ -20,6 +29,7 @@ import type {
   OutlierTable,
   ProcessingConfig,
   ProcessingWorkspace,
+  SaturationCorrectionMethod,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
@@ -40,24 +50,60 @@ const ISOTOPE_KEYS: IsotopeKey[] = ["d13C", "d18O"];
 type IsotopeNumericMap = Record<IsotopeKey, number>;
 type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
 type LinearityOffsetDraftState = Record<LinearityOffsetField, string>;
+type LinearityCycleIntensityAggregation = "run_median" | "first_valid_cycle" | "last_valid_cycle";
+const SATURATION_METHOD_OPTIONS: Array<{ value: SaturationCorrectionMethod; label: string }> = [
+  { value: "cycle_mean", label: "Cycle mean" },
+  { value: "first_valid_cycle", label: "First valid cycle" },
+  { value: "last_valid_cycle", label: "Last valid cycle" },
+  { value: "reference_gas_intensity", label: "Reference-gas signal intensity" },
+  { value: "first_cycle", label: "Stabilized cycle curve" },
+  { value: "cycle_relative_mismatch", label: "Cycle relative mismatch" },
+  { value: "cycle_symmetric_mismatch", label: "Cycle symmetric mismatch" },
+  { value: "cycle_mean_intensity", label: "Cycle mean intensity" },
+  { value: "cycle_intensity_weighted_mismatch", label: "Cycle intensity-weighted mismatch" },
+  { value: "cycle_two_term_mean_mismatch", label: "Cycle two-term mean + mismatch" },
+  { value: "cycle_plateau", label: "Cycle late plateau" },
+];
 const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const RESTORE_STDEV_DEFAULT_CAP = 0.04;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
+const SELECTION_EDITOR_CHART_DEFER_MS = 350;
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
+const LINEARITY_INTENSITY_RELATIVE_MISMATCH44 = "1  Cycle Int  Relative Mismatch Samp-Ref/Ref  44";
+const LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44 = "1  Cycle Int  Symmetric Relative Mismatch Samp-Ref  44";
+const LINEARITY_INTENSITY_MEAN44 = "1  Cycle Int  Mean Samp-Ref  44";
+const LINEARITY_INTENSITY_TWO_TERM44 = "Linearity Two-Term Mean Intensity + Symmetric Mismatch 44";
 const LINEARITY_INTENSITY_OPTIONS = [
   LINEARITY_INTENSITY_SAMP44,
   LINEARITY_INTENSITY_DIFF44,
-  LINEARITY_INTENSITY_MISMATCH44,
+  LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44,
+  LINEARITY_INTENSITY_MEAN44,
+  LINEARITY_INTENSITY_TWO_TERM44,
 ] as const;
 const LINEARITY_INTENSITY_OPTION_LABELS: Record<(typeof LINEARITY_INTENSITY_OPTIONS)[number], string> = {
   [LINEARITY_INTENSITY_SAMP44]: "Sample intensity",
-  [LINEARITY_INTENSITY_DIFF44]: "Intensity diff",
-  [LINEARITY_INTENSITY_MISMATCH44]: "Pressure-adjusted int diff",
+  [LINEARITY_INTENSITY_DIFF44]: "Samp-Ref difference",
+  [LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44]: "Symmetric mismatch",
+  [LINEARITY_INTENSITY_MEAN44]: "Mean Samp-Ref intensity",
+  [LINEARITY_INTENSITY_TWO_TERM44]: "Two-term: mean + mismatch",
 };
+const LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS: Array<{ value: LinearityCycleIntensityAggregation; label: string }> = [
+  { value: "run_median", label: "Run median intensities" },
+  { value: "first_valid_cycle", label: "First valid cycle intensity" },
+  { value: "last_valid_cycle", label: "Last valid cycle intensity" },
+];
+type LinearityCoefficientTerm = "primary" | "secondary";
 
-type DisplayStateMap = Record<string, { rawOnly: boolean; hideCalibrated: boolean }>;
+type ChartDisplayState = {
+  hideCalibrated: boolean;
+  hideSymbols: boolean;
+  runningAverage: boolean;
+  runningAveragePeriod: number;
+  rawOnly?: boolean;
+};
+type DisplayStateMap = Record<string, ChartDisplayState>;
 type FigureShape = Record<string, unknown> & {
   data: Array<Record<string, unknown>>;
   layout: Record<string, unknown>;
@@ -83,6 +129,24 @@ type HoverPreviewState = {
   clientX: number;
   clientY: number;
 };
+const DEFAULT_CHART_DISPLAY_STATE: ChartDisplayState = {
+  hideCalibrated: true,
+  hideSymbols: false,
+  runningAverage: false,
+  runningAveragePeriod: 5,
+};
+const DEFAULT_PLOTLY_COLORWAY = [
+  "#636EFA",
+  "#EF553B",
+  "#00CC96",
+  "#AB63FA",
+  "#FFA15A",
+  "#19D3F3",
+  "#FF6692",
+  "#B6E880",
+  "#FF97FF",
+  "#FECB52",
+];
 
 function getLinearityIntensityOptionLabel(value: string): string {
   if (value in LINEARITY_INTENSITY_OPTION_LABELS) {
@@ -91,21 +155,102 @@ function getLinearityIntensityOptionLabel(value: string): string {
   return value;
 }
 
+function getLinearityCycleAggregationLabel(value: string | null | undefined): string {
+  return LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.find((option) => option.value === value)?.label ?? "Run median intensities";
+}
+
+function getLinearityAggregationExpression(expression: string, aggregation: LinearityCycleIntensityAggregation = "run_median"): string {
+  if (aggregation === "first_valid_cycle") {
+    return `first_valid_cycle(${expression})`;
+  }
+  if (aggregation === "last_valid_cycle") {
+    return `last_valid_cycle(${expression})`;
+  }
+  return `median(${expression})`;
+}
+
+function getLinearityBasisFormula(intensityCol: string, aggregation: LinearityCycleIntensityAggregation = "run_median"): string {
+  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
+    return "Legacy cycle basis: I = 10 * (Samp44 - Ref44) / Ref44 * (Samp44 / median(Samp44))";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44) {
+    return "Legacy cycle basis: I = (Samp44 - Ref44) / Ref44";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44) {
+    return `x = ${getLinearityAggregationExpression("(Samp44 - Ref44) / ((Samp44 + Ref44) / 2)", aggregation)} for each analysis`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_MEAN44) {
+    return `x = ${getLinearityAggregationExpression("(Samp44 + Ref44) / 2", aggregation)} for each analysis`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return `Residual = a + b1 * ${getLinearityAggregationExpression("(Samp44 + Ref44) / 2", aggregation)} + b2 * ${getLinearityAggregationExpression("(Samp44 - Ref44) / ((Samp44 + Ref44) / 2)", aggregation)}`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
+    return `x = ${getLinearityAggregationExpression("Samp44 - Ref44", aggregation)} for each analysis`;
+  }
+  return `x = ${getLinearityAggregationExpression("Samp44", aggregation)} for each analysis`;
+}
+
+function getLinearityBasisDescription(intensityCol: string, aggregation: LinearityCycleIntensityAggregation = "run_median"): string {
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return "Fits residuals across standards with one row per analysis. Correction is centered as delta = b1 * (I_mean - median(I_mean across the calibration set)) + b2 * (Mismatch - median(Mismatch across the calibration set)).";
+  }
+  const formula = getLinearityBasisFormula(intensityCol, aggregation);
+  if (intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 || intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44) {
+    return `${formula}. The fit is across analyses, not cycle-by-cycle. Correction is centered at the calibration-set median basis value: delta = b * (x - median(x)); quadratic mode adds c * (x^2 - median(x)^2).`;
+  }
+  return `${formula}. The fit is across analyses, not cycle-by-cycle. Correction is centered at the calibration-set median basis value: delta = b * (x - median(x)); quadratic mode adds c * (x^2 - median(x)^2). Coefficients for intensity-like bases are entered per 10V.`;
+}
+
+function getLinearityBasisTerm(intensityCol: string, aggregation: LinearityCycleIntensityAggregation = "run_median"): string {
+  const prefix = aggregation === "first_valid_cycle" ? "first valid cycle" : aggregation === "last_valid_cycle" ? "last valid cycle" : "run median";
+  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
+    return "intensity-weighted mismatch";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44) {
+    return "relative mismatch";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44) {
+    return `${prefix} symmetric mismatch`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_MEAN44) {
+    return `${prefix} mean intensity`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return `${prefix} two-term model`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
+    return `${prefix} intensity-diff`;
+  }
+  return `${prefix} sample-intensity`;
+}
+
+function getLinearityCoefficientTermLabel(term: LinearityCoefficientTerm, intensityCol?: string): string {
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return term === "primary" ? "mean-intensity coefficient (b1)" : "mismatch coefficient (b2)";
+  }
+  return term === "primary" ? "primary coefficient (b)" : "secondary coefficient (c)";
+}
+
+function getLinearityCoefficientUnit(term: LinearityCoefficientTerm, intensityCol: string): string {
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return term === "primary" ? "per 10V" : "per unit mismatch";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 || intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44) {
+    return term === "primary" ? "per unit mismatch" : "per unit mismatch^2";
+  }
+  return term === "primary" ? "per 10V" : "per (10V)^2";
+}
+
 function getLinearityCoefficientLabel(
   isotope: "d13C" | "d18O",
   intensityCol: string,
-  quadratic: boolean,
+  term: LinearityCoefficientTerm,
+  aggregation: LinearityCycleIntensityAggregation = "run_median",
 ): string {
   const prefix = isotope === "d13C" ? "d13C" : "d18O";
-  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
-    return quadratic
-      ? `${prefix} pressure-weighted mismatch coefficient per (10V)^2`
-      : `${prefix} pressure-weighted mismatch coefficient`;
-  }
-  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
-    return quadratic ? `${prefix} intensity-diff coefficient per (10V)^2` : `${prefix} intensity-diff coefficient per 10V`;
-  }
-  return quadratic ? `${prefix} coefficient per (10V)^2` : `${prefix} coefficient per 10V`;
+  const coefficient = getLinearityCoefficientTermLabel(term, intensityCol).replace(" coefficient", "");
+  return `${prefix} ${coefficient} offset, ${getLinearityBasisTerm(intensityCol, aggregation)} ${getLinearityCoefficientUnit(term, intensityCol)}`;
 }
 
 function parseDecimalInput(value: string): number | null {
@@ -193,32 +338,177 @@ function cloneFigure(figure?: Record<string, unknown>): FigureShape {
   };
 }
 
+function clampRunningAveragePeriod(value: unknown): number {
+  const parsed = Number.parseInt(String(value ?? DEFAULT_CHART_DISPLAY_STATE.runningAveragePeriod), 10);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_CHART_DISPLAY_STATE.runningAveragePeriod;
+  }
+  return Math.min(999, Math.max(2, parsed));
+}
+
+function normalizeDisplayState(state?: Partial<ChartDisplayState> | null): ChartDisplayState {
+  const hasCurrentShape =
+    state != null && ("hideSymbols" in state || "runningAverage" in state || "runningAveragePeriod" in state);
+  return {
+    ...DEFAULT_CHART_DISPLAY_STATE,
+    hideCalibrated: hasCurrentShape
+      ? Boolean(state?.hideCalibrated || state?.rawOnly)
+      : Boolean(state?.hideCalibrated || state?.rawOnly || DEFAULT_CHART_DISPLAY_STATE.hideCalibrated),
+    hideSymbols: Boolean(state?.hideSymbols),
+    runningAverage: Boolean(state?.runningAverage),
+    runningAveragePeriod: clampRunningAveragePeriod(state?.runningAveragePeriod),
+  };
+}
+
+function chartDisplayStateKey(state: ChartDisplayState): string {
+  const display = normalizeDisplayState(state);
+  return [
+    display.hideCalibrated ? "hide-calibrated" : "show-calibrated",
+    display.hideSymbols ? "hide-symbols" : "show-symbols",
+    display.runningAverage ? "running-average" : "no-running-average",
+    String(display.runningAveragePeriod),
+  ].join("|");
+}
+
+function normalizeDisplayStateMap(value: unknown): DisplayStateMap {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const next: DisplayStateMap = {};
+  for (const [key, state] of Object.entries(value as Record<string, unknown>)) {
+    if (!key || !state || typeof state !== "object" || Array.isArray(state)) {
+      continue;
+    }
+    next[key] = normalizeDisplayState(state as Partial<ChartDisplayState>);
+  }
+  return next;
+}
+
+function hasTraceMode(trace: Record<string, unknown>, mode: string): boolean {
+  return String(trace.mode ?? "").split("+").includes(mode);
+}
+
+function getColorwayColor(layout: Record<string, unknown>, index: number): string {
+  const colorway = Array.isArray(layout.colorway) ? layout.colorway.filter((item): item is string => typeof item === "string") : [];
+  const colors = colorway.length ? colorway : DEFAULT_PLOTLY_COLORWAY;
+  return colors[index % colors.length];
+}
+
+function hideTraceSymbols(trace: Record<string, unknown>, traceIndex: number, layout: Record<string, unknown>): Record<string, unknown> | null {
+  if (!hasTraceMode(trace, "markers")) {
+    return trace;
+  }
+  if (!hasTraceMode(trace, "lines")) {
+    return null;
+  }
+  const nextTrace = { ...trace };
+  const line = trace.line && typeof trace.line === "object" ? (trace.line as Record<string, unknown>) : {};
+  const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : {};
+  const markerColor = typeof marker.color === "string" ? marker.color : null;
+  nextTrace.line = {
+    ...line,
+    ...(line.color == null ? { color: markerColor ?? getColorwayColor(layout, traceIndex) } : {}),
+  };
+  nextTrace.mode = String(trace.mode ?? "")
+    .split("+")
+    .filter((item) => item !== "markers")
+    .join("+");
+  if (trace.error_x && typeof trace.error_x === "object") {
+    nextTrace.error_x = { ...(trace.error_x as Record<string, unknown>), visible: false };
+  }
+  if (trace.error_y && typeof trace.error_y === "object") {
+    nextTrace.error_y = { ...(trace.error_y as Record<string, unknown>), visible: false };
+  }
+  return nextTrace;
+}
+
+function rollingAverage(values: unknown[], period: number): Array<number | null> {
+  const averaged: Array<number | null> = [];
+  const windowValues: number[] = [];
+  let sum = 0;
+  for (const value of values) {
+    const numeric = toFiniteNumber(value);
+    if (numeric == null) {
+      averaged.push(null);
+      continue;
+    }
+    windowValues.push(numeric);
+    sum += numeric;
+    if (windowValues.length > period) {
+      sum -= windowValues.shift() ?? 0;
+    }
+    averaged.push(windowValues.length === period ? sum / period : null);
+  }
+  return averaged;
+}
+
+function buildRunningAverageTrace(
+  trace: Record<string, unknown>,
+  period: number,
+  index: number,
+): Record<string, unknown> | null {
+  const name = String(trace.name ?? "");
+  if (!name.startsWith("Raw ")) {
+    return null;
+  }
+  const x = coerceVector(trace.x);
+  const y = coerceVector(trace.y);
+  if (!x || !y || x.length !== y.length || x.length < period) {
+    return null;
+  }
+  const averaged = rollingAverage(y, period);
+  if (!averaged.some((value) => value != null)) {
+    return null;
+  }
+  const line = trace.line && typeof trace.line === "object" ? (trace.line as Record<string, unknown>) : {};
+  const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : {};
+  const lineColor = typeof line.color === "string" ? line.color : typeof marker.color === "string" ? marker.color : "#111827";
+  return {
+    type: trace.type ?? "scatter",
+    x,
+    y: averaged,
+    mode: "lines",
+    name: `${name.replace(/^Raw\s+/, "")} running average (${period})`,
+    showlegend: false,
+    legendgroup: `running-average-${index}`,
+    line: {
+      color: lineColor,
+      width: 2.5,
+      dash: "dash",
+    },
+    hovertemplate: `Running average (${period})<br>x: %{x}<br>value: %{y:.3f}<extra></extra>`,
+  };
+}
+
 function applyDisplayState(
   figure: Record<string, unknown> | undefined,
-  rawOnly: boolean,
-  hideCalibrated: boolean,
+  state: ChartDisplayState,
 ) {
+  const display = normalizeDisplayState(state);
   const cloned = cloneFigure(figure);
   if (!Array.isArray(cloned.data)) {
     return cloned;
   }
-  let traces = cloned.data as Array<Record<string, unknown>>;
-  if (rawOnly) {
-    traces = traces.filter((trace) => String(trace.name ?? "").startsWith("Raw "));
-  } else if (hideCalibrated) {
-    traces = traces.filter((trace) => !String(trace.name ?? "").startsWith("Calibrated"));
+  let traces = (cloned.data as Array<Record<string, unknown>>).map((trace, index) => ({ trace, index }));
+  if (display.hideCalibrated) {
+    traces = traces.filter(({ trace }) => !String(trace.name ?? "").startsWith("Calibrated"));
   }
-  return { ...cloned, data: traces };
-}
-
-function displayModeFromState(state: { rawOnly: boolean; hideCalibrated: boolean }): string {
-  if (state.rawOnly) {
-    return "raw";
+  if (display.hideSymbols) {
+    traces = traces
+      .map(({ trace, index }) => {
+        const nextTrace = hideTraceSymbols(trace, index, cloned.layout);
+        return nextTrace ? { trace: nextTrace, index } : null;
+      })
+      .filter((item): item is { trace: Record<string, unknown>; index: number } => item != null);
   }
-  if (state.hideCalibrated) {
-    return "hide-calibrated";
+  let displayTraces = traces.map(({ trace }) => trace);
+  if (display.runningAverage) {
+    const averageTraces = displayTraces
+      .map((trace, index) => buildRunningAverageTrace(trace, display.runningAveragePeriod, index))
+      .filter((trace): trace is Record<string, unknown> => trace != null);
+    displayTraces = [...displayTraces, ...averageTraces];
   }
-  return "all";
+  return { ...cloned, data: displayTraces };
 }
 
 function TraceModeControl({
@@ -226,21 +516,62 @@ function TraceModeControl({
   hasCalibrated,
   onChange,
 }: {
-  state: { rawOnly: boolean; hideCalibrated: boolean };
+  state: ChartDisplayState;
   hasCalibrated: boolean;
-  onChange: (mode: string) => void;
+  onChange: (patch: Partial<ChartDisplayState>) => void;
 }) {
+  const display = normalizeDisplayState(state);
   return (
-    <SegmentedControl
-      label="Trace display"
-      value={displayModeFromState(state)}
-      onChange={onChange}
-      items={[
-        { value: "all", label: "All" },
-        { value: "raw", label: "Raw" },
-        { value: "hide-calibrated", label: "No calibrated", disabled: !hasCalibrated },
-      ]}
-    />
+    <div
+      className="flex flex-wrap items-center gap-3 rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm shadow-sm"
+      role="group"
+      aria-label="Chart display options"
+    >
+      <label className={cn("inline-flex items-center gap-2 font-medium", hasCalibrated ? "text-stone-700" : "text-stone-400")}>
+        <input
+          type="checkbox"
+          checked={hasCalibrated && display.hideCalibrated}
+          disabled={!hasCalibrated}
+          onChange={(event) => onChange({ hideCalibrated: event.target.checked })}
+          className="h-4 w-4"
+        />
+        Hide calibrated
+      </label>
+      <label className="inline-flex items-center gap-2 font-medium text-stone-700">
+        <input
+          type="checkbox"
+          checked={display.hideSymbols}
+          onChange={(event) => onChange({ hideSymbols: event.target.checked })}
+          className="h-4 w-4"
+        />
+        Hide symbols
+      </label>
+      <label className="inline-flex items-center gap-2 font-medium text-stone-700">
+        <input
+          type="checkbox"
+          checked={display.runningAverage}
+          onChange={(event) => onChange({ runningAverage: event.target.checked })}
+          className="h-4 w-4"
+        />
+        Running average
+      </label>
+      <label className="inline-flex items-center gap-2 font-medium text-stone-700">
+        <span>Period</span>
+        <input
+          type="number"
+          min={2}
+          max={999}
+          step={1}
+          value={display.runningAveragePeriod}
+          disabled={!display.runningAverage}
+          onChange={(event) => onChange({ runningAveragePeriod: clampRunningAveragePeriod(event.target.value) })}
+          className={cn(
+            "h-8 w-20 rounded-md border border-stone-300 px-2 text-sm",
+            display.runningAverage ? "bg-white" : "cursor-not-allowed bg-stone-100 text-stone-500",
+          )}
+        />
+      </label>
+    </div>
   );
 }
 
@@ -499,12 +830,47 @@ function hasReferenceCollectorTrace(trace: Record<string, unknown>, mass: 44 | 4
   return traceName.includes(String(mass)) && (traceName.includes("ref") || traceName.includes("std") || traceName.includes("reference"));
 }
 
-function getSetValueCycleNumber(tableRows: Array<Record<string, unknown>>): number | null {
-  const selectedRow = tableRows.find((row) => asBoolean(row["Set Value Cycle"]));
-  if (!selectedRow) {
-    return null;
-  }
-  return toFiniteNumber(selectedRow["Cycle"]);
+type CycleMarker = {
+  cycle: number;
+  label: string;
+  color: string;
+  symbol: string;
+  dash: "dot" | "dash";
+  textColor: string;
+};
+
+function getCycleMarkers(tableRows: Array<Record<string, unknown>>): CycleMarker[] {
+  const markers: CycleMarker[] = [];
+  const addMarker = (column: string, marker: Omit<CycleMarker, "cycle">) => {
+    const selectedRow = tableRows.find((row) => asBoolean(row[column]));
+    const cycle = selectedRow ? toFiniteNumber(selectedRow["Cycle"]) : null;
+    if (cycle == null) {
+      return;
+    }
+    const existing = markers.find((item) => Math.abs(item.cycle - cycle) <= 0.0001);
+    if (existing) {
+      existing.label = "First and last valid cycle";
+      existing.color = "#0F766E";
+      existing.textColor = "#115E59";
+      return;
+    }
+    markers.push({ ...marker, cycle });
+  };
+  addMarker("First Valid Cycle", {
+    label: "First valid cycle",
+    color: "#0284C7",
+    symbol: "diamond-open",
+    dash: "dot",
+    textColor: "#075985",
+  });
+  addMarker("Last Valid Cycle", {
+    label: "Last valid cycle",
+    color: "#D97706",
+    symbol: "square-open",
+    dash: "dash",
+    textColor: "#92400E",
+  });
+  return markers;
 }
 
 function ensureCollectorIntensityTraces(
@@ -589,69 +955,71 @@ function ensureCollectorIntensityTraces(
 
   let hasChanges = traces.length !== existingTraceCount;
   let nextLayout: Record<string, unknown> = cloned.layout;
-  const setValueCycle = getSetValueCycleNumber(tableRows);
-  if (setValueCycle != null) {
-    const highlightX: number[] = [];
-    const highlightY: number[] = [];
-    for (const trace of traces) {
-      const xVals = coerceVector(trace.x);
-      const yVals = coerceVector(trace.y);
-      if (!xVals || !yVals || xVals.length !== yVals.length) {
-        continue;
-      }
-      for (let index = 0; index < xVals.length; index += 1) {
-        const x = toFiniteNumber(xVals[index]);
-        const y = toFiniteNumber(yVals[index]);
-        if (x == null || y == null) {
-          continue;
-        }
-        if (Math.abs(x - setValueCycle) > 0.0001) {
-          continue;
-        }
-        highlightX.push(x);
-        highlightY.push(y);
-      }
-    }
-    if (highlightX.length) {
-      traces.push({
-        type: "scatter",
-        mode: "markers",
-        name: "Set-value cycle",
-        x: highlightX,
-        y: highlightY,
-        marker: {
-          size: 11,
-          color: "#7C3AED",
-          symbol: "diamond-open",
-          line: { color: "#7C3AED", width: 2 },
-        },
-      });
-      hasChanges = true;
-    }
+  const cycleMarkers = getCycleMarkers(tableRows);
+  if (cycleMarkers.length) {
     const existingShapes = Array.isArray(cloned.layout.shapes) ? [...(cloned.layout.shapes as Array<Record<string, unknown>>)] : [];
-    existingShapes.push({
-      type: "line",
-      x0: setValueCycle,
-      x1: setValueCycle,
-      y0: 0,
-      y1: 1,
-      xref: "x",
-      yref: "paper",
-      line: { color: "#7C3AED", width: 2, dash: "dot" },
-    });
     const existingAnnotations = Array.isArray(cloned.layout.annotations)
       ? [...(cloned.layout.annotations as Array<Record<string, unknown>>)]
       : [];
-    existingAnnotations.push({
-      x: setValueCycle,
-      y: 1,
-      xref: "x",
-      yref: "paper",
-      yanchor: "bottom",
-      showarrow: false,
-      text: "Set value cycle",
-      font: { color: "#5B21B6", size: 11 },
-    });
+    for (const cycleMarker of cycleMarkers) {
+      const highlightX: number[] = [];
+      const highlightY: number[] = [];
+      for (const trace of traces) {
+        const xVals = coerceVector(trace.x);
+        const yVals = coerceVector(trace.y);
+        if (!xVals || !yVals || xVals.length !== yVals.length) {
+          continue;
+        }
+        for (let index = 0; index < xVals.length; index += 1) {
+          const x = toFiniteNumber(xVals[index]);
+          const y = toFiniteNumber(yVals[index]);
+          if (x == null || y == null) {
+            continue;
+          }
+          if (Math.abs(x - cycleMarker.cycle) > 0.0001) {
+            continue;
+          }
+          highlightX.push(x);
+          highlightY.push(y);
+        }
+      }
+      if (highlightX.length) {
+        traces.push({
+          type: "scatter",
+          mode: "markers",
+          name: cycleMarker.label,
+          x: highlightX,
+          y: highlightY,
+          marker: {
+            size: 11,
+            color: cycleMarker.color,
+            symbol: cycleMarker.symbol,
+            line: { color: cycleMarker.color, width: 2 },
+          },
+        });
+        hasChanges = true;
+      }
+      existingShapes.push({
+        type: "line",
+        x0: cycleMarker.cycle,
+        x1: cycleMarker.cycle,
+        y0: 0,
+        y1: 1,
+        xref: "x",
+        yref: "paper",
+        line: { color: cycleMarker.color, width: 2, dash: cycleMarker.dash },
+      });
+      existingAnnotations.push({
+        x: cycleMarker.cycle,
+        y: 1,
+        xref: "x",
+        yref: "paper",
+        yanchor: "bottom",
+        showarrow: false,
+        text: cycleMarker.label,
+        font: { color: cycleMarker.textColor, size: 11 },
+      });
+    }
     nextLayout = {
       ...cloned.layout,
       shapes: existingShapes,
@@ -826,6 +1194,23 @@ function isFailedSampleCollectorStatus(value: unknown): boolean {
   return String(value ?? "").trim().toLowerCase() === "failed sample";
 }
 
+function formatMethodLabel(value: unknown): string {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    return "Imported";
+  }
+  const labels: Record<string, string> = {
+    imported: "Imported",
+    edited: "Edited",
+    cycle_mean: "Cycle mean",
+    first_valid_cycle: "First valid cycle",
+    last_valid_cycle: "Last valid cycle",
+    reference_gas_intensity: "Reference-gas intensity",
+    first_cycle: "First cycle",
+  };
+  return labels[normalized] ?? normalized.replaceAll("_", " ");
+}
+
 function targetNumberValue(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value) ? String(value) : "null";
 }
@@ -984,6 +1369,11 @@ function isDeltaColumnLabel(label: string): boolean {
   return normalized.includes("d13") || normalized.includes("d18");
 }
 
+function isSignalIntensityColumnLabel(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  return normalized.includes("int m/z") && normalized.includes("(v)");
+}
+
 function parseStrictNumber(value: string): number | null {
   const normalized = value.trim().replace(/,/g, "");
   if (!/^[-+]?\d+(\.\d+)?$/.test(normalized)) {
@@ -999,6 +1389,26 @@ function roundDeltaValue(value: number, precision = 3): number {
 
 function formatDeltaValue(value: number | null | undefined, precision = 3): string {
   return typeof value === "number" && Number.isFinite(value) ? value.toFixed(precision) : "N/A";
+}
+
+function formatFirstNonZeroDigits(value: number | null | undefined, significantDigits = 2): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "N/A";
+  }
+  if (value === 0) {
+    return "0";
+  }
+  const sign = value < 0 ? "-" : "";
+  const absValue = Math.abs(value);
+  const magnitude = Math.floor(Math.log10(absValue));
+  const factor = Math.pow(10, magnitude - significantDigits + 1);
+  const truncated = Math.trunc(absValue / factor) * factor;
+  if (!Number.isFinite(truncated) || truncated === 0) {
+    return "0";
+  }
+  const decimals = factor < 1 ? Math.max(0, Math.ceil(-Math.log10(factor))) : 0;
+  const fixed = truncated.toFixed(decimals);
+  return `${sign}${fixed.replace(/(\.\d*?[1-9])0+$|\.0+$/, "$1")}`;
 }
 
 function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ label: string; value: string }> {
@@ -1727,19 +2137,24 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   const statusRows: Array<Record<string, unknown>> = rows.map((row) => {
     const excludedD13 = asBoolean(row["Excluded d13C"]);
     const excludedD18 = asBoolean(row["Excluded d18O"]);
-    const excludedAny = asBoolean(row["Excluded (Saturation)"]) || excludedD13 || excludedD18;
-    const setValueCycle = asBoolean(row["Set Value Cycle"]);
+    const excludedSaturation = asBoolean(row["Excluded (Saturation)"]);
+    const excludedSampleGasEscape = asBoolean(row["Excluded (Sample Gas Escape)"]);
+    const excludedAny = excludedSaturation || excludedSampleGasEscape || excludedD13 || excludedD18;
+    const firstValidCycle = asBoolean(row["First Valid Cycle"]);
+    const lastValidCycle = asBoolean(row["Last Valid Cycle"]);
     return {
       ...row,
-      "Cycle status": excludedAny ? "Saturated" : "Successful",
-      "Set Value Cycle": setValueCycle,
+      "Cycle status": excludedSampleGasEscape ? "Sample gas escape" : excludedSaturation ? "Saturated" : excludedAny ? "Excluded" : "Successful",
+      "First Valid Cycle": firstValidCycle,
+      "Last Valid Cycle": lastValidCycle,
     };
   });
 
   const preferredColumns = [
     "Cycle",
     "Cycle status",
-    "Set Value Cycle",
+    "First Valid Cycle",
+    "Last Valid Cycle",
     "SMP Int m/z 44 (V)",
     "REF Int m/z 44 (V)",
     "SMP Int m/z 45 (V)",
@@ -1751,6 +2166,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
     "Excluded d13C",
     "Excluded d18O",
     "Excluded (Saturation)",
+    "Excluded (Sample Gas Escape)",
   ];
   const discoveredColumns = Object.keys(statusRows[0] ?? {});
   const columns = [
@@ -1769,11 +2185,14 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
       return value ? "Yes" : "No";
     }
     if (typeof value === "number" && Number.isFinite(value)) {
-      if (Number.isInteger(value)) {
-        return String(value);
-      }
       if (isDeltaColumnLabel(column)) {
         return formatDeltaValue(value);
+      }
+      if (isSignalIntensityColumnLabel(column)) {
+        return value.toFixed(2);
+      }
+      if (Number.isInteger(value)) {
+        return String(value);
       }
       return value.toFixed(6);
     }
@@ -1783,9 +2202,11 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-md bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
+        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">First valid cycle</span>
+        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">Last valid cycle</span>
         <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
         <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
+        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">Sample gas escape</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -1801,23 +2222,40 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
           <tbody className="divide-y divide-stone-100">
             {statusRows.slice(0, 25).map((row, rowIndex) => {
               const saturated = String(row["Cycle status"]) === "Saturated";
-              const setValueCycle = asBoolean(row["Set Value Cycle"]);
+              const sampleGasEscape = String(row["Cycle status"]) === "Sample gas escape";
+              const firstValidCycle = asBoolean(row["First Valid Cycle"]);
+              const lastValidCycle = asBoolean(row["Last Valid Cycle"]);
               return (
-                <tr key={rowIndex} className={cn(setValueCycle ? "bg-violet-100/90" : saturated ? "bg-rose-50/80" : "bg-emerald-50/70")}>
+                <tr
+                  key={rowIndex}
+                  className={cn(
+                    firstValidCycle && lastValidCycle
+                      ? "bg-teal-100/85"
+                      : firstValidCycle
+                        ? "bg-sky-100/85"
+                        : lastValidCycle
+                          ? "bg-amber-100/80"
+                          : sampleGasEscape
+                            ? "bg-orange-50/85"
+                          : saturated
+                            ? "bg-rose-50/80"
+                            : "bg-emerald-50/70",
+                  )}
+                >
                   {columns.map((column) => {
                     const cellValue = row[column];
                     const flaggedColumn = column.startsWith("Excluded");
                     const flaggedValue = flaggedColumn ? asBoolean(cellValue) : false;
-                    const setValueColumn = column === "Set Value Cycle";
-                    const setValueColumnValue = setValueColumn ? asBoolean(cellValue) : false;
+                    const validCycleColumn = column === "First Valid Cycle" || column === "Last Valid Cycle";
+                    const validCycleColumnValue = validCycleColumn ? asBoolean(cellValue) : false;
                     return (
                       <td
                         key={column}
                         className={cn(
                           "px-3 py-2",
-                          setValueColumn
-                            ? setValueColumnValue
-                              ? "font-semibold text-violet-800"
+                          validCycleColumn
+                            ? validCycleColumnValue
+                              ? "font-semibold text-stone-900"
                               : "font-medium text-stone-500"
                             : "",
                           flaggedColumn
@@ -1998,21 +2436,164 @@ function DiagnosticsPanel({
   diagnostics?: CycleDiagnosticsPayload;
   loading: boolean;
   displayDelta?: number;
-  onPickDeltaValue?: (value: number, valueSpace?: "raw" | "display") => void;
+  onPickDeltaValue?: (value: number, valueSpace?: "raw" | "display", stdev?: number | null) => void;
 }) {
+  const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
+  const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
   const cycleMean = diagnostics?.cycle_mean ?? {};
   const validMean = asNumber(cycleMean.valid_mean);
+  const validStdDev = asNumber(cycleMean.valid_std_dev);
+  const validCycleCount = asNumber(cycleMean.valid_cycles);
+  const hasTooFewLinearityCycles = validCycleCount != null && validCycleCount < 4;
   const firstValidCycleRaw = asNumber(cycleMean.selected_value) ?? asNumber(cycleMean.mean);
+  const lastValidCycleRaw = asNumber(cycleMean.last_valid_value);
+  const referenceGasCorrectionRaw = asNumber(cycleMean.saturation_reference_gas_value);
+  const firstCycleCorrectionRaw = asNumber(cycleMean.saturation_first_cycle_value);
+  const saturationCorrection =
+    diagnostics?.saturation_correction && typeof diagnostics.saturation_correction === "object"
+      ? (diagnostics.saturation_correction as Record<string, unknown>)
+      : {};
+  const cycleLinearityValue = (key: string) => {
+    const payload = saturationCorrection[key];
+    return payload && typeof payload === "object" ? asNumber((payload as Record<string, unknown>).value) : null;
+  };
+  const cycleRelativeMismatchRaw = cycleLinearityValue("cycle_relative_mismatch");
+  const cycleSymmetricMismatchRaw = cycleLinearityValue("cycle_symmetric_mismatch");
+  const cycleMeanIntensityRaw = cycleLinearityValue("cycle_mean_intensity");
+  const cycleIntensityWeightedMismatchRaw = cycleLinearityValue("cycle_intensity_weighted_mismatch");
+  const cycleTwoTermRaw = cycleLinearityValue("cycle_two_term_mean_mismatch");
+  const cyclePlateauPayload =
+    saturationCorrection.cycle_plateau && typeof saturationCorrection.cycle_plateau === "object"
+      ? (saturationCorrection.cycle_plateau as Record<string, unknown>)
+      : {};
+  const cyclePlateauRaw = asNumber(cyclePlateauPayload.value);
+  const cyclePlateauStd = asNumber(cyclePlateauPayload.std_dev);
   const collectorStatus = asString((diagnostics?.target ?? {})["collector_status"]);
   const isPartiallySaturated = isPartiallySaturatedCollectorStatus(collectorStatus);
   const validMeanDisplay = validMean == null ? null : validMean + displayDelta;
   const validMeanCardValue = isPartiallySaturated ? validMean : validMeanDisplay;
   const firstValidCycleDisplay = firstValidCycleRaw == null ? null : firstValidCycleRaw + displayDelta;
   const firstValidCycleCardValue = isPartiallySaturated ? firstValidCycleRaw : firstValidCycleDisplay;
+  const lastValidCycleDisplay = lastValidCycleRaw == null ? null : lastValidCycleRaw + displayDelta;
+  const lastValidCycleCardValue = isPartiallySaturated ? lastValidCycleRaw : lastValidCycleDisplay;
   const reason = asString(cycleMean.reason);
   const diagnosticsFigure = ensureCollectorIntensityTraces(diagnostics?.figure, diagnostics?.table ?? []);
-  const canPickValidMean = typeof onPickDeltaValue === "function" && validMeanCardValue != null;
-  const canPickFinalMean = typeof onPickDeltaValue === "function" && firstValidCycleCardValue != null;
+  const saturationFiguresRaw =
+    Object.keys(saturationCorrection).length
+      ? (saturationCorrection.figures as Record<string, unknown> | undefined)
+      : undefined;
+  const targetIsotopeKey = asString((diagnostics?.target ?? {})["isotope_key"]);
+  const defaultSaturationYAxis: SaturationAxisKey = targetIsotopeKey === "d18O" ? "d18O" : "d13C";
+  useEffect(() => {
+    setSaturationYAxis(defaultSaturationYAxis);
+  }, [defaultSaturationYAxis]);
+  const saturationMethodDescriptions: Record<string, string> = {
+    reference_gas_intensity:
+      "Fits isotope value versus the reference-gas intensity from valid cycles, then predicts the value at the saturated cycle's reference intensity. Points are colored by cycle number.",
+    first_cycle:
+      "Fits a quadratic curve of isotope value versus cycle number from valid cycles, then predicts where the curve becomes horizontal.",
+    cycle_relative_mismatch:
+      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / Ref44, then predicts where that curve becomes horizontal.",
+    cycle_symmetric_mismatch:
+      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / ((Samp44 + Ref44) / 2), then predicts where that curve becomes horizontal.",
+    cycle_mean_intensity:
+      "Fits a quadratic curve of isotope value versus mean intensity, (Samp44 + Ref44) / 2, then predicts where that curve becomes horizontal.",
+    cycle_intensity_weighted_mismatch:
+      "Fits a quadratic curve of isotope value versus the cycle-level weighted mismatch term, then predicts where that curve becomes horizontal.",
+    cycle_two_term_mean_mismatch:
+      "Fits isotope value with two predictors: mean intensity and symmetric mismatch. The green line connects the model-fitted values for the valid cycles using each cycle's own mismatch; dot color also shows mismatch.",
+    cycle_plateau:
+      "Measures the signed cycle-to-cycle isotope change in the latest valid cycles, fits isotope value versus that change rate, then predicts the asymptote where the change rate reaches zero. The highlighted circles are the cycles used.",
+  };
+  const saturationFigureItems = [
+    {
+      key: "reference_gas_intensity",
+      title: "Reference-gas saturation correction",
+      description: saturationMethodDescriptions.reference_gas_intensity,
+      figure:
+        saturationFiguresRaw?.reference_gas_intensity && typeof saturationFiguresRaw.reference_gas_intensity === "object"
+          ? (saturationFiguresRaw.reference_gas_intensity as Record<string, unknown>)
+          : undefined,
+    },
+    {
+      key: "first_cycle",
+      title: "Stabilized-cycle correction",
+      description: saturationMethodDescriptions.first_cycle,
+      figure:
+        saturationFiguresRaw?.first_cycle && typeof saturationFiguresRaw.first_cycle === "object"
+          ? (saturationFiguresRaw.first_cycle as Record<string, unknown>)
+          : undefined,
+    },
+    {
+      key: "cycle_relative_mismatch",
+      title: "Cycle relative mismatch correction",
+      description: saturationMethodDescriptions.cycle_relative_mismatch,
+      figure:
+        saturationFiguresRaw?.cycle_relative_mismatch && typeof saturationFiguresRaw.cycle_relative_mismatch === "object"
+          ? (saturationFiguresRaw.cycle_relative_mismatch as Record<string, unknown>)
+          : undefined,
+    },
+    {
+      key: "cycle_symmetric_mismatch",
+      title: "Cycle symmetric mismatch correction",
+      description: saturationMethodDescriptions.cycle_symmetric_mismatch,
+      figure:
+        saturationFiguresRaw?.cycle_symmetric_mismatch && typeof saturationFiguresRaw.cycle_symmetric_mismatch === "object"
+          ? (saturationFiguresRaw.cycle_symmetric_mismatch as Record<string, unknown>)
+          : undefined,
+    },
+    {
+      key: "cycle_mean_intensity",
+      title: "Cycle mean intensity correction",
+      description: saturationMethodDescriptions.cycle_mean_intensity,
+      figure:
+        saturationFiguresRaw?.cycle_mean_intensity && typeof saturationFiguresRaw.cycle_mean_intensity === "object"
+          ? (saturationFiguresRaw.cycle_mean_intensity as Record<string, unknown>)
+          : undefined,
+    },
+    {
+      key: "cycle_intensity_weighted_mismatch",
+      title: "Cycle intensity-weighted mismatch correction",
+      description: saturationMethodDescriptions.cycle_intensity_weighted_mismatch,
+      figure:
+        saturationFiguresRaw?.cycle_intensity_weighted_mismatch &&
+        typeof saturationFiguresRaw.cycle_intensity_weighted_mismatch === "object"
+          ? (saturationFiguresRaw.cycle_intensity_weighted_mismatch as Record<string, unknown>)
+          : undefined,
+    },
+    {
+      key: "cycle_two_term_mean_mismatch",
+      title: "Cycle two-term mean + mismatch correction",
+      description: saturationMethodDescriptions.cycle_two_term_mean_mismatch,
+      figure:
+        saturationFiguresRaw?.cycle_two_term_mean_mismatch &&
+        typeof saturationFiguresRaw.cycle_two_term_mean_mismatch === "object"
+          ? (saturationFiguresRaw.cycle_two_term_mean_mismatch as Record<string, unknown>)
+          : undefined,
+    },
+    {
+      key: "cycle_plateau",
+      title: "Cycle late-plateau correction",
+      description: saturationMethodDescriptions.cycle_plateau,
+      figure:
+        saturationFiguresRaw?.cycle_plateau && typeof saturationFiguresRaw.cycle_plateau === "object"
+          ? (saturationFiguresRaw.cycle_plateau as Record<string, unknown>)
+          : undefined,
+    },
+  ].filter((item) => item.figure);
+  const suggestionCards = [
+    { label: "Cycle mean", value: validMeanCardValue, stdev: validStdDev, linearity: false },
+    { label: "First valid cycle", value: firstValidCycleCardValue, stdev: null, linearity: false },
+    { label: "Last valid cycle", value: lastValidCycleCardValue, stdev: null, linearity: false },
+    { label: "Lin. corr. to ref gas int", value: referenceGasCorrectionRaw, stdev: null, linearity: true },
+    { label: "Lin. corr. to first cycle", value: firstCycleCorrectionRaw, stdev: null, linearity: true },
+    { label: "Cycle relative mismatch", value: cycleRelativeMismatchRaw, stdev: null, linearity: true },
+    { label: "Cycle symmetric mismatch", value: cycleSymmetricMismatchRaw, stdev: null, linearity: true },
+    { label: "Cycle mean intensity", value: cycleMeanIntensityRaw, stdev: null, linearity: true },
+    { label: "Cycle weighted mismatch", value: cycleIntensityWeightedMismatchRaw, stdev: null, linearity: true },
+    { label: "Cycle two-term model", value: cycleTwoTermRaw, stdev: null, linearity: true },
+    { label: "Cycle plateau", value: cyclePlateauRaw, stdev: cyclePlateauStd, linearity: false },
+  ];
 
   return (
     <Card className="border-stone-300">
@@ -2025,53 +2606,119 @@ function DiagnosticsPanel({
 
         {diagnostics ? (
           <>
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-              <button
-                type="button"
-                onClick={() => {
-                  if (canPickValidMean) {
-                    onPickDeltaValue(validMeanCardValue, "raw");
-                  }
-                }}
-                disabled={!canPickValidMean}
-                className={cn(
-                  "rounded-lg border border-stone-200 p-3 text-left transition",
-                  canPickValidMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
-                )}
-              >
-                <div className="text-xs uppercase tracking-normal text-stone-500">Cycle Mean</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMeanCardValue)}</div>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  if (canPickFinalMean) {
-                    onPickDeltaValue(firstValidCycleCardValue, "raw");
-                  }
-                }}
-                disabled={!canPickFinalMean}
-                className={cn(
-                  "rounded-lg border border-stone-200 p-3 text-left transition",
-                  canPickFinalMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
-                )}
-              >
-                <div className="text-xs uppercase tracking-normal text-stone-500">First valid cycle</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(firstValidCycleCardValue)}</div>
-              </button>
-              <div className="rounded-lg border border-stone-200 p-3">
-                <div className="text-xs uppercase tracking-normal text-stone-500">Method</div>
-                <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
-              </div>
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+              {suggestionCards.map((item) => {
+                const value = item.value;
+                const blockedByLinearityCycleCount = item.linearity && hasTooFewLinearityCycles && value != null;
+                const canPick = typeof onPickDeltaValue === "function" && value != null && !blockedByLinearityCycleCount;
+                const displayValue = value == null ? "N/A" : formatDeltaValue(value);
+                const valueElement = (
+                  <span
+                    className={cn(
+                      "inline-block",
+                      blockedByLinearityCycleCount ? "cursor-help text-stone-400" : "text-stone-900",
+                    )}
+                  >
+                    {displayValue}
+                  </span>
+                );
+                return (
+                  <button
+                    key={item.label}
+                    type="button"
+                    onClick={() => {
+                      if (canPick && value != null) {
+                        onPickDeltaValue(value, "raw", item.stdev ?? null);
+                      }
+                    }}
+                    disabled={value == null}
+                    aria-disabled={!canPick}
+                    className={cn(
+                      "rounded-lg border border-stone-200 p-3 text-left transition",
+                      canPick ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
+                      blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
+                    )}
+                  >
+                    <div className="text-xs uppercase tracking-normal text-stone-500">{item.label}</div>
+                    <div className="mt-1 text-lg font-semibold">
+                      {blockedByLinearityCycleCount ? (
+                        <Tooltip label="not enough cycles for linearity calculation" align="start">
+                          {valueElement}
+                        </Tooltip>
+                      ) : (
+                        valueElement
+                      )}
+                    </div>
+                    {item.stdev != null ? (
+                      <div className="mt-1 text-xs text-stone-500">Std dev: {formatDeltaValue(item.stdev)}</div>
+                    ) : null}
+                  </button>
+                );
+              })}
             </div>
 
             {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
 
             <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
-              <PlotlyChart figure={diagnosticsFigure} className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]" />
+              <PlotlyChart
+                figure={diagnosticsFigure}
+                className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
+                deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+              />
               <div className="min-w-0">
                 <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
               </div>
             </div>
+
+            {saturationFigureItems.length ? (
+              <>
+                <div className="flex flex-wrap items-end gap-4">
+                  <label className="block w-full max-w-xs text-sm">
+                    <SaturationAxisHelpTooltip label="Chart color axis" />
+                    <select
+                      value={saturationColorAxis}
+                      onChange={(event) => setSaturationColorAxis(event.target.value as SaturationColorAxisKey)}
+                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                    >
+                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block w-full max-w-xs text-sm">
+                    <SaturationAxisHelpTooltip label="Chart y axis" />
+                    <select
+                      value={saturationYAxis}
+                      onChange={(event) => setSaturationYAxis(event.target.value as SaturationAxisKey)}
+                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                    >
+                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <SaturationSharedColorbar figures={saturationFigureItems.map((item) => item.figure)} colorAxis={saturationColorAxis} />
+                </div>
+                <div className="grid gap-4 xl:grid-cols-2">
+                  {saturationFigureItems.map((item) => (
+                    <SaturationFigureCard
+                      key={item.key}
+                      chartKey={item.key}
+                      title={item.title}
+                      description={item.description}
+                      figure={item.figure}
+                      colorAxis={saturationColorAxis}
+                      yAxis={saturationYAxis}
+                      deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+                    />
+                  ))}
+                </div>
+              </>
+            ) : null}
           </>
         ) : loading ? null : (
           <div className="text-sm text-stone-500">Cycle diagnostics appear here once a point is selected.</div>
@@ -2082,6 +2729,7 @@ function DiagnosticsPanel({
 }
 
 function FigureCard({
+  chartKey,
   title,
   description,
   figure,
@@ -2093,6 +2741,7 @@ function FigureCard({
   onPointHover,
   onHoverEnd,
 }: {
+  chartKey?: string;
   title: string;
   description: string;
   figure?: Record<string, unknown>;
@@ -2117,6 +2766,7 @@ function FigureCard({
         <PlotlyChart
           figure={figure}
           className={chartClassName ?? "min-h-[340px]"}
+          uiRevision={chartKey ? `processing:${chartKey}` : undefined}
           onPointClick={onPointClick}
           onSelection={onSelection}
           onPointHover={onPointHover}
@@ -2142,6 +2792,7 @@ export default function ProcessingPage() {
     d13C: "raw",
     d18O: "raw",
   });
+  const [singleStdevs, setSingleStdevs] = useState<Record<IsotopeKey, number | null>>({ d13C: null, d18O: null });
   const [singleOffsets, setSingleOffsets] = useState<IsotopeNumericMap>({
     d13C: SELECTION_EDITOR_DEFAULT_OFFSET,
     d18O: SELECTION_EDITOR_DEFAULT_OFFSET,
@@ -2159,6 +2810,7 @@ export default function ProcessingPage() {
   const [isSetValueInputHighlighted, setIsSetValueInputHighlighted] = useState(false);
   const [isSelectionEditorOpen, setSelectionEditorOpen] = useState(false);
   const [isExportModalOpen, setExportModalOpen] = useState(false);
+  const [openSpeciesSections, setOpenSpeciesSections] = useState<Set<string>>(() => new Set());
   const [exportOutputType, setExportOutputType] = useState<"dataset" | "client_output">("dataset");
   const [duplicateCheckResult, setDuplicateCheckResult] = useState<ClientOutputDuplicateCheckResponse | null>(null);
   const [restoreStdevEnabled, setRestoreStdevEnabled] = useState(false);
@@ -2172,10 +2824,18 @@ export default function ProcessingPage() {
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
+  const colorScaleFigureCacheRef = useRef<
+    WeakMap<Record<string, unknown>, { rangeKey: string; figure: Record<string, unknown> | undefined }>
+  >(new WeakMap());
+  const displayFigureCacheRef = useRef<WeakMap<Record<string, unknown>, Map<string, Record<string, unknown>>>>(
+    new WeakMap(),
+  );
+  const openSpeciesSectionList = useMemo(() => Array.from(openSpeciesSections).sort(), [openSpeciesSections]);
+  const openSpeciesSectionKey = useMemo(() => openSpeciesSectionList.join("||"), [openSpeciesSectionList]);
 
   const workspaceQuery = useQuery({
-    queryKey: ["processing-workspace", sessionId],
-    queryFn: () => api.getProcessingWorkspace(sessionId!),
+    queryKey: ["processing-workspace", sessionId, openSpeciesSectionKey],
+    queryFn: () => api.getProcessingWorkspace(sessionId!, openSpeciesSectionList),
     enabled: Boolean(sessionId),
   });
   const calibrationWorkspaceQuery = useQuery({
@@ -2238,7 +2898,7 @@ export default function ProcessingPage() {
     const raw = window.sessionStorage.getItem(`processing-display-state:${sessionId}`);
     if (raw) {
       try {
-        setDisplayState(JSON.parse(raw) as DisplayStateMap);
+        setDisplayState(normalizeDisplayStateMap(JSON.parse(raw)));
       } catch {
         setDisplayState({});
       }
@@ -2253,9 +2913,9 @@ export default function ProcessingPage() {
   }, [displayState, sessionId]);
 
   const saveConfigMutation = useMutation({
-    mutationFn: (nextConfig: ProcessingConfig) => api.setProcessingConfig(sessionId!, nextConfig),
+    mutationFn: (nextConfig: ProcessingConfig) => api.setProcessingConfig(sessionId!, nextConfig, openSpeciesSectionList),
     onSuccess: (workspace) => {
-      queryClient.setQueryData(["processing-workspace", sessionId], workspace);
+      queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
       setConfig(workspace.config);
     },
   });
@@ -2265,21 +2925,33 @@ export default function ProcessingPage() {
         sessionId!,
         nextLinearity,
         calibrationWorkspaceQuery.data?.config?.selected_standards ?? [],
+        { summaryOnly: true },
       ),
-    onSuccess: async (workspace) => {
-      queryClient.setQueryData(["calibration-workspace", sessionId], workspace);
+    onSuccess: (workspace) => {
+      queryClient.setQueryData<CalibrationWorkspace | undefined>(["calibration-workspace", sessionId], (current) =>
+        current
+          ? {
+              ...current,
+              config: workspace.config,
+              available_values: workspace.available_values,
+              precision_summaries: workspace.precision_summaries,
+              selected_standard_official_values: workspace.selected_standard_official_values,
+              linearity_fits: workspace.linearity_fits,
+            }
+          : workspace,
+      );
       setSharedLinearityConfig(workspace.config.linearity);
-      await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
     },
   });
 
   const editMutation = useMutation({
-    mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload),
+    mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload, openSpeciesSectionList),
     onSuccess: (workspace) => {
-      queryClient.setQueryData(["processing-workspace", sessionId], workspace);
+      queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
       queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       setSelectedTargets([]);
       setActiveTargetIndex(0);
@@ -2292,9 +2964,9 @@ export default function ProcessingPage() {
       api.editProcessing(sessionId!, {
         action: "reset_all",
         targets: [],
-      }),
+      }, openSpeciesSectionList),
     onSuccess: (workspace) => {
-      queryClient.setQueryData(["processing-workspace", sessionId], workspace);
+      queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -2302,9 +2974,9 @@ export default function ProcessingPage() {
   });
 
   const removeCalibrationMutation = useMutation({
-    mutationFn: () => api.removeProcessingCalibration(sessionId!),
+    mutationFn: () => api.removeProcessingCalibration(sessionId!, openSpeciesSectionList),
     onSuccess: (workspace) => {
-      queryClient.setQueryData(["processing-workspace", sessionId], workspace);
+      queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
       setConfig(workspace.config);
       setSelectedTargets([]);
       setActiveTargetIndex(0);
@@ -2325,6 +2997,8 @@ export default function ProcessingPage() {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
         setSelectionEditorOpen(false);
+        setSelectedTargets([]);
+        setActiveTargetIndex(0);
         setExportModalOpen(false);
       }
     }
@@ -2451,6 +3125,7 @@ export default function ProcessingPage() {
     setSelectionEditorTab(activeSampleTarget.isotopeKey === "d18O" ? "d18O" : "d13C");
     setSingleOffsets({ d13C: SELECTION_EDITOR_DEFAULT_OFFSET, d18O: SELECTION_EDITOR_DEFAULT_OFFSET });
     setSingleValueSpaces({ d13C: "raw", d18O: "raw" });
+    setSingleStdevs({ d13C: null, d18O: null });
   }, [activeSampleTarget?.rowLabel, activeSampleTarget?.isotopeKey]);
 
   useEffect(() => {
@@ -2470,12 +3145,8 @@ export default function ProcessingPage() {
     const d18Current = d18MatchesActiveRow ? asNumber(d18Target["current_value"]) : null;
     const d13SelectedCycleValue = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]);
     const d18SelectedCycleValue = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]);
-    const useD13SelectedCycleDefault =
-      isPartiallySaturatedCollectorStatus(d13Status) && d13SelectedCycleValue != null;
-    const useD18SelectedCycleDefault =
-      isPartiallySaturatedCollectorStatus(d18Status) && d18SelectedCycleValue != null;
-    const d13SeedRawValue = useD13SelectedCycleDefault ? d13SelectedCycleValue : d13Current;
-    const d18SeedRawValue = useD18SelectedCycleDefault ? d18SelectedCycleValue : d18Current;
+    const d13SeedRawValue = d13Current ?? (isPartiallySaturatedCollectorStatus(d13Status) ? d13SelectedCycleValue : null);
+    const d18SeedRawValue = d18Current ?? (isPartiallySaturatedCollectorStatus(d18Status) ? d18SelectedCycleValue : null);
     const nextValues: IsotopeNumericMap = {
       d13C: roundDeltaValue(
         d13SeedRawValue != null ? d13SeedRawValue : selectedD13 ?? fallbackTargetValue(activeSampleTarget, "d13C"),
@@ -2486,6 +3157,7 @@ export default function ProcessingPage() {
     };
     setSingleValues(nextValues);
     setSingleValueSpaces({ d13C: "raw", d18O: "raw" });
+    setSingleStdevs({ d13C: null, d18O: null });
   }, [
     activeSampleTarget,
     sampleD13DiagnosticsQuery.data?.target,
@@ -2507,12 +3179,15 @@ export default function ProcessingPage() {
       workspace.overview_figures.d18_summary,
     ];
     for (const section of workspace.species_sections) {
+      if (!openSpeciesSections.has(section.species)) {
+        continue;
+      }
       for (const figureSet of section.identifier_figures) {
         figures.push(figureSet.d13c, figureSet.d18o);
       }
     }
     return figures;
-  }, [workspace]);
+  }, [openSpeciesSections, workspace]);
   const colorScaleBounds = useMemo(() => deriveColorScaleBounds(colorScaleFigures), [colorScaleFigures]);
   const colorScaleTwoSigmaRange = useMemo(() => {
     if (!colorScaleBounds) {
@@ -2554,8 +3229,47 @@ export default function ProcessingPage() {
     colorScaleRange ?? colorScaleTwoSigmaRange ?? [colorSliderBounds.min, colorSliderBounds.max],
     colorSliderBounds,
   );
-  const withColorScaleRange = (figure: Record<string, unknown> | undefined) =>
-    applyColorScaleRangeToFigure(figure, effectiveColorScaleRange);
+  const colorScaleRangeKey = effectiveColorScaleRange
+    ? `${effectiveColorScaleRange[0]}:${effectiveColorScaleRange[1]}`
+    : "none";
+  const withColorScaleRange = useMemo(() => {
+    const range = effectiveColorScaleRange;
+    const rangeKey = colorScaleRangeKey;
+    const cache = colorScaleFigureCacheRef.current;
+    return (figure: Record<string, unknown> | undefined) => {
+      if (!figure || !range) {
+        return figure;
+      }
+      const cached = cache.get(figure);
+      if (cached?.rangeKey === rangeKey) {
+        return cached.figure;
+      }
+      const nextFigure = applyColorScaleRangeToFigure(figure, range);
+      cache.set(figure, { rangeKey, figure: nextFigure });
+      return nextFigure;
+    };
+  }, [colorScaleRangeKey]);
+  const withDisplayState = useMemo(() => {
+    const cache = displayFigureCacheRef.current;
+    return (figure: Record<string, unknown> | undefined, state: ChartDisplayState) => {
+      if (!figure) {
+        return applyDisplayState(figure, state);
+      }
+      const stateKey = chartDisplayStateKey(state);
+      let stateCache = cache.get(figure);
+      if (!stateCache) {
+        stateCache = new Map<string, Record<string, unknown>>();
+        cache.set(figure, stateCache);
+      }
+      const cached = stateCache.get(stateKey);
+      if (cached) {
+        return cached;
+      }
+      const nextFigure = applyDisplayState(figure, state);
+      stateCache.set(stateKey, nextFigure);
+      return nextFigure;
+    };
+  }, []);
 
   useEffect(() => {
     if (!sessionId || typeof window === "undefined" || !workspaceQuery.data) {
@@ -2657,8 +3371,40 @@ export default function ProcessingPage() {
     setSelectionEditorOpen((current) => (current === shouldOpen ? current : shouldOpen));
   }
 
+  function closeSelectionEditor() {
+    setSelectionEditorOpen(false);
+    setSelectedTargets([]);
+    setActiveTargetIndex(0);
+  }
+
+  function setSpeciesSectionOpen(species: string, open: boolean) {
+    setOpenSpeciesSections((current) => {
+      if (current.has(species) === open) {
+        return current;
+      }
+      const next = new Set(current);
+      if (open) {
+        next.add(species);
+      } else {
+        next.delete(species);
+      }
+      return next;
+    });
+  }
+
   function updateConfig<T extends keyof ProcessingConfig>(key: T, value: ProcessingConfig[T]) {
     setConfig((current) => (current ? { ...current, [key]: value } : current));
+  }
+
+  function updateSaturationMethod(isotopeKey: IsotopeKey, value: SaturationCorrectionMethod) {
+    setConfig((current) => {
+      if (!current) {
+        return current;
+      }
+      return isotopeKey === "d13C"
+        ? { ...current, saturation_correction_method: value, saturation_correction_method_d13: value }
+        : { ...current, saturation_correction_method_d18: value };
+    });
   }
 
   function updateOverlay(key: keyof ProcessingConfig["overlays"], value: boolean) {
@@ -2701,26 +3447,33 @@ export default function ProcessingPage() {
     );
   }
 
-  function updateLinearityCoefficientOffset(isotopeKey: "d13C" | "d18O", value: number) {
+  function updateLinearityCoefficientOffset(
+    isotopeKey: "d13C" | "d18O",
+    term: LinearityCoefficientTerm,
+    value: number,
+  ) {
     setSharedLinearityConfig((current) => {
       if (!current) {
         return current;
       }
       const next = { ...current };
-      if (next.quadratic) {
-        if (isotopeKey === "d13C") {
-          next.manual_d13_per_10v2 = value;
-        } else {
-          next.manual_d18_per_10v2 = value;
-        }
-      } else if (isotopeKey === "d13C") {
+      if (term === "primary" && isotopeKey === "d13C") {
         next.manual_d13_per_10v = value;
-      } else {
+      } else if (term === "primary") {
         next.manual_d18_per_10v = value;
+      } else if (isotopeKey === "d13C") {
+        next.manual_d13_per_10v2 = value;
+      } else {
+        next.manual_d18_per_10v2 = value;
       }
-      const d13Offset = next.quadratic ? Number(next.manual_d13_per_10v2 ?? 0) : Number(next.manual_d13_per_10v ?? 0);
-      const d18Offset = next.quadratic ? Number(next.manual_d18_per_10v2 ?? 0) : Number(next.manual_d18_per_10v ?? 0);
-      const hasOffset = Math.abs(d13Offset) > 1e-12 || Math.abs(d18Offset) > 1e-12;
+      const activeOffsets = [
+        Number(next.manual_d13_per_10v ?? 0),
+        Number(next.manual_d18_per_10v ?? 0),
+        ...(next.quadratic || selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44
+          ? [Number(next.manual_d13_per_10v2 ?? 0), Number(next.manual_d18_per_10v2 ?? 0)]
+          : []),
+      ];
+      const hasOffset = activeOffsets.some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
       next.manual_override_enabled = hasOffset;
       return next;
     });
@@ -2789,13 +3542,10 @@ export default function ProcessingPage() {
     );
   }
 
-  function setDisplayMode(key: string, mode: string) {
+  function updateChartDisplayState(key: string, patch: Partial<ChartDisplayState>) {
     setDisplayState((current) => ({
       ...current,
-      [key]: {
-        rawOnly: mode === "raw",
-        hideCalibrated: mode === "hide-calibrated",
-      },
+      [key]: normalizeDisplayState({ ...normalizeDisplayState(current[key]), ...patch }),
     }));
   }
 
@@ -2815,10 +3565,12 @@ export default function ProcessingPage() {
     isotopeKey: IsotopeKey,
     value: number,
     valueSpace: "raw" | "display" = "raw",
+    stdev: number | null = null,
   ) {
     setSelectionEditorTab(isotopeKey);
     setSingleValues((current) => ({ ...current, [isotopeKey]: roundDeltaValue(value) }));
     setSingleValueSpaces((current) => ({ ...current, [isotopeKey]: valueSpace }));
+    setSingleStdevs((current) => ({ ...current, [isotopeKey]: stdev }));
     setSetValueHighlightNonce((current) => current + 1);
   }
 
@@ -3024,6 +3776,7 @@ export default function ProcessingPage() {
       action: "set_value",
       targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
       value: payloadValue,
+      stdev: singleStdevs[isotopeKey],
     });
   }
 
@@ -3211,7 +3964,16 @@ export default function ProcessingPage() {
         ? LINEARITY_INTENSITY_DIFF44
         : LINEARITY_INTENSITY_SAMP44
     : LINEARITY_INTENSITY_SAMP44;
-  const selectedLinearityBasisLabel = getLinearityIntensityOptionLabel(selectedLinearityIntensityCol);
+  const selectedLinearityCycleIntensityAggregation = LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.some(
+    (option) => option.value === activeLinearity?.cycle_intensity_aggregation,
+  )
+    ? (activeLinearity?.cycle_intensity_aggregation as LinearityCycleIntensityAggregation)
+    : "run_median";
+  const selectedLinearityBasisLabel = `${getLinearityIntensityOptionLabel(selectedLinearityIntensityCol)} · ${getLinearityCycleAggregationLabel(
+    selectedLinearityCycleIntensityAggregation,
+  )}`;
+  const isTwoTermLinearityBasis = selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44;
+  const showSecondaryCoefficientOffset = Boolean(activeLinearity?.quadratic) || isTwoTermLinearityBasis;
   const d13Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d13C ?? {}) as Record<string, unknown>;
   const d18Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d18O ?? {}) as Record<string, unknown>;
   const d13FitSlope = asNumber(d13Fit.slope);
@@ -3222,7 +3984,15 @@ export default function ProcessingPage() {
   const standardPrecisionRows = (calibrationWorkspaceQuery.data?.precision_summaries ?? [])
     .filter((summary) => selectedStandards.includes(summary.standard))
     .slice(0, 6);
-  const coefficientOffsetEnabled = Boolean(activeLinearity?.manual_override_enabled);
+  const coefficientOffsetEnabled = activeLinearity
+    ? [
+        Number(activeLinearity.manual_d13_per_10v ?? 0),
+        Number(activeLinearity.manual_d18_per_10v ?? 0),
+        ...(activeLinearity.quadratic || isTwoTermLinearityBasis
+          ? [Number(activeLinearity.manual_d13_per_10v2 ?? 0), Number(activeLinearity.manual_d18_per_10v2 ?? 0)]
+          : []),
+      ].some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12)
+    : false;
   const renderFailedSampleTableControls = (table: OutlierTable, context: { selectedRowLabels: string[] }) => {
     const isFailedSampleTable = isFailedSampleOutlierTable(table);
     if (!isFailedSampleTable) {
@@ -3361,38 +4131,14 @@ export default function ProcessingPage() {
     asString(d18TargetPayload["row_label"]).trim() === activeRowLabel
       ? asString(d18TargetPayload["collector_status"]).trim()
       : "";
-  const d13IsPartiallySaturated = isPartiallySaturatedCollectorStatus(d13ActiveStatus);
-  const d18IsPartiallySaturated = isPartiallySaturatedCollectorStatus(d18ActiveStatus);
   const d13CurrentRawValue = asNumber(d13TargetPayload["current_value"]);
   const d18CurrentRawValue = asNumber(d18TargetPayload["current_value"]);
-  const d13CycleMeanRawValue = asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]);
-  const d18CycleMeanRawValue = asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]);
-  const d13FirstValidCycleRawValue =
-    asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]) ??
-    asNumber((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
-  const d18FirstValidCycleRawValue =
-    asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["selected_value"]) ??
-    asNumber((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["mean"]);
   const d13LinearityCorrectedRawValue = asNumber(d13TargetPayload["linearity_corrected_value"]);
   const d18LinearityCorrectedRawValue = asNumber(d18TargetPayload["linearity_corrected_value"]);
-  const d13Method = asString((sampleD13DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A";
-  const d18Method = asString((sampleD18DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A";
-  const detailsDisplayValue = (value: number | null, isotopeKey: IsotopeKey, isPartiallySaturated: boolean): number | null => {
-    if (value == null) {
-      return null;
-    }
-    return isPartiallySaturated ? value : value + rawToDisplayDelta(isotopeKey);
-  };
+  const d13Method = formatMethodLabel(d13TargetPayload["current_method"]);
+  const d18Method = formatMethodLabel(d18TargetPayload["current_method"]);
   const d13CurrentDisplayValue = d13CurrentRawValue ?? selectedPointD13;
   const d18CurrentDisplayValue = d18CurrentRawValue ?? selectedPointD18;
-  const d13CycleMeanDisplayValue = d13IsPartiallySaturated
-    ? d13CycleMeanRawValue
-    : detailsDisplayValue(d13CycleMeanRawValue, "d13C", d13IsPartiallySaturated);
-  const d18CycleMeanDisplayValue = d18IsPartiallySaturated
-    ? d18CycleMeanRawValue
-    : detailsDisplayValue(d18CycleMeanRawValue, "d18O", d18IsPartiallySaturated);
-  const d13FirstValidCycleDisplayValue = detailsDisplayValue(d13FirstValidCycleRawValue, "d13C", d13IsPartiallySaturated);
-  const d18FirstValidCycleDisplayValue = detailsDisplayValue(d18FirstValidCycleRawValue, "d18O", d18IsPartiallySaturated);
   const d13LinearityCorrectedDisplayValue = d13LinearityCorrectedRawValue;
   const d18LinearityCorrectedDisplayValue = d18LinearityCorrectedRawValue;
   const effectiveOutlier =
@@ -3431,12 +4177,12 @@ export default function ProcessingPage() {
       figure: withColorScaleRange(workspace.overview_figures.crossplot),
     },
   };
-  const d13SummaryState = displayState[overviewCards.d13Summary.key] ?? { rawOnly: false, hideCalibrated: false };
-  const d18SummaryState = displayState[overviewCards.d18Summary.key] ?? { rawOnly: false, hideCalibrated: false };
+  const d13SummaryState = normalizeDisplayState(displayState[overviewCards.d13Summary.key]);
+  const d18SummaryState = normalizeDisplayState(displayState[overviewCards.d18Summary.key]);
   const d13SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d13Summary.figure, "Calibrated");
   const d18SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d18Summary.figure, "Calibrated");
-  const d13SummaryFigure = applyDisplayState(overviewCards.d13Summary.figure, d13SummaryState.rawOnly, d13SummaryState.hideCalibrated);
-  const d18SummaryFigure = applyDisplayState(overviewCards.d18Summary.figure, d18SummaryState.rawOnly, d18SummaryState.hideCalibrated);
+  const d13SummaryFigure = withDisplayState(overviewCards.d13Summary.figure, d13SummaryState);
+  const d18SummaryFigure = withDisplayState(overviewCards.d18Summary.figure, d18SummaryState);
   const activeSelectionChartKey = isSelectionEditorOpen ? (activeTarget?.chartKey ?? selectedTargets[0]?.chartKey ?? null) : null;
   const selectionSourceChart: SelectionSourceChart | null = (() => {
     if (!activeSelectionChartKey) {
@@ -3450,10 +4196,10 @@ export default function ProcessingPage() {
         for (const figureSet of section.identifier_figures) {
           const d13Key = `${section.species}|${figureSet.identifier}|d13C`;
           const d18Key = `${section.species}|${figureSet.identifier}|d18O`;
-          const d13State = displayState[d13Key] ?? { rawOnly: false, hideCalibrated: false };
-          const d18State = displayState[d18Key] ?? { rawOnly: false, hideCalibrated: false };
-          const d13FigureBase = applyDisplayState(withColorScaleRange(figureSet.d13c), d13State.rawOnly, d13State.hideCalibrated);
-          const d18FigureBase = applyDisplayState(withColorScaleRange(figureSet.d18o), d18State.rawOnly, d18State.hideCalibrated);
+          const d13State = normalizeDisplayState(displayState[d13Key]);
+          const d18State = normalizeDisplayState(displayState[d18Key]);
+          const d13FigureBase = withDisplayState(withColorScaleRange(figureSet.d13c), d13State);
+          const d18FigureBase = withDisplayState(withColorScaleRange(figureSet.d18o), d18State);
           const containsSelectedRow =
             figureContainsRowLabel(d13FigureBase, activeTarget.rowLabel) || figureContainsRowLabel(d18FigureBase, activeTarget.rowLabel);
           if (!containsSelectedRow) {
@@ -3529,15 +4275,15 @@ export default function ProcessingPage() {
     if (!figureSet) {
       return null;
     }
-    const state = displayState[activeSelectionChartKey] ?? { rawOnly: false, hideCalibrated: false };
+    const state = normalizeDisplayState(displayState[activeSelectionChartKey]);
     return {
       title: `${species} | ${identifier} | ${isotopeKey}`,
       description: "Source chart used for the current selection.",
       chartKey: activeSelectionChartKey,
       figure: highlightSelectionSourceFigure(
         isotopeKey === "d13C"
-          ? applyDisplayState(withColorScaleRange(figureSet.d13c), state.rawOnly, state.hideCalibrated)
-          : applyDisplayState(withColorScaleRange(figureSet.d18o), state.rawOnly, state.hideCalibrated),
+          ? withDisplayState(withColorScaleRange(figureSet.d13c), state)
+          : withDisplayState(withColorScaleRange(figureSet.d18o), state),
         activeTarget,
       ),
     };
@@ -3746,6 +4492,48 @@ export default function ProcessingPage() {
                 </Button>
               </div>
 
+              <div className="space-y-3">
+                <div className="text-sm font-medium text-stone-800">Saturation correction</div>
+                <CheckboxField
+                  checked={Boolean(activeConfig.enable_saturation_correction)}
+                  label="Enable saturation correction"
+                  description="Applies only to unedited partially saturated samples before shared linearity."
+                  onChange={(checked) => updateConfig("enable_saturation_correction", checked)}
+                />
+                {activeConfig.enable_saturation_correction ? (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">d13C default method</span>
+                      <select
+                        value={activeConfig.saturation_correction_method_d13 ?? activeConfig.saturation_correction_method}
+                        onChange={(event) => updateSaturationMethod("d13C", event.target.value as SaturationCorrectionMethod)}
+                        className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                      >
+                        {SATURATION_METHOD_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">d18O default method</span>
+                      <select
+                        value={activeConfig.saturation_correction_method_d18 ?? activeConfig.saturation_correction_method}
+                        onChange={(event) => updateSaturationMethod("d18O", event.target.value as SaturationCorrectionMethod)}
+                        className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                      >
+                        {SATURATION_METHOD_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                ) : null}
+              </div>
+
               <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-sm font-medium text-stone-800">Linearity (shared with calibration)</div>
@@ -3765,26 +4553,50 @@ export default function ProcessingPage() {
                       description="Also corrects recovered partially saturated values with the shared linearity fit."
                       onChange={(checked) => updateConfig("apply_shared_linearity_to_partially_saturated", checked)}
                     />
-                    <CheckboxField
-                      checked={Boolean(activeLinearity.quadratic)}
-                      label="Use quadratic linearity relationship"
-                      description="Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I."
-                      onChange={(checked) => updateSharedLinearity("quadratic", checked)}
-                    />
+                    {!isTwoTermLinearityBasis ? (
+                      <CheckboxField
+                        checked={Boolean(activeLinearity.quadratic)}
+                        label="Use quadratic linearity relationship"
+                        description="Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I."
+                        onChange={(checked) => updateSharedLinearity("quadratic", checked)}
+                      />
+                    ) : null}
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">Linearity basis</span>
                       <select
                         value={selectedLinearityIntensityCol}
                         onChange={(event) => updateSharedLinearityIntensityCol(event.target.value)}
+                        title={getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
                         className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                       >
                         {LINEARITY_INTENSITY_OPTIONS.map((option) => (
-                          <option key={option} value={option}>
+                          <option key={option} value={option} title={getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation)}>
                             {getLinearityIntensityOptionLabel(option)}
                           </option>
                         ))}
                       </select>
                     </label>
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">Linearity cycle intensity</span>
+                      <select
+                        value={selectedLinearityCycleIntensityAggregation}
+                        onChange={(event) => updateSharedLinearity("cycle_intensity_aggregation", event.target.value)}
+                        title="Choose which cycle intensity is used when building the selected linearity basis for each analysis."
+                        className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                      >
+                        {LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600">
+                      <span className="font-medium text-stone-700">Basis formula:</span>{" "}
+                      <code className="font-mono">
+                        {getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
+                      </code>
+                    </div>
                     {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">Max sample intensity</span>
@@ -3808,48 +4620,90 @@ export default function ProcessingPage() {
                     ) : null}
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                        <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficient</div>
-                        <div className="mt-1 font-semibold text-stone-900">
-                          {activeLinearity.quadratic
-                            ? `${formatDeltaValue(d13FitSlope, 6)} (linear), ${formatDeltaValue(d13FitQuad, 8)} (quadratic)`
-                            : formatDeltaValue(d13FitSlope, 6)}
+                        <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficients</div>
+                        <div className="mt-1 space-y-1 font-semibold text-stone-900">
+                          <div>
+                            <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
+                            {formatFirstNonZeroDigits(d13FitSlope)}
+                          </div>
+                          {showSecondaryCoefficientOffset ? (
+                            <div>
+                              <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
+                              {formatFirstNonZeroDigits(d13FitQuad)}
+                            </div>
+                          ) : null}
                         </div>
                       </div>
                       <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                        <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficient</div>
-                        <div className="mt-1 font-semibold text-stone-900">
-                          {activeLinearity.quadratic
-                            ? `${formatDeltaValue(d18FitSlope, 6)} (linear), ${formatDeltaValue(d18FitQuad, 8)} (quadratic)`
-                            : formatDeltaValue(d18FitSlope, 6)}
+                        <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficients</div>
+                        <div className="mt-1 space-y-1 font-semibold text-stone-900">
+                          <div>
+                            <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
+                            {formatFirstNonZeroDigits(d18FitSlope)}
+                          </div>
+                          {showSecondaryCoefficientOffset ? (
+                            <div>
+                              <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
+                              {formatFirstNonZeroDigits(d18FitQuad)}
+                            </div>
+                          ) : null}
                         </div>
                       </div>
                     </div>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">
-                          {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, Boolean(activeLinearity.quadratic))}
+                              {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                         </span>
                         <input
                           type="number"
                           step="0.01"
-                          value={activeLinearity.quadratic ? (activeLinearity.manual_d13_per_10v2 ?? 0) : (activeLinearity.manual_d13_per_10v ?? 0)}
-                          onChange={(event) => updateLinearityCoefficientOffset("d13C", Number(event.target.value))}
+                          value={activeLinearity.manual_d13_per_10v ?? 0}
+                          onChange={(event) => updateLinearityCoefficientOffset("d13C", "primary", Number(event.target.value))}
                           className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">
-                          {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, Boolean(activeLinearity.quadratic))}
+                              {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                         </span>
                         <input
                           type="number"
                           step="0.01"
-                          value={activeLinearity.quadratic ? (activeLinearity.manual_d18_per_10v2 ?? 0) : (activeLinearity.manual_d18_per_10v ?? 0)}
-                          onChange={(event) => updateLinearityCoefficientOffset("d18O", Number(event.target.value))}
+                          value={activeLinearity.manual_d18_per_10v ?? 0}
+                          onChange={(event) => updateLinearityCoefficientOffset("d18O", "primary", Number(event.target.value))}
                           className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
                     </div>
+                    {showSecondaryCoefficientOffset ? (
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="text-sm">
+                          <span className="mb-1 block text-stone-700">
+                                {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                          </span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={activeLinearity.manual_d13_per_10v2 ?? 0}
+                            onChange={(event) => updateLinearityCoefficientOffset("d13C", "secondary", Number(event.target.value))}
+                            className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                          />
+                        </label>
+                        <label className="text-sm">
+                          <span className="mb-1 block text-stone-700">
+                                {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                          </span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={activeLinearity.manual_d18_per_10v2 ?? 0}
+                            onChange={(event) => updateLinearityCoefficientOffset("d18O", "secondary", Number(event.target.value))}
+                            className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                          />
+                        </label>
+                      </div>
+                    ) : null}
                     <div className="text-xs text-stone-500">
                       Coefficient offset active: {coefficientOffsetEnabled ? "Yes" : "No"}
                     </div>
@@ -3976,6 +4830,7 @@ export default function ProcessingPage() {
             <div className="grid gap-6 xl:grid-cols-2">
               <FigureCard
                 key={overviewCards.processing3d.key}
+                chartKey={overviewCards.processing3d.key}
                 title={overviewCards.processing3d.title}
                 description={overviewCards.processing3d.description}
                 figure={overviewCards.processing3d.figure}
@@ -3986,6 +4841,7 @@ export default function ProcessingPage() {
               />
               <FigureCard
                 key={overviewCards.crossplot.key}
+                chartKey={overviewCards.crossplot.key}
                 title={overviewCards.crossplot.title}
                 description={overviewCards.crossplot.description}
                 figure={overviewCards.crossplot.figure}
@@ -4197,7 +5053,7 @@ export default function ProcessingPage() {
           ) : null}
 
           {isSelectionEditorOpen ? (
-            <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setSelectionEditorOpen(false)}>
+            <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={closeSelectionEditor}>
               <div
                 className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
                 onClick={(event) => event.stopPropagation()}
@@ -4207,7 +5063,7 @@ export default function ProcessingPage() {
                     <div className="text-base font-semibold text-stone-900">Selection Editor</div>
                     <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => setSelectionEditorOpen(false)}>
+                  <Button variant="outline" size="sm" onPointerDown={closeSelectionEditor} onClick={closeSelectionEditor}>
                     <X className="h-4 w-4" />
                     Close
                   </Button>
@@ -4230,6 +5086,7 @@ export default function ProcessingPage() {
                                 <PlotlyChart
                                   figure={item.figure}
                                   className="h-[280px] w-full"
+                                  deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
                                   onPointClick={(points) => handleSelectionSourceChartClick(item.chartKey, points)}
                                   onSelection={(points) => handleSelectionSourceChartSelection(item.chartKey, points)}
                                 />
@@ -4240,6 +5097,7 @@ export default function ProcessingPage() {
                           <PlotlyChart
                             figure={selectionSourceChart.figure}
                             className="h-[360px] w-full"
+                            deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
                             onPointClick={(points) =>
                               handleSelectionSourceChartClick(selectionSourceChart.chartKey ?? activeSelectionChartKey ?? "", points)
                             }
@@ -4338,16 +5196,9 @@ export default function ProcessingPage() {
                                   <div className="text-right font-medium text-stone-900">
                                     {d13LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d13LinearityCorrectedDisplayValue)}
                                   </div>
-                                  <div className="text-stone-500">Cycle mean</div>
-                                  <div className="text-right font-medium text-stone-900">
-                                    {d13CycleMeanDisplayValue == null ? "N/A" : formatDeltaValue(d13CycleMeanDisplayValue)}
-                                  </div>
-                                  <div className="text-stone-500">First valid cycle</div>
-                                  <div className="text-right font-medium text-stone-900">
-                                    {d13FirstValidCycleDisplayValue == null ? "N/A" : formatDeltaValue(d13FirstValidCycleDisplayValue)}
-                                  </div>
+                                  <div className="text-stone-500">Method</div>
+                                  <div className="text-right font-medium text-stone-900">{d13Method}</div>
                                 </div>
-                                <div className="mt-3 text-xs text-stone-500">Method: {d13Method}</div>
                               </div>
                               <div className="rounded-lg border border-stone-200 bg-stone-50/50 p-4">
                                 <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">d18O</div>
@@ -4360,16 +5211,9 @@ export default function ProcessingPage() {
                                   <div className="text-right font-medium text-stone-900">
                                     {d18LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d18LinearityCorrectedDisplayValue)}
                                   </div>
-                                  <div className="text-stone-500">Cycle mean</div>
-                                  <div className="text-right font-medium text-stone-900">
-                                    {d18CycleMeanDisplayValue == null ? "N/A" : formatDeltaValue(d18CycleMeanDisplayValue)}
-                                  </div>
-                                  <div className="text-stone-500">First valid cycle</div>
-                                  <div className="text-right font-medium text-stone-900">
-                                    {d18FirstValidCycleDisplayValue == null ? "N/A" : formatDeltaValue(d18FirstValidCycleDisplayValue)}
-                                  </div>
+                                  <div className="text-stone-500">Method</div>
+                                  <div className="text-right font-medium text-stone-900">{d18Method}</div>
                                 </div>
-                                <div className="mt-3 text-xs text-stone-500">Method: {d18Method}</div>
                               </div>
                             </div>
                           </div>
@@ -4402,9 +5246,10 @@ export default function ProcessingPage() {
                                 type="number"
                                 step="0.001"
                                 value={singleValues[selectionEditorTab]}
-                                onChange={(event) =>
-                                  setSingleValues((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }))
-                                }
+                                onChange={(event) => {
+                                  setSingleValues((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }));
+                                  setSingleStdevs((current) => ({ ...current, [selectionEditorTab]: null }));
+                                }}
                                 className={cn(
                                   "w-full rounded-lg border px-3 py-2 transition-all duration-200",
                                   isSetValueInputHighlighted
@@ -4456,8 +5301,8 @@ export default function ProcessingPage() {
                             diagnostics={activeDiagnostics}
                             loading={activeDiagnosticsLoading}
                             displayDelta={rawToDisplayDelta(selectionEditorTab)}
-                            onPickDeltaValue={(value, valueSpace = "raw") =>
-                              setSingleValueFromSuggestion(selectionEditorTab, value, valueSpace)
+                            onPickDeltaValue={(value, valueSpace = "raw", stdev = null) =>
+                              setSingleValueFromSuggestion(selectionEditorTab, value, valueSpace, stdev)
                             }
                           />
                         </div>
@@ -4515,6 +5360,7 @@ export default function ProcessingPage() {
           <div className="space-y-6">
             <FigureCard
               key={overviewCards.d13Summary.key}
+              chartKey={overviewCards.d13Summary.key}
               title={overviewCards.d13Summary.title}
               description={overviewCards.d13Summary.description}
               figure={d13SummaryFigure}
@@ -4522,7 +5368,7 @@ export default function ProcessingPage() {
                 <TraceModeControl
                   state={d13SummaryState}
                   hasCalibrated={d13SummaryHasCalibrated}
-                  onChange={(mode) => setDisplayMode(overviewCards.d13Summary.key, mode)}
+                  onChange={(patch) => updateChartDisplayState(overviewCards.d13Summary.key, patch)}
                 />
               }
               chartClassName="h-[460px] w-full"
@@ -4532,6 +5378,7 @@ export default function ProcessingPage() {
             />
             <FigureCard
               key={overviewCards.d18Summary.key}
+              chartKey={overviewCards.d18Summary.key}
               title={overviewCards.d18Summary.title}
               description={overviewCards.d18Summary.description}
               figure={d18SummaryFigure}
@@ -4539,7 +5386,7 @@ export default function ProcessingPage() {
                 <TraceModeControl
                   state={d18SummaryState}
                   hasCalibrated={d18SummaryHasCalibrated}
-                  onChange={(mode) => setDisplayMode(overviewCards.d18Summary.key, mode)}
+                  onChange={(patch) => updateChartDisplayState(overviewCards.d18Summary.key, patch)}
                 />
               }
               chartClassName="h-[460px] w-full"
@@ -4556,17 +5403,32 @@ export default function ProcessingPage() {
           />
 
           <div className="space-y-6">
-            {workspace.species_sections.map((section) => (
-              <details key={section.species} className="rounded-lg border border-stone-200 bg-white shadow-sm" open>
-                <summary className="cursor-pointer px-6 py-4 text-lg font-semibold text-stone-900">
-                  {section.species} ({section.identifier_figures.length} identifiers)
-                </summary>
-                <div className="space-y-6 p-6 pt-0">
+            {workspace.species_sections.map((section) => {
+              const isSectionOpen = openSpeciesSections.has(section.species);
+              const identifierCount = section.identifier_count ?? section.identifier_figures.length;
+              const isLoadingSectionFigures = workspaceQuery.isFetching && isSectionOpen && identifierCount > 0 && section.identifier_figures.length === 0;
+              return (
+                <details
+                  key={section.species}
+                  className="rounded-lg border border-stone-200 bg-white shadow-sm"
+                  open={isSectionOpen}
+                  onToggle={(event) => setSpeciesSectionOpen(section.species, event.currentTarget.open)}
+                >
+                  <summary className="cursor-pointer px-6 py-4 text-lg font-semibold text-stone-900">
+                    {section.species} ({identifierCount} identifiers)
+                  </summary>
+                  {isSectionOpen ? (
+                    <div className="space-y-6 p-6 pt-0">
+                  {isLoadingSectionFigures ? (
+                    <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
+                      Loading species charts...
+                    </div>
+                  ) : null}
                   {section.identifier_figures.map((figureSet) => {
                     const d13Key = `${section.species}|${figureSet.identifier}|d13C`;
                     const d18Key = `${section.species}|${figureSet.identifier}|d18O`;
-                    const d13State = displayState[d13Key] ?? { rawOnly: false, hideCalibrated: false };
-                    const d18State = displayState[d18Key] ?? { rawOnly: false, hideCalibrated: false };
+                    const d13State = normalizeDisplayState(displayState[d13Key]);
+                    const d18State = normalizeDisplayState(displayState[d18Key]);
                     return (
                       <Card key={`${section.species}-${figureSet.identifier}`} className="border-stone-300">
                         <CardHeader>
@@ -4582,13 +5444,14 @@ export default function ProcessingPage() {
                                 <TraceModeControl
                                   state={d13State}
                                   hasCalibrated={figureSet.has_calibrated_d13c}
-                                  onChange={(mode) => setDisplayMode(d13Key, mode)}
+                                  onChange={(patch) => updateChartDisplayState(d13Key, patch)}
                                 />
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
-                                  figure={applyDisplayState(withColorScaleRange(figureSet.d13c), d13State.rawOnly, d13State.hideCalibrated)}
+                                  figure={withDisplayState(withColorScaleRange(figureSet.d13c), d13State)}
                                   className="h-full w-full"
+                                  uiRevision={`processing:${d13Key}`}
                                   {...chartHoverProps(d13Key)}
                                   onPointClick={(points) => handleChartClick(d13Key, points)}
                                   onSelection={(points) => handleChartSelection(d13Key, points)}
@@ -4604,13 +5467,14 @@ export default function ProcessingPage() {
                                 <TraceModeControl
                                   state={d18State}
                                   hasCalibrated={figureSet.has_calibrated_d18o}
-                                  onChange={(mode) => setDisplayMode(d18Key, mode)}
+                                  onChange={(patch) => updateChartDisplayState(d18Key, patch)}
                                 />
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
-                                  figure={applyDisplayState(withColorScaleRange(figureSet.d18o), d18State.rawOnly, d18State.hideCalibrated)}
+                                  figure={withDisplayState(withColorScaleRange(figureSet.d18o), d18State)}
                                   className="h-full w-full"
+                                  uiRevision={`processing:${d18Key}`}
                                   {...chartHoverProps(d18Key)}
                                   onPointClick={(points) => handleChartClick(d18Key, points)}
                                   onSelection={(points) => handleChartSelection(d18Key, points)}
@@ -4628,9 +5492,11 @@ export default function ProcessingPage() {
                     tables={section.outlier_tables}
                     renderTableControls={renderFailedSampleTableControls}
                   />
-                </div>
-              </details>
-            ))}
+                    </div>
+                  ) : null}
+                </details>
+              );
+            })}
           </div>
         </div>
       </div>

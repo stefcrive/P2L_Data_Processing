@@ -6,7 +6,13 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from services.irms_api.domain.constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL
+from services.irms_api.domain.constants import (
+    CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+    CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+    CYCLE1_SIGNAL_SAMP44_COL,
+    VALID_CYCLES_COL,
+)
 from services.irms_api.domain.contracts import EditAction
 from services.irms_api.domain.processing.core import (
     RangeConfig,
@@ -14,7 +20,11 @@ from services.irms_api.domain.processing.core import (
     _range_outlier_mask,
     build_category_masks,
 )
-from services.irms_api.domain.processing.cycles import build_cycle_diagnostics_payload, build_target_info
+from services.irms_api.domain.processing.cycles import (
+    apply_run_level_linearity_basis_from_cycles,
+    build_cycle_diagnostics_payload,
+    build_target_info,
+)
 from services.irms_api.domain.processing.edits import (
     _interpolate_single_target_within_identifier_group,
     apply_edit_action,
@@ -835,8 +845,42 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertGreaterEqual(len(workspace.species_sections), 2)
         self.assertIn("All", workspace.available_values.identifiers)
         self.assertGreaterEqual(workspace.summary.total_measurements, 1)
+        self.assertIn(VALID_CYCLES_COL, workspace.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, workspace.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, workspace.available_values.z_axis_options)
+
+    def test_run_level_linearity_basis_can_use_cycle_endpoint_intensities(self) -> None:
+        df = sample_processing_df().iloc[[0]].copy()
+        cycles = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", "1", "2", "3"],
+                "Identifier 1": ["SampleA", "SampleA", "SampleA", "SampleA"],
+                "Identifier 2": ["1", "1", "1", "1"],
+                "Excel File": ["run1.xlsx", "run1.xlsx", "run1.xlsx", "run1.xlsx"],
+                "Run ID": ["run-1", "run-1", "run-1", "run-1"],
+                "Date": ["2025-01-01", "2025-01-01", "2025-01-01", "2025-01-01"],
+                "d 13C/12C  Mean": [1.0, 0.9, 1.0, 1.1],
+                "Cycle Intensity Samp 44": [np.nan, 49.0, 20.0, 30.0],
+                "Cycle Intensity Ref 44": [np.nan, 10.0, 18.0, 28.0],
+            }
+        )
+
+        first = apply_run_level_linearity_basis_from_cycles(
+            df,
+            cycles,
+            cycle_intensity_aggregation="first_valid_cycle",
+        )
+        last = apply_run_level_linearity_basis_from_cycles(
+            df,
+            cycles,
+            cycle_intensity_aggregation="last_valid_cycle",
+        )
+        median = apply_run_level_linearity_basis_from_cycles(df, cycles)
+
+        self.assertAlmostEqual(float(first.iloc[0][CYCLE1_SIGNAL_SAMP44_COL]), 20.0)
+        self.assertAlmostEqual(float(first.iloc[0][CYCLE1_SIGNAL_DIFF44_COL]), 2.0)
+        self.assertAlmostEqual(float(last.iloc[0][CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL]), 29.0)
+        self.assertAlmostEqual(float(median.iloc[0][CYCLE1_SIGNAL_SAMP44_COL]), 30.0)
 
     def test_manual_linearity_override_uses_processing_diff_intensity_toggle(self) -> None:
         df = sample_processing_df().copy()
@@ -1304,6 +1348,7 @@ class ProcessingCoreTests(unittest.TestCase):
         )
         config = normalize_processing_config(
             {
+                "apply_shared_linearity_to_partially_saturated": False,
                 "manual_linearity_override": {
                     "enabled": False,
                     "use_diff_intensity": False,
@@ -1330,6 +1375,29 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertAlmostEqual(float(work.loc[0, "d 13C/12C  Mean"]), 1.0, places=6)
         # Edited rows must preserve the explicitly set raw value in charts/tables.
         self.assertAlmostEqual(float(work.loc[1, "d 13C/12C  Mean"]), -0.844, places=6)
+
+    def test_derive_working_frame_applies_shared_linearity_to_edited_partials_when_enabled(self) -> None:
+        df = sample_processing_df().copy()
+        config = normalize_processing_config({})
+        calibration_meta = {
+            "config": {"linearity": {"apply": True, "use_diff_intensity": False}},
+            "linearity_fits": {
+                "d13C": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 3},
+                "d18O": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 3},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+            "coefficients": {
+                "d13C": {"slope": 2.0, "intercept": 0.0},
+                "d18O": {"slope": 2.0, "intercept": 0.0},
+            },
+            "selected_standards": [],
+        }
+        edit_state = {"edited_rows": ["2"], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        work = _derive_working_frame(df, config, calibration_meta=calibration_meta, edit_state=edit_state)
+
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 18O/16O  Mean"]), 1.4, places=6)
 
     def test_derive_working_frame_applies_manual_override_to_edited_rows_when_enabled(self) -> None:
         df = pd.DataFrame(
@@ -1563,6 +1631,31 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertIn("Coral", species_3d_symbols)
         self.assertIn("Shell", species_3d_symbols)
         self.assertNotEqual(species_3d_symbols["Coral"], species_3d_symbols["Shell"])
+
+    def test_overview_charts_highlight_edited_rows(self) -> None:
+        df = sample_processing_df().copy()
+        config = normalize_processing_config({}).model_dump()
+        config["selected_identifier"] = "All"
+        config["sigma_level_data"] = 99.0
+        config["signal_range"] = [0.0, 100.0]
+        config["leak_range"] = [0.0, 1000.0]
+        config["d13c_range"] = [-100.0, 100.0]
+        config["d18o_range"] = [-100.0, 100.0]
+        metadata = {
+            "processing": {"config": config},
+            "edit_state": {"edited_rows": ["0"], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
+
+        for figure_key in ["d13_summary", "d18_summary", "crossplot", "processing_3d"]:
+            trace_names = [
+                str(trace.get("name", ""))
+                for trace in workspace.overview_figures.get(figure_key, {}).get("data", [])
+                if isinstance(trace, dict)
+            ]
+            self.assertIn("Edited Samples", trace_names, figure_key)
 
     def test_unselected_outlier_overlays_are_hidden_from_base_charts(self) -> None:
         df = sample_processing_df()
@@ -2029,6 +2122,10 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(payload.target["row_label"], 0)
         self.assertEqual(len(payload.table), 2)
         self.assertEqual(payload.cycle_mean["valid_cycles"], 2)
+        self.assertAlmostEqual(float(payload.cycle_mean["valid_std_dev"]), 0.14142135623730953, places=6)
+        self.assertIn("reference_gas_intensity", payload.saturation_correction.get("figures", {}))
+        self.assertIn("first_cycle", payload.saturation_correction.get("figures", {}))
+        self.assertIn("cycle_relative_mismatch", payload.saturation_correction.get("figures", {}))
 
     def test_build_cycle_diagnostics_payload_uses_first_valid_cycle_for_partially_saturated_target(self) -> None:
         df = sample_processing_df().copy()
@@ -2051,10 +2148,265 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(int(payload.cycle_mean["selected_cycle"]), 1)
         self.assertAlmostEqual(float(payload.cycle_mean["selected_value"]), 0.9, places=6)
         self.assertAlmostEqual(float(payload.cycle_mean["valid_mean"]), 1.0, places=6)
+        self.assertAlmostEqual(float(payload.cycle_mean["valid_std_dev"]), 0.14142135623730953, places=6)
         self.assertAlmostEqual(float(payload.cycle_mean["mean"]), 0.9, places=6)
-        selected_rows = [row for row in payload.table if bool(row.get("Set Value Cycle"))]
-        self.assertEqual(len(selected_rows), 1)
-        self.assertEqual(int(selected_rows[0]["Cycle"]), 1)
+        first_valid_rows = [row for row in payload.table if bool(row.get("First Valid Cycle"))]
+        last_valid_rows = [row for row in payload.table if bool(row.get("Last Valid Cycle"))]
+        self.assertEqual(len(first_valid_rows), 1)
+        self.assertEqual(len(last_valid_rows), 1)
+        self.assertEqual(int(first_valid_rows[0]["Cycle"]), 1)
+        self.assertEqual(int(last_valid_rows[0]["Cycle"]), 2)
+
+    def test_build_cycle_diagnostics_payload_adds_saturation_correction_candidates(self) -> None:
+        df = sample_processing_df().copy()
+        df.loc[0, "Collector Status"] = "Partially Saturated Collectors"
+        cycles_df = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", "1", "2", "3", "4", "5"],
+                "Identifier 1": ["SampleA"] * 6,
+                "Identifier 2": ["1"] * 6,
+                "Species": ["Coral"] * 6,
+                "Excel File": ["run1.xlsx"] * 6,
+                "Run ID": ["run-1"] * 6,
+                "Date": ["2025-01-01"] * 6,
+                "d 13C/12C  Mean": [1.0, 30.0, 20.0, 3.0, 2.0, 1.0],
+                "d 18O/16O  Mean": [2.0, 2.0, 2.0, 2.0, 2.0, 2.0],
+                "Cycle Intensity Samp 44": [15.0, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Ref 44": [10.0, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Samp 45": [0.5, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Ref 45": [0.4, 50.0, 49.0, 30.0, 20.0, 10.0],
+            }
+        )
+        target = build_target_info(df, 0, "d13C", {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}})
+        self.assertIsNotNone(target)
+
+        payload = build_cycle_diagnostics_payload(
+            session_id="session-1",
+            df=df,
+            cycles_df=cycles_df,
+            target=target,
+            config=RangeConfig(),
+            edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+        )
+
+        self.assertAlmostEqual(float(payload.cycle_mean["last_valid_value"]), 1.0, places=6)
+        self.assertAlmostEqual(float(payload.cycle_mean["saturation_reference_gas_value"]), 5.0, places=6)
+        self.assertAlmostEqual(float(payload.cycle_mean["saturation_first_cycle_value"]), 1.0, places=6)
+        self.assertIn("reference_gas_intensity", payload.saturation_correction.get("figures", {}))
+        self.assertIn("first_cycle", payload.saturation_correction.get("figures", {}))
+        ref_fig = payload.saturation_correction["figures"]["reference_gas_intensity"]
+        first_fig = payload.saturation_correction["figures"]["first_cycle"]
+        self.assertNotIn("title", ref_fig.get("layout", {}))
+        self.assertNotIn("title", first_fig.get("layout", {}))
+        ref_target_trace = next(
+            trace
+            for trace in ref_fig.get("data", [])
+            if trace.get("name") == "Reference-gas prediction"
+        )
+        first_target_trace = next(
+            trace
+            for trace in first_fig.get("data", [])
+            if trace.get("name") == "Stabilized cycle prediction"
+        )
+        self.assertEqual(ref_target_trace.get("mode"), "markers")
+        self.assertEqual(first_target_trace.get("mode"), "markers")
+        self.assertIn("annotations", ref_fig.get("layout", {}))
+        self.assertIn("annotations", first_fig.get("layout", {}))
+
+    def test_cycle_intensity_weighted_mismatch_uses_quadratic_horizontal_target(self) -> None:
+        df = sample_processing_df().copy()
+        df.loc[2, "Collector Status"] = "Partially Saturated Collectors"
+        samples44 = [10.0, 50.0, 49.0, 10.0, 11.0, 12.0, 13.0]
+        refs44 = [10.0] * len(samples44)
+        samp_median = float(np.median(samples44))
+        weighted = [
+            10.0 * ((sample - ref) / ref) * (sample / samp_median)
+            for sample, ref in zip(samples44[-4:], refs44[-4:])
+        ]
+        valid_d13 = [5.0 - 0.8 * value + 0.1 * value * value for value in weighted]
+        cycles_df = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", "1", "2", "3", "4", "5", "6"],
+                "Identifier 1": ["SampleA"] * 7,
+                "Identifier 2": ["3"] * 7,
+                "Species": ["Coral"] * 7,
+                "Excel File": ["run1.xlsx"] * 7,
+                "Run ID": ["run-1"] * 7,
+                "Date": ["2025-01-01"] * 7,
+                "d 13C/12C  Mean": [2.0, 30.0, 20.0, *valid_d13],
+                "d 18O/16O  Mean": [2.0] * 7,
+                "Cycle Intensity Samp 44": samples44,
+                "Cycle Intensity Ref 44": refs44,
+                "Cycle Intensity Samp 45": [0.5, 50.0, 49.0, 0.5, 0.5, 0.5, 0.5],
+                "Cycle Intensity Ref 45": [0.4, 50.0, 49.0, 0.4, 0.4, 0.4, 0.4],
+            }
+        )
+        target = build_target_info(df, 2, "d13C", {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}})
+        self.assertIsNotNone(target)
+
+        payload = build_cycle_diagnostics_payload(
+            session_id="session-1",
+            df=df,
+            cycles_df=cycles_df,
+            target=target,
+            config=RangeConfig(),
+            edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+        )
+
+        method_payload = payload.saturation_correction["cycle_intensity_weighted_mismatch"]
+        coeffs = [float(value) for value in method_payload["coefficients"]]
+        expected_target = -coeffs[1] / (2.0 * coeffs[0])
+        expected_value = float(np.polyval(coeffs, expected_target))
+        self.assertAlmostEqual(float(method_payload["target_basis"]), expected_target, places=6)
+        self.assertEqual(method_payload["fit_degree"], 2)
+        self.assertEqual(method_payload["target_reason"], "quadratic_horizontal")
+        self.assertAlmostEqual(float(method_payload["value"]), expected_value, places=6)
+        figure = payload.saturation_correction["figures"]["cycle_intensity_weighted_mismatch"]
+        curve_trace = next((trace for trace in figure.get("data", []) if trace.get("name") == "Curve fit"), None)
+        self.assertIsNotNone(curve_trace)
+
+    def test_cycle_plateau_uses_clustered_latest_valid_cycles(self) -> None:
+        df = sample_processing_df().copy()
+        df.loc[2, "Collector Status"] = "Partially Saturated Collectors"
+        d18_values = [3.60, 3.72, 3.78, 3.83, 3.86, 3.89, 3.900, 3.905, 3.907, 3.908]
+        mean44_values = [45.0, 40.0, 32.0, 25.0, 20.0, 17.0, 15.0, 14.0, 13.5, 13.0]
+        cycles_df = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", *[str(value) for value in range(1, 11)]],
+                "Identifier 1": ["SampleA"] * 11,
+                "Identifier 2": ["3"] * 11,
+                "Species": ["Coral"] * 11,
+                "Excel File": ["run1.xlsx"] * 11,
+                "Run ID": ["run-1"] * 11,
+                "Date": ["2025-01-01"] * 11,
+                "d 13C/12C  Mean": [2.0, *([1.0] * 10)],
+                "d 18O/16O  Mean": [2.4, *d18_values],
+                "Cycle Intensity Samp 44": [16.0, *mean44_values],
+                "Cycle Intensity Ref 44": [10.0, *mean44_values],
+                "Cycle Intensity Samp 45": [0.5, *([0.5] * 10)],
+                "Cycle Intensity Ref 45": [0.4, *([0.4] * 10)],
+                "Cycle Intensity Samp 46": [0.3, *([0.3] * 10)],
+                "Cycle Intensity Ref 46": [0.2, *([0.2] * 10)],
+            }
+        )
+        target = build_target_info(df, 2, "d18O", {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}})
+        self.assertIsNotNone(target)
+
+        payload = build_cycle_diagnostics_payload(
+            session_id="session-1",
+            df=df,
+            cycles_df=cycles_df,
+            target=target,
+            config=RangeConfig(),
+            edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+        )
+
+        plateau = payload.saturation_correction["cycle_plateau"]
+        expected_values = d18_values[-6:]
+        expected_delta_changes = np.diff(d18_values)[-6:]
+        _, expected_asymptote = np.polyfit(expected_delta_changes, expected_values, 1)
+        self.assertEqual(plateau["selected_cycles"], [5, 6, 7, 8, 9, 10])
+        self.assertAlmostEqual(float(plateau["value"]), float(expected_asymptote), places=6)
+        self.assertAlmostEqual(float(plateau["std_dev"]), float(np.std(expected_values, ddof=1)), places=6)
+        self.assertEqual(plateau["reason"], "delta_rate_asymptote")
+        self.assertIn("cycle_plateau", payload.saturation_correction.get("figures", {}))
+
+        config = normalize_processing_config(
+            {
+                "enable_saturation_correction": True,
+                "saturation_correction_method": "cycle_plateau",
+            }
+        )
+        work = _derive_working_frame(df, config, cycles_df=cycles_df)
+        self.assertAlmostEqual(float(work.loc[2, "d 18O/16O  Mean"]), float(expected_asymptote), places=6)
+        self.assertAlmostEqual(float(work.loc[2, "d 18O/16O  Std Dev"]), float(np.std(expected_values, ddof=1)), places=6)
+        self.assertEqual(str(work.loc[2, "__d18O_current_method"]), "cycle_plateau")
+
+    def test_derive_working_frame_applies_enabled_saturation_correction_to_unedited_partials(self) -> None:
+        df = sample_processing_df().copy()
+        cycles_df = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", "1", "2", "3", "4", "5"],
+                "Identifier 1": ["SampleA"] * 6,
+                "Identifier 2": ["3"] * 6,
+                "Species": ["Coral"] * 6,
+                "Excel File": ["run1.xlsx"] * 6,
+                "Run ID": ["run-1"] * 6,
+                "Date": ["2025-01-01"] * 6,
+                "d 13C/12C  Mean": [1.0, 30.0, 20.0, 3.0, 2.0, 1.0],
+                "d 18O/16O  Mean": [2.0, 2.0, 2.0, 2.0, 2.0, 2.0],
+                "Cycle Intensity Samp 44": [15.0, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Ref 44": [10.0, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Samp 45": [0.5, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Ref 45": [0.4, 50.0, 49.0, 30.0, 20.0, 10.0],
+            }
+        )
+        expected_values = {
+            "cycle_mean": 2.0,
+            "first_valid_cycle": 3.0,
+            "last_valid_cycle": 1.0,
+            "reference_gas_intensity": 5.0,
+            "first_cycle": 1.0,
+        }
+        for method, expected_value in expected_values.items():
+            with self.subTest(method=method):
+                config = normalize_processing_config(
+                    {
+                        "enable_saturation_correction": True,
+                        "saturation_correction_method": method,
+                    }
+                )
+
+                work = _derive_working_frame(df, config, cycles_df=cycles_df)
+                edited_work = _derive_working_frame(
+                    df,
+                    config,
+                    cycles_df=cycles_df,
+                    edit_state={"edited_rows": ["2"], "original_delta_values": {}, "manual_outlier_overrides": {}},
+                )
+
+                self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), expected_value, places=6)
+                self.assertEqual(str(work.loc[2, "__d13C_current_method"]), method)
+                if method in {"cycle_mean", "first_valid_cycle"}:
+                    self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Std Dev"]), 1.0, places=6)
+                self.assertAlmostEqual(float(edited_work.loc[2, "d 13C/12C  Mean"]), 2.0, places=6)
+                self.assertEqual(str(edited_work.loc[2, "__d13C_current_method"]), "edited")
+
+    def test_derive_working_frame_uses_independent_saturation_methods_by_isotope(self) -> None:
+        df = sample_processing_df().copy()
+        cycles_df = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", "1", "2", "3", "4", "5"],
+                "Identifier 1": ["SampleA"] * 6,
+                "Identifier 2": ["3"] * 6,
+                "Species": ["Coral"] * 6,
+                "Excel File": ["run1.xlsx"] * 6,
+                "Run ID": ["run-1"] * 6,
+                "Date": ["2025-01-01"] * 6,
+                "d 13C/12C  Mean": [1.0, 30.0, 20.0, 3.0, 2.0, 1.0],
+                "d 18O/16O  Mean": [2.0, 30.0, 20.0, 6.0, 8.0, 10.0],
+                "Cycle Intensity Samp 44": [15.0, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Ref 44": [10.0, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Samp 45": [0.5, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Ref 45": [0.4, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Samp 46": [0.3, 50.0, 49.0, 30.0, 20.0, 10.0],
+                "Cycle Intensity Ref 46": [0.2, 50.0, 49.0, 30.0, 20.0, 10.0],
+            }
+        )
+        config = normalize_processing_config(
+            {
+                "enable_saturation_correction": True,
+                "saturation_correction_method_d13": "last_valid_cycle",
+                "saturation_correction_method_d18": "first_valid_cycle",
+            }
+        )
+
+        work = _derive_working_frame(df, config, cycles_df=cycles_df)
+
+        self.assertAlmostEqual(float(work.loc[2, "d 13C/12C  Mean"]), 1.0, places=6)
+        self.assertEqual(str(work.loc[2, "__d13C_current_method"]), "last_valid_cycle")
+        self.assertAlmostEqual(float(work.loc[2, "d 18O/16O  Mean"]), 6.0, places=6)
+        self.assertEqual(str(work.loc[2, "__d18O_current_method"]), "first_valid_cycle")
 
     def test_build_cycle_diagnostics_payload_uses_first_valid_cycle_for_partially_saturated_target_even_with_many_valid_cycles(self) -> None:
         df = sample_processing_df().copy()
@@ -2096,10 +2448,61 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(int(payload.cycle_mean["selected_cycle"]), 1)
         self.assertAlmostEqual(float(payload.cycle_mean["selected_value"]), 0.6, places=6)
         self.assertAlmostEqual(float(payload.cycle_mean["valid_mean"]), 1.1, places=6)
+        self.assertAlmostEqual(float(payload.cycle_mean["valid_std_dev"]), 0.37416573867739417, places=6)
         self.assertAlmostEqual(float(payload.cycle_mean["mean"]), 0.6, places=6)
-        selected_rows = [row for row in payload.table if bool(row.get("Set Value Cycle"))]
-        self.assertEqual(len(selected_rows), 1)
-        self.assertEqual(int(selected_rows[0]["Cycle"]), 1)
+        first_valid_rows = [row for row in payload.table if bool(row.get("First Valid Cycle"))]
+        last_valid_rows = [row for row in payload.table if bool(row.get("Last Valid Cycle"))]
+        self.assertEqual(len(first_valid_rows), 1)
+        self.assertEqual(len(last_valid_rows), 1)
+        self.assertEqual(int(first_valid_rows[0]["Cycle"]), 1)
+        self.assertEqual(int(last_valid_rows[0]["Cycle"]), 6)
+
+    def test_build_cycle_diagnostics_payload_stops_before_sample_gas_escape(self) -> None:
+        df = sample_processing_df().copy()
+        df.loc[0, "Collector Status"] = "Partially Saturated Collectors"
+        cycles_df = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", "1", "2", "3", "4", "5", "6"],
+                "Identifier 1": ["SampleA"] * 7,
+                "Identifier 2": ["1"] * 7,
+                "Species": ["Coral"] * 7,
+                "Excel File": ["run1.xlsx"] * 7,
+                "Run ID": ["run-1"] * 7,
+                "Date": ["2025-01-01"] * 7,
+                "d 13C/12C  Mean": [1.0, 1.0, 2.0, 3.0, 4.0, 99.0, 88.0],
+                "d 18O/16O  Mean": [2.0, 2.0, 2.05, 2.1, 2.15, 9.0, 8.0],
+                "Cycle Intensity Samp 44": [15.0, 20.0, 19.0, 18.0, 17.0, 0.0, 12.0],
+                "Cycle Intensity Ref 44": [10.0, 10.1, 10.0, 10.0, 9.9, 10.0, 9.8],
+                "Cycle Intensity Samp 45": [0.5, 2.0, 2.1, 2.0, 1.8, 0.0, 1.0],
+                "Cycle Intensity Ref 45": [0.4, 1.8, 1.8, 1.8, 1.8, 1.8, 1.8],
+                "Cycle Intensity Samp 46": [0.3, 0.8, 0.8, 0.8, 0.8, 0.0, 0.5],
+                "Cycle Intensity Ref 46": [0.2, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6],
+            }
+        )
+        target = build_target_info(df, 0, "d13C", {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}})
+        self.assertIsNotNone(target)
+
+        payload = build_cycle_diagnostics_payload(
+            session_id="session-1",
+            df=df,
+            cycles_df=cycles_df,
+            target=target,
+            config=RangeConfig(),
+            edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+        )
+
+        self.assertEqual(int(payload.cycle_mean["valid_cycles"]), 4)
+        self.assertEqual(int(payload.cycle_mean["last_valid_cycle"]), 4)
+        self.assertAlmostEqual(float(payload.cycle_mean["last_valid_value"]), 4.0, places=6)
+        self.assertAlmostEqual(float(payload.saturation_correction["last_valid_value"]), 4.0, places=6)
+        first_valid_rows = [row for row in payload.table if bool(row.get("First Valid Cycle"))]
+        last_valid_rows = [row for row in payload.table if bool(row.get("Last Valid Cycle"))]
+        escaped_rows = [row for row in payload.table if bool(row.get("Excluded (Sample Gas Escape)"))]
+        self.assertEqual(len(first_valid_rows), 1)
+        self.assertEqual(len(last_valid_rows), 1)
+        self.assertEqual(int(first_valid_rows[0]["Cycle"]), 1)
+        self.assertEqual(int(last_valid_rows[0]["Cycle"]), 4)
+        self.assertEqual([int(row["Cycle"]) for row in escaped_rows], [5, 6])
 
     def test_build_cycle_diagnostics_payload_uses_column_order_for_unlabeled_duplicate_masses(self) -> None:
         df = sample_processing_df()

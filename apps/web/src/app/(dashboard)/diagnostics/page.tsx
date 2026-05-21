@@ -6,9 +6,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
+import {
+  SATURATION_COLOR_AXIS_OPTIONS,
+  SaturationAxisHelpTooltip,
+  SaturationSharedColorbar,
+  SaturationFigureCard,
+  type SaturationAxisKey,
+  type SaturationColorAxisKey,
+} from "@/components/diagnostics/saturation-figure-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
+import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type { CalibrationConfig, CalibrationPrecisionSummary, CycleDiagnosticsPayload, EditAction } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -16,20 +25,36 @@ import { useSessionStore } from "@/store/use-session-store";
 
 const RANGE_FETCH_DEBOUNCE_MS = 300;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
+const SELECTION_EDITOR_CHART_DEFER_MS = 350;
 type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
+type LinearityCycleIntensityAggregation = "run_median" | "first_valid_cycle" | "last_valid_cycle";
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
+const LINEARITY_INTENSITY_RELATIVE_MISMATCH44 = "1  Cycle Int  Relative Mismatch Samp-Ref/Ref  44";
+const LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44 = "1  Cycle Int  Symmetric Relative Mismatch Samp-Ref  44";
+const LINEARITY_INTENSITY_MEAN44 = "1  Cycle Int  Mean Samp-Ref  44";
+const LINEARITY_INTENSITY_TWO_TERM44 = "Linearity Two-Term Mean Intensity + Symmetric Mismatch 44";
 const LINEARITY_INTENSITY_OPTIONS = [
   LINEARITY_INTENSITY_SAMP44,
   LINEARITY_INTENSITY_DIFF44,
-  LINEARITY_INTENSITY_MISMATCH44,
+  LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44,
+  LINEARITY_INTENSITY_MEAN44,
+  LINEARITY_INTENSITY_TWO_TERM44,
 ] as const;
 const LINEARITY_INTENSITY_OPTION_LABELS: Record<(typeof LINEARITY_INTENSITY_OPTIONS)[number], string> = {
   [LINEARITY_INTENSITY_SAMP44]: "Sample intensity",
-  [LINEARITY_INTENSITY_DIFF44]: "Intensity diff",
-  [LINEARITY_INTENSITY_MISMATCH44]: "Pressure-adjusted int diff",
+  [LINEARITY_INTENSITY_DIFF44]: "Samp-Ref difference",
+  [LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44]: "Symmetric mismatch",
+  [LINEARITY_INTENSITY_MEAN44]: "Mean Samp-Ref intensity",
+  [LINEARITY_INTENSITY_TWO_TERM44]: "Two-term: mean + mismatch",
 };
+const LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS: Array<{ value: LinearityCycleIntensityAggregation; label: string }> = [
+  { value: "run_median", label: "Run median intensities" },
+  { value: "first_valid_cycle", label: "First valid cycle intensity" },
+  { value: "last_valid_cycle", label: "Last valid cycle intensity" },
+];
+type LinearityCoefficientTerm = "primary" | "secondary";
 type ColorScaleBounds = {
   min: number;
   max: number;
@@ -64,21 +89,102 @@ function getLinearityIntensityOptionLabel(value: string): string {
   return value;
 }
 
+function getLinearityCycleAggregationLabel(value: string | null | undefined): string {
+  return LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.find((option) => option.value === value)?.label ?? "Run median intensities";
+}
+
+function getLinearityAggregationExpression(expression: string, aggregation: LinearityCycleIntensityAggregation = "run_median"): string {
+  if (aggregation === "first_valid_cycle") {
+    return `first_valid_cycle(${expression})`;
+  }
+  if (aggregation === "last_valid_cycle") {
+    return `last_valid_cycle(${expression})`;
+  }
+  return `median(${expression})`;
+}
+
+function getLinearityBasisFormula(intensityCol: string, aggregation: LinearityCycleIntensityAggregation = "run_median"): string {
+  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
+    return "Legacy cycle basis: I = 10 * (Samp44 - Ref44) / Ref44 * (Samp44 / median(Samp44))";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44) {
+    return "Legacy cycle basis: I = (Samp44 - Ref44) / Ref44";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44) {
+    return `x = ${getLinearityAggregationExpression("(Samp44 - Ref44) / ((Samp44 + Ref44) / 2)", aggregation)} for each analysis`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_MEAN44) {
+    return `x = ${getLinearityAggregationExpression("(Samp44 + Ref44) / 2", aggregation)} for each analysis`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return `Residual = a + b1 * ${getLinearityAggregationExpression("(Samp44 + Ref44) / 2", aggregation)} + b2 * ${getLinearityAggregationExpression("(Samp44 - Ref44) / ((Samp44 + Ref44) / 2)", aggregation)}`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
+    return `x = ${getLinearityAggregationExpression("Samp44 - Ref44", aggregation)} for each analysis`;
+  }
+  return `x = ${getLinearityAggregationExpression("Samp44", aggregation)} for each analysis`;
+}
+
+function getLinearityBasisDescription(intensityCol: string, aggregation: LinearityCycleIntensityAggregation = "run_median"): string {
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return "Fits residuals across standards with one row per analysis. Correction is centered as delta = b1 * (I_mean - median(I_mean across the calibration set)) + b2 * (Mismatch - median(Mismatch across the calibration set)).";
+  }
+  const formula = getLinearityBasisFormula(intensityCol, aggregation);
+  if (intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 || intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44) {
+    return `${formula}. The fit is across analyses, not cycle-by-cycle. Correction is centered at the calibration-set median basis value: delta = b * (x - median(x)); quadratic mode adds c * (x^2 - median(x)^2).`;
+  }
+  return `${formula}. The fit is across analyses, not cycle-by-cycle. Correction is centered at the calibration-set median basis value: delta = b * (x - median(x)); quadratic mode adds c * (x^2 - median(x)^2). Coefficients for intensity-like bases are entered per 10V.`;
+}
+
+function getLinearityBasisTerm(intensityCol: string, aggregation: LinearityCycleIntensityAggregation = "run_median"): string {
+  const prefix = aggregation === "first_valid_cycle" ? "first valid cycle" : aggregation === "last_valid_cycle" ? "last valid cycle" : "run median";
+  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
+    return "intensity-weighted mismatch";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44) {
+    return "relative mismatch";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44) {
+    return `${prefix} symmetric mismatch`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_MEAN44) {
+    return `${prefix} mean intensity`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return `${prefix} two-term model`;
+  }
+  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
+    return `${prefix} intensity-diff`;
+  }
+  return `${prefix} sample-intensity`;
+}
+
+function getLinearityCoefficientTermLabel(term: LinearityCoefficientTerm, intensityCol?: string): string {
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return term === "primary" ? "mean-intensity coefficient (b1)" : "mismatch coefficient (b2)";
+  }
+  return term === "primary" ? "primary coefficient (b)" : "secondary coefficient (c)";
+}
+
+function getLinearityCoefficientUnit(term: LinearityCoefficientTerm, intensityCol: string): string {
+  if (intensityCol === LINEARITY_INTENSITY_TWO_TERM44) {
+    return term === "primary" ? "per 10V" : "per unit mismatch";
+  }
+  if (intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 || intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44) {
+    return term === "primary" ? "per unit mismatch" : "per unit mismatch^2";
+  }
+  return term === "primary" ? "per 10V" : "per (10V)^2";
+}
+
 function getLinearityCoefficientLabel(
   isotope: "d13C" | "d18O",
   intensityCol: string,
-  quadratic: boolean,
+  term: LinearityCoefficientTerm,
+  aggregation: LinearityCycleIntensityAggregation = "run_median",
 ): string {
   const prefix = isotope === "d13C" ? "d13C" : "d18O";
-  if (intensityCol === LINEARITY_INTENSITY_MISMATCH44) {
-    return quadratic
-      ? `${prefix} pressure-weighted mismatch coefficient per (10V)^2`
-      : `${prefix} pressure-weighted mismatch coefficient`;
-  }
-  if (intensityCol === LINEARITY_INTENSITY_DIFF44) {
-    return quadratic ? `${prefix} intensity-diff coefficient per (10V)^2` : `${prefix} intensity-diff coefficient per 10V`;
-  }
-  return quadratic ? `${prefix} coefficient per (10V)^2` : `${prefix} coefficient per 10V`;
+  const coefficient = getLinearityCoefficientTermLabel(term, intensityCol).replace(" coefficient", "");
+  return `${prefix} ${coefficient} offset, ${getLinearityBasisTerm(intensityCol, aggregation)} ${getLinearityCoefficientUnit(term, intensityCol)}`;
 }
 
 function linearityOffsetWithFallback(value: number | null | undefined, fallback: number): number {
@@ -131,6 +237,26 @@ function formatCoefficient(value?: number | null): string {
     return "N/A";
   }
   return value.toFixed(3);
+}
+
+function formatFirstNonZeroDigits(value: number | null | undefined, significantDigits = 2): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "N/A";
+  }
+  if (value === 0) {
+    return "0";
+  }
+  const sign = value < 0 ? "-" : "";
+  const absValue = Math.abs(value);
+  const magnitude = Math.floor(Math.log10(absValue));
+  const factor = Math.pow(10, magnitude - significantDigits + 1);
+  const truncated = Math.trunc(absValue / factor) * factor;
+  if (!Number.isFinite(truncated) || truncated === 0) {
+    return "0";
+  }
+  const decimals = factor < 1 ? Math.max(0, Math.ceil(-Math.log10(factor))) : 0;
+  const fixed = truncated.toFixed(decimals);
+  return `${sign}${fixed.replace(/(\.\d*?[1-9])0+$|\.0+$/, "$1")}`;
 }
 
 function asStringArray(value: unknown): string[] {
@@ -197,6 +323,11 @@ function asBoolean(value: unknown): boolean {
 function isDeltaColumnLabel(label: string): boolean {
   const normalized = label.trim().toLowerCase();
   return normalized.includes("d13") || normalized.includes("d18");
+}
+
+function isSignalIntensityColumnLabel(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  return normalized.includes("int m/z") && normalized.includes("(v)");
 }
 
 function clampNumber(value: number, min: number, max: number) {
@@ -369,12 +500,47 @@ function hasReferenceCollectorTrace(trace: Record<string, unknown>, mass: 44 | 4
   return traceName.includes(String(mass)) && (traceName.includes("ref") || traceName.includes("std") || traceName.includes("reference"));
 }
 
-function getSetValueCycleNumber(tableRows: Array<Record<string, unknown>>): number | null {
-  const selectedRow = tableRows.find((row) => asBoolean(row["Set Value Cycle"]));
-  if (!selectedRow) {
-    return null;
-  }
-  return toFiniteNumber(selectedRow["Cycle"]);
+type CycleMarker = {
+  cycle: number;
+  label: string;
+  color: string;
+  symbol: string;
+  dash: "dot" | "dash";
+  textColor: string;
+};
+
+function getCycleMarkers(tableRows: Array<Record<string, unknown>>): CycleMarker[] {
+  const markers: CycleMarker[] = [];
+  const addMarker = (column: string, marker: Omit<CycleMarker, "cycle">) => {
+    const selectedRow = tableRows.find((row) => asBoolean(row[column]));
+    const cycle = selectedRow ? toFiniteNumber(selectedRow["Cycle"]) : null;
+    if (cycle == null) {
+      return;
+    }
+    const existing = markers.find((item) => Math.abs(item.cycle - cycle) <= 0.0001);
+    if (existing) {
+      existing.label = "First and last valid cycle";
+      existing.color = "#0F766E";
+      existing.textColor = "#115E59";
+      return;
+    }
+    markers.push({ ...marker, cycle });
+  };
+  addMarker("First Valid Cycle", {
+    label: "First valid cycle",
+    color: "#0284C7",
+    symbol: "diamond-open",
+    dash: "dot",
+    textColor: "#075985",
+  });
+  addMarker("Last Valid Cycle", {
+    label: "Last valid cycle",
+    color: "#D97706",
+    symbol: "square-open",
+    dash: "dash",
+    textColor: "#92400E",
+  });
+  return markers;
 }
 
 function ensureCollectorIntensityTraces(
@@ -459,66 +625,68 @@ function ensureCollectorIntensityTraces(
 
   let hasChanges = traces.length !== existingTraceCount;
   let nextLayout: Record<string, unknown> = cloned.layout;
-  const setValueCycle = getSetValueCycleNumber(tableRows);
-  if (setValueCycle != null) {
-    const highlightX: number[] = [];
-    const highlightY: number[] = [];
-    for (const trace of traces) {
-      const xVals = coerceVector(trace.x);
-      const yVals = coerceVector(trace.y);
-      if (!xVals || !yVals || xVals.length !== yVals.length) {
-        continue;
-      }
-      for (let index = 0; index < xVals.length; index += 1) {
-        const x = toFiniteNumber(xVals[index]);
-        const y = toFiniteNumber(yVals[index]);
-        if (x == null || y == null || Math.abs(x - setValueCycle) > 0.0001) {
-          continue;
-        }
-        highlightX.push(x);
-        highlightY.push(y);
-      }
-    }
-    if (highlightX.length) {
-      traces.push({
-        type: "scatter",
-        mode: "markers",
-        name: "Set-value cycle",
-        x: highlightX,
-        y: highlightY,
-        marker: {
-          size: 11,
-          color: "#7C3AED",
-          symbol: "diamond-open",
-          line: { color: "#7C3AED", width: 2 },
-        },
-      });
-      hasChanges = true;
-    }
+  const cycleMarkers = getCycleMarkers(tableRows);
+  if (cycleMarkers.length) {
     const existingShapes = Array.isArray(cloned.layout.shapes) ? [...(cloned.layout.shapes as Array<Record<string, unknown>>)] : [];
-    existingShapes.push({
-      type: "line",
-      x0: setValueCycle,
-      x1: setValueCycle,
-      y0: 0,
-      y1: 1,
-      xref: "x",
-      yref: "paper",
-      line: { color: "#7C3AED", width: 2, dash: "dot" },
-    });
     const existingAnnotations = Array.isArray(cloned.layout.annotations)
       ? [...(cloned.layout.annotations as Array<Record<string, unknown>>)]
       : [];
-    existingAnnotations.push({
-      x: setValueCycle,
-      y: 1,
-      xref: "x",
-      yref: "paper",
-      yanchor: "bottom",
-      showarrow: false,
-      text: "Set value cycle",
-      font: { color: "#5B21B6", size: 11 },
-    });
+    for (const cycleMarker of cycleMarkers) {
+      const highlightX: number[] = [];
+      const highlightY: number[] = [];
+      for (const trace of traces) {
+        const xVals = coerceVector(trace.x);
+        const yVals = coerceVector(trace.y);
+        if (!xVals || !yVals || xVals.length !== yVals.length) {
+          continue;
+        }
+        for (let index = 0; index < xVals.length; index += 1) {
+          const x = toFiniteNumber(xVals[index]);
+          const y = toFiniteNumber(yVals[index]);
+          if (x == null || y == null || Math.abs(x - cycleMarker.cycle) > 0.0001) {
+            continue;
+          }
+          highlightX.push(x);
+          highlightY.push(y);
+        }
+      }
+      if (highlightX.length) {
+        traces.push({
+          type: "scatter",
+          mode: "markers",
+          name: cycleMarker.label,
+          x: highlightX,
+          y: highlightY,
+          marker: {
+            size: 11,
+            color: cycleMarker.color,
+            symbol: cycleMarker.symbol,
+            line: { color: cycleMarker.color, width: 2 },
+          },
+        });
+        hasChanges = true;
+      }
+      existingShapes.push({
+        type: "line",
+        x0: cycleMarker.cycle,
+        x1: cycleMarker.cycle,
+        y0: 0,
+        y1: 1,
+        xref: "x",
+        yref: "paper",
+        line: { color: cycleMarker.color, width: 2, dash: cycleMarker.dash },
+      });
+      existingAnnotations.push({
+        x: cycleMarker.cycle,
+        y: 1,
+        xref: "x",
+        yref: "paper",
+        yanchor: "bottom",
+        showarrow: false,
+        text: cycleMarker.label,
+        font: { color: cycleMarker.textColor, size: 11 },
+      });
+    }
     nextLayout = {
       ...cloned.layout,
       shapes: existingShapes,
@@ -644,19 +812,24 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   const statusRows: Array<Record<string, unknown>> = rows.map((row) => {
     const excludedD13 = asBoolean(row["Excluded d13C"]);
     const excludedD18 = asBoolean(row["Excluded d18O"]);
-    const excludedAny = asBoolean(row["Excluded (Saturation)"]) || excludedD13 || excludedD18;
-    const setValueCycle = asBoolean(row["Set Value Cycle"]);
+    const excludedSaturation = asBoolean(row["Excluded (Saturation)"]);
+    const excludedSampleGasEscape = asBoolean(row["Excluded (Sample Gas Escape)"]);
+    const excludedAny = excludedSaturation || excludedSampleGasEscape || excludedD13 || excludedD18;
+    const firstValidCycle = asBoolean(row["First Valid Cycle"]);
+    const lastValidCycle = asBoolean(row["Last Valid Cycle"]);
     return {
       ...row,
-      "Cycle status": excludedAny ? "Saturated" : "Successful",
-      "Set Value Cycle": setValueCycle,
+      "Cycle status": excludedSampleGasEscape ? "Sample gas escape" : excludedSaturation ? "Saturated" : excludedAny ? "Excluded" : "Successful",
+      "First Valid Cycle": firstValidCycle,
+      "Last Valid Cycle": lastValidCycle,
     };
   });
 
   const preferredColumns = [
     "Cycle",
     "Cycle status",
-    "Set Value Cycle",
+    "First Valid Cycle",
+    "Last Valid Cycle",
     "SMP Int m/z 44 (V)",
     "REF Int m/z 44 (V)",
     "SMP Int m/z 45 (V)",
@@ -668,6 +841,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
     "Excluded d13C",
     "Excluded d18O",
     "Excluded (Saturation)",
+    "Excluded (Sample Gas Escape)",
   ];
   const discoveredColumns = Object.keys(statusRows[0] ?? {});
   const columns = [
@@ -686,11 +860,14 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
       return value ? "Yes" : "No";
     }
     if (typeof value === "number" && Number.isFinite(value)) {
-      if (Number.isInteger(value)) {
-        return String(value);
-      }
       if (isDeltaColumnLabel(column)) {
         return formatDeltaValue(value);
+      }
+      if (isSignalIntensityColumnLabel(column)) {
+        return value.toFixed(2);
+      }
+      if (Number.isInteger(value)) {
+        return String(value);
       }
       return value.toFixed(6);
     }
@@ -700,9 +877,11 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-md bg-violet-100 px-2 py-1 text-violet-800">Set-value cycle</span>
+        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">First valid cycle</span>
+        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">Last valid cycle</span>
         <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
         <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
+        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">Sample gas escape</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -718,23 +897,40 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
           <tbody className="divide-y divide-stone-100">
             {statusRows.slice(0, 25).map((row, rowIndex) => {
               const saturated = String(row["Cycle status"]) === "Saturated";
-              const setValueCycle = asBoolean(row["Set Value Cycle"]);
+              const sampleGasEscape = String(row["Cycle status"]) === "Sample gas escape";
+              const firstValidCycle = asBoolean(row["First Valid Cycle"]);
+              const lastValidCycle = asBoolean(row["Last Valid Cycle"]);
               return (
-                <tr key={rowIndex} className={cn(setValueCycle ? "bg-violet-100/90" : saturated ? "bg-rose-50/80" : "bg-emerald-50/70")}>
+                <tr
+                  key={rowIndex}
+                  className={cn(
+                    firstValidCycle && lastValidCycle
+                      ? "bg-teal-100/85"
+                      : firstValidCycle
+                        ? "bg-sky-100/85"
+                        : lastValidCycle
+                          ? "bg-amber-100/80"
+                          : sampleGasEscape
+                            ? "bg-orange-50/85"
+                          : saturated
+                            ? "bg-rose-50/80"
+                            : "bg-emerald-50/70",
+                  )}
+                >
                   {columns.map((column) => {
                     const cellValue = row[column];
                     const flaggedColumn = column.startsWith("Excluded");
                     const flaggedValue = flaggedColumn ? asBoolean(cellValue) : false;
-                    const setValueColumn = column === "Set Value Cycle";
-                    const setValueColumnValue = setValueColumn ? asBoolean(cellValue) : false;
+                    const validCycleColumn = column === "First Valid Cycle" || column === "Last Valid Cycle";
+                    const validCycleColumnValue = validCycleColumn ? asBoolean(cellValue) : false;
                     return (
                       <td
                         key={column}
                         className={cn(
                           "px-3 py-2",
-                          setValueColumn
-                            ? setValueColumnValue
-                              ? "font-semibold text-violet-800"
+                          validCycleColumn
+                            ? validCycleColumnValue
+                              ? "font-semibold text-stone-900"
                               : "font-medium text-stone-500"
                             : "",
                           flaggedColumn
@@ -824,15 +1020,93 @@ function DiagnosticsPanel({
   title: string;
   diagnostics?: CycleDiagnosticsPayload;
   loading: boolean;
-  onPickDeltaValue?: (value: number) => void;
+  onPickDeltaValue?: (value: number, stdev?: number | null) => void;
 }) {
+  const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
+  const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
   const cycleMean = diagnostics?.cycle_mean ?? {};
   const validMean = toFiniteNumber(cycleMean.valid_mean);
+  const validStdDev = toFiniteNumber(cycleMean.valid_std_dev);
+  const validCycleCount = toFiniteNumber(cycleMean.valid_cycles);
+  const hasTooFewLinearityCycles = validCycleCount != null && validCycleCount < 4;
   const firstValidCycle = toFiniteNumber(cycleMean.selected_value) ?? toFiniteNumber(cycleMean.mean);
+  const lastValidCycle = toFiniteNumber(cycleMean.last_valid_value);
+  const referenceGasCorrection = toFiniteNumber(cycleMean.saturation_reference_gas_value);
+  const firstCycleCorrection = toFiniteNumber(cycleMean.saturation_first_cycle_value);
+  const saturationCorrection =
+    diagnostics?.saturation_correction && typeof diagnostics.saturation_correction === "object"
+      ? (diagnostics.saturation_correction as Record<string, unknown>)
+      : {};
+  const cycleLinearityValue = (key: string) => {
+    const payload = saturationCorrection[key];
+    return payload && typeof payload === "object" ? toFiniteNumber((payload as Record<string, unknown>).value) : null;
+  };
+  const cycleLinearityStd = (key: string) => {
+    const payload = saturationCorrection[key];
+    return payload && typeof payload === "object" ? toFiniteNumber((payload as Record<string, unknown>).std_dev) : null;
+  };
   const reason = asString(cycleMean.reason);
   const diagnosticsFigure = ensureCollectorIntensityTraces(diagnostics?.figure, diagnostics?.table ?? []);
-  const canPickValidMean = typeof onPickDeltaValue === "function" && validMean != null;
-  const canPickFinalMean = typeof onPickDeltaValue === "function" && firstValidCycle != null;
+  const saturationFiguresRaw =
+    Object.keys(saturationCorrection).length
+      ? (saturationCorrection.figures as Record<string, unknown> | undefined)
+      : undefined;
+  const targetIsotopeKey = asString((diagnostics?.target ?? {})["isotope_key"]);
+  const defaultSaturationYAxis: SaturationAxisKey = targetIsotopeKey === "d18O" ? "d18O" : "d13C";
+  useEffect(() => {
+    setSaturationYAxis(defaultSaturationYAxis);
+  }, [defaultSaturationYAxis]);
+  const saturationMethodDescriptions: Record<string, string> = {
+    reference_gas_intensity:
+      "Fits isotope value versus the reference-gas intensity from valid cycles, then predicts the value at the saturated cycle's reference intensity. Points are colored by cycle number.",
+    first_cycle:
+      "Fits a quadratic curve of isotope value versus cycle number from valid cycles, then predicts where the curve becomes horizontal.",
+    cycle_relative_mismatch:
+      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / Ref44, then predicts where that curve becomes horizontal.",
+    cycle_symmetric_mismatch:
+      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / ((Samp44 + Ref44) / 2), then predicts where that curve becomes horizontal.",
+    cycle_mean_intensity:
+      "Fits a quadratic curve of isotope value versus mean intensity, (Samp44 + Ref44) / 2, then predicts where that curve becomes horizontal.",
+    cycle_intensity_weighted_mismatch:
+      "Fits a quadratic curve of isotope value versus the cycle-level weighted mismatch term, then predicts where that curve becomes horizontal.",
+    cycle_two_term_mean_mismatch:
+      "Fits isotope value with two predictors: mean intensity and symmetric mismatch. The green line connects the model-fitted values for the valid cycles using each cycle's own mismatch; dot color also shows mismatch.",
+    cycle_plateau:
+      "Measures the signed cycle-to-cycle isotope change in the latest valid cycles, fits isotope value versus that change rate, then predicts the asymptote where the change rate reaches zero. The highlighted circles are the cycles used.",
+  };
+  const saturationFigureItems = [
+    ["reference_gas_intensity", "Reference-gas saturation correction"],
+    ["first_cycle", "Stabilized-cycle correction"],
+    ["cycle_relative_mismatch", "Cycle relative mismatch correction"],
+    ["cycle_symmetric_mismatch", "Cycle symmetric mismatch correction"],
+    ["cycle_mean_intensity", "Cycle mean intensity correction"],
+    ["cycle_intensity_weighted_mismatch", "Cycle intensity-weighted mismatch correction"],
+    ["cycle_two_term_mean_mismatch", "Cycle two-term mean + mismatch correction"],
+    ["cycle_plateau", "Cycle late-plateau correction"],
+  ]
+    .map(([key, itemTitle]) => ({
+      key,
+      title: itemTitle,
+      description: saturationMethodDescriptions[key],
+      figure:
+        saturationFiguresRaw?.[key] && typeof saturationFiguresRaw[key] === "object"
+          ? (saturationFiguresRaw[key] as Record<string, unknown>)
+          : undefined,
+    }))
+    .filter((item) => item.figure);
+  const suggestionCards = [
+    { label: "Cycle Mean", value: validMean, stdev: validStdDev, linearity: false },
+    { label: "First valid cycle", value: firstValidCycle, stdev: null, linearity: false },
+    { label: "Last valid cycle", value: lastValidCycle, stdev: null, linearity: false },
+    { label: "Lin. corr. to ref gas int", value: referenceGasCorrection, stdev: null, linearity: true },
+    { label: "Lin. corr. to first cycle", value: firstCycleCorrection, stdev: null, linearity: true },
+    { label: "Cycle relative mismatch", value: cycleLinearityValue("cycle_relative_mismatch"), stdev: null, linearity: true },
+    { label: "Cycle symmetric mismatch", value: cycleLinearityValue("cycle_symmetric_mismatch"), stdev: null, linearity: true },
+    { label: "Cycle mean intensity", value: cycleLinearityValue("cycle_mean_intensity"), stdev: null, linearity: true },
+    { label: "Cycle weighted mismatch", value: cycleLinearityValue("cycle_intensity_weighted_mismatch"), stdev: null, linearity: true },
+    { label: "Cycle two-term model", value: cycleLinearityValue("cycle_two_term_mean_mismatch"), stdev: null, linearity: true },
+    { label: "Cycle plateau", value: cycleLinearityValue("cycle_plateau"), stdev: cycleLinearityStd("cycle_plateau"), linearity: false },
+  ];
 
   return (
     <Card className="border-stone-300">
@@ -845,39 +1119,54 @@ function DiagnosticsPanel({
 
         {diagnostics ? (
           <>
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-              <button
-                type="button"
-                onClick={() => {
-                  if (canPickValidMean && validMean != null) {
-                    onPickDeltaValue(validMean);
-                  }
-                }}
-                disabled={!canPickValidMean}
-                className={cn(
-                  "rounded-lg border border-stone-200 p-3 text-left transition",
-                  canPickValidMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
-                )}
-              >
-                <div className="text-xs uppercase tracking-normal text-stone-500">Cycle Mean</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(validMean)}</div>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  if (canPickFinalMean && firstValidCycle != null) {
-                    onPickDeltaValue(firstValidCycle);
-                  }
-                }}
-                disabled={!canPickFinalMean}
-                className={cn(
-                  "rounded-lg border border-stone-200 p-3 text-left transition",
-                  canPickFinalMean ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
-                )}
-              >
-                <div className="text-xs uppercase tracking-normal text-stone-500">First valid cycle</div>
-                <div className="mt-1 text-lg font-semibold text-stone-900">{formatDeltaValue(firstValidCycle)}</div>
-              </button>
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+              {suggestionCards.map((item) => {
+                const blockedByLinearityCycleCount = item.linearity && hasTooFewLinearityCycles && item.value != null;
+                const canPick = typeof onPickDeltaValue === "function" && item.value != null && !blockedByLinearityCycleCount;
+                const displayValue = formatDeltaValue(item.value);
+                const valueElement = (
+                  <span
+                    className={cn(
+                      "inline-block",
+                      blockedByLinearityCycleCount ? "cursor-help text-stone-400" : "text-stone-900",
+                    )}
+                  >
+                    {displayValue}
+                  </span>
+                );
+                return (
+                  <button
+                    key={item.label}
+                    type="button"
+                    onClick={() => {
+                      if (canPick && item.value != null) {
+                        onPickDeltaValue(item.value, item.stdev ?? null);
+                      }
+                    }}
+                    disabled={item.value == null}
+                    aria-disabled={!canPick}
+                    className={cn(
+                      "rounded-lg border border-stone-200 p-3 text-left transition",
+                      canPick ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
+                      blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
+                    )}
+                  >
+                    <div className="text-xs uppercase tracking-normal text-stone-500">{item.label}</div>
+                    <div className="mt-1 text-lg font-semibold">
+                      {blockedByLinearityCycleCount ? (
+                        <Tooltip label="not enough cycles for linearity calculation" align="start">
+                          {valueElement}
+                        </Tooltip>
+                      ) : (
+                        valueElement
+                      )}
+                    </div>
+                    {item.stdev != null ? (
+                      <div className="mt-1 text-xs text-stone-500">Std dev: {formatDeltaValue(item.stdev)}</div>
+                    ) : null}
+                  </button>
+                );
+              })}
               <div className="rounded-lg border border-stone-200 p-3">
                 <div className="text-xs uppercase tracking-normal text-stone-500">Method</div>
                 <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
@@ -887,11 +1176,65 @@ function DiagnosticsPanel({
             {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
 
             <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
-              <PlotlyChart figure={diagnosticsFigure} className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]" />
+              <PlotlyChart
+                figure={diagnosticsFigure}
+                className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
+                deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+              />
               <div className="min-w-0">
                 <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
               </div>
             </div>
+
+            {saturationFigureItems.length ? (
+              <>
+                <div className="flex flex-wrap items-end gap-4">
+                  <label className="block w-full max-w-xs text-sm">
+                    <SaturationAxisHelpTooltip label="Chart color axis" />
+                    <select
+                      value={saturationColorAxis}
+                      onChange={(event) => setSaturationColorAxis(event.target.value as SaturationColorAxisKey)}
+                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                    >
+                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block w-full max-w-xs text-sm">
+                    <SaturationAxisHelpTooltip label="Chart y axis" />
+                    <select
+                      value={saturationYAxis}
+                      onChange={(event) => setSaturationYAxis(event.target.value as SaturationAxisKey)}
+                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                    >
+                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <SaturationSharedColorbar figures={saturationFigureItems.map((item) => item.figure)} colorAxis={saturationColorAxis} />
+                </div>
+                <div className="grid gap-4 xl:grid-cols-2">
+                  {saturationFigureItems.map((item) => (
+                    <SaturationFigureCard
+                      key={item.key}
+                      chartKey={item.key}
+                      title={item.title}
+                      description={item.description}
+                      figure={item.figure}
+                      colorAxis={saturationColorAxis}
+                      yAxis={saturationYAxis}
+                      deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+                    />
+                  ))}
+                </div>
+              </>
+            ) : null}
           </>
         ) : loading ? null : (
           <div className="text-sm text-stone-500">Cycle diagnostics appear here once a point is selected.</div>
@@ -1312,6 +1655,7 @@ export default function DiagnosticsPage() {
   const [isSelectionEditorOpen, setSelectionEditorOpen] = useState(false);
   const [selectionEditorTab, setSelectionEditorTab] = useState<IsotopeKey>("d13C");
   const [singleValues, setSingleValues] = useState<IsotopeNumericMap>({ d13C: 0, d18O: 0 });
+  const [singleStdevs, setSingleStdevs] = useState<Record<IsotopeKey, number | null>>({ d13C: null, d18O: null });
   const [singleOffsets, setSingleOffsets] = useState<IsotopeNumericMap>({ d13C: 0, d18O: 0 });
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1440,7 +1784,16 @@ export default function DiagnosticsPage() {
         ? LINEARITY_INTENSITY_DIFF44
         : LINEARITY_INTENSITY_SAMP44
     : LINEARITY_INTENSITY_SAMP44;
-  const selectedLinearityBasisLabel = getLinearityIntensityOptionLabel(selectedLinearityIntensityCol);
+  const selectedLinearityCycleIntensityAggregation = LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.some(
+    (option) => option.value === activeLinearity?.cycle_intensity_aggregation,
+  )
+    ? (activeLinearity?.cycle_intensity_aggregation as LinearityCycleIntensityAggregation)
+    : "run_median";
+  const selectedLinearityBasisLabel = `${getLinearityIntensityOptionLabel(selectedLinearityIntensityCol)} · ${getLinearityCycleAggregationLabel(
+    selectedLinearityCycleIntensityAggregation,
+  )}`;
+  const isTwoTermLinearityBasis = selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44;
+  const showSecondaryCoefficientOffset = Boolean(activeLinearity?.quadratic) || isTwoTermLinearityBasis;
   const d13Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d13C ?? {}) as Record<string, unknown>;
   const d18Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d18O ?? {}) as Record<string, unknown>;
   const d13FitSlope = toFiniteNumber(d13Fit.slope);
@@ -1451,7 +1804,15 @@ export default function DiagnosticsPage() {
   const standardPrecisionRows = (calibrationWorkspaceQuery.data?.precision_summaries ?? [])
     .filter((item: CalibrationPrecisionSummary) => selectedStandards.includes(item.standard))
     .sort((left: CalibrationPrecisionSummary, right: CalibrationPrecisionSummary) => left.standard.localeCompare(right.standard));
-  const coefficientOffsetEnabled = Boolean(activeLinearity?.manual_override_enabled);
+  const coefficientOffsetEnabled = activeLinearity
+    ? [
+        Number(activeLinearity.manual_d13_per_10v ?? 0),
+        Number(activeLinearity.manual_d18_per_10v ?? 0),
+        ...(activeLinearity.quadratic || isTwoTermLinearityBasis
+          ? [Number(activeLinearity.manual_d13_per_10v2 ?? 0), Number(activeLinearity.manual_d18_per_10v2 ?? 0)]
+          : []),
+      ].some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12)
+    : false;
   const activeSelectionDiagnostics: CycleDiagnosticsPayload | undefined =
     selectionEditorTab === "d13C" ? sampleD13DiagnosticsQuery.data : sampleD18DiagnosticsQuery.data;
   const activeSelectionTargetPayload = (activeSelectionDiagnostics?.target ?? {}) as Record<string, unknown>;
@@ -1575,6 +1936,20 @@ export default function DiagnosticsPage() {
   }, []);
 
   useEffect(() => {
+    if (!isSelectionEditorOpen || typeof window === "undefined") {
+      return;
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setSelectionEditorOpen(false);
+        setSelectionTarget(null);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isSelectionEditorOpen]);
+
+  useEffect(() => {
     if (isSelectionEditorOpen) {
       if (hoverPreviewHideTimerRef.current != null) {
         clearTimeout(hoverPreviewHideTimerRef.current);
@@ -1651,6 +2026,7 @@ export default function DiagnosticsPage() {
     }
     setSelectionEditorTab("d13C");
     setSingleOffsets({ d13C: 0, d18O: 0 });
+    setSingleStdevs({ d13C: null, d18O: null });
   }, [selectionTarget?.rowLabel]);
 
   useEffect(() => {
@@ -1673,6 +2049,7 @@ export default function DiagnosticsPage() {
       d13C: roundDeltaValue(d13SeedValue ?? 0),
       d18O: roundDeltaValue(d18SeedValue ?? 0),
     });
+    setSingleStdevs({ d13C: null, d18O: null });
   }, [
     selectionTarget,
     sampleD13DiagnosticsQuery.data?.target,
@@ -1707,26 +2084,33 @@ export default function DiagnosticsPage() {
     );
   }
 
-  function updateLinearityCoefficientOffset(isotopeKey: "d13C" | "d18O", value: number) {
+  function updateLinearityCoefficientOffset(
+    isotopeKey: "d13C" | "d18O",
+    term: LinearityCoefficientTerm,
+    value: number,
+  ) {
     setSharedLinearityConfig((current) => {
       if (!current) {
         return current;
       }
       const next = { ...current };
-      if (next.quadratic) {
-        if (isotopeKey === "d13C") {
-          next.manual_d13_per_10v2 = value;
-        } else {
-          next.manual_d18_per_10v2 = value;
-        }
-      } else if (isotopeKey === "d13C") {
+      if (term === "primary" && isotopeKey === "d13C") {
         next.manual_d13_per_10v = value;
-      } else {
+      } else if (term === "primary") {
         next.manual_d18_per_10v = value;
+      } else if (isotopeKey === "d13C") {
+        next.manual_d13_per_10v2 = value;
+      } else {
+        next.manual_d18_per_10v2 = value;
       }
-      const d13Offset = next.quadratic ? Number(next.manual_d13_per_10v2 ?? 0) : Number(next.manual_d13_per_10v ?? 0);
-      const d18Offset = next.quadratic ? Number(next.manual_d18_per_10v2 ?? 0) : Number(next.manual_d18_per_10v ?? 0);
-      const hasOffset = Math.abs(d13Offset) > 1e-12 || Math.abs(d18Offset) > 1e-12;
+      const activeOffsets = [
+        Number(next.manual_d13_per_10v ?? 0),
+        Number(next.manual_d18_per_10v ?? 0),
+        ...(next.quadratic || selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44
+          ? [Number(next.manual_d13_per_10v2 ?? 0), Number(next.manual_d18_per_10v2 ?? 0)]
+          : []),
+      ];
+      const hasOffset = activeOffsets.some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
       next.manual_override_enabled = hasOffset;
       return next;
     });
@@ -1763,6 +2147,7 @@ export default function DiagnosticsPage() {
       action: "set_value",
       targets: buildTargetsForAction(isotopeKey),
       value: singleValues[isotopeKey],
+      stdev: singleStdevs[isotopeKey],
     });
   }
 
@@ -1885,6 +2270,11 @@ export default function DiagnosticsPage() {
     setSelectionEditorOpen(true);
   }
 
+  function closeSelectionEditor() {
+    setSelectionEditorOpen(false);
+    setSelectionTarget(null);
+  }
+
   if (!sessionId) {
     return (
       <Card>
@@ -1981,29 +2371,53 @@ export default function DiagnosticsPage() {
                     />
                     <span>Enable linearity correction</span>
                   </label>
-                  <label className="flex items-start gap-2 text-sm text-stone-700">
-                    <input
-                      type="checkbox"
-                      className="mt-0.5 h-4 w-4 rounded border-stone-300 text-stone-900"
-                      checked={Boolean(activeLinearity.quadratic)}
-                      onChange={(event) => updateSharedLinearity("quadratic", event.target.checked)}
-                    />
-                    <span>Use quadratic linearity relationship</span>
-                  </label>
+                  {!isTwoTermLinearityBasis ? (
+                    <label className="flex items-start gap-2 text-sm text-stone-700">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 h-4 w-4 rounded border-stone-300 text-stone-900"
+                        checked={Boolean(activeLinearity.quadratic)}
+                        onChange={(event) => updateSharedLinearity("quadratic", event.target.checked)}
+                      />
+                      <span>Use quadratic linearity relationship</span>
+                    </label>
+                  ) : null}
                   <label className="text-sm">
                     <span className="mb-1 block text-stone-700">Linearity basis</span>
-                    <select
-                      value={selectedLinearityIntensityCol}
-                      onChange={(event) => updateSharedLinearityIntensityCol(event.target.value)}
-                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                    >
-                      {LINEARITY_INTENSITY_OPTIONS.map((option) => (
-                        <option key={option} value={option}>
-                          {getLinearityIntensityOptionLabel(option)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                      <select
+                        value={selectedLinearityIntensityCol}
+                        onChange={(event) => updateSharedLinearityIntensityCol(event.target.value)}
+                        title={getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
+                        className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                      >
+                        {LINEARITY_INTENSITY_OPTIONS.map((option) => (
+                          <option key={option} value={option} title={getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation)}>
+                            {getLinearityIntensityOptionLabel(option)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">Linearity cycle intensity</span>
+                      <select
+                        value={selectedLinearityCycleIntensityAggregation}
+                        onChange={(event) => updateSharedLinearity("cycle_intensity_aggregation", event.target.value)}
+                        title="Choose which cycle intensity is used when building the selected linearity basis for each analysis."
+                        className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                      >
+                        {LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600">
+                      <span className="font-medium text-stone-700">Basis formula:</span>{" "}
+                      <code className="font-mono">
+                        {getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
+                      </code>
+                    </div>
                   {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">Max sample intensity</span>
@@ -2027,48 +2441,90 @@ export default function DiagnosticsPage() {
                   ) : null}
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                      <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficient</div>
-                      <div className="mt-1 font-semibold text-stone-900">
-                        {activeLinearity.quadratic
-                          ? `${formatCoefficient(d13FitSlope)} (linear), ${formatCoefficient(d13FitQuad)} (quadratic)`
-                          : formatCoefficient(d13FitSlope)}
+                      <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficients</div>
+                      <div className="mt-1 space-y-1 font-semibold text-stone-900">
+                        <div>
+                          <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
+                          {formatFirstNonZeroDigits(d13FitSlope)}
+                        </div>
+                        {showSecondaryCoefficientOffset ? (
+                          <div>
+                            <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
+                            {formatFirstNonZeroDigits(d13FitQuad)}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                     <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                      <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficient</div>
-                      <div className="mt-1 font-semibold text-stone-900">
-                        {activeLinearity.quadratic
-                          ? `${formatCoefficient(d18FitSlope)} (linear), ${formatCoefficient(d18FitQuad)} (quadratic)`
-                          : formatCoefficient(d18FitSlope)}
+                      <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficients</div>
+                      <div className="mt-1 space-y-1 font-semibold text-stone-900">
+                        <div>
+                          <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
+                          {formatFirstNonZeroDigits(d18FitSlope)}
+                        </div>
+                        {showSecondaryCoefficientOffset ? (
+                          <div>
+                            <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
+                            {formatFirstNonZeroDigits(d18FitQuad)}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">
-                        {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, Boolean(activeLinearity.quadratic))}
+                        {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                       </span>
                       <input
                         type="number"
                         step="0.01"
-                        value={activeLinearity.quadratic ? (activeLinearity.manual_d13_per_10v2 ?? 0) : (activeLinearity.manual_d13_per_10v ?? 0)}
-                        onChange={(event) => updateLinearityCoefficientOffset("d13C", Number(event.target.value))}
+                        value={activeLinearity.manual_d13_per_10v ?? 0}
+                        onChange={(event) => updateLinearityCoefficientOffset("d13C", "primary", Number(event.target.value))}
                         className="w-full rounded-lg border border-stone-300 px-3 py-2"
                       />
                     </label>
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">
-                        {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, Boolean(activeLinearity.quadratic))}
+                        {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                       </span>
                       <input
                         type="number"
                         step="0.01"
-                        value={activeLinearity.quadratic ? (activeLinearity.manual_d18_per_10v2 ?? 0) : (activeLinearity.manual_d18_per_10v ?? 0)}
-                        onChange={(event) => updateLinearityCoefficientOffset("d18O", Number(event.target.value))}
+                        value={activeLinearity.manual_d18_per_10v ?? 0}
+                        onChange={(event) => updateLinearityCoefficientOffset("d18O", "primary", Number(event.target.value))}
                         className="w-full rounded-lg border border-stone-300 px-3 py-2"
                       />
                     </label>
                   </div>
+                  {showSecondaryCoefficientOffset ? (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">
+                          {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                        </span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={activeLinearity.manual_d13_per_10v2 ?? 0}
+                          onChange={(event) => updateLinearityCoefficientOffset("d13C", "secondary", Number(event.target.value))}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">
+                          {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                        </span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={activeLinearity.manual_d18_per_10v2 ?? 0}
+                          onChange={(event) => updateLinearityCoefficientOffset("d18O", "secondary", Number(event.target.value))}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                    </div>
+                  ) : null}
                   <div className="text-xs text-stone-500">
                     Coefficient offset active: {coefficientOffsetEnabled ? "Yes" : "No"}
                   </div>
@@ -2173,7 +2629,7 @@ export default function DiagnosticsPage() {
       </div>
 
       {isSelectionEditorOpen ? (
-        <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setSelectionEditorOpen(false)}>
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={closeSelectionEditor}>
           <div
             className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
@@ -2183,7 +2639,7 @@ export default function DiagnosticsPage() {
                 <div className="text-base font-semibold text-stone-900">Selection Editor</div>
                 <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
               </div>
-              <Button variant="outline" size="sm" onClick={() => setSelectionEditorOpen(false)}>
+              <Button variant="outline" size="sm" onPointerDown={closeSelectionEditor} onClick={closeSelectionEditor}>
                 <X className="h-4 w-4" />
                 Close
               </Button>
@@ -2274,9 +2730,10 @@ export default function DiagnosticsPage() {
                         type="number"
                         step="0.001"
                         value={singleValues[selectionEditorTab]}
-                        onChange={(event) =>
-                          setSingleValues((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }))
-                        }
+                        onChange={(event) => {
+                          setSingleValues((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }));
+                          setSingleStdevs((current) => ({ ...current, [selectionEditorTab]: null }));
+                        }}
                         className="w-full rounded-lg border border-stone-300 px-3 py-2"
                       />
                     </label>
@@ -2329,8 +2786,9 @@ export default function DiagnosticsPage() {
                     title={`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`}
                     diagnostics={activeSelectionDiagnostics}
                     loading={activeSelectionLoading}
-                    onPickDeltaValue={(value) => {
+                    onPickDeltaValue={(value, stdev = null) => {
                       setSingleValues((current) => ({ ...current, [selectionEditorTab]: roundDeltaValue(value) }));
+                      setSingleStdevs((current) => ({ ...current, [selectionEditorTab]: stdev }));
                     }}
                   />
                 </>

@@ -8,6 +8,21 @@ from pydantic import BaseModel, Field
 from .constants import CYCLE1_SIGNAL_SAMP44_COL
 
 
+SaturationCorrectionMethod = Literal[
+    "cycle_mean",
+    "first_valid_cycle",
+    "last_valid_cycle",
+    "reference_gas_intensity",
+    "first_cycle",
+    "cycle_relative_mismatch",
+    "cycle_symmetric_mismatch",
+    "cycle_mean_intensity",
+    "cycle_intensity_weighted_mismatch",
+    "cycle_two_term_mean_mismatch",
+    "cycle_plateau",
+]
+
+
 class SessionSnapshot(BaseModel):
     session_id: str
     session_name: str | None = None
@@ -38,6 +53,7 @@ class LinearityConfig(BaseModel):
     apply: bool = False
     intensity_col: str = CYCLE1_SIGNAL_SAMP44_COL
     use_diff_intensity: bool = False
+    cycle_intensity_aggregation: Literal["run_median", "first_valid_cycle", "last_valid_cycle"] = "run_median"
     quadratic: bool = False
     max_sample_intensity: float | None = None
     manual_override_enabled: bool = False
@@ -169,6 +185,10 @@ class ProcessingWorkspaceConfig(BaseModel):
     color_param: str = "Date"
     z_axis: str = "1  Cycle Int  Samp  44"
     apply_shared_linearity_to_partially_saturated: bool = True
+    enable_saturation_correction: bool = False
+    saturation_correction_method: SaturationCorrectionMethod = "reference_gas_intensity"
+    saturation_correction_method_d13: SaturationCorrectionMethod = "reference_gas_intensity"
+    saturation_correction_method_d18: SaturationCorrectionMethod = "reference_gas_intensity"
     signal_range: tuple[float, float] = (0.0, 50.0)
     leak_range: tuple[float, float] = (0.0, 1000.0)
     d13c_range: tuple[float, float] = (-10.0, 10.0)
@@ -277,6 +297,7 @@ class IdentifierFigureSet(BaseModel):
 
 class SpeciesSection(BaseModel):
     species: str
+    identifier_count: int = 0
     identifier_figures: list[IdentifierFigureSet] = Field(default_factory=list)
     outlier_tables: list[OutlierTable] = Field(default_factory=list)
 
@@ -304,6 +325,7 @@ class CycleDiagnosticsPayload(BaseModel):
     target: dict[str, Any] = Field(default_factory=dict)
     inline_summary: str = ""
     figure: dict[str, Any] = Field(default_factory=dict)
+    saturation_correction: dict[str, Any] = Field(default_factory=dict)
     table: list[dict[str, Any]] = Field(default_factory=list)
     cycle_mean: dict[str, Any] = Field(default_factory=dict)
 

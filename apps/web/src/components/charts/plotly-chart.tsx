@@ -1,11 +1,20 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
 
-const Plot = dynamic(() => import("react-plotly.js"), { ssr: false });
+const Plot = dynamic(
+  async () => {
+    const [{ default: createPlotlyComponent }, { default: Plotly }] = await Promise.all([
+      import("react-plotly.js/factory"),
+      import("plotly.js-dist-min"),
+    ]);
+    return createPlotlyComponent(Plotly);
+  },
+  { ssr: false },
+);
 
 export type PlotlyPoint = {
   x?: number | string | null;
@@ -26,18 +35,15 @@ type PlotlyChartProps = {
   figure?: Record<string, unknown>;
   className?: string;
   fitContainer?: boolean;
+  deferRenderMs?: number;
+  uiRevision?: string;
   onPointClick?: (points: PlotlyPoint[]) => void;
   onSelection?: (points: PlotlyPoint[]) => void;
   onPointHover?: (payload: PlotlyHoverPayload) => void;
   onHoverEnd?: () => void;
 };
 
-function deepClone<T>(value: T): T {
-  if (typeof structuredClone === "function") {
-    return structuredClone(value);
-  }
-  return JSON.parse(JSON.stringify(value)) as T;
-}
+const persistedViewports = new Map<string, Record<string, unknown>>();
 
 function titleText(value: unknown): string {
   if (typeof value === "string") {
@@ -146,13 +152,146 @@ function buildDefaultUiRevision(data: unknown, layout: Record<string, unknown>):
   return ["persist-ui", plotTitle, ...axisTokens, ...traceTokens].join("|");
 }
 
-export function PlotlyChart({ figure, className, fitContainer = false, onPointClick, onSelection, onPointHover, onHoverEnd }: PlotlyChartProps) {
+function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
+  if (typeof structuredClone === "function") {
+    try {
+      return structuredClone(value) as Record<string, unknown>;
+    } catch {
+      // Fall through to JSON cloning for plain Plotly relayout payloads.
+    }
+  }
+  return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+}
+
+function isViewportRelayoutKey(key: string): boolean {
+  return (
+    /^xaxis\d*\.(range(\[\d+\])?|autorange)$/.test(key) ||
+    /^yaxis\d*\.(range(\[\d+\])?|autorange)$/.test(key) ||
+    /^scene\d*\.camera$/.test(key) ||
+    /^scene\d*\.[xyz]axis\.(range(\[\d+\])?|autorange)$/.test(key)
+  );
+}
+
+function setNestedViewportValue(layout: Record<string, unknown>, key: string, value: unknown) {
+  if (key.endsWith(".camera")) {
+    const [sceneKey] = key.split(".");
+    const scene = layout[sceneKey] && typeof layout[sceneKey] === "object" ? { ...(layout[sceneKey] as Record<string, unknown>) } : {};
+    scene.camera = value;
+    layout[sceneKey] = scene;
+    return;
+  }
+
+  const rangeMatch = key.match(/^(xaxis\d*|yaxis\d*|scene\d*\.[xyz]axis)\.range\[(\d+)\]$/);
+  if (rangeMatch) {
+    const [, axisPath, rawIndex] = rangeMatch;
+    const index = Number(rawIndex);
+    const axis = axisRecordForPath(layout, axisPath);
+    const range = Array.isArray(axis.range) ? [...axis.range] : [];
+    range[index] = value;
+    axis.range = range;
+    axis.autorange = false;
+    setAxisRecordForPath(layout, axisPath, axis);
+    return;
+  }
+
+  const rangeArrayMatch = key.match(/^(xaxis\d*|yaxis\d*|scene\d*\.[xyz]axis)\.range$/);
+  if (rangeArrayMatch) {
+    const axisPath = rangeArrayMatch[1];
+    const axis = axisRecordForPath(layout, axisPath);
+    axis.range = value;
+    axis.autorange = false;
+    setAxisRecordForPath(layout, axisPath, axis);
+    return;
+  }
+
+  const autorangeMatch = key.match(/^(xaxis\d*|yaxis\d*|scene\d*\.[xyz]axis)\.autorange$/);
+  if (autorangeMatch) {
+    const axisPath = autorangeMatch[1];
+    const axis = axisRecordForPath(layout, axisPath);
+    const nextAutorange = value === true && axis.autorange === "reversed" ? "reversed" : value;
+    axis.autorange = nextAutorange;
+    if (nextAutorange === true || nextAutorange === "reversed") {
+      delete axis.range;
+    }
+    setAxisRecordForPath(layout, axisPath, axis);
+  }
+}
+
+function axisRecordForPath(layout: Record<string, unknown>, axisPath: string): Record<string, unknown> {
+  if (!axisPath.includes(".")) {
+    return layout[axisPath] && typeof layout[axisPath] === "object" ? { ...(layout[axisPath] as Record<string, unknown>) } : {};
+  }
+  const [sceneKey, axisKey] = axisPath.split(".");
+  const scene = layout[sceneKey] && typeof layout[sceneKey] === "object" ? (layout[sceneKey] as Record<string, unknown>) : {};
+  return scene[axisKey] && typeof scene[axisKey] === "object" ? { ...(scene[axisKey] as Record<string, unknown>) } : {};
+}
+
+function setAxisRecordForPath(layout: Record<string, unknown>, axisPath: string, axis: Record<string, unknown>) {
+  if (!axisPath.includes(".")) {
+    layout[axisPath] = axis;
+    return;
+  }
+  const [sceneKey, axisKey] = axisPath.split(".");
+  const scene = layout[sceneKey] && typeof layout[sceneKey] === "object" ? { ...(layout[sceneKey] as Record<string, unknown>) } : {};
+  scene[axisKey] = axis;
+  layout[sceneKey] = scene;
+}
+
+function applyPersistedViewport(layout: Record<string, unknown>, viewport: Record<string, unknown> | undefined) {
+  if (!viewport) {
+    return;
+  }
+  for (const [key, value] of Object.entries(viewport)) {
+    setNestedViewportValue(layout, key, value);
+  }
+}
+
+function mergeViewportRelayout(current: Record<string, unknown>, update: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...current };
+  for (const [key, value] of Object.entries(update)) {
+    if (!isViewportRelayoutKey(key)) {
+      continue;
+    }
+    next[key] = value;
+
+    const rangePartMatch = key.match(/^(.+)\.range\[(\d+)\]$/);
+    if (rangePartMatch) {
+      const base = rangePartMatch[1];
+      delete next[`${base}.autorange`];
+    }
+
+    const autorangeMatch = key.match(/^(.+)\.autorange$/);
+    if (autorangeMatch && (value === true || value === "reversed")) {
+      const base = autorangeMatch[1];
+      delete next[`${base}.range`];
+      delete next[`${base}.range[0]`];
+      delete next[`${base}.range[1]`];
+    }
+  }
+  return next;
+}
+
+export function PlotlyChart({
+  figure,
+  className,
+  fitContainer = false,
+  deferRenderMs = 0,
+  uiRevision,
+  onPointClick,
+  onSelection,
+  onPointHover,
+  onHoverEnd,
+}: PlotlyChartProps) {
+  const [renderRevision, setRenderRevision] = useState(0);
+  const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
+  const didRefreshAfterInitializeRef = useRef(false);
+  const shouldDeferRender = deferRenderMs > 0;
   const preparedFigure = useMemo(() => {
     if (!figure || Object.keys(figure).length === 0) {
       return null;
     }
-    const safeFigure = deepClone(figure);
-    const layout = typeof safeFigure.layout === "object" && safeFigure.layout ? { ...(safeFigure.layout as Record<string, unknown>) } : {};
+    const figureData = Array.isArray(figure.data) ? figure.data : [];
+    const layout = typeof figure.layout === "object" && figure.layout ? { ...(figure.layout as Record<string, unknown>) } : {};
     applyD18AxisInversion(layout);
     const hoverLabel = layout.hoverlabel && typeof layout.hoverlabel === "object" ? { ...(layout.hoverlabel as Record<string, unknown>) } : {};
     hoverLabel.namelength = -1;
@@ -166,18 +305,67 @@ export function PlotlyChart({ figure, className, fitContainer = false, onPointCl
     } else if (!hasExplicitWidth && !hasExplicitHeight && typeof (layout as { autosize?: unknown }).autosize !== "boolean") {
       layout.autosize = true;
     }
-    if (typeof (layout as { uirevision?: unknown }).uirevision === "undefined") {
-      layout.uirevision = buildDefaultUiRevision(safeFigure.data, layout);
+    if (uiRevision) {
+      layout.uirevision = uiRevision;
+    } else if (typeof (layout as { uirevision?: unknown }).uirevision === "undefined") {
+      layout.uirevision = buildDefaultUiRevision(figureData, layout);
     }
+    applyPersistedViewport(layout, uiRevision ? persistedViewports.get(uiRevision) : undefined);
     return {
-      data: (safeFigure.data as never[]) ?? [],
+      data: figureData as never[],
       layout: layout as never,
       useResizeHandler: fitContainer || !hasExplicitHeight,
     };
-  }, [figure, fitContainer]);
+  }, [figure, fitContainer, uiRevision]);
+
+  useEffect(() => {
+    if (!shouldDeferRender) {
+      setIsDeferredReady(true);
+      return;
+    }
+    setIsDeferredReady(false);
+    const timer = window.setTimeout(() => {
+      setIsDeferredReady(true);
+    }, deferRenderMs);
+    return () => window.clearTimeout(timer);
+  }, [deferRenderMs, figure, shouldDeferRender]);
+
+  function refreshAfterInitialize() {
+    if (didRefreshAfterInitializeRef.current) {
+      return;
+    }
+    didRefreshAfterInitializeRef.current = true;
+    window.requestAnimationFrame(() => {
+      setRenderRevision((current) => current + 1);
+    });
+  }
+
+  function persistViewportUpdate(update: Record<string, unknown> | undefined) {
+    if (!uiRevision || !update) {
+      return;
+    }
+    const current = persistedViewports.get(uiRevision) ?? {};
+    const next = mergeViewportRelayout(current, update);
+    if (Object.keys(next).length > 0) {
+      persistedViewports.set(uiRevision, cloneRecord(next));
+    }
+  }
 
   if (!preparedFigure) {
     return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">No chart data yet.</div>;
+  }
+  if (!isDeferredReady) {
+    return (
+      <div
+        className={cn(
+          "flex min-w-0 items-center justify-center rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500",
+          className,
+        )}
+        aria-busy="true"
+      >
+        Preparing chart...
+      </div>
+    );
   }
   const shouldUseContainerHeight = preparedFigure.useResizeHandler;
   const hoverHandlers =
@@ -214,6 +402,9 @@ export function PlotlyChart({ figure, className, fitContainer = false, onPointCl
         data={preparedFigure.data}
         layout={preparedFigure.layout}
         config={{ responsive: true }}
+        revision={renderRevision}
+        onInitialized={refreshAfterInitialize}
+        onRelayout={persistViewportUpdate}
         useResizeHandler={preparedFigure.useResizeHandler}
         className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}
         style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%" }}

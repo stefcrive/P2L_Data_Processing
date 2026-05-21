@@ -15,6 +15,7 @@ from services.irms_api.domain.constants import (
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SAMP45_COL,
     CYCLE1_SIGNAL_SAMP46_COL,
+    VALID_CYCLES_COL,
 )
 from services.irms_api.domain.shared.dataframe import (
     _apply_cycle_averages,
@@ -71,6 +72,19 @@ class DataframeUtilsTests(unittest.TestCase):
         self.assertAlmostEqual(float(result.loc[0, CYCLE1_SIGNAL_SAMP44_COL]), 30.0, places=6)
         self.assertAlmostEqual(float(result.loc[0, CYCLE1_SIGNAL_REF44_COL]), 23.0, places=6)
         self.assertAlmostEqual(float(result.loc[0, CYCLE1_SIGNAL_DIFF44_COL]), 7.0, places=6)
+
+    def test_ensure_cycle1_signal_difference_columns_adds_valid_cycles(self) -> None:
+        df = pd.DataFrame(
+            {
+                "d13C Cycles Used": [8, 7, None],
+                "d18O Cycles Used": [8, 6, 5],
+            }
+        )
+
+        result = _ensure_cycle1_signal_difference_columns(df)
+
+        self.assertIn(VALID_CYCLES_COL, result.columns)
+        self.assertEqual(pd.to_numeric(result[VALID_CYCLES_COL], errors="coerce").tolist(), [8.0, 6.0, 5.0])
 
     def test_apply_cycle_averages_marks_fully_saturated_when_valid_cycles_below_three(self) -> None:
         df = pd.DataFrame(

@@ -12,6 +12,7 @@ from ..calibration.core import (
     _resolve_linearity_intensity_column_for_fits,
     _with_isotope_linearity_intensity_columns,
 )
+from ..constants import CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL, CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL
 from ..contracts import EditAction
 from ..shared.dataframe import _parse_numeric_token
 
@@ -166,9 +167,31 @@ def _refresh_calibrated_after_delta_edit(
             if intensity_col in context.columns
             else np.nan
         )
+        if not np.isfinite(intensity) and str(fit.get("model", "")).strip() == "two_term":
+            intensity = (
+                pd.to_numeric(pd.Series([context.at[row_label, CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL]]), errors="coerce").iloc[0]
+                if CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL in context.columns
+                else np.nan
+            )
         if np.isfinite(intensity):
             intensity_series = pd.Series([float(intensity)], index=[row_label], dtype=float)
-            delta = pd.to_numeric(_linearity_correction_delta(intensity_series, fit), errors="coerce").iloc[0]
+            secondary_series = None
+            if str(fit.get("model", "")).strip() == "two_term":
+                primary_col = str(fit.get("primary_col") or CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL)
+                secondary_col = str(fit.get("secondary_col") or CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL)
+                primary_value = (
+                    pd.to_numeric(pd.Series([context.at[row_label, primary_col]]), errors="coerce").iloc[0]
+                    if primary_col in context.columns
+                    else intensity
+                )
+                secondary_value = (
+                    pd.to_numeric(pd.Series([context.at[row_label, secondary_col]]), errors="coerce").iloc[0]
+                    if secondary_col in context.columns
+                    else np.nan
+                )
+                intensity_series = pd.Series([float(primary_value)], index=[row_label], dtype=float)
+                secondary_series = pd.Series([float(secondary_value)], index=[row_label], dtype=float)
+            delta = pd.to_numeric(_linearity_correction_delta(intensity_series, fit, secondary_series), errors="coerce").iloc[0]
     effective_raw_source = line_adjusted_raw if np.isfinite(line_adjusted_raw) else new_raw
     effective_raw = (
         float(effective_raw_source - delta)
@@ -603,9 +626,18 @@ def apply_edit_action(
         delta = edit.offset if edit.action == "offset" else edit.value
         if delta is None:
             raise ValueError("Missing edit value")
+        set_value_stdev: float | None = None
+        if edit.action == "set_value" and edit.stdev is not None:
+            parsed_stdev = pd.to_numeric(pd.Series([edit.stdev]), errors="coerce").iloc[0]
+            if not np.isfinite(parsed_stdev):
+                raise ValueError("Invalid set-value stdev")
+            if float(parsed_stdev) < 0:
+                raise ValueError("Set-value stdev must be non-negative")
+            set_value_stdev = float(parsed_stdev)
         for target in edit.targets:
             row_label = _resolve_target_row(target.row_label)
             raw_col, cal_col, _ = _get_isotope_columns(target.isotope_key)
+            std_col = _get_isotope_std_column(target.isotope_key)
             if raw_col is None:
                 continue
             key = f"{target.isotope_key}|{target.row_label}"
@@ -622,6 +654,14 @@ def apply_edit_action(
                 else None
             )
             work.at[row_label, raw_col] = new_value
+            if set_value_stdev is not None and std_col and std_col in work.columns:
+                if key not in original_std_map and key not in original_missing_std_tokens:
+                    current_std = pd.to_numeric(pd.Series([work.at[row_label, std_col]]), errors="coerce").iloc[0]
+                    if pd.notna(current_std):
+                        original_std_map[key] = float(current_std)
+                    else:
+                        original_missing_std_tokens.add(key)
+                work.at[row_label, std_col] = float(set_value_stdev)
             work = _refresh_collector_status_after_delta_edit(work, row_label)
             work = _refresh_calibrated_after_delta_edit(
                 work,

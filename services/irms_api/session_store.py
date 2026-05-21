@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,13 @@ class SessionPaths:
     log_path: Path
 
 
+@dataclass(slots=True)
+class _CachedFrame:
+    mtime_ns: int
+    size: int
+    frame: pd.DataFrame
+
+
 class FileSessionStore:
     def __init__(self, root_dir: str | Path | None = None) -> None:
         base = Path(root_dir or os.getenv("IRMS_API_DATA_DIR", DEFAULT_SESSION_DATA_DIR))
@@ -32,6 +40,8 @@ class FileSessionStore:
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root_dir / "_session_index.json"
         self._session_roots = self._load_index()
+        self._frame_cache: dict[tuple[str, str], _CachedFrame] = {}
+        self._cache_lock = threading.RLock()
 
     def _load_index(self) -> dict[str, str]:
         if not self.index_path.exists():
@@ -342,21 +352,68 @@ class FileSessionStore:
         paths = self._paths(session_id)
         paths.root.mkdir(parents=True, exist_ok=True)
         df.to_csv(paths.snapshot_path, index=False)
+        self._refresh_cached_csv_frame(session_id, "snapshot", paths.snapshot_path)
         if cycles_df is not None:
             cycles_df.to_csv(paths.cycles_snapshot_path, index=False)
+            self._refresh_cached_csv_frame(session_id, "cycles", paths.cycles_snapshot_path)
+
+    def _refresh_cached_csv_frame(self, session_id: str, frame_key: str, path: Path) -> None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            with self._cache_lock:
+                self._frame_cache.pop((str(session_id), frame_key), None)
+            return
+        try:
+            frame = pd.read_csv(path, low_memory=False)
+        except pd.errors.EmptyDataError:
+            frame = pd.DataFrame()
+        cached = _CachedFrame(
+            mtime_ns=int(stat.st_mtime_ns),
+            size=int(stat.st_size),
+            frame=frame,
+        )
+        with self._cache_lock:
+            self._frame_cache[(str(session_id), frame_key)] = cached
+
+    def _load_cached_csv_frame(self, session_id: str, frame_key: str, path: Path) -> pd.DataFrame:
+        if not path.exists():
+            with self._cache_lock:
+                self._frame_cache.pop((str(session_id), frame_key), None)
+            raise FileNotFoundError(f"Session {session_id} has no snapshot")
+
+        stat = path.stat()
+        cache_key = (str(session_id), frame_key)
+        with self._cache_lock:
+            cached = self._frame_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached.mtime_ns == int(stat.st_mtime_ns)
+                and cached.size == int(stat.st_size)
+            ):
+                return cached.frame.copy(deep=True)
+
+        frame = pd.read_csv(path, low_memory=False)
+        with self._cache_lock:
+            self._frame_cache[cache_key] = _CachedFrame(
+                mtime_ns=int(stat.st_mtime_ns),
+                size=int(stat.st_size),
+                frame=frame.copy(deep=True),
+            )
+        return frame
 
     def load_frame(self, session_id: str) -> pd.DataFrame:
         paths = self._paths(session_id)
-        if not paths.snapshot_path.exists():
-            raise FileNotFoundError(f"Session {session_id} has no snapshot")
-        return pd.read_csv(paths.snapshot_path, low_memory=False)
+        return self._load_cached_csv_frame(session_id, "snapshot", paths.snapshot_path)
 
     def load_cycles_frame(self, session_id: str) -> pd.DataFrame | None:
         paths = self._paths(session_id)
         if not paths.cycles_snapshot_path.exists():
+            with self._cache_lock:
+                self._frame_cache.pop((str(session_id), "cycles"), None)
             return None
         try:
-            return pd.read_csv(paths.cycles_snapshot_path, low_memory=False)
+            return self._load_cached_csv_frame(session_id, "cycles", paths.cycles_snapshot_path)
         except pd.errors.EmptyDataError:
             return pd.DataFrame()
 
@@ -425,9 +482,11 @@ class FileSessionStore:
         paths = self._paths(session_id)
         if not paths.root.exists():
             self._unregister_session_root(session_id)
+            self._clear_session_frame_cache(session_id)
             return False
         shutil.rmtree(paths.root)
         self._unregister_session_root(session_id)
+        self._clear_session_frame_cache(session_id)
         if paths.root.parent.name == SESSION_RECORD_DIRNAME:
             try:
                 if not any(paths.root.parent.iterdir()):
@@ -435,3 +494,10 @@ class FileSessionStore:
             except Exception:
                 pass
         return True
+
+    def _clear_session_frame_cache(self, session_id: str) -> None:
+        session_key = str(session_id)
+        with self._cache_lock:
+            for cache_key in list(self._frame_cache):
+                if cache_key[0] == session_key:
+                    self._frame_cache.pop(cache_key, None)

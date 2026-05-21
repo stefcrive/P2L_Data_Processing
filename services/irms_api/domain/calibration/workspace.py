@@ -14,10 +14,15 @@ from ..constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
     CYCLE1_SIGNAL_DIFF45_COL,
     CYCLE1_SIGNAL_DIFF46_COL,
+    CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+    CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
+    CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+    VALID_CYCLES_COL,
     ISOTYPE_D13C,
     ISOTYPE_D18O,
+    LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44,
 )
 from ..contracts import (
     CalibrationAvailableValues,
@@ -56,6 +61,7 @@ from .core import (
     identify_outliers,
     identify_outliers_iqr,
 )
+from ..processing.cycles import apply_run_level_linearity_basis_from_cycles
 
 
 def normalize_calibration_config(raw: dict[str, Any] | None) -> CalibrationConfig:
@@ -81,8 +87,12 @@ def _candidate_color_columns(df: pd.DataFrame) -> list[str]:
         "Species",
         "Comment",
         "Label",
+        VALID_CYCLES_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
         "leak_rate",
         "Line",
@@ -96,6 +106,9 @@ def _candidate_z_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         CYCLE1_SIGNAL_SAMP44_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
         "leak_rate",
         "Line",
@@ -561,11 +574,18 @@ def _build_linearity_figure(
     color_param: str,
     corrected: bool = False,
 ) -> dict[str, Any]:
-    if go is None or df_src is None or df_src.empty or y_col not in df_src.columns or intensity_col not in df_src.columns:
+    two_term = intensity_col == LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44 or str(fit.get("model", "")).strip() == "two_term"
+    plot_intensity_col = CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL if two_term else intensity_col
+    if go is None or df_src is None or df_src.empty or y_col not in df_src.columns or plot_intensity_col not in df_src.columns:
         return {}
     isotope_key = "d13C" if "13" in str(y_col) else "d18O"
     effective_color_param = _resolve_isotope_specific_color_param(df_src, color_param, isotope_key=isotope_key)
-    intensity = pd.to_numeric(df_src[intensity_col], errors="coerce")
+    intensity = pd.to_numeric(df_src[plot_intensity_col], errors="coerce")
+    secondary_intensity = (
+        pd.to_numeric(df_src[CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL], errors="coerce")
+        if two_term and CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL in df_src.columns
+        else None
+    )
     y = pd.to_numeric(df_src[y_col], errors="coerce")
     color_values, _ = _prepare_color_values(
         df_src[effective_color_param] if effective_color_param in df_src.columns else None,
@@ -591,13 +611,17 @@ def _build_linearity_figure(
     fit_degree = int(fit_degree_raw) if np.isfinite(fit_degree_raw) and int(fit_degree_raw) >= 2 else 1
     if fit_degree >= 2:
         work["x"] = np.square(work["intensity"])
-        xaxis_title = f"Selected Coefficient Axis (I^2) - {intensity_col}"
+        xaxis_title = f"Selected Coefficient Axis (I^2) - {plot_intensity_col}"
     else:
         work["x"] = work["intensity"]
-        xaxis_title = f"Selected Coefficient Axis (I) - {intensity_col}"
+        xaxis_title = f"Selected Coefficient Axis (I) - {plot_intensity_col}"
     x_ref = pd.to_numeric(pd.Series([fit.get("x_ref")]), errors="coerce").iloc[0]
     if corrected and np.isfinite(slope) and np.isfinite(x_ref):
-        delta = _linearity_correction_delta(work["intensity"], fit)
+        delta = _linearity_correction_delta(
+            work["intensity"],
+            fit,
+            secondary_intensity.reindex(work.index) if secondary_intensity is not None else None,
+        )
         work["y"] = (work["y"] - delta).where(np.isfinite(work["intensity"]) & np.isfinite(work["y"]) & np.isfinite(delta))
     work = work[np.isfinite(work["x"]) & np.isfinite(work["intensity"]) & np.isfinite(work["y"])].copy()
     fig = go.Figure()
@@ -640,7 +664,38 @@ def _build_linearity_figure(
             )
         )
     eq_text = "Insufficient data for regression"
-    if not corrected and int(fit.get("n", 0) or 0) >= 2 and np.isfinite(slope) and np.isfinite(intercept) and not work.empty:
+    if (
+        not corrected
+        and two_term
+        and int(fit.get("n", 0) or 0) >= 3
+        and np.isfinite(slope)
+        and np.isfinite(quad)
+        and np.isfinite(intercept)
+        and not work.empty
+    ):
+        secondary_ref = pd.to_numeric(pd.Series([fit.get("secondary_x_ref")]), errors="coerce").iloc[0]
+        if not np.isfinite(secondary_ref) and secondary_intensity is not None:
+            finite_secondary = pd.to_numeric(secondary_intensity.reindex(work.index), errors="coerce")
+            finite_secondary = finite_secondary[np.isfinite(finite_secondary)]
+            if not finite_secondary.empty:
+                secondary_ref = float(finite_secondary.median())
+        if np.isfinite(secondary_ref):
+            intensity_grid = np.linspace(float(work["intensity"].min()), float(work["intensity"].max()), 100)
+            ys = float(intercept) + float(slope) * intensity_grid + float(quad) * float(secondary_ref)
+            fig.add_trace(
+                go.Scatter(
+                    x=intensity_grid,
+                    y=ys,
+                    mode="lines",
+                    name="Fit at median mismatch",
+                    line=dict(color="#f59e0b"),
+                    hovertemplate="I_mean: %{x:.3f}<br>Fit: %{y:.3f}<extra></extra>",
+                )
+            )
+        r2 = pd.to_numeric(pd.Series([fit.get("r2")]), errors="coerce").iloc[0]
+        equation = f"y = {float(intercept):.3f} + {float(slope):.6f}*I_mean + {float(quad):.6f}*Mismatch"
+        eq_text = f"{equation} | R^2={float(r2):.3f}" if np.isfinite(r2) else equation
+    elif not corrected and int(fit.get("n", 0) or 0) >= 2 and np.isfinite(slope) and np.isfinite(intercept) and not work.empty:
         intensity_grid = np.linspace(float(work["intensity"].min()), float(work["intensity"].max()), 100)
         xs = np.square(intensity_grid) if fit_degree >= 2 else intensity_grid
         if fit_degree >= 2 and np.isfinite(quad):
@@ -798,6 +853,9 @@ def build_calibration_workspace(
     df: pd.DataFrame,
     metadata: dict[str, Any],
     config_override: CalibrationConfig | dict[str, Any] | None = None,
+    cycles_df: pd.DataFrame | None = None,
+    include_figures: bool = True,
+    include_standard_sections: bool = True,
 ) -> CalibrationWorkspace:
     work_df = _ensure_cycle1_signal_difference_columns(df.copy())
     calibration_meta = metadata.get("calibration", {})
@@ -811,6 +869,12 @@ def build_calibration_workspace(
     config = normalize_calibration_config(
         config_payload.model_dump() if isinstance(config_payload, CalibrationConfig) else config_payload
     )
+    if bool(config.linearity.apply):
+        work_df = apply_run_level_linearity_basis_from_cycles(
+            work_df,
+            cycles_df,
+            cycle_intensity_aggregation=getattr(config.linearity, "cycle_intensity_aggregation", "run_median"),
+        )
     work_df = _apply_isotope_line_offsets(
         work_df,
         line_1_offset_d13=getattr(config.linearity, "line_1_offset_d13", None),
@@ -961,7 +1025,7 @@ def build_calibration_workspace(
     )
     chart_src = _apply_precision_date_range(clean_stds, config) if clean_stds is not None and not clean_stds.empty else pd.DataFrame(columns=work_df.columns)
     main_figures: dict[str, dict[str, Any]] = {}
-    if chart_src is not None and not chart_src.empty:
+    if include_figures and chart_src is not None and not chart_src.empty:
         calibration_figs = create_calibration_plots(standards_reference, chart_src, selected_standards, config.color_param)
         for key, value in calibration_figs.items():
             main_figures[key] = _figure_json(value)
@@ -1023,80 +1087,47 @@ def build_calibration_workspace(
             "d18_intensity_col": calculation_d18_intensity_col,
         }
 
-        display_intensity_col = _resolve_selected_linearity_intensity_column(
-            df=linearity_src,
-            use_diff_intensity=config.linearity.use_diff_intensity,
-            selected_intensity_col=selected_linearity_intensity_col,
-        )
-        display_d13_intensity_col = (
-            d13_offset_intensity_col if d13_offset_intensity_col in linearity_src.columns else display_intensity_col
-        )
-        display_d18_intensity_col = (
-            d18_offset_intensity_col if d18_offset_intensity_col in linearity_src.columns else display_intensity_col
-        )
-        display_fit13 = _compute_linearity_fit(
-            _filter_linearity_fit_input_by_max_intensity(
-                linearity_src,
-                display_d13_intensity_col,
-                max_sample_intensity,
-            ),
-            "d 13C/12C  Mean",
-            display_d13_intensity_col,
-            quadratic=bool(config.linearity.quadratic),
-        )
-        display_fit18 = _compute_linearity_fit(
-            _filter_linearity_fit_input_by_max_intensity(
-                linearity_src,
-                display_d18_intensity_col,
-                max_sample_intensity,
-            ),
-            "d 18O/16O  Mean",
-            display_d18_intensity_col,
-            quadratic=bool(config.linearity.quadratic),
-        )
-        display_fits = {
-            "d13C": display_fit13,
-            "d18O": display_fit18,
-            "intensity_col": display_intensity_col,
-            "d13_intensity_col": display_d13_intensity_col,
-            "d18_intensity_col": display_d18_intensity_col,
-        }
-        linearity_figures = {
-            "d13_raw": _build_linearity_figure(
-                linearity_src,
-                "d 13C/12C  Mean",
-                display_fit13,
-                display_d13_intensity_col,
-                config.color_param,
-                corrected=False,
-            ),
-            "d13_corrected": _build_linearity_figure(
-                linearity_src,
-                "d 13C/12C  Mean",
-                display_fit13,
-                display_d13_intensity_col,
-                config.color_param,
-                corrected=True,
-            ),
-            "d18_raw": _build_linearity_figure(
-                linearity_src,
-                "d 18O/16O  Mean",
-                display_fit18,
-                display_d18_intensity_col,
-                config.color_param,
-                corrected=False,
-            ),
-            "d18_corrected": _build_linearity_figure(
-                linearity_src,
-                "d 18O/16O  Mean",
-                display_fit18,
-                display_d18_intensity_col,
-                config.color_param,
-                corrected=True,
-            ),
-        }
+        display_fit13 = calculation_fit13
+        display_fit18 = calculation_fit18
+        display_intensity_col = calculation_intensity_col
+        display_d13_intensity_col = calculation_d13_intensity_col
+        display_d18_intensity_col = calculation_d18_intensity_col
+        if include_figures:
+            linearity_figures = {
+                "d13_raw": _build_linearity_figure(
+                    linearity_src,
+                    "d 13C/12C  Mean",
+                    display_fit13,
+                    display_d13_intensity_col,
+                    config.color_param,
+                    corrected=False,
+                ),
+                "d13_corrected": _build_linearity_figure(
+                    linearity_src,
+                    "d 13C/12C  Mean",
+                    display_fit13,
+                    display_d13_intensity_col,
+                    config.color_param,
+                    corrected=True,
+                ),
+                "d18_raw": _build_linearity_figure(
+                    linearity_src,
+                    "d 18O/16O  Mean",
+                    display_fit18,
+                    display_d18_intensity_col,
+                    config.color_param,
+                    corrected=False,
+                ),
+                "d18_corrected": _build_linearity_figure(
+                    linearity_src,
+                    "d 18O/16O  Mean",
+                    display_fit18,
+                    display_d18_intensity_col,
+                    config.color_param,
+                    corrected=True,
+                ),
+            }
     else:
-        display_fits = {}
         calculation_fits = {}
     correction_fits = _apply_manual_linearity_offsets_to_fits(
         calculation_fits,
@@ -1108,7 +1139,7 @@ def build_calibration_workspace(
         d18_per_10v2=float(config.linearity.manual_d18_per_10v2),
     )
 
-    if linearity_enabled and chart_src is not None and not chart_src.empty and correction_fits:
+    if include_figures and linearity_enabled and chart_src is not None and not chart_src.empty and correction_fits:
         correction_intensity_col = str(correction_fits.get("intensity_col") or selected_linearity_intensity_col)
         corrected_chart_src = _promote_linearity_corrected_raw_columns(
             _apply_linearity_correction(chart_src, correction_intensity_col, correction_fits)
@@ -1143,6 +1174,8 @@ def build_calibration_workspace(
                 outlier_reference_df=std_outlier_ref_df,
             )
         )
+        if not include_standard_sections:
+            continue
         out13, out18 = _standard_outlier_masks(std_df, config, outlier_reference_df=std_outlier_ref_df)
         true_d13 = (
             standards_repo.get_true_value(standard, ISOTYPE_D13C)

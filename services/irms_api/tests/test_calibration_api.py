@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 from services.irms_api.api import main as api_main
 from services.irms_api.domain.calibration.core import convert_d18o_carbonate_material
-from services.irms_api.domain.constants import ISOTYPE_D13C
+from services.irms_api.domain.constants import ISOTYPE_D13C, VALID_CYCLES_COL
 from services.irms_api.domain.contracts import CalibrationConfig, CalibrationOfficialValueUpsertRequest, LinearityConfig
 from services.irms_api.session_store import FileSessionStore
 
@@ -40,6 +40,8 @@ def sample_calibration_df() -> pd.DataFrame:
             "1  Cycle Int  Ref  44": [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
             "1  Cycle Int  Diff Samp-Ref  44": [5.0, 5.4, 5.8, 3.8, 4.2, 4.6, 4.0, 4.4],
             "leak_rate": [5.0, 4.8, 5.1, 5.3, 5.2, 5.1, 4.9, 5.0],
+            "d13C Cycles Used": [8, 8, 7, 8, 8, 7, 8, 8],
+            "d18O Cycles Used": [8, 7, 7, 8, 7, 6, 8, 7],
             "Line": [1, 1, 2, 1, 1, 2, 1, 2],
             "Date": [
                 "2025-01-01",
@@ -116,6 +118,7 @@ class CalibrationApiTests(unittest.TestCase):
         self.assertEqual(len(preview.precision_summaries), 2)
         self.assertEqual(len(preview.standard_sections), 2)
         self.assertEqual(len(preview.selected_standard_official_values), 4)
+        self.assertIn(VALID_CYCLES_COL, preview.available_values.color_params)
         shpl2_summary = next(item for item in preview.precision_summaries if item.standard == "SHP2L")
         self.assertIn("1", shpl2_summary.line_precisions)
         line1 = shpl2_summary.line_precisions["1"]
