@@ -96,12 +96,36 @@ if not exist "%VENV_PYTHON%" (
   )
 )
 
-if not exist "%VENV_ACTIVATE%" if not exist "%VENV_PYTHON%" (
-  echo Python virtual environment not found. Running setup...
+call :is_python_usable "%VENV_PYTHON%"
+if errorlevel 1 (
+  if exist "%LEGACY_VENV_PYTHON%" (
+    call :is_python_usable "%LEGACY_VENV_PYTHON%"
+    if not errorlevel 1 (
+      set "VENV_ACTIVATE=%LEGACY_VENV_ACTIVATE%"
+      set "VENV_PYTHON=%LEGACY_VENV_PYTHON%"
+    )
+  )
+)
+
+call :is_python_usable "%VENV_PYTHON%"
+if errorlevel 1 (
+  echo Python virtual environment not found or not usable. Running setup...
   call "%ROOT_DIR%\setup.bat"
   if errorlevel 1 (
     echo setup.bat failed.
     exit /b 1
+  )
+  set "VENV_ACTIVATE=%ROOT_DIR%\.venv\Scripts\activate.bat"
+  set "VENV_PYTHON=%ROOT_DIR%\.venv\Scripts\python.exe"
+  call :is_python_usable "%VENV_PYTHON%"
+  if errorlevel 1 (
+    if exist "%LEGACY_VENV_PYTHON%" (
+      call :is_python_usable "%LEGACY_VENV_PYTHON%"
+      if not errorlevel 1 (
+        set "VENV_ACTIVATE=%LEGACY_VENV_ACTIVATE%"
+        set "VENV_PYTHON=%LEGACY_VENV_PYTHON%"
+      )
+    )
   )
   if not exist "%VENV_ACTIVATE%" if not exist "%VENV_PYTHON%" (
     if exist "%LEGACY_VENV_ACTIVATE%" if exist "%LEGACY_VENV_PYTHON%" (
@@ -117,6 +141,12 @@ if not exist "%VENV_ACTIVATE%" if not exist "%VENV_PYTHON%" (
 
 if not exist "%VENV_PYTHON%" (
   echo Python executable was not found in virtual environment: %VENV_PYTHON%
+  exit /b 1
+)
+
+call :is_python_usable "%VENV_PYTHON%"
+if errorlevel 1 (
+  echo Python executable is not usable: %VENV_PYTHON%
   exit /b 1
 )
 
@@ -254,3 +284,9 @@ set "IRMS_CHECK_PORT=%~1"
 powershell -NoLogo -NoProfile -Command "$port=[int]$env:IRMS_CHECK_PORT; $existing=@(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue); if ($existing.Count -gt 0) { exit 0 }; foreach ($addr in @([System.Net.IPAddress]::Loopback, [System.Net.IPAddress]::IPv6Loopback)) { $listener=$null; try { $listener=[System.Net.Sockets.TcpListener]::new($addr, $port); $listener.Start() } catch { exit 0 } finally { if ($listener -ne $null) { $listener.Stop() } } }; exit 1" >nul 2>&1
 set "PS_EXIT=%ERRORLEVEL%"
 endlocal & exit /b %PS_EXIT%
+
+:is_python_usable
+if "%~1"=="" exit /b 1
+if not exist "%~1" exit /b 1
+"%~1" -c "import sys" >nul 2>&1
+exit /b %ERRORLEVEL%

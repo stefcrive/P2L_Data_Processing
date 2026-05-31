@@ -9,6 +9,24 @@ if exist "ven\\Scripts\\activate.bat" if not exist ".venv\\Scripts\\activate.bat
 set "VENV_ACTIVATE=%VENV_DIR%\\Scripts\\activate.bat"
 set "VENV_PYTHON=%VENV_DIR%\\Scripts\\python.exe"
 
+if exist "%VENV_PYTHON%" (
+  call :is_python_usable "%VENV_PYTHON%"
+  if errorlevel 1 (
+    if exist "ven\\Scripts\\python.exe" (
+      call :is_python_usable "ven\\Scripts\\python.exe"
+      if not errorlevel 1 (
+        set "VENV_DIR=ven"
+        set "VENV_ACTIVATE=ven\\Scripts\\activate.bat"
+        set "VENV_PYTHON=ven\\Scripts\\python.exe"
+      )
+    ) else (
+      set "VENV_DIR=ven"
+      set "VENV_ACTIVATE=ven\\Scripts\\activate.bat"
+      set "VENV_PYTHON=ven\\Scripts\\python.exe"
+    )
+  )
+)
+
 call :resolve_python
 if errorlevel 1 exit /b 1
 
@@ -68,3 +86,9 @@ if not errorlevel 1 (
 
 echo Python interpreter not found. Install Python 3 and make sure `py` or `python` works in PATH.
 exit /b 1
+
+:is_python_usable
+if "%~1"=="" exit /b 1
+if not exist "%~1" exit /b 1
+"%~1" -c "import sys" >nul 2>&1
+exit /b %ERRORLEVEL%
