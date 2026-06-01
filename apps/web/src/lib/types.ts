@@ -133,6 +133,7 @@ export type ProcessingConfig = {
   x_axis_option: "By Identifier 2" | "By Sequence";
   color_param: string;
   z_axis: string;
+  species_name_map: Record<string, string>;
   apply_shared_linearity_to_partially_saturated: boolean;
   enable_saturation_correction: boolean;
   saturation_correction_method: SaturationCorrectionMethod;
@@ -244,6 +245,38 @@ export type ProcessingWorkspace = {
     [key: string]: unknown;
   };
   [key: string]: unknown;
+};
+
+export type LinearityPreviewRow = {
+  row_label: string;
+  line?: number | null;
+  d13_raw?: number | null;
+  d18_raw?: number | null;
+  d13_calibrated?: number | null;
+  d18_calibrated?: number | null;
+  intensities: Record<string, number | null>;
+};
+
+export type LinearityPreviewTrace = {
+  chart_key?: string;
+  trace_index?: number;
+  trace_name?: string;
+  row_labels?: string[];
+  isotope_key?: "d13C" | "d18O" | "cross";
+};
+
+export type LinearityPreviewChart = {
+  chart_key: string;
+  traces: LinearityPreviewTrace[];
+};
+
+export type ProcessingLinearityPreviewData = {
+  session_id: string;
+  intensity_col: string;
+  fits: JsonRecord;
+  coefficients: JsonRecord;
+  rows: LinearityPreviewRow[];
+  charts?: LinearityPreviewChart[];
 };
 
 export type EditTarget = {

@@ -16,6 +16,7 @@ import {
 } from "@/components/diagnostics/saturation-figure-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { DecimalInput } from "@/components/ui/decimal-input";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
@@ -2116,16 +2117,6 @@ export default function DiagnosticsPage() {
     });
   }
 
-  function handleLinearityOffsetChange(field: LinearityOffsetField, rawValue: string) {
-    const trimmed = rawValue.trim();
-    if (trimmed === "") {
-      updateSharedLinearity(field, null);
-      return;
-    }
-    const parsed = Number(trimmed);
-    updateSharedLinearity(field, Number.isFinite(parsed) ? parsed : 0);
-  }
-
   function buildTargetsForAction(isotopeKey?: IsotopeKey): Array<{ row_label: string; isotope_key: IsotopeKey }> {
     if (!selectionTarget) {
       return [];
@@ -2476,11 +2467,9 @@ export default function DiagnosticsPage() {
                       <span className="mb-1 block text-stone-700">
                         {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                       </span>
-                      <input
-                        type="number"
-                        step="0.01"
+                      <DecimalInput
                         value={activeLinearity.manual_d13_per_10v ?? 0}
-                        onChange={(event) => updateLinearityCoefficientOffset("d13C", "primary", Number(event.target.value))}
+                        onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "primary", value)}
                         className="w-full rounded-lg border border-stone-300 px-3 py-2"
                       />
                     </label>
@@ -2488,11 +2477,9 @@ export default function DiagnosticsPage() {
                       <span className="mb-1 block text-stone-700">
                         {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                       </span>
-                      <input
-                        type="number"
-                        step="0.01"
+                      <DecimalInput
                         value={activeLinearity.manual_d18_per_10v ?? 0}
-                        onChange={(event) => updateLinearityCoefficientOffset("d18O", "primary", Number(event.target.value))}
+                        onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "primary", value)}
                         className="w-full rounded-lg border border-stone-300 px-3 py-2"
                       />
                     </label>
@@ -2503,11 +2490,9 @@ export default function DiagnosticsPage() {
                         <span className="mb-1 block text-stone-700">
                           {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
                         </span>
-                        <input
-                          type="number"
-                          step="0.01"
+                        <DecimalInput
                           value={activeLinearity.manual_d13_per_10v2 ?? 0}
-                          onChange={(event) => updateLinearityCoefficientOffset("d13C", "secondary", Number(event.target.value))}
+                          onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "secondary", value)}
                           className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
@@ -2515,11 +2500,9 @@ export default function DiagnosticsPage() {
                         <span className="mb-1 block text-stone-700">
                           {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
                         </span>
-                        <input
-                          type="number"
-                          step="0.01"
+                        <DecimalInput
                           value={activeLinearity.manual_d18_per_10v2 ?? 0}
-                          onChange={(event) => updateLinearityCoefficientOffset("d18O", "secondary", Number(event.target.value))}
+                          onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "secondary", value)}
                           className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
@@ -2534,21 +2517,17 @@ export default function DiagnosticsPage() {
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
                           <span className="mb-1 block text-stone-700">d13C</span>
-                          <input
-                            type="number"
-                            step="0.01"
+                          <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_1_offset_d13")}
-                            onChange={(event) => handleLinearityOffsetChange("line_1_offset_d13", event.target.value)}
+                            onValueChange={(value) => updateSharedLinearity("line_1_offset_d13", value)}
                             className="w-full rounded-lg border border-stone-300 px-3 py-2"
                           />
                         </label>
                         <label className="text-sm">
                           <span className="mb-1 block text-stone-700">d18O</span>
-                          <input
-                            type="number"
-                            step="0.01"
+                          <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_1_offset_d18")}
-                            onChange={(event) => handleLinearityOffsetChange("line_1_offset_d18", event.target.value)}
+                            onValueChange={(value) => updateSharedLinearity("line_1_offset_d18", value)}
                             className="w-full rounded-lg border border-stone-300 px-3 py-2"
                           />
                         </label>
@@ -2559,21 +2538,17 @@ export default function DiagnosticsPage() {
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
                           <span className="mb-1 block text-stone-700">d13C</span>
-                          <input
-                            type="number"
-                            step="0.01"
+                          <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_2_offset_d13")}
-                            onChange={(event) => handleLinearityOffsetChange("line_2_offset_d13", event.target.value)}
+                            onValueChange={(value) => updateSharedLinearity("line_2_offset_d13", value)}
                             className="w-full rounded-lg border border-stone-300 px-3 py-2"
                           />
                         </label>
                         <label className="text-sm">
                           <span className="mb-1 block text-stone-700">d18O</span>
-                          <input
-                            type="number"
-                            step="0.01"
+                          <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_2_offset_d18")}
-                            onChange={(event) => handleLinearityOffsetChange("line_2_offset_d18", event.target.value)}
+                            onValueChange={(value) => updateSharedLinearity("line_2_offset_d18", value)}
                             className="w-full rounded-lg border border-stone-300 px-3 py-2"
                           />
                         </label>

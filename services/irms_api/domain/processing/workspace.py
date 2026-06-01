@@ -114,7 +114,33 @@ def normalize_processing_config(raw: dict[str, Any] | None) -> ProcessingWorkspa
             "client_name": payload.pop("client_name", None),
             "comment_map": payload.pop("comment_map", payload.pop("comment_replacements", {})) or {},
         }
+    payload["species_name_map"] = _normalize_species_name_map(payload.get("species_name_map"))
     return ProcessingWorkspaceConfig.model_validate(payload)
+
+
+def _normalize_species_name_map(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for source, target in raw.items():
+        source_label = str(source).strip()
+        target_label = str(target).strip()
+        if not source_label or not target_label or source_label == target_label:
+            continue
+        normalized[source_label] = target_label
+    return normalized
+
+
+def _apply_species_name_map(df: pd.DataFrame, species_name_map: dict[str, str] | None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    normalized_map = _normalize_species_name_map(species_name_map)
+    if not normalized_map:
+        return df
+    work = df.copy()
+    species = _get_species_series(work).reindex(work.index).fillna("").astype(str).map(str.strip)
+    work["Species"] = species.map(lambda value: normalized_map.get(value, value))
+    return work
 
 
 def _build_export_filename(config: ProcessingWorkspaceConfig) -> str:
@@ -558,7 +584,7 @@ def _derive_working_frame(
         calibration_meta=calibration,
         edit_state=edit_state,
     )
-    return work
+    return _apply_species_name_map(work, config.species_name_map)
 
 
 def _build_plot_frames(
@@ -660,6 +686,13 @@ def build_processing_workspace(
     standards_repo = StandardsRepository.default()
     selected_standards = [str(item) for item in calibration.get("selected_standards", [])]
     all_standards = sorted(set(standards_repo.standards_list()) | set(selected_standards))
+    source_species_values = sorted(
+        {
+            str(value).strip()
+            for value in _get_species_series(df).dropna().astype(str).tolist()
+            if str(value).strip() != ""
+        }
+    )
 
     working_df = _derive_working_frame(
         df,
@@ -747,13 +780,7 @@ def build_processing_workspace(
     available_values = ProcessingAvailableValues(
         identifiers=["All", *identifiers],
         export_identifiers=["All", *export_identifiers],
-        species=sorted(
-            {
-                str(value)
-                for value in _get_species_series(unfiltered_df).dropna().astype(str).tolist()
-                if str(value).strip() != ""
-            }
-        ),
+        species=source_species_values,
         color_params=available_color_params,
         z_axis_options=_candidate_z_columns(working_df),
     )

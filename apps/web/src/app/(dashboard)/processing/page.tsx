@@ -16,6 +16,7 @@ import {
 } from "@/components/diagnostics/saturation-figure-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { DecimalInput } from "@/components/ui/decimal-input";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type {
@@ -28,6 +29,7 @@ import type {
   ExportRequest,
   OutlierTable,
   ProcessingConfig,
+  ProcessingLinearityPreviewData,
   ProcessingWorkspace,
   SaturationCorrectionMethod,
 } from "@/lib/types";
@@ -147,6 +149,7 @@ const DEFAULT_PLOTLY_COLORWAY = [
   "#FF97FF",
   "#FECB52",
 ];
+const selectionSourceHighlightCache = new WeakMap<Record<string, unknown>, Map<string, Record<string, unknown> | undefined>>();
 
 function getLinearityIntensityOptionLabel(value: string): string {
   if (value in LINEARITY_INTENSITY_OPTION_LABELS) {
@@ -306,6 +309,333 @@ function linearityConfigEquals(
   right: CalibrationConfig["linearity"] | null | undefined,
 ): boolean {
   return JSON.stringify(normalizeLinearityConfigForCompare(left)) === JSON.stringify(normalizeLinearityConfigForCompare(right));
+}
+
+function finiteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function lineOffsetForPreview(linearity: CalibrationConfig["linearity"], isotopeKey: IsotopeKey, line: number | null | undefined): number {
+  if (line !== 1 && line !== 2) {
+    return 0;
+  }
+  if (isotopeKey === "d13C") {
+    return line === 1 ? finiteNumber(linearity.line_1_offset_d13) ?? 0 : finiteNumber(linearity.line_2_offset_d13) ?? 0;
+  }
+  return line === 1 ? finiteNumber(linearity.line_1_offset_d18) ?? 0 : finiteNumber(linearity.line_2_offset_d18) ?? 0;
+}
+
+function linearityPrimaryOffsetScale(intensityCol: string | null | undefined): number {
+  return intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44 || intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 ? 1 : 10;
+}
+
+function linearitySecondaryOffsetScale(intensityCol: string | null | undefined): number {
+  if (
+    intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44 ||
+    intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 ||
+    intensityCol === LINEARITY_INTENSITY_TWO_TERM44
+  ) {
+    return 1;
+  }
+  return 100;
+}
+
+function applyManualLinearityOffsetsForPreview(
+  fits: Record<string, unknown> | undefined,
+  linearity: CalibrationConfig["linearity"],
+): Record<string, unknown> {
+  const adjusted: Record<string, unknown> = {
+    ...(fits ?? {}),
+    d13C: { ...(((fits ?? {}).d13C as Record<string, unknown> | undefined) ?? {}) },
+    d18O: { ...(((fits ?? {}).d18O as Record<string, unknown> | undefined) ?? {}) },
+  };
+  if (!linearity.manual_override_enabled) {
+    return adjusted;
+  }
+  const basisCol = String(adjusted.intensity_col ?? linearity.intensity_col ?? "");
+  const configByIsotope: Record<IsotopeKey, { linear: number; quadratic: number }> = {
+    d13C: {
+      linear: finiteNumber(linearity.manual_d13_per_10v) ?? 0,
+      quadratic: finiteNumber(linearity.manual_d13_per_10v2) ?? 0,
+    },
+    d18O: {
+      linear: finiteNumber(linearity.manual_d18_per_10v) ?? 0,
+      quadratic: finiteNumber(linearity.manual_d18_per_10v2) ?? 0,
+    },
+  };
+  for (const isotopeKey of ISOTOPE_KEYS) {
+    const fit = { ...((adjusted[isotopeKey] as Record<string, unknown> | undefined) ?? {}) };
+    const xRef = finiteNumber(fit.x_ref) ?? 0;
+    const baseIntercept = finiteNumber(fit.intercept);
+    let interceptShift = 0;
+    if (String(fit.model ?? "") === "two_term") {
+      const slopeOffsetRaw = configByIsotope[isotopeKey].linear;
+      const secondaryOffsetRaw = configByIsotope[isotopeKey].quadratic;
+      if (Number.isFinite(slopeOffsetRaw) && Math.abs(slopeOffsetRaw) > 1e-15) {
+        const slopeOffset = slopeOffsetRaw / linearityPrimaryOffsetScale(LINEARITY_INTENSITY_TWO_TERM44);
+        fit.slope = (finiteNumber(fit.slope) ?? 0) + slopeOffset;
+        interceptShift += slopeOffset * xRef;
+      }
+      if (Number.isFinite(secondaryOffsetRaw) && Math.abs(secondaryOffsetRaw) > 1e-15) {
+        const secondaryOffset = secondaryOffsetRaw / linearitySecondaryOffsetScale(LINEARITY_INTENSITY_TWO_TERM44);
+        fit.quad = (finiteNumber(fit.quad) ?? 0) + secondaryOffset;
+        const secondaryRef = finiteNumber(fit.secondary_x_ref);
+        if (secondaryRef != null) {
+          interceptShift += secondaryOffset * secondaryRef;
+        }
+      }
+      if (baseIntercept != null && Math.abs(interceptShift) > 1e-15) {
+        fit.intercept = baseIntercept - interceptShift;
+      }
+      adjusted[isotopeKey] = fit;
+      continue;
+    }
+
+    const slopeOffsetRaw = configByIsotope[isotopeKey].linear;
+    if (Number.isFinite(slopeOffsetRaw) && Math.abs(slopeOffsetRaw) > 1e-15) {
+      const slopeOffset = slopeOffsetRaw / linearityPrimaryOffsetScale(basisCol);
+      fit.slope = (finiteNumber(fit.slope) ?? 0) + slopeOffset;
+      if (baseIntercept != null) {
+        fit.intercept = baseIntercept - slopeOffset * xRef;
+      }
+    }
+    if (linearity.quadratic) {
+      const quadOffsetRaw = configByIsotope[isotopeKey].quadratic;
+      if (Number.isFinite(quadOffsetRaw) && Math.abs(quadOffsetRaw) > 1e-15) {
+        const quadOffset = quadOffsetRaw / linearitySecondaryOffsetScale(basisCol);
+        fit.quad = (finiteNumber(fit.quad) ?? 0) + quadOffset;
+        const currentIntercept = finiteNumber(fit.intercept);
+        if (currentIntercept != null) {
+          fit.intercept = currentIntercept - quadOffset * xRef ** 2;
+        }
+        fit.degree = Math.max(Number(fit.degree ?? 1), 2);
+      }
+    }
+    adjusted[isotopeKey] = fit;
+  }
+  return adjusted;
+}
+
+function linearityFitDegree(fit: Record<string, unknown>): number {
+  const degree = finiteNumber(fit.degree);
+  if (degree != null && degree >= 2) {
+    return 2;
+  }
+  if (fit.quadratic === true) {
+    return 2;
+  }
+  const quad = finiteNumber(fit.quad);
+  return quad != null && Math.abs(quad) > 1e-15 ? 2 : 1;
+}
+
+function linearityCorrectionDeltaForPreview(
+  fit: Record<string, unknown>,
+  intensity: number | null,
+  secondaryIntensity?: number | null,
+): number | null {
+  const slope = finiteNumber(fit.slope);
+  const xRef = finiteNumber(fit.x_ref);
+  if (slope == null || xRef == null || intensity == null) {
+    return null;
+  }
+  if (String(fit.model ?? "") === "two_term") {
+    const secondaryRef = finiteNumber(fit.secondary_x_ref);
+    const secondarySlope = finiteNumber(fit.quad);
+    if (secondaryRef == null || secondarySlope == null || secondaryIntensity == null) {
+      return null;
+    }
+    return slope * (intensity - xRef) + secondarySlope * (secondaryIntensity - secondaryRef);
+  }
+  let delta = slope * (intensity - xRef);
+  const quad = finiteNumber(fit.quad);
+  if (linearityFitDegree(fit) >= 2 && quad != null) {
+    delta += quad * (intensity ** 2 - xRef ** 2);
+  }
+  return Number.isFinite(delta) ? delta : null;
+}
+
+function buildPreviewRowMap(data: ProcessingLinearityPreviewData | undefined): Map<string, ProcessingLinearityPreviewData["rows"][number]> {
+  const map = new Map<string, ProcessingLinearityPreviewData["rows"][number]>();
+  for (const row of data?.rows ?? []) {
+    map.set(String(row.row_label), row);
+  }
+  return map;
+}
+
+function previewValueForRow(
+  row: ProcessingLinearityPreviewData["rows"][number] | undefined,
+  isotopeKey: IsotopeKey,
+  linearity: CalibrationConfig["linearity"],
+  previewData: ProcessingLinearityPreviewData,
+  effectiveFits: Record<string, unknown>,
+  valueSpace: "raw" | "calibrated",
+): number | null {
+  if (!row) {
+    return null;
+  }
+  const baseRaw = isotopeKey === "d13C" ? finiteNumber(row.d13_raw) : finiteNumber(row.d18_raw);
+  if (baseRaw == null) {
+    return null;
+  }
+  const adjustedRaw = baseRaw + lineOffsetForPreview(linearity, isotopeKey, finiteNumber(row.line));
+  let rawValue = adjustedRaw;
+  const fit = (effectiveFits[isotopeKey] as Record<string, unknown> | undefined) ?? {};
+  if (linearity.apply) {
+    const intensityCol =
+      String(
+        (String(fit.model ?? "") === "two_term"
+          ? fit.primary_col
+          : effectiveFits[isotopeKey === "d13C" ? "d13_intensity_col" : "d18_intensity_col"]) ??
+          previewData.intensity_col ??
+          linearity.intensity_col ??
+          "",
+      ).trim();
+    const fallbackIntensityCol = String(previewData.intensity_col ?? linearity.intensity_col ?? "").trim();
+    const primaryIntensity = finiteNumber(row.intensities[intensityCol]) ?? finiteNumber(row.intensities[fallbackIntensityCol]);
+    const secondaryCol = String(fit.secondary_col ?? LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44);
+    const secondaryIntensity = finiteNumber(row.intensities[secondaryCol]);
+    const delta = linearityCorrectionDeltaForPreview(fit, primaryIntensity, secondaryIntensity);
+    if (delta != null) {
+      rawValue = adjustedRaw - delta;
+    }
+  }
+  if (valueSpace === "raw") {
+    return Number.isFinite(rawValue) ? rawValue : null;
+  }
+  const coeff = (previewData.coefficients?.[isotopeKey] as Record<string, unknown> | undefined) ?? {};
+  const slope = finiteNumber(coeff.slope);
+  const intercept = finiteNumber(coeff.intercept);
+  if (slope != null && intercept != null) {
+    return slope * rawValue + intercept;
+  }
+  return isotopeKey === "d13C" ? finiteNumber(row.d13_calibrated) : finiteNumber(row.d18_calibrated);
+}
+
+function customDataRowLabel(value: unknown): string {
+  if (Array.isArray(value)) {
+    return String(value[0] ?? "").trim();
+  }
+  if (value && typeof value === "object") {
+    const payload = value as Record<string, unknown>;
+    return String(payload.row_label ?? payload.rowLabel ?? payload[0] ?? "").trim();
+  }
+  return String(value ?? "").trim();
+}
+
+function customDataIsotope(value: unknown): IsotopeKey | "cross" | null {
+  if (Array.isArray(value)) {
+    return normalizeIsotopeKey(value[1]);
+  }
+  if (value && typeof value === "object") {
+    const payload = value as Record<string, unknown>;
+    return normalizeIsotopeKey(payload.isotope_key ?? payload.isotopeKey ?? payload[1]);
+  }
+  return null;
+}
+
+function patchVectorValue(vector: unknown[] | null, index: number, value: number | null): { values: unknown[] | null; changed: boolean } {
+  if (!vector || value == null || index < 0 || index >= vector.length) {
+    return { values: vector, changed: false };
+  }
+  const current = finiteNumber(vector[index]);
+  if (current != null && Math.abs(current - value) < 1e-12) {
+    return { values: vector, changed: false };
+  }
+  const values = [...vector];
+  values[index] = value;
+  return { values, changed: true };
+}
+
+function applyLinearityPreviewToFigure(
+  figure: Record<string, unknown> | undefined,
+  previewData: ProcessingLinearityPreviewData | undefined,
+  linearity: CalibrationConfig["linearity"] | null | undefined,
+  processingConfig: ProcessingConfig | null | undefined,
+): Record<string, unknown> | undefined {
+  if (!figure || !previewData || !linearity || !processingConfig) {
+    return figure;
+  }
+  const cloned = cloneFigure(figure);
+  const rowMap = buildPreviewRowMap(previewData);
+  if (!rowMap.size || !Array.isArray(cloned.data)) {
+    return figure;
+  }
+  const effectiveFits = applyManualLinearityOffsetsForPreview(previewData.fits, linearity);
+  let changed = false;
+  const nextData = cloned.data.map((trace) => {
+    const customdata = coerceVector(trace.customdata);
+    if (!customdata?.length) {
+      return trace;
+    }
+    const traceName = String(trace.name ?? "");
+    const valueSpace: "raw" | "calibrated" = traceName.startsWith("Calibrated") ? "calibrated" : "raw";
+    const x = coerceVector(trace.x);
+    const y = coerceVector(trace.y);
+    const z = coerceVector(trace.z);
+    let nextTrace = trace;
+    let nextX = x;
+    let nextY = y;
+    let nextZ = z;
+    let traceChanged = false;
+    for (let index = 0; index < customdata.length; index += 1) {
+      const rowLabel = customDataRowLabel(customdata[index]);
+      if (!rowLabel) {
+        continue;
+      }
+      const row = rowMap.get(rowLabel);
+      if (!row) {
+        continue;
+      }
+      const isotope = customDataIsotope(customdata[index]);
+      if (isotope === "cross") {
+        const d18 = previewValueForRow(row, "d18O", linearity, previewData, effectiveFits, "raw");
+        const d13 = previewValueForRow(row, "d13C", linearity, previewData, effectiveFits, "raw");
+        const patchedX = patchVectorValue(nextX, index, d18);
+        const patchedY = patchVectorValue(nextY, index, d13);
+        nextX = patchedX.values;
+        nextY = patchedY.values;
+        traceChanged = traceChanged || patchedX.changed || patchedY.changed;
+        if (processingConfig.z_axis === "d 13C/12C  Mean") {
+          const patchedZ = patchVectorValue(nextZ, index, d13);
+          nextZ = patchedZ.values;
+          traceChanged = traceChanged || patchedZ.changed;
+        } else if (processingConfig.z_axis === "d 18O/16O  Mean") {
+          const patchedZ = patchVectorValue(nextZ, index, d18);
+          nextZ = patchedZ.values;
+          traceChanged = traceChanged || patchedZ.changed;
+        }
+        continue;
+      }
+      if (isotope === "d13C" || isotope === "d18O") {
+        const value = previewValueForRow(row, isotope, linearity, previewData, effectiveFits, valueSpace);
+        const patchedY = patchVectorValue(nextY, index, value);
+        nextY = patchedY.values;
+        traceChanged = traceChanged || patchedY.changed;
+      }
+    }
+    if (traceChanged) {
+      nextTrace = { ...trace };
+      if (nextX && nextX !== x) {
+        nextTrace.x = nextX;
+      }
+      if (nextY && nextY !== y) {
+        nextTrace.y = nextY;
+      }
+      if (nextZ && nextZ !== z) {
+        nextTrace.z = nextZ;
+      }
+      changed = true;
+    }
+    return nextTrace;
+  });
+  return changed ? { ...cloned, data: nextData } : figure;
 }
 
 function formatPrecisionMetric(value?: number | null): string {
@@ -704,6 +1034,15 @@ function highlightSelectionSourceFigure(
   if (!figure || !target) {
     return figure;
   }
+  const cacheKey = targetSignature(target);
+  let figureCache = selectionSourceHighlightCache.get(figure);
+  if (!figureCache) {
+    figureCache = new Map<string, Record<string, unknown> | undefined>();
+    selectionSourceHighlightCache.set(figure, figureCache);
+  }
+  if (figureCache.has(cacheKey)) {
+    return figureCache.get(cacheKey);
+  }
   const cloned = cloneFigure(figure);
   const highlightTraces: Array<Record<string, unknown>> = [];
   const traces = Array.isArray(cloned.data) ? cloned.data : [];
@@ -780,12 +1119,15 @@ function highlightSelectionSourceFigure(
     highlightTraces.push(highlightTrace);
   }
   if (!highlightTraces.length) {
+    figureCache.set(cacheKey, cloned);
     return cloned;
   }
-  return {
+  const highlighted = {
     ...cloned,
     data: [...traces, ...highlightTraces],
   };
+  figureCache.set(cacheKey, highlighted);
+  return highlighted;
 }
 
 function figureContainsRowLabel(figure: Record<string, unknown> | undefined, rowLabel: string): boolean {
@@ -1284,6 +1626,22 @@ function parseCommentMap(raw: string) {
       }
     });
   return map;
+}
+
+function normalizeSpeciesLabel(value: string) {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function nextSpeciesNameMap(current: Record<string, string> | undefined, source: string, target: string) {
+  const sourceLabel = normalizeSpeciesLabel(source);
+  const targetLabel = normalizeSpeciesLabel(target);
+  const next = { ...(current ?? {}) };
+  if (!sourceLabel || !targetLabel || sourceLabel === targetLabel) {
+    delete next[sourceLabel];
+  } else {
+    next[sourceLabel] = targetLabel;
+  }
+  return next;
 }
 
 function fallbackTargetValue(target: SelectedTarget, isotopeKey: IsotopeKey): number {
@@ -2383,7 +2741,42 @@ function CheckboxField({
   );
 }
 
-function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }) {
+function ProcessingSummaryHero({
+  workspace,
+  speciesNameMap,
+  onSpeciesNameMapChange,
+  disabled = false,
+}: {
+  workspace: ProcessingWorkspace;
+  speciesNameMap: Record<string, string>;
+  onSpeciesNameMapChange: (source: string, target: string) => void;
+  disabled?: boolean;
+}) {
+  const [speciesDrafts, setSpeciesDrafts] = useState<Record<string, string>>({});
+  const speciesRows = useMemo(() => {
+    const labels = new Set<string>();
+    for (const value of workspace.available_values.species ?? []) {
+      const label = normalizeSpeciesLabel(String(value));
+      if (label) {
+        labels.add(label);
+      }
+    }
+    for (const value of Object.keys(speciesNameMap ?? {})) {
+      const label = normalizeSpeciesLabel(value);
+      if (label) {
+        labels.add(label);
+      }
+    }
+    return Array.from(labels).sort((a, b) => a.localeCompare(b));
+  }, [speciesNameMap, workspace.available_values.species]);
+  const renamedSpeciesCount = Object.entries(speciesNameMap ?? {}).filter(
+    ([source, target]) => normalizeSpeciesLabel(source) && normalizeSpeciesLabel(target) && normalizeSpeciesLabel(source) !== normalizeSpeciesLabel(target),
+  ).length;
+
+  useEffect(() => {
+    setSpeciesDrafts({});
+  }, [speciesNameMap, workspace.available_values.species]);
+
   if (!workspace.summary.metrics.length) {
     return null;
   }
@@ -2420,6 +2813,85 @@ function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }
             </div>
           ))}
         </div>
+        {speciesRows.length ? (
+          <div className="mt-4 rounded-lg border border-stone-200 bg-white">
+            <div className="flex flex-col gap-2 border-b border-stone-200 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <div className="text-sm font-semibold text-stone-900">Species names</div>
+                <div className="text-xs text-stone-500">Corrected names are used for processing groups, charts, tables, and exports.</div>
+              </div>
+              <span className="w-fit rounded-md bg-stone-50 px-2.5 py-1 text-xs text-stone-600 ring-1 ring-stone-200">
+                {renamedSpeciesCount} renamed
+              </span>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {speciesRows.map((source) => {
+                const savedTarget = speciesNameMap[source] ?? source;
+                const draftTarget = speciesDrafts[source] ?? savedTarget;
+                const isRenamed = normalizeSpeciesLabel(savedTarget) !== source;
+                const commitDraft = () => {
+                  const nextTarget = speciesDrafts[source] ?? savedTarget;
+                  onSpeciesNameMapChange(source, nextTarget);
+                };
+                return (
+                  <div key={source} className="grid gap-2 px-4 py-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
+                    <div className="min-w-0">
+                      <div className="text-xs font-medium uppercase tracking-normal text-stone-500">Source</div>
+                      <div className="truncate text-sm text-stone-800" title={source}>
+                        {source}
+                      </div>
+                    </div>
+                    <label className="min-w-0 text-sm">
+                      <span className="sr-only">Corrected species name for {source}</span>
+                      <input
+                        type="text"
+                        value={draftTarget}
+                        disabled={disabled}
+                        onChange={(event) =>
+                          setSpeciesDrafts((current) => ({
+                            ...current,
+                            [source]: event.target.value,
+                          }))
+                        }
+                        onBlur={commitDraft}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            commitDraft();
+                            event.currentTarget.blur();
+                          }
+                          if (event.key === "Escape") {
+                            event.preventDefault();
+                            setSpeciesDrafts((current) => {
+                              const next = { ...current };
+                              delete next[source];
+                              return next;
+                            });
+                            event.currentTarget.blur();
+                          }
+                        }}
+                        className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm disabled:cursor-not-allowed disabled:bg-stone-100"
+                      />
+                    </label>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={disabled || !isRenamed}
+                      onClick={() => {
+                        setSpeciesDrafts((current) => ({ ...current, [source]: source }));
+                        onSpeciesNameMapChange(source, source);
+                      }}
+                    >
+                      <X className="h-4 w-4" />
+                      Reset
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );
@@ -2799,6 +3271,7 @@ export default function ProcessingPage() {
   });
   const [multiOffsetD13, setMultiOffsetD13] = useState(0);
   const [multiOffsetD18, setMultiOffsetD18] = useState(0);
+  const [linearityPreviewConfig, setLinearityPreviewConfig] = useState<CalibrationConfig["linearity"] | null>(null);
   const [linearityOffsetDrafts, setLinearityOffsetDrafts] = useState<LinearityOffsetDraftState>({
     line_1_offset_d13: "0",
     line_1_offset_d18: "0",
@@ -2820,10 +3293,12 @@ export default function ProcessingPage() {
   const [failedRestoreStdev, setFailedRestoreStdev] = useState(0);
   const [colorScaleRange, setColorScaleRange] = useState<[number, number] | null>(null);
   const [colorScaleRangeParam, setColorScaleRangeParam] = useState<string | null>(null);
+  const [linearityPreviewStale, setLinearityPreviewStale] = useState(false);
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
+  const preserveLinearityPreviewOnWorkspaceUpdateRef = useRef(false);
   const colorScaleFigureCacheRef = useRef<
     WeakMap<Record<string, unknown>, { rangeKey: string; figure: Record<string, unknown> | undefined }>
   >(new WeakMap());
@@ -2843,10 +3318,22 @@ export default function ProcessingPage() {
     queryFn: () => api.getCalibrationWorkspace(sessionId!),
     enabled: Boolean(sessionId),
   });
+  const linearityPreviewDataQuery = useQuery({
+    queryKey: ["processing-linearity-preview-data", sessionId],
+    queryFn: () => api.getProcessingLinearityPreviewData(sessionId!),
+    enabled: Boolean(sessionId && calibrationWorkspaceQuery.data?.config?.linearity),
+    staleTime: 60_000,
+  });
 
   useEffect(() => {
     if (workspaceQuery.data) {
       setConfig(workspaceQuery.data.config);
+      if (preserveLinearityPreviewOnWorkspaceUpdateRef.current) {
+        preserveLinearityPreviewOnWorkspaceUpdateRef.current = false;
+      } else {
+        setLinearityPreviewStale(false);
+        setLinearityPreviewConfig(null);
+      }
     }
   }, [workspaceQuery.data]);
 
@@ -2917,6 +3404,11 @@ export default function ProcessingPage() {
     onSuccess: (workspace) => {
       queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
       setConfig(workspace.config);
+      if (!preserveLinearityPreviewOnWorkspaceUpdateRef.current) {
+        setLinearityPreviewStale(false);
+        setLinearityPreviewConfig(null);
+      }
+      void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
     },
   });
   const saveSharedLinearityMutation = useMutation({
@@ -2940,8 +3432,12 @@ export default function ProcessingPage() {
             }
           : workspace,
       );
+      queryClient.setQueryData<ProcessingLinearityPreviewData | undefined>(["processing-linearity-preview-data", sessionId], (current) =>
+        current ? { ...current, fits: workspace.linearity_fits } : current,
+      );
       setSharedLinearityConfig(workspace.config.linearity);
-      void queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      setLinearityPreviewStale(true);
+      void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       void queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       void queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
       void queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
@@ -2953,6 +3449,8 @@ export default function ProcessingPage() {
     onSuccess: (workspace) => {
       queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
       queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
+      setLinearityPreviewStale(false);
+      void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -2967,6 +3465,8 @@ export default function ProcessingPage() {
       }, openSpeciesSectionList),
     onSuccess: (workspace) => {
       queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
+      setLinearityPreviewStale(false);
+      void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -2978,6 +3478,8 @@ export default function ProcessingPage() {
     onSuccess: (workspace) => {
       queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
       setConfig(workspace.config);
+      setLinearityPreviewStale(false);
+      void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -3044,25 +3546,6 @@ export default function ProcessingPage() {
     }, 500);
     return () => window.clearTimeout(timer);
   }, [config, saveConfigMutation, saveConfigMutation.isPending, sessionId, workspaceQuery.data]);
-
-  useEffect(() => {
-    if (!sessionId || !sharedLinearityConfig || !calibrationWorkspaceQuery.data || saveSharedLinearityMutation.isPending) {
-      return;
-    }
-    if (linearityConfigEquals(sharedLinearityConfig, calibrationWorkspaceQuery.data.config.linearity)) {
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      saveSharedLinearityMutation.mutate(sharedLinearityConfig);
-    }, 450);
-    return () => window.clearTimeout(timer);
-  }, [
-    calibrationWorkspaceQuery.data,
-    saveSharedLinearityMutation,
-    saveSharedLinearityMutation.isPending,
-    sessionId,
-    sharedLinearityConfig,
-  ]);
 
   const activeTarget = selectedTargets.length ? selectedTargets[Math.min(activeTargetIndex, selectedTargets.length - 1)] : null;
   const activeSampleTarget = activeTarget;
@@ -3425,26 +3908,34 @@ export default function ProcessingPage() {
     key: keyof CalibrationConfig["linearity"],
     value: boolean | number | string | null,
   ) {
-    setSharedLinearityConfig((current) =>
-      current
-        ? {
-            ...current,
-            [key]: value,
-          }
-        : current,
-    );
+    setSharedLinearityConfig((current) => {
+      if (!current) {
+        return current;
+      }
+      const next = {
+        ...current,
+        [key]: value,
+      };
+      setLinearityPreviewConfig(next);
+      setLinearityPreviewStale(true);
+      return next;
+    });
   }
 
   function updateSharedLinearityIntensityCol(intensityCol: string) {
-    setSharedLinearityConfig((current) =>
-      current
-        ? {
-            ...current,
-            intensity_col: intensityCol,
-            use_diff_intensity: intensityCol === LINEARITY_INTENSITY_DIFF44,
-          }
-        : current,
-    );
+    setSharedLinearityConfig((current) => {
+      if (!current) {
+        return current;
+      }
+      const next = {
+        ...current,
+        intensity_col: intensityCol,
+        use_diff_intensity: intensityCol === LINEARITY_INTENSITY_DIFF44,
+      };
+      setLinearityPreviewConfig(next);
+      setLinearityPreviewStale(true);
+      return next;
+    });
   }
 
   function updateLinearityCoefficientOffset(
@@ -3475,6 +3966,8 @@ export default function ProcessingPage() {
       ];
       const hasOffset = activeOffsets.some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
       next.manual_override_enabled = hasOffset;
+      setLinearityPreviewConfig(next);
+      setLinearityPreviewStale(true);
       return next;
     });
   }
@@ -3723,6 +4216,15 @@ export default function ProcessingPage() {
     if (!activeConfig) {
       return;
     }
+    const shouldPreserveLinearityPreview = Boolean(linearityPreviewConfig) || hasPendingLinearityChanges || linearityPreviewStale;
+    if (
+      sharedLinearityConfig &&
+      calibrationWorkspaceQuery.data?.config?.linearity &&
+      !linearityConfigEquals(sharedLinearityConfig, calibrationWorkspaceQuery.data.config.linearity)
+    ) {
+      await saveSharedLinearityMutation.mutateAsync(sharedLinearityConfig);
+    }
+    preserveLinearityPreviewOnWorkspaceUpdateRef.current = shouldPreserveLinearityPreview;
     await saveConfigMutation.mutateAsync(activeConfig);
   }
 
@@ -3956,7 +4458,19 @@ export default function ProcessingPage() {
     resetAllMutation.isPending ||
     removeCalibrationMutation.isPending ||
     duplicateCheckMutation.isPending;
-  const activeLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config.linearity ?? null;
+  const savedLinearity = calibrationWorkspaceQuery.data?.config.linearity ?? null;
+  const activeLinearity = sharedLinearityConfig ?? savedLinearity;
+  const previewLinearity = linearityPreviewConfig ?? activeLinearity;
+  const hasPendingLinearityChanges = Boolean(
+    sharedLinearityConfig &&
+      savedLinearity &&
+      !linearityConfigEquals(sharedLinearityConfig, savedLinearity),
+  );
+  const shouldApplyLinearityPreview = Boolean(linearityPreviewConfig) || hasPendingLinearityChanges || linearityPreviewStale;
+  const applyPreviewFigure = (figure: Record<string, unknown> | undefined) =>
+    shouldApplyLinearityPreview
+      ? applyLinearityPreviewToFigure(figure, linearityPreviewDataQuery.data, previewLinearity, activeConfig)
+      : figure;
   const selectedLinearityIntensityCol = activeLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(activeLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
       ? activeLinearity.intensity_col
@@ -4156,25 +4670,25 @@ export default function ProcessingPage() {
       key: "processing_3d",
       title: "3D Processing Overview",
       description: "Global 3D view for the filtered processing scope.",
-      figure: withColorScaleRange(workspace.overview_figures.processing_3d),
+      figure: applyPreviewFigure(withColorScaleRange(workspace.overview_figures.processing_3d)),
     },
     d13Summary: {
       key: "d13_summary",
       title: "d13C Summary",
       description: "Summary curve for d13C across the active scope.",
-      figure: withColorScaleRange(workspace.overview_figures.d13_summary),
+      figure: applyPreviewFigure(withColorScaleRange(workspace.overview_figures.d13_summary)),
     },
     d18Summary: {
       key: "d18_summary",
       title: "d18O Summary",
       description: "Summary curve for d18O across the active scope.",
-      figure: withColorScaleRange(workspace.overview_figures.d18_summary),
+      figure: applyPreviewFigure(withColorScaleRange(workspace.overview_figures.d18_summary)),
     },
     crossplot: {
       key: "crossplot",
       title: "Crossplot",
       description: "d13C vs d18O selection surface for dual-isotope edits.",
-      figure: withColorScaleRange(workspace.overview_figures.crossplot),
+      figure: applyPreviewFigure(withColorScaleRange(workspace.overview_figures.crossplot)),
     },
   };
   const d13SummaryState = normalizeDisplayState(displayState[overviewCards.d13Summary.key]);
@@ -4215,13 +4729,13 @@ export default function ProcessingPage() {
                 key: `${d13Key}:selection-source`,
                 chartKey: d13Key,
                 title: "d13C series",
-                figure: highlightSelectionSourceFigure(d13FigureBase, activeTarget),
+                figure: highlightSelectionSourceFigure(applyPreviewFigure(d13FigureBase), activeTarget),
               },
               {
                 key: `${d18Key}:selection-source`,
                 chartKey: d18Key,
                 title: "d18O series",
-                figure: highlightSelectionSourceFigure(d18FigureBase, activeTarget),
+                figure: highlightSelectionSourceFigure(applyPreviewFigure(d18FigureBase), activeTarget),
               },
             ],
           };
@@ -4282,8 +4796,8 @@ export default function ProcessingPage() {
       chartKey: activeSelectionChartKey,
       figure: highlightSelectionSourceFigure(
         isotopeKey === "d13C"
-          ? withDisplayState(withColorScaleRange(figureSet.d13c), state)
-          : withDisplayState(withColorScaleRange(figureSet.d18o), state),
+          ? applyPreviewFigure(withDisplayState(withColorScaleRange(figureSet.d13c), state))
+          : applyPreviewFigure(withDisplayState(withColorScaleRange(figureSet.d18o), state)),
         activeTarget,
       ),
     };
@@ -4537,7 +5051,14 @@ export default function ProcessingPage() {
               <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-sm font-medium text-stone-800">Linearity (shared with calibration)</div>
-                  <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {hasPendingLinearityChanges || linearityPreviewStale ? (
+                      <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
+                        {hasPendingLinearityChanges ? "Draft preview" : "Preview active"}
+                      </span>
+                    ) : null}
+                    <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                  </div>
                 </div>
                 {activeLinearity ? (
                   <>
@@ -4655,11 +5176,9 @@ export default function ProcessingPage() {
                         <span className="mb-1 block text-stone-700">
                               {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                         </span>
-                        <input
-                          type="number"
-                          step="0.01"
+                        <DecimalInput
                           value={activeLinearity.manual_d13_per_10v ?? 0}
-                          onChange={(event) => updateLinearityCoefficientOffset("d13C", "primary", Number(event.target.value))}
+                          onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "primary", value)}
                           className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
@@ -4667,11 +5186,9 @@ export default function ProcessingPage() {
                         <span className="mb-1 block text-stone-700">
                               {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                         </span>
-                        <input
-                          type="number"
-                          step="0.01"
+                        <DecimalInput
                           value={activeLinearity.manual_d18_per_10v ?? 0}
-                          onChange={(event) => updateLinearityCoefficientOffset("d18O", "primary", Number(event.target.value))}
+                          onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "primary", value)}
                           className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
                       </label>
@@ -4682,11 +5199,9 @@ export default function ProcessingPage() {
                           <span className="mb-1 block text-stone-700">
                                 {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
                           </span>
-                          <input
-                            type="number"
-                            step="0.01"
+                          <DecimalInput
                             value={activeLinearity.manual_d13_per_10v2 ?? 0}
-                            onChange={(event) => updateLinearityCoefficientOffset("d13C", "secondary", Number(event.target.value))}
+                            onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "secondary", value)}
                             className="w-full rounded-lg border border-stone-300 px-3 py-2"
                           />
                         </label>
@@ -4694,11 +5209,9 @@ export default function ProcessingPage() {
                           <span className="mb-1 block text-stone-700">
                                 {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
                           </span>
-                          <input
-                            type="number"
-                            step="0.01"
+                          <DecimalInput
                             value={activeLinearity.manual_d18_per_10v2 ?? 0}
-                            onChange={(event) => updateLinearityCoefficientOffset("d18O", "secondary", Number(event.target.value))}
+                            onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "secondary", value)}
                             className="w-full rounded-lg border border-stone-300 px-3 py-2"
                           />
                         </label>
@@ -4797,7 +5310,7 @@ export default function ProcessingPage() {
 
               <div className="flex flex-wrap gap-2">
                 <Button onClick={applyConfig} disabled={busy}>
-                  Apply config
+                  {hasPendingLinearityChanges ? "Apply config + linearity" : "Apply config"}
                 </Button>
                 <Button
                   variant="outline"
@@ -4806,6 +5319,8 @@ export default function ProcessingPage() {
                     if (calibrationWorkspaceQuery.data?.config?.linearity) {
                       setSharedLinearityConfig(calibrationWorkspaceQuery.data.config.linearity);
                     }
+                    setLinearityPreviewConfig(null);
+                    setLinearityPreviewStale(false);
                   }}
                   disabled={busy}
                 >
@@ -4824,7 +5339,27 @@ export default function ProcessingPage() {
         </aside>
 
         <div className="space-y-6">
-          <ProcessingSummaryHero workspace={workspace} />
+          <ProcessingSummaryHero
+            workspace={workspace}
+            speciesNameMap={activeConfig.species_name_map ?? {}}
+            onSpeciesNameMapChange={(source, target) => {
+              updateConfig("species_name_map", nextSpeciesNameMap(activeConfig.species_name_map, source, target));
+              const sourceLabel = normalizeSpeciesLabel(source);
+              const targetLabel = normalizeSpeciesLabel(target);
+              if (sourceLabel && targetLabel && sourceLabel !== targetLabel) {
+                setOpenSpeciesSections((current) => {
+                  if (!current.has(sourceLabel)) {
+                    return current;
+                  }
+                  const next = new Set(current);
+                  next.delete(sourceLabel);
+                  next.add(targetLabel);
+                  return next;
+                });
+              }
+            }}
+            disabled={busy}
+          />
 
           <div className="space-y-6">
             <div className="grid gap-6 xl:grid-cols-2">

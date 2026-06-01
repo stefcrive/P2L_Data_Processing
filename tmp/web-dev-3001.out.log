@@ -1,0 +1,14 @@
+
+> irms-dashboard@0.1.0 dev
+> next dev -p 3001
+
+   ▲ Next.js 15.5.12
+   - Local:        http://localhost:3001
+   - Network:      http://10.46.104.45:3001
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 3.8s
+ ○ Compiling /processing ...
+ ✓ Compiled /processing in 56.4s (864 modules)
+ GET /calibration 200 in 7496ms

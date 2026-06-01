@@ -16,6 +16,7 @@ import {
 } from "@/components/diagnostics/saturation-figure-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { DecimalInput } from "@/components/ui/decimal-input";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
@@ -2660,7 +2661,7 @@ export default function CalibrationPage() {
       if (!current) {
         return current;
       }
-      const next = { ...current };
+      const next = { ...current, linearity: { ...current.linearity } };
       if (term === "primary" && isotopeKey === "d13C") {
         next.linearity.manual_d13_per_10v = value;
       } else if (term === "primary") {
@@ -4082,11 +4083,9 @@ export default function CalibrationPage() {
                     <span className="mb-1 block text-stone-700">
                       {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                     </span>
-                    <input
-                      type="number"
-                      step="0.01"
+                    <DecimalInput
                       value={activeConfig.linearity.manual_d13_per_10v ?? 0}
-                      onChange={(event) => updateLinearityCoefficientOffset("d13C", "primary", Number(event.target.value))}
+                      onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "primary", value)}
                       className="w-full rounded-lg border border-stone-300 px-3 py-2"
                     />
                   </label>
@@ -4094,11 +4093,9 @@ export default function CalibrationPage() {
                     <span className="mb-1 block text-stone-700">
                       {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                     </span>
-                    <input
-                      type="number"
-                      step="0.01"
+                    <DecimalInput
                       value={activeConfig.linearity.manual_d18_per_10v ?? 0}
-                      onChange={(event) => updateLinearityCoefficientOffset("d18O", "primary", Number(event.target.value))}
+                      onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "primary", value)}
                       className="w-full rounded-lg border border-stone-300 px-3 py-2"
                     />
                   </label>
@@ -4109,11 +4106,9 @@ export default function CalibrationPage() {
                       <span className="mb-1 block text-stone-700">
                         {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
                       </span>
-                      <input
-                        type="number"
-                        step="0.01"
+                      <DecimalInput
                         value={activeConfig.linearity.manual_d13_per_10v2 ?? 0}
-                        onChange={(event) => updateLinearityCoefficientOffset("d13C", "secondary", Number(event.target.value))}
+                        onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "secondary", value)}
                         className="w-full rounded-lg border border-stone-300 px-3 py-2"
                       />
                     </label>
@@ -4121,11 +4116,9 @@ export default function CalibrationPage() {
                       <span className="mb-1 block text-stone-700">
                         {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
                       </span>
-                      <input
-                        type="number"
-                        step="0.01"
+                      <DecimalInput
                         value={activeConfig.linearity.manual_d18_per_10v2 ?? 0}
-                        onChange={(event) => updateLinearityCoefficientOffset("d18O", "secondary", Number(event.target.value))}
+                        onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "secondary", value)}
                         className="w-full rounded-lg border border-stone-300 px-3 py-2"
                       />
                     </label>

@@ -10,6 +10,7 @@ import type {
   ImportResult,
   LinearityConfig,
   ProcessingConfig,
+  ProcessingLinearityPreviewData,
   ProcessingWorkspace,
   SessionSnapshot,
 } from "@/lib/types";
@@ -215,6 +216,10 @@ export const api = {
       `/sessions/${encodeURIComponent(sessionId)}/processing/workspace`,
       undefined,
       appendSpeciesSectionParams(new URLSearchParams(), speciesSections),
+    ),
+  getProcessingLinearityPreviewData: (sessionId: string) =>
+    requestJson<ProcessingLinearityPreviewData>(
+      `/sessions/${encodeURIComponent(sessionId)}/processing/linearity-preview-data`,
     ),
   setProcessingConfig: (sessionId: string, config: ProcessingConfig, speciesSections?: string[]) =>
     requestJson<ProcessingWorkspace>(

@@ -184,6 +184,7 @@ class ProcessingWorkspaceConfig(BaseModel):
     x_axis_option: Literal["By Identifier 2", "By Sequence"] = "By Identifier 2"
     color_param: str = "Date"
     z_axis: str = "1  Cycle Int  Samp  44"
+    species_name_map: dict[str, str] = Field(default_factory=dict)
     apply_shared_linearity_to_partially_saturated: bool = True
     enable_saturation_correction: bool = False
     saturation_correction_method: SaturationCorrectionMethod = "reference_gas_intensity"
@@ -344,3 +345,21 @@ class ProcessingWorkspace(BaseModel):
     outlier_tables: list[OutlierTable] = Field(default_factory=list)
     edit_state: ProcessingEditState = Field(default_factory=ProcessingEditState)
     export_state: ProcessingExportState = Field(default_factory=ProcessingExportState)
+
+
+class ProcessingLinearityPreviewRow(BaseModel):
+    row_label: str
+    line: float | None = None
+    d13_raw: float | None = None
+    d18_raw: float | None = None
+    d13_calibrated: float | None = None
+    d18_calibrated: float | None = None
+    intensities: dict[str, float | None] = Field(default_factory=dict)
+
+
+class ProcessingLinearityPreviewData(BaseModel):
+    session_id: str
+    intensity_col: str = CYCLE1_SIGNAL_SAMP44_COL
+    fits: dict[str, Any] = Field(default_factory=dict)
+    coefficients: dict[str, Any] = Field(default_factory=dict)
+    rows: list[ProcessingLinearityPreviewRow] = Field(default_factory=list)

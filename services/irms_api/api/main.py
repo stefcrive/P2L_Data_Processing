@@ -46,11 +46,14 @@ from ..domain.contracts import (
     LinearityConfig,
     ProcessingConfig,
     ProcessingExportConfig,
+    ProcessingLinearityPreviewData,
     ProcessingWorkspace,
     SessionSnapshot,
 )
 from ..domain.constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
+    CYCLE1_SIGNAL_DIFF45_COL,
+    CYCLE1_SIGNAL_DIFF46_COL,
     CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
@@ -1628,6 +1631,65 @@ def _workspace_to_chart_bundle(workspace: ProcessingWorkspace) -> ChartBundle:
     )
 
 
+def _numeric_or_none(value: Any) -> float | None:
+    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.notna(parsed) and np.isfinite(parsed):
+        return float(parsed)
+    return None
+
+
+def _processing_linearity_preview_rows(
+    df: pd.DataFrame,
+    fits: dict[str, Any],
+    selected_intensity_col: str,
+) -> list[dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    intensity_cols = {
+        CYCLE1_SIGNAL_SAMP44_COL,
+        CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_DIFF45_COL,
+        CYCLE1_SIGNAL_DIFF46_COL,
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+        str(selected_intensity_col or "").strip(),
+    }
+    if isinstance(fits, dict):
+        for key in ("intensity_col", "d13_intensity_col", "d18_intensity_col"):
+            value = str(fits.get(key, "")).strip()
+            if value:
+                intensity_cols.add(value)
+        for isotope_key in ("d13C", "d18O"):
+            fit = fits.get(isotope_key, {})
+            if isinstance(fit, dict):
+                for key in ("primary_col", "secondary_col"):
+                    value = str(fit.get(key, "")).strip()
+                    if value:
+                        intensity_cols.add(value)
+    line_col = next((col for col in df.columns if str(col).strip().lower() == "line"), None)
+    rows: list[dict[str, Any]] = []
+    for row_label, row in df.iterrows():
+        intensities = {
+            col: _numeric_or_none(row.get(col))
+            for col in sorted(intensity_cols)
+            if col and col in df.columns
+        }
+        rows.append(
+            {
+                "row_label": str(row_label),
+                "line": _numeric_or_none(row.get(line_col)) if line_col else None,
+                "d13_raw": _numeric_or_none(row.get("d 13C/12C  Mean")),
+                "d18_raw": _numeric_or_none(row.get("d 18O/16O  Mean")),
+                "d13_calibrated": _numeric_or_none(row.get("d13C_calibrated")),
+                "d18_calibrated": _numeric_or_none(row.get("d18O_calibrated")),
+                "intensities": intensities,
+            }
+        )
+    return rows
+
+
 @app.get("/sessions/{session_id}/processing/workspace", response_model=ProcessingWorkspace)
 def processing_workspace(
     session_id: str,
@@ -1642,6 +1704,36 @@ def processing_workspace(
             include_all_species_sections,
             species_section,
         ),
+    )
+
+
+@app.get("/sessions/{session_id}/processing/linearity-preview-data", response_model=ProcessingLinearityPreviewData)
+def processing_linearity_preview_data(session_id: str) -> ProcessingLinearityPreviewData:
+    _session_exists_or_404(session_id)
+    metadata = store.load_metadata(session_id)
+    df = store.load_frame(session_id)
+    cycles_df = store.load_cycles_frame(session_id)
+    calibration = _processing_calibration_meta(metadata)
+    linearity_cfg = calibration.get("config", {}).get("linearity", {}) if isinstance(calibration.get("config"), dict) else {}
+    fits = calibration.get("linearity_fits", {}) if isinstance(calibration.get("linearity_fits", {}), dict) else {}
+    selected_intensity_col = _resolve_selected_linearity_intensity_column(
+        df=df,
+        use_diff_intensity=bool(linearity_cfg.get("use_diff_intensity", False)),
+        selected_intensity_col=linearity_cfg.get("intensity_col"),
+    )
+    base_df = _ensure_cycle1_signal_difference_columns(df.copy())
+    if cycles_df is not None and not cycles_df.empty:
+        base_df = apply_run_level_linearity_basis_from_cycles(
+            base_df,
+            cycles_df,
+            cycle_intensity_aggregation=str(linearity_cfg.get("cycle_intensity_aggregation", "run_median")),
+        )
+    return ProcessingLinearityPreviewData(
+        session_id=session_id,
+        intensity_col=selected_intensity_col,
+        fits=to_json_compatible(fits),
+        coefficients=to_json_compatible(calibration.get("coefficients", {})),
+        rows=_processing_linearity_preview_rows(base_df, fits, selected_intensity_col),
     )
 
 

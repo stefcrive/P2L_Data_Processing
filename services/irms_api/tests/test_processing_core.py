@@ -849,6 +849,55 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, workspace.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, workspace.available_values.z_axis_options)
 
+    def test_species_name_map_merges_processing_sections(self) -> None:
+        df = sample_processing_df()
+        df.loc[2, "Species"] = "Corl"
+        df.loc[2, "Label"] = "SampleA - Corl"
+        metadata = {
+            "processing": {
+                "config": {
+                    "selected_identifier": "All",
+                    "x_axis_option": "By Identifier 2",
+                    "color_param": "Date_ordinal",
+                    "z_axis": "1  Cycle Int  Samp  44",
+                    "species_name_map": {"Corl": "Coral"},
+                    "signal_range": [0.0, 50.0],
+                    "leak_range": [0.0, 1000.0],
+                    "d13c_range": [-10.0, 10.0],
+                    "d18o_range": [-10.0, 10.0],
+                    "sigma_level_data": 4.0,
+                    "overlays": {
+                        "show_statistical_outliers": True,
+                        "show_range_outliers": True,
+                        "show_saturated_collectors": True,
+                        "show_saturated_samples": True,
+                        "show_failed_samples": True,
+                    },
+                    "manual_linearity_override": {
+                        "enabled": False,
+                        "d13_per_10v": 0.0,
+                        "d18_per_10v": 0.0,
+                    },
+                    "export": {
+                        "include_outliers": False,
+                        "selected_ids": ["All"],
+                        "interpolate_outliers": False,
+                        "client_name": None,
+                        "comment_map": {},
+                    },
+                }
+            },
+            "edit_state": {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
+
+        species_sections = {section.species for section in workspace.species_sections}
+        self.assertIn("Coral", species_sections)
+        self.assertNotIn("Corl", species_sections)
+        self.assertIn("Corl", workspace.available_values.species)
+
     def test_run_level_linearity_basis_can_use_cycle_endpoint_intensities(self) -> None:
         df = sample_processing_df().iloc[[0]].copy()
         cycles = pd.DataFrame(

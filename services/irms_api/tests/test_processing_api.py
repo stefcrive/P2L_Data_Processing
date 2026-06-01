@@ -219,6 +219,48 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertGreater(len(identifier_customdata), 0)
         self.assertEqual(len(identifier_customdata), len(identifier_calibrated.get("y", [])))
 
+    def test_linearity_preview_data_returns_vectors_without_persisting(self) -> None:
+        metadata = api_main.store.load_metadata(self.session_id)
+        metadata_before = dict(metadata)
+        metadata["calibration"] = {
+            **metadata.get("calibration", {}),
+            "coefficients": {
+                "d13C": {"slope": 1.0, "intercept": 1.0},
+                "d18O": {"slope": 2.0, "intercept": -1.0},
+            },
+            "config": {
+                "linearity": {
+                    "apply": True,
+                    "use_diff_intensity": False,
+                    "intensity_col": "1  Cycle Int  Samp  44",
+                    "manual_override_enabled": False,
+                    "quadratic": False,
+                    "line_1_offset_d13": 3.0,
+                }
+            },
+            "linearity_fits": {
+                "d13C": {"slope": 1.0, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+                "d18O": {"slope": 0.5, "intercept": 0.0, "x_ref": 15.0, "n": 4},
+                "intensity_col": "1  Cycle Int  Samp  44",
+            },
+        }
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        preview = api_main.processing_linearity_preview_data(self.session_id)
+
+        self.assertEqual(preview.session_id, self.session_id)
+        self.assertEqual(preview.intensity_col, "1  Cycle Int  Samp  44")
+        self.assertEqual(preview.fits["intensity_col"], "1  Cycle Int  Samp  44")
+        self.assertEqual(preview.coefficients["d18O"]["slope"], 2.0)
+        self.assertGreaterEqual(len(preview.rows), 4)
+        row0 = next(row for row in preview.rows if row.row_label == "0")
+        self.assertAlmostEqual(float(row0.d13_raw), 1.0, places=6)
+        self.assertAlmostEqual(float(row0.intensities["1  Cycle Int  Samp  44"]), 15.0, places=6)
+        # Preview rows are intentionally pre-linearity and pre-line-offset so the client can draft edits locally.
+        self.assertNotEqual(float(row0.d13_raw), 4.0)
+        self.assertEqual(api_main.store.load_metadata(self.session_id)["calibration"], metadata["calibration"])
+        self.assertEqual(metadata_before.get("processing"), api_main.store.load_metadata(self.session_id).get("processing"))
+
     def test_remove_processing_calibration_drops_applied_columns_only(self) -> None:
         workspace = api_main.remove_processing_calibration(self.session_id)
         self.assertEqual(workspace.session_id, self.session_id)
