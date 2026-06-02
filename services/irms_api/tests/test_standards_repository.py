@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from services.irms_api.domain.constants import ISOTYPE_D13C, ISOTYPE_D18O
@@ -41,7 +42,7 @@ class StandardsRepositoryTests(unittest.TestCase):
 
     def test_existing_database_value_is_used_for_true_value(self) -> None:
         ensure_standards_database(db_path=self.db_path, standards_csv_path=self.csv_path)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute(
                 """
                 UPDATE standards_official_values
@@ -64,7 +65,7 @@ class StandardsRepositoryTests(unittest.TestCase):
 
     def test_ensure_standards_database_reinserts_missing_csv_rows(self) -> None:
         ensure_standards_database(db_path=self.db_path, standards_csv_path=self.csv_path)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute("DELETE FROM standards_official_values WHERE standard IN (?, ?)", ("NBS18", "NBS19"))
             conn.commit()
         ensure_standards_database(db_path=self.db_path, standards_csv_path=self.csv_path)

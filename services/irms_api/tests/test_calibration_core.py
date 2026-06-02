@@ -10,7 +10,9 @@ from services.irms_api.domain.calibration.core import (
     _apply_linearity_correction,
     _apply_manual_linearity_override_to_standards,
     _compute_linearity_fit,
+    _compute_standard_linearity_fit,
     _filter_linearity_fit_input_by_max_intensity,
+    _with_standard_linearity_residual_columns,
     _with_isotope_linearity_intensity_columns,
     calibrate_results,
     convert_d18o_carbonate_material,
@@ -79,7 +81,10 @@ class CalibrationCoreTests(unittest.TestCase):
     def test_compute_linearity_fit_returns_expected_keys(self) -> None:
         df = pd.DataFrame({"intensity": [10.0, 15.0, 20.0], "value": [1.0, 2.0, 3.0]})
         result = _compute_linearity_fit(df, "value", "intensity")
-        self.assertEqual(set(result.keys()), {"slope", "intercept", "quad", "degree", "r2", "x_ref", "n"})
+        self.assertEqual(
+            set(result.keys()),
+            {"slope", "intercept", "quad", "degree", "r2", "x_ref", "secondary_x_ref", "n"},
+        )
         self.assertEqual(result["n"], 3)
         self.assertEqual(result["degree"], 1)
 
@@ -102,6 +107,32 @@ class CalibrationCoreTests(unittest.TestCase):
         self.assertEqual(int(result["n"]), 3)
         self.assertTrue(pd.isna(pd.to_numeric(pd.Series([result["slope"]]), errors="coerce").iloc[0]))
         self.assertAlmostEqual(float(result["intercept"]), 2.0, places=6)
+
+    def test_standard_linearity_fit_uses_residuals_instead_of_standard_offsets(self) -> None:
+        repository = StandardsRepository(
+            pd.DataFrame(
+                {
+                    "Standard": ["LOW", "LOW", "HIGH", "HIGH"],
+                    "Isotopic_Value_Type": [ISOTYPE_D13C, ISOTYPE_D18O, ISOTYPE_D13C, ISOTYPE_D18O],
+                    "Value": [-10.0, -20.0, 10.0, 20.0],
+                }
+            )
+        )
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["LOW", "LOW", "HIGH", "HIGH"],
+                "intensity": [1.0, 2.0, 9.0, 10.0],
+                "d 13C/12C  Mean": [-9.8, -9.6, 11.8, 12.0],
+            }
+        )
+        residual_df = _with_standard_linearity_residual_columns(df, ["LOW", "HIGH"], repository)
+
+        raw_fit = _compute_linearity_fit(residual_df, "d 13C/12C  Mean", "intensity")
+        residual_fit = _compute_standard_linearity_fit(residual_df, "d13C", "d 13C/12C  Mean", "intensity")
+
+        self.assertGreater(float(raw_fit["slope"]), 1.0)
+        self.assertAlmostEqual(float(residual_fit["slope"]), 0.2, places=6)
+        self.assertEqual(residual_fit.get("fit_y_kind"), "standard_residual")
 
     def test_filter_linearity_fit_input_by_max_intensity(self) -> None:
         df = pd.DataFrame(

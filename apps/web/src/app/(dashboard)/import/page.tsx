@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderOpen, Plus, RefreshCw, Upload } from "lucide-react";
+import { FileJson, FolderOpen, Plus, RefreshCw, Upload } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -13,6 +13,7 @@ import type { SessionSnapshot } from "@/lib/types";
 import { useSessionStore } from "@/store/use-session-store";
 
 const WORKBOOK_EXTENSION_REGEX = /\.(xls|xlsx)$/i;
+const SESSION_STATE_FILE_REGEX = /(^|\/)irms_session_state\.json$/i;
 const SESSION_RECORD_METADATA_REGEX = /(^|\/)session record\/[^/]+\/metadata\.json$/i;
 
 type FileWithRelativePath = File & { webkitRelativePath?: string };
@@ -78,6 +79,14 @@ async function detectSessionIdFromSessionRecord(folderFiles: File[]): Promise<st
     }
   }
   return null;
+}
+
+function detectSessionStateFile(folderFiles: File[]): File | null {
+  const candidates = folderFiles
+    .map((file) => ({ file, relativePath: normalizeRelativePath(file).toLowerCase() }))
+    .filter(({ relativePath }) => SESSION_STATE_FILE_REGEX.test(relativePath))
+    .sort((a, b) => b.file.lastModified - a.file.lastModified);
+  return candidates[0]?.file ?? null;
 }
 
 function sourceWorkbookNames(session: SessionSnapshot): string[] {
@@ -151,6 +160,7 @@ export default function ImportPage() {
   const [browseInfo, setBrowseInfo] = useState<string | null>(null);
   const [browseError, setBrowseError] = useState<string | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const sessionFileInputRef = useRef<HTMLInputElement | null>(null);
   const queryClient = useQueryClient();
   const setSessionId = useSessionStore((state) => state.setSessionId);
   const sessionId = useSessionStore((state) => state.sessionId);
@@ -176,6 +186,7 @@ export default function ImportPage() {
     { label: "Session event log", path: stringValue(autosave.log_path) },
     { label: "Session snapshot", path: stringValue(autosave.snapshot_path) },
     { label: "Session metadata", path: stringValue(autosave.meta_path) },
+    { label: "Session state file", path: stringValue(autosave.source_session_state_path) ?? stringValue(autosave.session_state_path) },
   ];
   const sessionSourceFiles = useMemo(
     () =>
@@ -227,10 +238,49 @@ export default function ImportPage() {
     },
   });
 
+  const openSessionFileMutation = useMutation({
+    mutationFn: (file: File) => api.openSessionFile(file),
+    onSuccess: async (result) => {
+      setSessionId(result.session_id);
+      setBrowseError(null);
+      await queryClient.invalidateQueries({ queryKey: ["session", result.session_id] });
+      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    },
+  });
+
+  const openSessionFolderMutation = useMutation({
+    mutationFn: (folderFiles: File[]) => api.openSessionFolder(folderFiles),
+    onSuccess: async (result) => {
+      setSessionId(result.session_id);
+      setBrowseError(null);
+      await queryClient.invalidateQueries({ queryKey: ["session", result.session_id] });
+      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    },
+  });
+
   const handleBrowseFolderClick = () => {
     setBrowseError(null);
     setBrowseInfo(null);
     folderInputRef.current?.click();
+  };
+
+  const handleOpenSessionFileClick = () => {
+    setBrowseError(null);
+    setBrowseInfo(null);
+    sessionFileInputRef.current?.click();
+  };
+
+  const handleSessionFileSelected = (event: ChangeEvent<HTMLInputElement>) => {
+    const selected = Array.from(event.target.files ?? []);
+    event.currentTarget.value = "";
+    setBrowseError(null);
+    setBrowseInfo(null);
+    const file = selected[0];
+    if (!file) {
+      return;
+    }
+    setBrowseInfo("Opening session file...");
+    openSessionFileMutation.mutate(file);
   };
 
   const handleFolderSelected = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -242,10 +292,17 @@ export default function ImportPage() {
       return;
     }
 
+    const sessionStateFile = detectSessionStateFile(selected);
+    if (sessionStateFile) {
+      setBrowseInfo("Found session state file in selected folder. Opening...");
+      openSessionFolderMutation.mutate(selected);
+      return;
+    }
+
     const sessionIdFromRecord = await detectSessionIdFromSessionRecord(selected);
     if (sessionIdFromRecord) {
       setBrowseInfo("Found session record in selected folder. Opening...");
-      openMutation.mutate(sessionIdFromRecord);
+      openSessionFolderMutation.mutate(selected);
       return;
     }
 
@@ -274,7 +331,7 @@ export default function ImportPage() {
       <Card>
         <CardHeader>
           <CardTitle>Import Workbooks</CardTitle>
-          <CardDescription>Start a new session, add files to an open session, or reopen one of your recent sessions.</CardDescription>
+          <CardDescription>Start a new session, add files to an open session, or reopen a saved session state file.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
           <input
@@ -330,9 +387,21 @@ export default function ImportPage() {
           <div className="space-y-3 rounded-lg border border-stone-200 p-4">
             <div className="form-section-title">Recent Sessions</div>
             <div className="flex flex-wrap gap-3">
-              <Button variant="outline" onClick={handleBrowseFolderClick} disabled={openMutation.isPending}>
+              <Button
+                variant="outline"
+                onClick={handleBrowseFolderClick}
+                disabled={openMutation.isPending || openSessionFileMutation.isPending || openSessionFolderMutation.isPending}
+              >
                 <FolderOpen className="h-4 w-4" />
                 Browse folder
+              </Button>
+              <Button
+                variant="outline"
+                onClick={handleOpenSessionFileClick}
+                disabled={openSessionFileMutation.isPending || openSessionFolderMutation.isPending}
+              >
+                <FileJson className="h-4 w-4" />
+                Open session file
               </Button>
               <Button variant="secondary" onClick={() => sessionsQuery.refetch()} disabled={sessionsQuery.isFetching}>
                 <RefreshCw className="h-4 w-4" />
@@ -340,6 +409,13 @@ export default function ImportPage() {
               </Button>
             </div>
             <input ref={folderInputRef} type="file" multiple onChange={handleFolderSelected} className="hidden" />
+            <input
+              ref={sessionFileInputRef}
+              type="file"
+              accept=".json"
+              onChange={handleSessionFileSelected}
+              className="hidden"
+            />
             {browseInfo ? <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">{browseInfo}</div> : null}
             {browseError ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{browseError}</div> : null}
             {recentSessions.length > 0 ? (
@@ -365,8 +441,10 @@ export default function ImportPage() {
             ) : (
               <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-sm text-stone-600">No saved sessions yet.</div>
             )}
-            {openMutation.error ? (
-              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{String(openMutation.error)}</div>
+            {openMutation.error || openSessionFileMutation.error || openSessionFolderMutation.error ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                {String(openMutation.error ?? openSessionFileMutation.error ?? openSessionFolderMutation.error)}
+              </div>
             ) : null}
           </div>
         </CardContent>
@@ -374,7 +452,7 @@ export default function ImportPage() {
       <Card>
         <CardHeader>
           <CardTitle>Autosave Session</CardTitle>
-          <CardDescription>Autosave stores event logs, snapshots, and metadata in a Session record folder for this workbook set.</CardDescription>
+          <CardDescription>Autosave stores event logs, snapshots, metadata, and a portable session state file for this workbook set.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4 text-sm text-stone-600">
           <div className="grid gap-3 sm:grid-cols-2">

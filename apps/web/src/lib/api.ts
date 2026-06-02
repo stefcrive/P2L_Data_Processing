@@ -39,6 +39,8 @@ type LinearityOptions = {
   summaryOnly?: boolean;
 };
 
+type FileWithRelativePath = File & { webkitRelativePath?: string };
+
 function endpoint(path: string, params?: URLSearchParams): string {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   const query = params?.toString();
@@ -88,10 +90,12 @@ async function requestJson<T>(path: string, init?: RequestInit, params?: URLSear
   return response.json() as Promise<T>;
 }
 
-function formDataFromFiles(files: File[]): FormData {
+function formDataFromFiles(files: File[], includeRelativePaths = false): FormData {
   const form = new FormData();
   for (const file of files) {
-    form.append("files", file);
+    const relativePath = (file as FileWithRelativePath).webkitRelativePath;
+    const filename = includeRelativePaths && relativePath && relativePath.trim().length > 0 ? relativePath : file.name;
+    form.append("files", file, filename);
   }
   return form;
 }
@@ -134,6 +138,19 @@ export const api = {
     requestJson<ImportResult>("/sessions/import", {
       method: "POST",
       body: formDataFromFiles(files),
+    }),
+  openSessionFile: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return requestJson<SessionSnapshot>("/sessions/open-file", {
+      method: "POST",
+      body: form,
+    });
+  },
+  openSessionFolder: (files: File[]) =>
+    requestJson<SessionSnapshot>("/sessions/open-folder", {
+      method: "POST",
+      body: formDataFromFiles(files, true),
     }),
   appendSession: (sessionId: string, files: File[]) =>
     requestJson<ImportResult>(`/sessions/${encodeURIComponent(sessionId)}/append`, {

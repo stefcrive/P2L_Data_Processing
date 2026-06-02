@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Database, X } from "lucide-react";
-import { useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
@@ -27,6 +27,7 @@ import type {
   CalibrationWorkspace,
   CycleDiagnosticsPayload,
   EditAction,
+  ProcessingLinearityPreviewData,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
@@ -46,6 +47,8 @@ type HoverPreviewState = {
   clientX: number;
   clientY: number;
 };
+type IsotopeKey = "d13C" | "d18O";
+const ISOTOPE_KEYS: IsotopeKey[] = ["d13C", "d18O"];
 type FigureShape = Record<string, unknown> & {
   data: Array<Record<string, unknown>>;
   layout: Record<string, unknown>;
@@ -60,6 +63,34 @@ type ColorScaleBounds = {
   min: number;
   max: number;
 };
+type CalibrationPreviewRowState = {
+  rowLabel: string;
+  identifier1: string;
+  identifier2: string;
+  species: string;
+  line: number | null;
+  d13: number | null;
+  d18: number | null;
+  attributes: Record<string, unknown>;
+  intensities: Record<string, number | null>;
+};
+type CalibrationPreviewColorState = {
+  param: string;
+  valuesByRow: Map<string, number>;
+  tickvals?: number[];
+  ticktext?: string[];
+};
+type CalibrationPreviewMasks = {
+  rowsByLabel: Map<string, CalibrationPreviewRowState>;
+  selectedRows: Set<string>;
+  baseD13: Set<string>;
+  baseD18: Set<string>;
+  baseCross: Set<string>;
+  outlierD13: Set<string>;
+  outlierD18: Set<string>;
+  outlierCombined: Set<string>;
+  color: CalibrationPreviewColorState | null;
+};
 type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
 type LinearityOffsetDraftState = Record<LinearityOffsetField, string>;
 type LinearityCycleIntensityAggregation = "run_median" | "first_valid_cycle" | "last_valid_cycle";
@@ -71,6 +102,7 @@ const OFFICIAL_VALUE_TYPE_D18 = "VSMOW(18O)";
 const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const SELECTION_EDITOR_CHART_DEFER_MS = 350;
+const SELECTION_EDITOR_CLOSE_SUPPRESSION_MS = 5000;
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
@@ -1070,39 +1102,823 @@ function linearityOffsetWithFallback(value: number | null | undefined, fallback:
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-function normalizeLinearityConfigForCompare(linearity: CalibrationConfig["linearity"] | null | undefined) {
-  if (!linearity) {
+function normalizeStandardKey(value: unknown): string {
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function finiteNumber(value: unknown): number | null {
+  return toFiniteNumber(value);
+}
+
+function lineOffsetForPreview(linearity: CalibrationConfig["linearity"], isotopeKey: IsotopeKey, line: number | null | undefined): number {
+  if (line !== 1 && line !== 2) {
+    return 0;
+  }
+  if (isotopeKey === "d13C") {
+    return line === 1 ? finiteNumber(linearity.line_1_offset_d13) ?? 0 : finiteNumber(linearity.line_2_offset_d13) ?? 0;
+  }
+  return line === 1 ? finiteNumber(linearity.line_1_offset_d18) ?? 0 : finiteNumber(linearity.line_2_offset_d18) ?? 0;
+}
+
+function linearityPrimaryOffsetScale(intensityCol: string | null | undefined): number {
+  return intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44 || intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 ? 1 : 10;
+}
+
+function linearitySecondaryOffsetScale(intensityCol: string | null | undefined): number {
+  if (
+    intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44 ||
+    intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 ||
+    intensityCol === LINEARITY_INTENSITY_TWO_TERM44
+  ) {
+    return 1;
+  }
+  return 100;
+}
+
+function applyManualLinearityOffsetsForPreview(
+  fits: Record<string, unknown> | undefined,
+  linearity: CalibrationConfig["linearity"],
+): Record<string, unknown> {
+  const adjusted: Record<string, unknown> = {
+    ...(fits ?? {}),
+    d13C: { ...(((fits ?? {}).d13C as Record<string, unknown> | undefined) ?? {}) },
+    d18O: { ...(((fits ?? {}).d18O as Record<string, unknown> | undefined) ?? {}) },
+  };
+  if (!linearity.manual_override_enabled) {
+    return adjusted;
+  }
+  const basisCol = String(adjusted.intensity_col ?? linearity.intensity_col ?? "");
+  const configByIsotope: Record<IsotopeKey, { linear: number; quadratic: number }> = {
+    d13C: {
+      linear: finiteNumber(linearity.manual_d13_per_10v) ?? 0,
+      quadratic: finiteNumber(linearity.manual_d13_per_10v2) ?? 0,
+    },
+    d18O: {
+      linear: finiteNumber(linearity.manual_d18_per_10v) ?? 0,
+      quadratic: finiteNumber(linearity.manual_d18_per_10v2) ?? 0,
+    },
+  };
+  for (const isotopeKey of ISOTOPE_KEYS) {
+    const fit = { ...((adjusted[isotopeKey] as Record<string, unknown> | undefined) ?? {}) };
+    const xRef = finiteNumber(fit.x_ref) ?? 0;
+    const baseIntercept = finiteNumber(fit.intercept);
+    let interceptShift = 0;
+    if (String(fit.model ?? "") === "two_term") {
+      const slopeOffsetRaw = configByIsotope[isotopeKey].linear;
+      const secondaryOffsetRaw = configByIsotope[isotopeKey].quadratic;
+      if (Number.isFinite(slopeOffsetRaw) && Math.abs(slopeOffsetRaw) > 1e-15) {
+        const slopeOffset = slopeOffsetRaw / linearityPrimaryOffsetScale(LINEARITY_INTENSITY_TWO_TERM44);
+        fit.slope = (finiteNumber(fit.slope) ?? 0) + slopeOffset;
+        interceptShift += slopeOffset * xRef;
+      }
+      if (Number.isFinite(secondaryOffsetRaw) && Math.abs(secondaryOffsetRaw) > 1e-15) {
+        const secondaryOffset = secondaryOffsetRaw / linearitySecondaryOffsetScale(LINEARITY_INTENSITY_TWO_TERM44);
+        fit.quad = (finiteNumber(fit.quad) ?? 0) + secondaryOffset;
+        const secondaryRef = finiteNumber(fit.secondary_x_ref);
+        if (secondaryRef != null) {
+          interceptShift += secondaryOffset * secondaryRef;
+        }
+      }
+      if (baseIntercept != null && Math.abs(interceptShift) > 1e-15) {
+        fit.intercept = baseIntercept - interceptShift;
+      }
+      adjusted[isotopeKey] = fit;
+      continue;
+    }
+
+    const slopeOffsetRaw = configByIsotope[isotopeKey].linear;
+    if (Number.isFinite(slopeOffsetRaw) && Math.abs(slopeOffsetRaw) > 1e-15) {
+      const slopeOffset = slopeOffsetRaw / linearityPrimaryOffsetScale(basisCol);
+      fit.slope = (finiteNumber(fit.slope) ?? 0) + slopeOffset;
+      if (baseIntercept != null) {
+        fit.intercept = baseIntercept - slopeOffset * xRef;
+      }
+    }
+    if (linearity.quadratic) {
+      const quadOffsetRaw = configByIsotope[isotopeKey].quadratic;
+      if (Number.isFinite(quadOffsetRaw) && Math.abs(quadOffsetRaw) > 1e-15) {
+        const quadOffset = quadOffsetRaw / linearitySecondaryOffsetScale(basisCol);
+        fit.quad = (finiteNumber(fit.quad) ?? 0) + quadOffset;
+        const currentIntercept = finiteNumber(fit.intercept);
+        if (currentIntercept != null) {
+          fit.intercept = currentIntercept - quadOffset * xRef ** 2;
+        }
+        fit.degree = Math.max(finiteNumber(fit.degree) ?? 1, 2);
+      }
+    }
+    adjusted[isotopeKey] = fit;
+  }
+  return adjusted;
+}
+
+function linearityFitDegree(fit: Record<string, unknown>): number {
+  const degree = finiteNumber(fit.degree);
+  if (degree != null && degree >= 2) {
+    return 2;
+  }
+  if (fit.quadratic === true) {
+    return 2;
+  }
+  const quad = finiteNumber(fit.quad);
+  return quad != null && Math.abs(quad) > 1e-15 ? 2 : 1;
+}
+
+function linearityCorrectionDeltaForPreview(
+  fit: Record<string, unknown>,
+  intensity: number | null,
+  secondaryIntensity?: number | null,
+): number | null {
+  const slope = finiteNumber(fit.slope);
+  const xRef = finiteNumber(fit.x_ref);
+  if (slope == null || xRef == null || intensity == null) {
     return null;
   }
+  if (String(fit.model ?? "") === "two_term") {
+    const secondaryRef = finiteNumber(fit.secondary_x_ref);
+    const secondarySlope = finiteNumber(fit.quad);
+    if (secondaryRef == null || secondarySlope == null || secondaryIntensity == null) {
+      return null;
+    }
+    const delta = slope * (intensity - xRef) + secondarySlope * (secondaryIntensity - secondaryRef);
+    return Number.isFinite(delta) ? delta : null;
+  }
+  let delta = slope * (intensity - xRef);
+  const quad = finiteNumber(fit.quad);
+  if (linearityFitDegree(fit) >= 2 && quad != null) {
+    delta += quad * (intensity ** 2 - xRef ** 2);
+  }
+  return Number.isFinite(delta) ? delta : null;
+}
+
+function previewValueForRow(
+  row: ProcessingLinearityPreviewData["rows"][number] | undefined,
+  isotopeKey: IsotopeKey,
+  linearity: CalibrationConfig["linearity"],
+  previewData: ProcessingLinearityPreviewData,
+  effectiveFits: Record<string, unknown>,
+  valueSpace: "raw" | "calibrated",
+): number | null {
+  if (!row) {
+    return null;
+  }
+  const baseRaw = isotopeKey === "d13C" ? finiteNumber(row.d13_raw) : finiteNumber(row.d18_raw);
+  if (baseRaw == null) {
+    return null;
+  }
+  const adjustedRaw = baseRaw + lineOffsetForPreview(linearity, isotopeKey, finiteNumber(row.line));
+  let rawValue = adjustedRaw;
+  const fit = (effectiveFits[isotopeKey] as Record<string, unknown> | undefined) ?? {};
+  if (linearity.apply) {
+    const intensityCol =
+      String(
+        (String(fit.model ?? "") === "two_term"
+          ? fit.primary_col
+          : effectiveFits[isotopeKey === "d13C" ? "d13_intensity_col" : "d18_intensity_col"]) ??
+          previewData.intensity_col ??
+          linearity.intensity_col ??
+          "",
+      ).trim();
+    const fallbackIntensityCol = String(previewData.intensity_col ?? linearity.intensity_col ?? "").trim();
+    const primaryIntensity = finiteNumber(row.intensities[intensityCol]) ?? finiteNumber(row.intensities[fallbackIntensityCol]);
+    const secondaryCol = String(fit.secondary_col ?? LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44);
+    const secondaryIntensity = finiteNumber(row.intensities[secondaryCol]);
+    const delta = linearityCorrectionDeltaForPreview(fit, primaryIntensity, secondaryIntensity);
+    if (delta != null) {
+      rawValue = adjustedRaw - delta;
+    }
+  }
+  if (valueSpace === "raw") {
+    return Number.isFinite(rawValue) ? rawValue : null;
+  }
+  const coeff = (previewData.coefficients?.[isotopeKey] as Record<string, unknown> | undefined) ?? {};
+  const slope = finiteNumber(coeff.slope);
+  const intercept = finiteNumber(coeff.intercept);
+  if (slope != null && intercept != null) {
+    return slope * rawValue + intercept;
+  }
+  return isotopeKey === "d13C" ? finiteNumber(row.d13_calibrated) : finiteNumber(row.d18_calibrated);
+}
+
+function customDataRowLabel(value: unknown): string {
+  if (Array.isArray(value)) {
+    return String(value[0] ?? "").trim();
+  }
+  if (value && typeof value === "object") {
+    const payload = value as Record<string, unknown>;
+    return String(payload.row_label ?? payload.rowLabel ?? payload[0] ?? "").trim();
+  }
+  return String(value ?? "").trim();
+}
+
+function customDataIsotope(value: unknown): IsotopeKey | "cross" | null {
+  if (Array.isArray(value)) {
+    return normalizeIsotopeKey(value[1]);
+  }
+  if (value && typeof value === "object") {
+    const payload = value as Record<string, unknown>;
+    return normalizeIsotopeKey(payload.isotope_key ?? payload.isotopeKey ?? payload[1]);
+  }
+  return null;
+}
+
+function sortedFinite(values: Array<number | null>): number[] {
+  return values.filter((value): value is number => value != null && Number.isFinite(value)).sort((a, b) => a - b);
+}
+
+function quantile(values: number[], q: number): number | null {
+  if (!values.length) {
+    return null;
+  }
+  if (values.length === 1) {
+    return values[0];
+  }
+  const position = (values.length - 1) * q;
+  const lowerIndex = Math.floor(position);
+  const upperIndex = Math.ceil(position);
+  const lower = values[lowerIndex];
+  const upper = values[upperIndex];
+  if (lower == null || upper == null) {
+    return null;
+  }
+  return lower + (upper - lower) * (position - lowerIndex);
+}
+
+function statisticalOutlierRows(valuesByRow: Array<{ rowLabel: string; value: number | null }>, method: string, sigmaLevel: number, iqrMultiplier: number): Set<string> {
+  const finiteValues = sortedFinite(valuesByRow.map((item) => item.value));
+  const outliers = new Set<string>();
+  if (finiteValues.length <= 1) {
+    return outliers;
+  }
+  if (String(method).trim().toUpperCase() === "IQR") {
+    const q1 = quantile(finiteValues, 0.25);
+    const q3 = quantile(finiteValues, 0.75);
+    if (q1 == null || q3 == null) {
+      return outliers;
+    }
+    const iqr = q3 - q1;
+    const lower = q1 - iqrMultiplier * iqr;
+    const upper = q3 + iqrMultiplier * iqr;
+    for (const item of valuesByRow) {
+      if (item.value != null && (item.value < lower || item.value > upper)) {
+        outliers.add(item.rowLabel);
+      }
+    }
+    return outliers;
+  }
+  const mean = finiteValues.reduce((sum, value) => sum + value, 0) / finiteValues.length;
+  const variance =
+    finiteValues.length > 1
+      ? finiteValues.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (finiteValues.length - 1)
+      : 0;
+  const std = Math.sqrt(variance);
+  if (!Number.isFinite(mean) || !Number.isFinite(std) || std <= 0) {
+    return outliers;
+  }
+  const lower = mean - sigmaLevel * std;
+  const upper = mean + sigmaLevel * std;
+  for (const item of valuesByRow) {
+    if (item.value != null && (item.value < lower || item.value > upper)) {
+      outliers.add(item.rowLabel);
+    }
+  }
+  return outliers;
+}
+
+function localDateTime(value: unknown): number | null {
+  if (value == null) {
+    return null;
+  }
+  const text = String(value).trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const time = new Date(year, month - 1, day).getTime();
+    return Number.isFinite(time) ? time : null;
+  }
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function dateOrdinal(value: unknown): number | null {
+  const time = localDateTime(value);
+  if (time == null) {
+    return null;
+  }
+  return Math.floor(time / 86_400_000) + 719_163;
+}
+
+function rowInPrecisionDateRange(row: CalibrationPreviewRowState, config: CalibrationConfig): boolean {
+  const range = config.precision_date_range;
+  if (!range || !range[0] || !range[1]) {
+    return true;
+  }
+  const rowTime = localDateTime(row.attributes.Date);
+  const startTime = localDateTime(range[0]);
+  const endTime = localDateTime(range[1]);
+  if (rowTime == null || startTime == null || endTime == null) {
+    return true;
+  }
+  return rowTime >= startTime && rowTime < endTime + 86_400_000;
+}
+
+function calibrationPreviewAttribute(row: CalibrationPreviewRowState, param: string): unknown {
+  const normalized = param.trim();
+  if (normalized === "Identifier 1") {
+    return row.identifier1;
+  }
+  if (normalized === "Identifier 2") {
+    return row.identifier2;
+  }
+  if (normalized === "Species") {
+    return row.species;
+  }
+  if (normalized === "Line") {
+    return row.line;
+  }
+  if (normalized === "d 13C/12C  Mean") {
+    return row.d13;
+  }
+  if (normalized === "d 18O/16O  Mean") {
+    return row.d18;
+  }
+  if (normalized === "leak_rate") {
+    return row.attributes.leak_rate ?? row.attributes[normalized];
+  }
+  return row.attributes[normalized] ?? row.intensities[normalized];
+}
+
+function calibrationPreviewNumericAttribute(row: CalibrationPreviewRowState, param: string): number | null {
+  const value = calibrationPreviewAttribute(row, param);
+  if (param.trim() === "Date") {
+    return dateOrdinal(value);
+  }
+  return finiteNumber(value);
+}
+
+function buildCalibrationPreviewColorState(rows: CalibrationPreviewRowState[], colorParam: string): CalibrationPreviewColorState | null {
+  const param = String(colorParam ?? "").trim();
+  if (!param) {
+    return null;
+  }
+  const numericPairs: Array<{ rowLabel: string; value: number }> = [];
+  const rawPairs: Array<{ rowLabel: string; value: string }> = [];
+  for (const row of rows) {
+    const numeric = calibrationPreviewNumericAttribute(row, param);
+    if (numeric != null) {
+      numericPairs.push({ rowLabel: row.rowLabel, value: numeric });
+    }
+    const raw = calibrationPreviewAttribute(row, param);
+    if (raw != null && String(raw).trim() !== "") {
+      rawPairs.push({ rowLabel: row.rowLabel, value: String(raw).trim() });
+    }
+  }
+  if (numericPairs.length) {
+    return {
+      param,
+      valuesByRow: new Map(numericPairs.map((item) => [item.rowLabel, item.value])),
+    };
+  }
+  if (!rawPairs.length) {
+    return null;
+  }
+  const categories = Array.from(new Set(rawPairs.map((item) => item.value))).sort((left, right) => left.localeCompare(right));
+  const codes = new Map(categories.map((value, index) => [value, index]));
   return {
-    ...linearity,
-    max_sample_intensity: linearity.max_sample_intensity ?? null,
-    line_1_offset_d13: linearity.line_1_offset_d13 ?? null,
-    line_1_offset_d18: linearity.line_1_offset_d18 ?? null,
-    line_2_offset_d13: linearity.line_2_offset_d13 ?? null,
-    line_2_offset_d18: linearity.line_2_offset_d18 ?? null,
+    param,
+    valuesByRow: new Map(rawPairs.map((item) => [item.rowLabel, codes.get(item.value) ?? 0])),
+    tickvals: categories.map((_, index) => index),
+    ticktext: categories,
   };
 }
 
-function linearityConfigEquals(
-  left: CalibrationConfig["linearity"] | null | undefined,
-  right: CalibrationConfig["linearity"] | null | undefined,
-): boolean {
-  return JSON.stringify(normalizeLinearityConfigForCompare(left)) === JSON.stringify(normalizeLinearityConfigForCompare(right));
+function buildCalibrationPreviewMasks(
+  previewData: ProcessingLinearityPreviewData | undefined,
+  config: CalibrationConfig | null | undefined,
+): CalibrationPreviewMasks | null {
+  if (!previewData || !config) {
+    return null;
+  }
+  const selectedStandards = new Set(config.selected_standards.map(normalizeStandardKey).filter(Boolean));
+  if (!selectedStandards.size) {
+    return {
+      rowsByLabel: new Map(),
+      selectedRows: new Set(),
+      baseD13: new Set(),
+      baseD18: new Set(),
+      baseCross: new Set(),
+      outlierD13: new Set(),
+      outlierD18: new Set(),
+      outlierCombined: new Set(),
+      color: null,
+    };
+  }
+  const effectiveFits = applyManualLinearityOffsetsForPreview(previewData.fits, config.linearity);
+  const rowsByLabel = new Map<string, CalibrationPreviewRowState>();
+  const selectedRows: CalibrationPreviewRowState[] = [];
+  for (const row of previewData.rows) {
+    const identifier1 = String(row.identifier1 ?? "").trim();
+    if (!selectedStandards.has(normalizeStandardKey(identifier1))) {
+      continue;
+    }
+    const state: CalibrationPreviewRowState = {
+      rowLabel: String(row.row_label),
+      identifier1,
+      identifier2: String(row.identifier2 ?? "").trim(),
+      species: String(row.species ?? identifier1).trim(),
+      line: finiteNumber(row.line),
+      d13: previewValueForRow(row, "d13C", config.linearity, previewData, effectiveFits, "raw"),
+      d18: previewValueForRow(row, "d18O", config.linearity, previewData, effectiveFits, "raw"),
+      attributes: (row.attributes ?? {}) as Record<string, unknown>,
+      intensities: row.intensities ?? {},
+    };
+    if (!rowInPrecisionDateRange(state, config)) {
+      continue;
+    }
+    rowsByLabel.set(state.rowLabel, state);
+    selectedRows.push(state);
+  }
+
+  const masks: CalibrationPreviewMasks = {
+    rowsByLabel,
+    selectedRows: new Set(selectedRows.map((row) => row.rowLabel)),
+    baseD13: new Set(),
+    baseD18: new Set(),
+    baseCross: new Set(),
+    outlierD13: new Set(),
+    outlierD18: new Set(),
+    outlierCombined: new Set(),
+    color: buildCalibrationPreviewColorState(selectedRows, config.color_param),
+  };
+
+  const rowsByStandard = new Map<string, CalibrationPreviewRowState[]>();
+  for (const row of selectedRows) {
+    const key = normalizeStandardKey(row.identifier1);
+    const groupRows = rowsByStandard.get(key) ?? [];
+    groupRows.push(row);
+    rowsByStandard.set(key, groupRows);
+  }
+  const sigmaLevel = finiteNumber(config.sigma_level) ?? 3;
+  const iqrMultiplier = finiteNumber(config.iqr_multiplier) ?? 1.5;
+  for (const groupRows of rowsByStandard.values()) {
+    const d13Outliers = statisticalOutlierRows(
+      groupRows.map((row) => ({ rowLabel: row.rowLabel, value: row.d13 })),
+      config.calibration_type,
+      sigmaLevel,
+      iqrMultiplier,
+    );
+    const d18Outliers = statisticalOutlierRows(
+      groupRows.map((row) => ({ rowLabel: row.rowLabel, value: row.d18 })),
+      config.calibration_type,
+      sigmaLevel,
+      iqrMultiplier,
+    );
+    for (const row of groupRows) {
+      const d13Outlier = d13Outliers.has(row.rowLabel);
+      const d18Outlier = d18Outliers.has(row.rowLabel);
+      if (d13Outlier) {
+        masks.outlierD13.add(row.rowLabel);
+      }
+      if (d18Outlier) {
+        masks.outlierD18.add(row.rowLabel);
+      }
+      if (d13Outlier || d18Outlier) {
+        masks.outlierCombined.add(row.rowLabel);
+      }
+    }
+  }
+  for (const row of selectedRows) {
+    const combinedOutlier = masks.outlierCombined.has(row.rowLabel);
+    const d13Excluded = config.independent_isotope_outliers ? masks.outlierD13.has(row.rowLabel) : combinedOutlier;
+    const d18Excluded = config.independent_isotope_outliers ? masks.outlierD18.has(row.rowLabel) : combinedOutlier;
+    if (!d13Excluded) {
+      masks.baseD13.add(row.rowLabel);
+    }
+    if (!d18Excluded) {
+      masks.baseD18.add(row.rowLabel);
+    }
+    if (!combinedOutlier) {
+      masks.baseCross.add(row.rowLabel);
+    }
+  }
+  return masks;
 }
 
-function normalizeSelectedStandardsForCompare(values: string[] | null | undefined): string[] {
-  if (!Array.isArray(values)) {
+function filterTraceVector(vector: unknown, keepIndexes: number[], sourceLength: number): unknown {
+  const values = coerceVector(vector);
+  if (!values || values.length !== sourceLength) {
+    return vector;
+  }
+  return keepIndexes.map((index) => values[index]);
+}
+
+function filterTraceNestedVectors(record: Record<string, unknown> | undefined, keepIndexes: number[], sourceLength: number): Record<string, unknown> | undefined {
+  if (!record) {
+    return record;
+  }
+  let changed = false;
+  const next: Record<string, unknown> = { ...record };
+  for (const key of ["color", "size", "symbol", "text", "opacity"]) {
+    if (!(key in next)) {
+      continue;
+    }
+    const filtered = filterTraceVector(next[key], keepIndexes, sourceLength);
+    if (filtered !== next[key]) {
+      next[key] = filtered;
+      changed = true;
+    }
+  }
+  return changed ? next : record;
+}
+
+function isotopeFromChartKey(chartKey?: string): IsotopeKey | "cross" | null {
+  if (!chartKey) {
+    return null;
+  }
+  if (chartKey === "calibration_3d" || chartKey === "crossplot") {
+    return "cross";
+  }
+  if (chartKey === "VPDB(13C)" || chartKey.includes("d13")) {
+    return "d13C";
+  }
+  if (chartKey === "VSMOW(18O)" || chartKey.includes("d18")) {
+    return "d18O";
+  }
+  return null;
+}
+
+function rowsForStandard(rowSet: Set<string>, standard: string | null, masks: CalibrationPreviewMasks): Set<string> {
+  if (!standard) {
+    return rowSet;
+  }
+  const standardKey = normalizeStandardKey(standard);
+  return new Set(Array.from(rowSet).filter((rowLabel) => normalizeStandardKey(masks.rowsByLabel.get(rowLabel)?.identifier1) === standardKey));
+}
+
+function calibrationTraceRowSet(
+  trace: Record<string, unknown>,
+  chartKey: string | undefined,
+  masks: CalibrationPreviewMasks,
+  config: CalibrationConfig,
+): Set<string> {
+  const traceName = String(trace.name ?? "");
+  const chartIsotope = isotopeFromChartKey(chartKey);
+  const sectionMatch = chartKey?.match(/^(.*)\|(d13C|d18O)$/);
+  const sectionStandard = sectionMatch?.[1] ?? null;
+  if (sectionMatch) {
+    const isotope = sectionMatch[2] as IsotopeKey;
+    if (traceName.includes("Outliers")) {
+      return rowsForStandard(isotope === "d13C" ? masks.outlierD13 : masks.outlierD18, sectionStandard, masks);
+    }
+    if (traceName.includes("Included")) {
+      const excluded = isotope === "d13C" ? masks.outlierD13 : masks.outlierD18;
+      return rowsForStandard(new Set(Array.from(masks.selectedRows).filter((rowLabel) => !excluded.has(rowLabel))), sectionStandard, masks);
+    }
+    return rowsForStandard(masks.selectedRows, sectionStandard, masks);
+  }
+  const customdata = coerceVector(trace.customdata);
+  const firstIsotope = customdata?.length ? customDataIsotope(customdata[0]) : null;
+  const isotope = firstIsotope ?? chartIsotope;
+  if (traceName.includes("Outliers")) {
+    if (isotope === "d13C") {
+      return masks.outlierD13;
+    }
+    if (isotope === "d18O") {
+      return masks.outlierD18;
+    }
+    return masks.outlierCombined;
+  }
+  if (isotope === "d13C") {
+    return masks.baseD13;
+  }
+  if (isotope === "d18O") {
+    return masks.baseD18;
+  }
+  return masks.baseCross;
+}
+
+function patchedCalibrationAxisValue(
+  row: CalibrationPreviewRowState | undefined,
+  axis: "x" | "y" | "z",
+  chartKey: string | undefined,
+  config: CalibrationConfig,
+): number | null {
+  if (!row) {
+    return null;
+  }
+  const chartIsotope = isotopeFromChartKey(chartKey);
+  if (chartIsotope === "cross") {
+    if (axis === "x") {
+      return row.d18;
+    }
+    if (axis === "y") {
+      return row.d13;
+    }
+    return calibrationPreviewNumericAttribute(row, config.z_axis);
+  }
+  if (axis === "y" && chartIsotope === "d13C") {
+    return row.d13;
+  }
+  if (axis === "y" && chartIsotope === "d18O") {
+    return row.d18;
+  }
+  return null;
+}
+
+function patchFilteredVector(
+  vector: unknown,
+  keepIndexes: number[],
+  customdata: unknown[],
+  sourceLength: number,
+  masks: CalibrationPreviewMasks,
+  axis: "x" | "y" | "z",
+  chartKey: string | undefined,
+  config: CalibrationConfig,
+): unknown {
+  const filtered = filterTraceVector(vector, keepIndexes, sourceLength);
+  const values = coerceVector(filtered);
+  if (!values) {
+    return filtered;
+  }
+  let changed = false;
+  const nextValues = [...values];
+  for (let outputIndex = 0; outputIndex < keepIndexes.length; outputIndex += 1) {
+    const sourceIndex = keepIndexes[outputIndex];
+    const rowLabel = customDataRowLabel(customdata[sourceIndex]);
+    const patched = patchedCalibrationAxisValue(masks.rowsByLabel.get(rowLabel), axis, chartKey, config);
+    if (patched == null) {
+      continue;
+    }
+    const current = finiteNumber(nextValues[outputIndex]);
+    if (current == null || Math.abs(current - patched) > 1e-12) {
+      nextValues[outputIndex] = patched;
+      changed = true;
+    }
+  }
+  return changed ? nextValues : filtered;
+}
+
+function colorValuesForIndexes(customdata: unknown[], keepIndexes: number[], masks: CalibrationPreviewMasks): number[] | null {
+  if (!masks.color?.valuesByRow.size) {
+    return null;
+  }
+  const values: number[] = [];
+  for (const index of keepIndexes) {
+    const rowLabel = customDataRowLabel(customdata[index]);
+    const value = masks.color.valuesByRow.get(rowLabel);
+    if (value == null) {
+      return null;
+    }
+    values.push(value);
+  }
+  return values;
+}
+
+function filterCalibrationTraceByRows(
+  trace: Record<string, unknown>,
+  rowSet: Set<string>,
+  masks: CalibrationPreviewMasks,
+  config: CalibrationConfig,
+  chartKey?: string,
+): Record<string, unknown> {
+  const customdata = coerceVector(trace.customdata);
+  if (!customdata?.length) {
+    return trace;
+  }
+  const keepIndexes: number[] = [];
+  for (let index = 0; index < customdata.length; index += 1) {
+    const rowLabel = customDataRowLabel(customdata[index]);
+    if (rowLabel && rowSet.has(rowLabel)) {
+      keepIndexes.push(index);
+    }
+  }
+  const nextTrace: Record<string, unknown> = { ...trace };
+  let changed = keepIndexes.length !== customdata.length;
+  for (const key of ["customdata", "text", "hovertext", "ids"]) {
+    if (key in nextTrace) {
+      const filtered = filterTraceVector(nextTrace[key], keepIndexes, customdata.length);
+      if (filtered !== nextTrace[key]) {
+        nextTrace[key] = filtered;
+        changed = true;
+      }
+    }
+  }
+  for (const axis of ["x", "y", "z"] as const) {
+    if (axis in nextTrace) {
+      const patched = patchFilteredVector(nextTrace[axis], keepIndexes, customdata, customdata.length, masks, axis, chartKey, config);
+      if (patched !== nextTrace[axis]) {
+        nextTrace[axis] = patched;
+        changed = true;
+      }
+    }
+  }
+  const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : undefined;
+  let nextMarker = filterTraceNestedVectors(marker, keepIndexes, customdata.length);
+  const previewColors = colorValuesForIndexes(customdata, keepIndexes, masks);
+  if (previewColors) {
+    nextMarker = {
+      ...(nextMarker ?? marker ?? {}),
+      color: previewColors,
+      coloraxis: "coloraxis",
+    };
+  }
+  if (nextMarker && nextMarker !== marker) {
+    nextTrace.marker = nextMarker;
+    changed = true;
+  }
+  const errorY = trace.error_y && typeof trace.error_y === "object" ? (trace.error_y as Record<string, unknown>) : undefined;
+  const nextErrorY = filterTraceNestedVectors(errorY, keepIndexes, customdata.length);
+  if (nextErrorY && nextErrorY !== errorY) {
+    nextTrace.error_y = nextErrorY;
+    changed = true;
+  }
+  return changed ? nextTrace : trace;
+}
+
+function colorAxisLayout(color: CalibrationPreviewColorState | null): Record<string, unknown> | null {
+  if (!color) {
+    return null;
+  }
+  const values = Array.from(color.valuesByRow.values()).filter((value) => Number.isFinite(value));
+  const min = values.length ? Math.min(...values) : undefined;
+  const max = values.length ? Math.max(...values) : undefined;
+  return {
+    colorscale: "Viridis",
+    ...(min != null && max != null ? { cmin: min === max ? min - 0.5 : min, cmax: min === max ? max + 0.5 : max } : {}),
+    colorbar: {
+      title: {
+        text: color.param === "Date" ? "Date" : color.param,
+        side: "top",
+      },
+      ...(color.tickvals && color.ticktext ? { tickmode: "array", tickvals: color.tickvals, ticktext: color.ticktext } : {}),
+    },
+  };
+}
+
+function applyCalibrationConfigPreviewToFigure(
+  figure: Record<string, unknown> | undefined,
+  masks: CalibrationPreviewMasks | null,
+  config: CalibrationConfig | null | undefined,
+  chartKey?: string,
+): Record<string, unknown> | undefined {
+  if (!figure || !masks || !config) {
+    return figure;
+  }
+  const cloned = cloneFigure(figure);
+  if (!Array.isArray(cloned.data)) {
+    return figure;
+  }
+  let changed = false;
+  const nextData = cloned.data.map((trace) => {
+    const customdata = coerceVector(trace.customdata);
+    if (!customdata?.length) {
+      return trace;
+    }
+    const rowSet = calibrationTraceRowSet(trace, chartKey, masks, config);
+    const nextTrace = filterCalibrationTraceByRows(trace, rowSet, masks, config, chartKey);
+    changed = changed || nextTrace !== trace;
+    return nextTrace;
+  });
+  const nextColorAxis = colorAxisLayout(masks.color);
+  const nextLayout = nextColorAxis
+    ? {
+        ...cloned.layout,
+        coloraxis: {
+          ...((cloned.layout.coloraxis as Record<string, unknown> | undefined) ?? {}),
+          ...nextColorAxis,
+        },
+      }
+    : cloned.layout;
+  changed = changed || nextLayout !== cloned.layout;
+  return changed ? { ...cloned, data: nextData, layout: nextLayout } : figure;
+}
+
+function collectCalibrationPreviewFigures(
+  workspace: CalibrationWorkspace | undefined,
+  masks: CalibrationPreviewMasks | null,
+  config: CalibrationConfig | null | undefined,
+): Array<Record<string, unknown> | undefined> {
+  if (!workspace) {
     return [];
   }
-  return values
-    .map((value) => String(value ?? "").trim().toUpperCase())
-    .filter((value) => value.length > 0)
-    .sort((left, right) => left.localeCompare(right));
-}
-
-function selectedStandardsEquals(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
-  return JSON.stringify(normalizeSelectedStandardsForCompare(left)) === JSON.stringify(normalizeSelectedStandardsForCompare(right));
+  const figures: Array<Record<string, unknown> | undefined> = [
+    applyCalibrationConfigPreviewToFigure(workspace.figures["VPDB(13C)"], masks, config, "VPDB(13C)"),
+    applyCalibrationConfigPreviewToFigure(workspace.figures["VSMOW(18O)"], masks, config, "VSMOW(18O)"),
+    applyCalibrationConfigPreviewToFigure(workspace.figures.calibration_3d, masks, config, "calibration_3d"),
+    applyCalibrationConfigPreviewToFigure(workspace.figures.crossplot, masks, config, "crossplot"),
+    applyCalibrationConfigPreviewToFigure(workspace.linearity_figures.d13_raw, masks, config, "linearity|d13_raw"),
+    applyCalibrationConfigPreviewToFigure(workspace.linearity_figures.d13_corrected, masks, config, "linearity|d13_corrected"),
+    applyCalibrationConfigPreviewToFigure(workspace.linearity_figures.d18_raw, masks, config, "linearity|d18_raw"),
+    applyCalibrationConfigPreviewToFigure(workspace.linearity_figures.d18_corrected, masks, config, "linearity|d18_corrected"),
+  ];
+  for (const section of workspace.standard_sections) {
+    figures.push(
+      applyCalibrationConfigPreviewToFigure(section.d13_figure, masks, config, `${section.standard}|d13C`),
+      applyCalibrationConfigPreviewToFigure(section.d18_figure, masks, config, `${section.standard}|d18O`),
+    );
+  }
+  return figures;
 }
 
 function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ label: string; value: string }> {
@@ -2162,7 +2978,6 @@ export default function CalibrationPage() {
   const [crossD18Value, setCrossD18Value] = useState(0);
   const [multiOffsetD13, setMultiOffsetD13] = useState(0);
   const [multiOffsetD18, setMultiOffsetD18] = useState(0);
-  const [linearityTouched, setLinearityTouched] = useState(false);
   const [setValueHighlightNonce, setSetValueHighlightNonce] = useState(0);
   const [isSetValueInputHighlighted, setIsSetValueInputHighlighted] = useState(false);
   const [colorScaleRange, setColorScaleRange] = useState<[number, number] | null>(null);
@@ -2178,6 +2993,8 @@ export default function CalibrationPage() {
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
+  const selectionEditorOpenRef = useRef(false);
+  const selectionEditorSuppressEventsUntilRef = useRef(0);
   const colorScaledFigureCacheRef = useRef<WeakMap<Record<string, unknown>, Record<string, unknown>>>(new WeakMap());
   const colorScaleSignatureRef = useRef<string>("");
   const draftStorageKey = sessionId ? `calibration-config:${sessionId}` : null;
@@ -2193,14 +3010,16 @@ export default function CalibrationPage() {
         : hoverPreviewTarget;
 
   useEffect(() => {
+    selectionEditorOpenRef.current = isSelectionEditorOpen;
+  }, [isSelectionEditorOpen]);
+
+  useEffect(() => {
     if (!(isSelectionEditorOpen || isOfficialValuesModalOpen) || typeof window === "undefined") {
       return;
     }
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
-        setSelectionEditorOpen(false);
-        setSelectedTargets([]);
-        setActiveTargetIndex(0);
+        closeSelectionEditor();
         setOfficialValuesModalOpen(false);
         setOfficialValuesEditMode(false);
         setOfficialValuesError(null);
@@ -2356,7 +3175,6 @@ export default function CalibrationPage() {
   useEffect(() => {
     setConfig(null);
     setHasLoadedDraft(false);
-    setLinearityTouched(false);
     setOfficialValuesModalOpen(false);
     setOfficialValuesEditMode(false);
     setOfficialValuesDraftRows({});
@@ -2395,6 +3213,7 @@ export default function CalibrationPage() {
             ...current,
             linearity: {
               ...workspaceQuery.data.config.linearity,
+              ...current.linearity,
             },
           }
         : workspaceQuery.data.config,
@@ -2447,36 +3266,36 @@ export default function CalibrationPage() {
     setOfficialValuesDraftRows(drafts);
   }, [isOfficialValuesModalOpen, officialValuesQuery.data]);
 
-  const deferredConfig = useDeferredValue(config);
-
-  const previewQuery = useQuery({
-    queryKey: ["calibration-workspace-preview", sessionId, deferredConfig],
-    queryFn: () => api.previewCalibrationWorkspace(sessionId!, deferredConfig!),
-    enabled: Boolean(sessionId && deferredConfig),
-  });
-  const previewWorkspace = previewQuery.data as CalibrationWorkspace | undefined;
   const persistedWorkspace = workspaceQuery.data as CalibrationWorkspace | undefined;
-  const workspaceForColorScale = previewWorkspace ?? persistedWorkspace;
-  const activeColorParam = config?.color_param ?? workspaceForColorScale?.config.color_param ?? null;
+  const activeDraftConfig = config ?? persistedWorkspace?.config ?? null;
+  const activeDraftConfigSignature = activeDraftConfig ? JSON.stringify(activeDraftConfig) : "";
+  const persistedConfigSignature = persistedWorkspace?.config ? JSON.stringify(persistedWorkspace.config) : "";
+  const hasDraftConfigChanges = Boolean(
+    sessionId &&
+      activeDraftConfig &&
+      persistedWorkspace?.config &&
+      activeDraftConfigSignature !== persistedConfigSignature,
+  );
+  const calibrationPreviewWorkspaceQuery = useQuery({
+    queryKey: ["calibration-workspace-preview", sessionId, activeDraftConfigSignature],
+    queryFn: () => api.previewCalibrationWorkspace(sessionId!, activeDraftConfig!),
+    enabled: hasDraftConfigChanges,
+    staleTime: 5_000,
+  });
+  const linearityPreviewDataQuery = useQuery({
+    queryKey: ["processing-linearity-preview-data", sessionId],
+    queryFn: () => api.getProcessingLinearityPreviewData(sessionId!),
+    enabled: Boolean(sessionId),
+    staleTime: 60_000,
+  });
+  const calibrationPreviewMasks = useMemo(
+    () => buildCalibrationPreviewMasks(linearityPreviewDataQuery.data, activeDraftConfig),
+    [activeDraftConfig, linearityPreviewDataQuery.data],
+  );
+  const activeColorParam = activeDraftConfig?.color_param ?? persistedWorkspace?.config.color_param ?? null;
   const colorScaleFigures = useMemo<Array<Record<string, unknown> | undefined>>(() => {
-    if (!workspaceForColorScale) {
-      return [];
-    }
-    const figures: Array<Record<string, unknown> | undefined> = [
-      workspaceForColorScale.figures["VPDB(13C)"],
-      workspaceForColorScale.figures["VSMOW(18O)"],
-      workspaceForColorScale.figures.calibration_3d,
-      workspaceForColorScale.figures.crossplot,
-      workspaceForColorScale.linearity_figures.d13_raw,
-      workspaceForColorScale.linearity_figures.d13_corrected,
-      workspaceForColorScale.linearity_figures.d18_raw,
-      workspaceForColorScale.linearity_figures.d18_corrected,
-    ];
-    for (const section of workspaceForColorScale.standard_sections) {
-      figures.push(section.d13_figure, section.d18_figure);
-    }
-    return figures;
-  }, [workspaceForColorScale]);
+    return collectCalibrationPreviewFigures(persistedWorkspace, calibrationPreviewMasks, activeDraftConfig);
+  }, [activeDraftConfig, calibrationPreviewMasks, persistedWorkspace]);
   const colorScaleBounds = useMemo(() => deriveColorScaleBounds(colorScaleFigures), [colorScaleFigures]);
   const colorScaleTwoSigmaRange = useMemo(() => {
     if (!colorScaleBounds) {
@@ -2512,52 +3331,13 @@ export default function CalibrationPage() {
     }
   }, [activeColorParam, colorScaleBounds, colorScaleRangeParam, colorScaleTwoSigmaRange]);
 
-  const saveLinearityMutation = useMutation({
-    mutationFn: (payload: { linearity: CalibrationConfig["linearity"]; selectedStandards: string[] }) =>
-      api.setCalibrationLinearity(sessionId!, payload.linearity, payload.selectedStandards),
-    onSuccess: async (workspace) => {
-      queryClient.setQueryData(["calibration-workspace", sessionId], workspace);
-      await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
-    },
-  });
-
-  useEffect(() => {
-    if (!sessionId || !hasLoadedDraft || !linearityTouched || !config || !workspaceQuery.data || saveLinearityMutation.isPending) {
-      return;
-    }
-    if (
-      linearityConfigEquals(config.linearity, workspaceQuery.data.config.linearity) &&
-      selectedStandardsEquals(config.selected_standards, workspaceQuery.data.config.selected_standards)
-    ) {
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      saveLinearityMutation.mutate({
-        linearity: config.linearity,
-        selectedStandards: config.selected_standards,
-      });
-    }, 450);
-    return () => window.clearTimeout(timer);
-  }, [
-    config,
-    hasLoadedDraft,
-    linearityTouched,
-    saveLinearityMutation,
-    saveLinearityMutation.isPending,
-    sessionId,
-    workspaceQuery.data,
-  ]);
-
   const runMutation = useMutation({
     mutationFn: (payload: CalibrationConfig) => api.runCalibration(sessionId!, payload),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
     },
   });
 
@@ -2570,9 +3350,9 @@ export default function CalibrationPage() {
       setConfig(null);
       await queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
@@ -2586,7 +3366,6 @@ export default function CalibrationPage() {
       await queryClient.invalidateQueries({ queryKey: ["official-standard-values"] });
       if (sessionId) {
         await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
-        await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
       }
     },
   });
@@ -2597,7 +3376,6 @@ export default function CalibrationPage() {
       await queryClient.invalidateQueries({ queryKey: ["official-standard-values"] });
       if (sessionId) {
         await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
-        await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
       }
     },
   });
@@ -2607,11 +3385,11 @@ export default function CalibrationPage() {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d18", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ["calibration-workspace-preview", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration", sessionId] });
     },
   });
@@ -2621,7 +3399,6 @@ export default function CalibrationPage() {
   }
 
   function updateLinearity(key: keyof CalibrationConfig["linearity"], value: boolean | number | string | null) {
-    setLinearityTouched(true);
     setConfig((current) =>
       current
         ? {
@@ -2636,7 +3413,6 @@ export default function CalibrationPage() {
   }
 
   function updateLinearityIntensityCol(intensityCol: string) {
-    setLinearityTouched(true);
     setConfig((current) =>
       current
         ? {
@@ -2656,7 +3432,6 @@ export default function CalibrationPage() {
     term: LinearityCoefficientTerm,
     value: number,
   ) {
-    setLinearityTouched(true);
     setConfig((current) => {
       if (!current) {
         return current;
@@ -2804,12 +3579,25 @@ export default function CalibrationPage() {
   }
 
   function closeSelectionEditor() {
+    selectionEditorOpenRef.current = false;
+    selectionEditorSuppressEventsUntilRef.current = Date.now() + SELECTION_EDITOR_CLOSE_SUPPRESSION_MS;
     setSelectionEditorOpen(false);
     setSelectedTargets([]);
     setActiveTargetIndex(0);
   }
 
-  function openProcessingSelectionEditor(chartKey: string, points: PlotlyPoint[], multi = false) {
+  function openProcessingSelectionEditor(
+    chartKey: string,
+    points: PlotlyPoint[],
+    multi = false,
+    source: "main" | "selection_source" = "main",
+  ) {
+    if (source === "selection_source" && !selectionEditorOpenRef.current) {
+      return;
+    }
+    if (Date.now() < selectionEditorSuppressEventsUntilRef.current) {
+      return;
+    }
     const targets = parseSelectedTargets(points, chartKey);
     if (!targets.length) {
       return;
@@ -3164,8 +3952,8 @@ export default function CalibrationPage() {
   }
 
   const workspace = persistedWorkspace;
-  const activeConfig = config ?? workspace?.config ?? null;
-  const displayedWorkspace = workspaceForColorScale;
+  const activeConfig = activeDraftConfig;
+  const displayedWorkspace = calibrationPreviewWorkspaceQuery.data ?? workspace;
 
   if (!workspace || !activeConfig || !displayedWorkspace) {
     return null;
@@ -3180,6 +3968,9 @@ export default function CalibrationPage() {
     colorScaleSignatureRef.current = colorScaleSignature;
     colorScaledFigureCacheRef.current = new WeakMap();
   }
+  const hasServerPreviewWorkspace = Boolean(calibrationPreviewWorkspaceQuery.data);
+  const withCalibrationPreview = (figure: Record<string, unknown> | undefined, chartKey: string) =>
+    hasServerPreviewWorkspace ? figure : applyCalibrationConfigPreviewToFigure(figure, calibrationPreviewMasks, activeConfig, chartKey);
   const withColorScaleRange = (figure: Record<string, unknown> | undefined) => {
     if (!figure) {
       return figure;
@@ -3230,7 +4021,6 @@ export default function CalibrationPage() {
   const d13FitQuad = asNumber(d13Fit.quad);
   const d18FitQuad = asNumber(d18Fit.quad);
   const lineIntensityBasis = String(displayedWorkspace.linearity_fits?.intensity_col ?? selectedLinearityIntensityCol ?? "N/A");
-  const previewError = previewQuery.error instanceof Error ? previewQuery.error.message : null;
   const runError = runMutation.error instanceof Error ? runMutation.error.message : null;
   const resetError = resetCalibrationMutation.error instanceof Error ? resetCalibrationMutation.error.message : null;
   const hasUnsavedPreview = JSON.stringify(activeConfig) !== JSON.stringify(workspace.config);
@@ -3244,7 +4034,7 @@ export default function CalibrationPage() {
       : []),
   ].some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
   const linePrecisionCount = precisionSummaries.reduce((count, summary) => count + Object.keys(summary.line_precisions).length, 0);
-  const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending || saveLinearityMutation.isPending;
+  const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
   const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
@@ -3298,49 +4088,49 @@ export default function CalibrationPage() {
         title: "d13C Calibration",
         description: "Source chart for current selection.",
         chartKey: "VPDB(13C)",
-        figure: withColorScaleRange(displayedWorkspace.figures["VPDB(13C)"]),
+        figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VPDB(13C)"], "VPDB(13C)")),
       },
       "VSMOW(18O)": {
         title: "d18O Calibration",
         description: "Source chart for current selection.",
         chartKey: "VSMOW(18O)",
-        figure: withColorScaleRange(displayedWorkspace.figures["VSMOW(18O)"]),
+        figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VSMOW(18O)"], "VSMOW(18O)")),
       },
       calibration_3d: {
         title: "Calibration 3D Chart",
         description: "Source chart for current selection.",
         chartKey: "calibration_3d",
-        figure: withColorScaleRange(displayedWorkspace.figures.calibration_3d),
+        figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.calibration_3d, "calibration_3d")),
       },
       crossplot: {
         title: "Calibration Crossplot",
         description: "Source chart for current selection.",
         chartKey: "crossplot",
-        figure: withColorScaleRange(displayedWorkspace.figures.crossplot),
+        figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.crossplot, "crossplot")),
       },
       "linearity|d13_raw": {
         title: "Linearity d13C Raw",
         description: "Source chart for current selection.",
         chartKey: "linearity|d13_raw",
-        figure: withColorScaleRange(displayedWorkspace.linearity_figures.d13_raw),
+        figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_raw, "linearity|d13_raw")),
       },
       "linearity|d13_corrected": {
         title: "Linearity d13C Corrected",
         description: "Source chart for current selection.",
         chartKey: "linearity|d13_corrected",
-        figure: withColorScaleRange(displayedWorkspace.linearity_figures.d13_corrected),
+        figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_corrected, "linearity|d13_corrected")),
       },
       "linearity|d18_raw": {
         title: "Linearity d18O Raw",
         description: "Source chart for current selection.",
         chartKey: "linearity|d18_raw",
-        figure: withColorScaleRange(displayedWorkspace.linearity_figures.d18_raw),
+        figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_raw, "linearity|d18_raw")),
       },
       "linearity|d18_corrected": {
         title: "Linearity d18O Corrected",
         description: "Source chart for current selection.",
         chartKey: "linearity|d18_corrected",
-        figure: withColorScaleRange(displayedWorkspace.linearity_figures.d18_corrected),
+        figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_corrected, "linearity|d18_corrected")),
       },
     };
     if (figureMap[chartKey]) {
@@ -3359,7 +4149,11 @@ export default function CalibrationPage() {
     if (!section) {
       return null;
     }
-    const figure = standardSuffix === "d13C" ? withColorScaleRange(section.d13_figure) : withColorScaleRange(section.d18_figure);
+    const standardChartKey = `${standardName}|${standardSuffix}`;
+    const figure =
+      standardSuffix === "d13C"
+        ? withColorScaleRange(withCalibrationPreview(section.d13_figure, standardChartKey))
+        : withColorScaleRange(withCalibrationPreview(section.d18_figure, standardChartKey));
     return {
       title: `${standardName} ${standardSuffix} Outlier Trace`,
       description: "Source chart for current selection.",
@@ -3385,7 +4179,7 @@ export default function CalibrationPage() {
               Linearity basis: {getLinearityIntensityOptionLabel(lineIntensityBasis)}
             </span>
             <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
-              {previewQuery.isFetching ? "Refreshing preview..." : hasUnsavedPreview ? "Preview mode" : "Saved config"}
+              {hasUnsavedPreview ? "Preview active" : "Saved config"}
             </span>
           </div>
         </CardHeader>
@@ -3404,7 +4198,7 @@ export default function CalibrationPage() {
             className="w-full max-w-5xl rounded-lg border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
+            <div className="relative z-20 flex items-center justify-between border-b border-stone-200 bg-white px-4 py-3">
               <div>
                 <div className="text-base font-semibold text-stone-900">Official Standard Values</div>
                 <div className="text-sm text-stone-500">Values from the standards database used by calibration calculations.</div>
@@ -3590,7 +4384,16 @@ export default function CalibrationPage() {
                 <div className="text-base font-semibold text-stone-900">Selection Editor</div>
                 <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
               </div>
-              <Button variant="outline" size="sm" onPointerDown={closeSelectionEditor} onClick={closeSelectionEditor}>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  closeSelectionEditor();
+                }}
+              >
                 <X className="h-4 w-4" />
                 Close
               </Button>
@@ -3607,16 +4410,9 @@ export default function CalibrationPage() {
                   <CardContent className="min-w-0 overflow-hidden">
                     <PlotlyChart
                       figure={selectionSourceChart.figure}
-                      className="h-[360px] w-full"
+                      className="pointer-events-none h-[360px] w-full"
                       fitContainer
                       deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                      {...chartHoverProps(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "")}
-                      onPointClick={(points) =>
-                        openProcessingSelectionEditor(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "", points, false)
-                      }
-                      onSelection={(points) =>
-                        openProcessingSelectionEditor(selectionSourceChart.chartKey ?? activeTarget?.chartKey ?? "", points, true)
-                      }
                     />
                   </CardContent>
                 </Card>
@@ -4325,7 +5121,6 @@ export default function CalibrationPage() {
                 </Button>
               </div>
               <div className="text-xs text-stone-500">Select exactly one or two standards to run calibration.</div>
-              {previewError ? <div className="text-xs text-red-600">Preview error: {previewError}</div> : null}
               {runError ? <div className="text-xs text-red-600">Calibration error: {runError}</div> : null}
               {resetError ? <div className="text-xs text-red-600">Reset error: {resetError}</div> : null}
             </CardContent>
@@ -4371,7 +5166,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent className="min-w-0 overflow-hidden">
                     <PlotlyChart
-                      figure={withColorScaleRange(displayedWorkspace.figures["VPDB(13C)"])}
+                      figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VPDB(13C)"], "VPDB(13C)"))}
                       className="aspect-square w-full"
                       {...chartHoverProps("VPDB(13C)")}
                       onPointClick={(points) => openProcessingSelectionEditor("VPDB(13C)", points, false)}
@@ -4385,7 +5180,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent className="min-w-0 overflow-hidden">
                     <PlotlyChart
-                      figure={withColorScaleRange(displayedWorkspace.figures["VSMOW(18O)"])}
+                      figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VSMOW(18O)"], "VSMOW(18O)"))}
                       className="aspect-square w-full"
                       {...chartHoverProps("VSMOW(18O)")}
                       onPointClick={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, false)}
@@ -4403,7 +5198,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent>
                     <PlotlyChart
-                      figure={withColorScaleRange(displayedWorkspace.figures.calibration_3d)}
+                      figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.calibration_3d, "calibration_3d"))}
                       className="min-h-[520px] xl:aspect-square"
                       {...chartHoverProps("calibration_3d")}
                       onPointClick={(points) => openProcessingSelectionEditor("calibration_3d", points, false)}
@@ -4418,7 +5213,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent>
                     <PlotlyChart
-                      figure={withColorScaleRange(displayedWorkspace.figures.crossplot)}
+                      figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.crossplot, "crossplot"))}
                       className="min-h-[520px] xl:aspect-square"
                       {...chartHoverProps("crossplot")}
                       onPointClick={(points) => openProcessingSelectionEditor("crossplot", points, false)}
@@ -4442,28 +5237,28 @@ export default function CalibrationPage() {
                 </CardHeader>
                 <CardContent className="grid gap-6 2xl:grid-cols-2">
                   <PlotlyChart
-                    figure={withColorScaleRange(displayedWorkspace.linearity_figures.d13_raw)}
+                    figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_raw, "linearity|d13_raw"))}
                     className="min-h-[440px]"
                     {...chartHoverProps("linearity|d13_raw")}
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, true)}
                   />
                   <PlotlyChart
-                    figure={withColorScaleRange(displayedWorkspace.linearity_figures.d13_corrected)}
+                    figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_corrected, "linearity|d13_corrected"))}
                     className="min-h-[440px]"
                     {...chartHoverProps("linearity|d13_corrected")}
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, true)}
                   />
                   <PlotlyChart
-                    figure={withColorScaleRange(displayedWorkspace.linearity_figures.d18_raw)}
+                    figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_raw, "linearity|d18_raw"))}
                     className="min-h-[440px]"
                     {...chartHoverProps("linearity|d18_raw")}
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, false)}
                     onSelection={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, true)}
                   />
                   <PlotlyChart
-                    figure={withColorScaleRange(displayedWorkspace.linearity_figures.d18_corrected)}
+                    figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_corrected, "linearity|d18_corrected"))}
                     className="min-h-[440px]"
                     {...chartHoverProps("linearity|d18_corrected")}
                     onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, false)}
@@ -4484,7 +5279,7 @@ export default function CalibrationPage() {
                           </CardHeader>
                           <CardContent>
                             <PlotlyChart
-                              figure={withColorScaleRange(section.d13_figure)}
+                              figure={withColorScaleRange(withCalibrationPreview(section.d13_figure, `${section.standard}|d13C`))}
                               className="min-h-[340px]"
                               {...chartHoverProps(`${section.standard}|d13C`)}
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, false)}
@@ -4498,7 +5293,7 @@ export default function CalibrationPage() {
                           </CardHeader>
                           <CardContent>
                             <PlotlyChart
-                              figure={withColorScaleRange(section.d18_figure)}
+                              figure={withColorScaleRange(withCalibrationPreview(section.d18_figure, `${section.standard}|d18O`))}
                               className="min-h-[340px]"
                               {...chartHoverProps(`${section.standard}|d18O`)}
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, false)}

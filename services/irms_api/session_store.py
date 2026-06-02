@@ -13,7 +13,7 @@ from typing import Any
 
 import pandas as pd
 
-from .domain.constants import DEFAULT_SESSION_DATA_DIR, SESSION_RECORD_DIRNAME
+from .domain.constants import DEFAULT_SESSION_DATA_DIR, SESSION_RECORD_DIRNAME, SESSION_STATE_FILENAME
 
 
 @dataclass(slots=True)
@@ -24,6 +24,7 @@ class SessionPaths:
     snapshot_path: Path
     cycles_snapshot_path: Path
     log_path: Path
+    session_state_path: Path
 
 
 @dataclass(slots=True)
@@ -87,6 +88,7 @@ class FileSessionStore:
             snapshot_path=root / "snapshot.csv",
             cycles_snapshot_path=root / "cycles_snapshot.csv",
             log_path=root / "events.jsonl",
+            session_state_path=root / SESSION_STATE_FILENAME,
         )
 
     def _session_root(self, session_id: str) -> Path:
@@ -271,6 +273,125 @@ class FileSessionStore:
     def _paths(self, session_id: str) -> SessionPaths:
         return self._paths_for_root(self._session_root(session_id))
 
+    def _source_directory_for_session_root(self, root: Path) -> Path | None:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            return None
+        parent = resolved.parent
+        if parent.name != SESSION_RECORD_DIRNAME:
+            return None
+        source_dir = parent.parent
+        if source_dir == parent:
+            return None
+        return source_dir
+
+    def _external_session_state_path(self, root: Path) -> Path | None:
+        source_dir = self._source_directory_for_session_root(root)
+        if source_dir is None:
+            return None
+        return source_dir / SESSION_STATE_FILENAME
+
+    def _build_session_state_payload(self, session_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        paths = self._paths(session_id)
+        source_dir = self._source_directory_for_session_root(paths.root)
+        payload: dict[str, Any] = {
+            "schema": "irms.session_state",
+            "schema_version": 1,
+            "application": "IRMS Output Analyzer",
+            "session_id": session_id,
+            "session_name": metadata.get("session_name"),
+            "created_at": metadata.get("created_at"),
+            "updated_at": metadata.get("updated_at"),
+            "source_files": metadata.get("source_files", []),
+            "session_record_dir": str(paths.root),
+            "relative_session_record_dir": f"{SESSION_RECORD_DIRNAME}/{session_id}",
+            "files": {
+                "metadata": str(paths.metadata_path),
+                "snapshot": str(paths.snapshot_path),
+                "cycles_snapshot": str(paths.cycles_snapshot_path),
+                "event_log": str(paths.log_path),
+                "session_state": str(paths.session_state_path),
+            },
+        }
+        if source_dir is not None:
+            payload["source_data_dir"] = str(source_dir)
+            payload["source_session_state_path"] = str(source_dir / SESSION_STATE_FILENAME)
+        return payload
+
+    def write_session_state_file(self, session_id: str, metadata: dict[str, Any]) -> Path:
+        paths = self._paths(session_id)
+        payload = self._build_session_state_payload(session_id, metadata)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        state_text = json.dumps(payload, indent=2, default=str)
+        paths.session_state_path.write_text(state_text, encoding="utf-8")
+
+        external_path = self._external_session_state_path(paths.root)
+        if external_path is not None:
+            try:
+                external_path.write_text(state_text, encoding="utf-8")
+            except OSError:
+                pass
+        return paths.session_state_path
+
+    def register_existing_session_root(self, session_id: str, root: str | Path) -> None:
+        root_path = Path(root).expanduser().resolve()
+        paths = self._paths_for_root(root_path)
+        if not paths.metadata_path.exists():
+            raise FileNotFoundError(f"Session metadata was not found at {paths.metadata_path}")
+        metadata = json.loads(paths.metadata_path.read_text(encoding="utf-8"))
+        actual_session_id = str(metadata.get("session_id") or "").strip()
+        if actual_session_id and actual_session_id != str(session_id):
+            raise ValueError(
+                f"Session state points to {session_id}, but metadata belongs to {actual_session_id}"
+            )
+        self._register_session_root(str(session_id), root_path)
+
+    def register_session_from_state(self, state_payload: dict[str, Any]) -> str:
+        raw_session_id = str(state_payload.get("session_id") or "").strip()
+        if raw_session_id == "":
+            raise ValueError("Session state file does not include a session_id")
+
+        candidates: list[Path] = []
+        for key in ("session_record_dir", "save_dir"):
+            value = state_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(Path(value).expanduser())
+
+        autosave = state_payload.get("autosave")
+        if isinstance(autosave, dict):
+            save_dir = autosave.get("save_dir")
+            if isinstance(save_dir, str) and save_dir.strip():
+                candidates.append(Path(save_dir).expanduser())
+
+        source_dir = state_payload.get("source_data_dir")
+        relative_record_dir = state_payload.get("relative_session_record_dir")
+        if isinstance(source_dir, str) and source_dir.strip() and isinstance(relative_record_dir, str):
+            clean_relative = Path(str(relative_record_dir).replace("\\", "/"))
+            if not clean_relative.is_absolute() and ".." not in clean_relative.parts:
+                candidates.append(Path(source_dir).expanduser() / clean_relative)
+
+        candidates.append(self.root_dir / raw_session_id)
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                continue
+            key = str(resolved).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if not (resolved / "metadata.json").exists():
+                continue
+            self.register_existing_session_root(raw_session_id, resolved)
+            return raw_session_id
+
+        raise FileNotFoundError(
+            "Could not find the session record folder referenced by the session state file"
+        )
+
     def create_session(self, metadata: dict[str, Any] | None = None) -> str:
         session_id = uuid.uuid4().hex
         payload = {
@@ -315,6 +436,7 @@ class FileSessionStore:
         payload["session_id"] = session_id
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         paths.metadata_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        self.write_session_state_file(session_id, payload)
 
     def load_metadata(self, session_id: str) -> dict[str, Any]:
         paths = self._paths(session_id)
@@ -488,6 +610,14 @@ class FileSessionStore:
         self._unregister_session_root(session_id)
         self._clear_session_frame_cache(session_id)
         if paths.root.parent.name == SESSION_RECORD_DIRNAME:
+            external_state_path = paths.root.parent.parent / SESSION_STATE_FILENAME
+            try:
+                if external_state_path.exists():
+                    payload = json.loads(external_state_path.read_text(encoding="utf-8"))
+                    if str(payload.get("session_id") or "") == str(session_id):
+                        external_state_path.unlink()
+            except Exception:
+                pass
             try:
                 if not any(paths.root.parent.iterdir()):
                     paths.root.parent.rmdir()

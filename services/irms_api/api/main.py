@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -18,12 +19,13 @@ from ..domain.calibration.core import (
     _apply_manual_linearity_offsets_to_fits,
     _apply_manual_linearity_override_to_standards,
     _compute_calibration_coefficients,
-    _compute_linearity_fit,
+    _compute_standard_linearity_fit,
     _filter_linearity_fit_input_by_max_intensity,
     _filter_standards_remove_outliers,
     _promote_linearity_corrected_raw_columns,
     _resolve_selected_linearity_intensity_column,
     _with_isotope_linearity_intensity_columns,
+    _with_standard_linearity_residual_columns,
     calibrate_results,
     create_calibration_plots,
     identify_outliers,
@@ -59,6 +61,8 @@ from ..domain.constants import (
     CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+    SESSION_RECORD_DIRNAME,
+    SESSION_STATE_FILENAME,
     VALID_CYCLES_COL,
 )
 from ..domain.diagnostics.core import create_diagnostic_plots
@@ -245,7 +249,6 @@ def _processing_target_linearity_corrected_value(
         calibration_meta=calibration,
         edit_state=edit_state,
         cycles_df=cycles_df,
-        saturation_row_labels={row_label},
     )
     if row_label not in working_df.index or working_col not in working_df.columns:
         return None
@@ -743,13 +746,18 @@ def _chart_visible_client_output_frame(
 
 def _autosave_paths_payload(session_id: str) -> dict[str, Any]:
     paths = store._paths(session_id)
-    return {
+    payload = {
         "save_dir": str(paths.root),
         "log_path": str(paths.log_path),
         "snapshot_path": str(paths.snapshot_path),
         "meta_path": str(paths.metadata_path),
+        "session_state_path": str(paths.session_state_path),
         "session_token": session_id,
     }
+    external_path = store._external_session_state_path(paths.root)
+    if external_path is not None:
+        payload["source_session_state_path"] = str(external_path)
+    return payload
 
 
 def _persist_session_update(
@@ -909,6 +917,139 @@ def list_sessions(limit: int = Query(50, ge=1, le=500)) -> list[SessionSnapshot]
 @app.get("/sessions/{session_id}", response_model=SessionSnapshot)
 def get_session(session_id: str) -> SessionSnapshot:
     _session_exists_or_404(session_id)
+    return _to_session_snapshot(session_id)
+
+
+def _clean_uploaded_relative_path(filename: str | None) -> list[str]:
+    normalized = str(filename or "").replace("\\", "/")
+    result: list[str] = []
+    for raw_part in normalized.split("/"):
+        part = raw_part.strip()
+        if part in ("", ".", "..") or part.endswith(":"):
+            continue
+        result.append(part)
+    return result
+
+
+def _record_relative_parts(path_parts: list[str], session_id: str) -> list[str] | None:
+    session_id_text = str(session_id)
+    for index in range(0, max(len(path_parts) - 2, 0)):
+        if path_parts[index].lower() != SESSION_RECORD_DIRNAME.lower():
+            continue
+        if path_parts[index + 1] != session_id_text:
+            continue
+        relative = path_parts[index + 2 :]
+        return relative if relative else None
+    if len(path_parts) >= 2 and path_parts[-2] == session_id_text:
+        return [path_parts[-1]]
+    if len(path_parts) == 1 and path_parts[0].lower() in {
+        "metadata.json",
+        "snapshot.csv",
+        "cycles_snapshot.csv",
+        "events.jsonl",
+        SESSION_STATE_FILENAME.lower(),
+    }:
+        return [path_parts[0]]
+    return None
+
+
+@app.post("/sessions/open-file", response_model=SessionSnapshot)
+async def open_session_file(file: UploadFile = File(...)) -> SessionSnapshot:
+    content = await file.read()
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Session file must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Session file JSON must be an object")
+    try:
+        session_id = store.register_session_from_state(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    metadata = store.load_metadata(session_id)
+    _persist_session_update(
+        session_id,
+        action="session_file_opened",
+        payload={"filename": file.filename or "session_state.json", "resumed": True},
+        metadata=metadata,
+        resumed=True,
+    )
+    return _to_session_snapshot(session_id)
+
+
+@app.post("/sessions/open-folder", response_model=SessionSnapshot)
+async def open_session_folder(files: list[UploadFile] = File(...)) -> SessionSnapshot:
+    uploaded: list[tuple[list[str], bytes]] = []
+    session_state_payload: dict[str, Any] | None = None
+    metadata_payload: dict[str, Any] | None = None
+    for file in files:
+        content = await file.read()
+        path_parts = _clean_uploaded_relative_path(file.filename)
+        if not path_parts:
+            continue
+        uploaded.append((path_parts, content))
+        if path_parts[-1].lower() == SESSION_STATE_FILENAME.lower() and session_state_payload is None:
+            try:
+                parsed = json.loads(content.decode("utf-8"))
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                session_state_payload = parsed
+        if path_parts[-1].lower() == "metadata.json" and metadata_payload is None:
+            try:
+                parsed = json.loads(content.decode("utf-8"))
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and str(parsed.get("session_id") or "").strip():
+                metadata_payload = parsed
+
+    session_id = str(
+        (session_state_payload or {}).get("session_id")
+        or (metadata_payload or {}).get("session_id")
+        or ""
+    ).strip()
+    if session_id == "":
+        raise HTTPException(status_code=400, detail="Selected folder does not contain a valid session record")
+
+    target_root = (store.root_dir / session_id).resolve()
+    record_files: list[tuple[list[str], bytes]] = []
+    for path_parts, content in uploaded:
+        relative_parts = _record_relative_parts(path_parts, session_id)
+        if relative_parts:
+            record_files.append((relative_parts, content))
+
+    if record_files:
+        target_root.mkdir(parents=True, exist_ok=True)
+        for relative_parts, content in record_files:
+            target = target_root.joinpath(*relative_parts).resolve()
+            if target != target_root and target_root not in target.parents:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+    try:
+        if (target_root / "metadata.json").exists():
+            store.register_existing_session_root(session_id, target_root)
+        elif session_state_payload is not None:
+            session_id = store.register_session_from_state(session_state_payload)
+        else:
+            raise FileNotFoundError("Selected folder does not include session metadata")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    metadata = store.load_metadata(session_id)
+    _persist_session_update(
+        session_id,
+        action="session_folder_opened",
+        payload={"resumed": True},
+        metadata=metadata,
+        resumed=True,
+    )
     return _to_session_snapshot(session_id)
 
 
@@ -1119,10 +1260,16 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         else pd.Series(False, index=outlier_input_df.index, dtype=bool)
     )
     standards_for_calibration = outlier_input_df.loc[selected_mask].copy() if bool(selected_mask.any()) else pd.DataFrame()
+    standards_for_linearity_fit = _with_standard_linearity_residual_columns(
+        standards_for_calibration,
+        config.selected_standards,
+        standards_repo,
+        carbonate_material=config.carbonate_material,
+    )
     outlier_reference_df = outlier_input_df
     fits: dict[str, Any] = {}
     if linearity_enabled:
-        fit_input = standards_for_calibration
+        fit_input = standards_for_linearity_fit
         intensity_col = _resolve_selected_linearity_intensity_column(
             df=fit_input if fit_input is not None and not fit_input.empty else outlier_input_df,
             use_diff_intensity=config.linearity.use_diff_intensity,
@@ -1131,12 +1278,13 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         fit13_intensity_col = d13_offset_intensity_col if d13_offset_intensity_col in fit_input.columns else intensity_col
         fit18_intensity_col = d18_offset_intensity_col if d18_offset_intensity_col in fit_input.columns else intensity_col
         fit13 = (
-            _compute_linearity_fit(
+            _compute_standard_linearity_fit(
                 _filter_linearity_fit_input_by_max_intensity(
                     fit_input,
                     fit13_intensity_col,
                     max_sample_intensity,
                 ),
+                "d13C",
                 "d 13C/12C  Mean",
                 fit13_intensity_col,
                 quadratic=bool(config.linearity.quadratic),
@@ -1145,12 +1293,13 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
             else {}
         )
         fit18 = (
-            _compute_linearity_fit(
+            _compute_standard_linearity_fit(
                 _filter_linearity_fit_input_by_max_intensity(
                     fit_input,
                     fit18_intensity_col,
                     max_sample_intensity,
                 ),
+                "d18O",
                 "d 18O/16O  Mean",
                 fit18_intensity_col,
                 quadratic=bool(config.linearity.quadratic),
@@ -1424,11 +1573,17 @@ def _compute_preview_coefficients_for_calibration_linearity(
         else pd.Series(False, index=outlier_input_df.index, dtype=bool)
     )
     standards_for_calibration = outlier_input_df.loc[selected_mask].copy() if bool(selected_mask.any()) else pd.DataFrame()
+    standards_for_linearity_fit = _with_standard_linearity_residual_columns(
+        standards_for_calibration,
+        config.selected_standards,
+        standards_repo,
+        carbonate_material=config.carbonate_material,
+    )
 
     fits: dict[str, Any] = {}
     outlier_reference_df = outlier_input_df
     if linearity_enabled and standards_for_calibration is not None and not standards_for_calibration.empty:
-        fit_input = standards_for_calibration
+        fit_input = standards_for_linearity_fit
         intensity_col = _resolve_selected_linearity_intensity_column(
             df=fit_input,
             use_diff_intensity=config.linearity.use_diff_intensity,
@@ -1437,22 +1592,24 @@ def _compute_preview_coefficients_for_calibration_linearity(
         fit13_intensity_col = d13_offset_intensity_col if d13_offset_intensity_col in fit_input.columns else intensity_col
         fit18_intensity_col = d18_offset_intensity_col if d18_offset_intensity_col in fit_input.columns else intensity_col
         fits = {
-            "d13C": _compute_linearity_fit(
+            "d13C": _compute_standard_linearity_fit(
                 _filter_linearity_fit_input_by_max_intensity(
                     fit_input,
                     fit13_intensity_col,
                     max_sample_intensity,
                 ),
+                "d13C",
                 "d 13C/12C  Mean",
                 fit13_intensity_col,
                 quadratic=bool(config.linearity.quadratic),
             ),
-            "d18O": _compute_linearity_fit(
+            "d18O": _compute_standard_linearity_fit(
                 _filter_linearity_fit_input_by_max_intensity(
                     fit_input,
                     fit18_intensity_col,
                     max_sample_intensity,
                 ),
+                "d18O",
                 "d 18O/16O  Mean",
                 fit18_intensity_col,
                 quadratic=bool(config.linearity.quadratic),
@@ -1668,6 +1825,55 @@ def _processing_linearity_preview_rows(
                     value = str(fit.get(key, "")).strip()
                     if value:
                         intensity_cols.add(value)
+    attribute_cols = {
+        "Date",
+        "Identifier 1",
+        "Identifier 2",
+        "Species",
+        "Comment",
+        "Label",
+        VALID_CYCLES_COL,
+        CYCLE1_SIGNAL_SAMP44_COL,
+        CYCLE1_SIGNAL_DIFF44_COL,
+        CYCLE1_SIGNAL_DIFF45_COL,
+        CYCLE1_SIGNAL_DIFF46_COL,
+        CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
+        CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+        CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+        CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+        "leak_rate",
+        "Line",
+        "d 13C/12C  Mean",
+        "d 18O/16O  Mean",
+        *intensity_cols,
+    }
+
+    def _preview_attribute_value(value: Any) -> str | float | None:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        if isinstance(value, pd.Timestamp):
+            return value.date().isoformat()
+        if isinstance(value, (np.integer, np.floating)):
+            numeric = float(value)
+            return numeric if np.isfinite(numeric) else None
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            return numeric if np.isfinite(numeric) else None
+        if hasattr(value, "isoformat"):
+            try:
+                return str(value.isoformat())
+            except Exception:
+                pass
+        numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.notna(numeric) and np.isfinite(float(numeric)):
+            return float(numeric)
+        return str(value)
+
     line_col = next((col for col in df.columns if str(col).strip().lower() == "line"), None)
     rows: list[dict[str, Any]] = []
     for row_label, row in df.iterrows():
@@ -1676,15 +1882,29 @@ def _processing_linearity_preview_rows(
             for col in sorted(intensity_cols)
             if col and col in df.columns
         }
+        attributes = {
+            col: _preview_attribute_value(row.get(col))
+            for col in sorted(attribute_cols)
+            if col and col in df.columns
+        }
         rows.append(
             {
                 "row_label": str(row_label),
+                "identifier1": str(row.get("Identifier 1") or "").strip(),
+                "identifier2": str(row.get("Identifier 2") or "").strip(),
+                "species": str(row.get("Species") or row.get("Identifier 1") or "").strip(),
+                "collector_status": str(row.get("Collector Status") or "").strip(),
                 "line": _numeric_or_none(row.get(line_col)) if line_col else None,
                 "d13_raw": _numeric_or_none(row.get("d 13C/12C  Mean")),
                 "d18_raw": _numeric_or_none(row.get("d 18O/16O  Mean")),
                 "d13_calibrated": _numeric_or_none(row.get("d13C_calibrated")),
                 "d18_calibrated": _numeric_or_none(row.get("d18O_calibrated")),
+                "signal": _numeric_or_none(row.get(CYCLE1_SIGNAL_SAMP44_COL)),
+                "leak_rate": _numeric_or_none(row.get("leak_rate")),
+                "d13_cycles_excluded": _numeric_or_none(row.get("d13C Cycles Excluded")),
+                "d18_cycles_excluded": _numeric_or_none(row.get("d18O Cycles Excluded")),
                 "intensities": intensities,
+                "attributes": attributes,
             }
         )
     return rows

@@ -27,6 +27,7 @@ _TYPE_MAP = {
 }
 
 _STANDARDS_TABLE = "standards_official_values"
+_DELETED_STANDARDS_TABLE = "standards_deleted_official_values"
 
 
 def _normalize_standard_name(value: Any) -> str:
@@ -71,7 +72,7 @@ def _connect_db(path: Path) -> sqlite3.Connection:
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
+    cursor = conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {_STANDARDS_TABLE} (
             standard TEXT NOT NULL,
@@ -83,12 +84,33 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    conn.commit()
+    try:
+        conn.commit()
+    finally:
+        cursor.close()
+    cursor = conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_DELETED_STANDARDS_TABLE} (
+            standard TEXT NOT NULL,
+            isotopic_value_type TEXT NOT NULL,
+            deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (standard, isotopic_value_type)
+        )
+        """
+    )
+    try:
+        conn.commit()
+    finally:
+        cursor.close()
 
 
 def _table_row_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute(f"SELECT COUNT(*) FROM {_STANDARDS_TABLE}").fetchone()
-    return int(row[0]) if row is not None else 0
+    cursor = conn.execute(f"SELECT COUNT(*) FROM {_STANDARDS_TABLE}")
+    try:
+        row = cursor.fetchone()
+        return int(row[0]) if row is not None else 0
+    finally:
+        cursor.close()
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -119,7 +141,7 @@ def _seed_database_from_csv(conn: sqlite3.Connection, csv_path: Path) -> None:
     rows = _rows_from_csv(csv_path)
     if not rows:
         return
-    conn.executemany(
+    cursor = conn.executemany(
         f"""
         INSERT INTO {_STANDARDS_TABLE} (
             standard,
@@ -137,14 +159,37 @@ def _seed_database_from_csv(conn: sqlite3.Connection, csv_path: Path) -> None:
         """,
         rows,
     )
-    conn.commit()
+    try:
+        conn.commit()
+    finally:
+        cursor.close()
 
 
 def _insert_missing_rows_from_csv(conn: sqlite3.Connection, csv_path: Path) -> None:
     rows = _rows_from_csv(csv_path)
     if not rows:
         return
-    conn.executemany(
+    deleted_cursor = conn.execute(
+        f"""
+        SELECT standard, isotopic_value_type
+        FROM {_DELETED_STANDARDS_TABLE}
+        """
+    )
+    try:
+        deleted_keys = {
+            (_normalize_standard_name(row[0]), _normalize_isotopic_type(row[1]))
+            for row in deleted_cursor.fetchall()
+        }
+    finally:
+        deleted_cursor.close()
+    rows = [
+        row
+        for row in rows
+        if (_normalize_standard_name(row[0]), _normalize_isotopic_type(row[1])) not in deleted_keys
+    ]
+    if not rows:
+        return
+    cursor = conn.executemany(
         f"""
         INSERT OR IGNORE INTO {_STANDARDS_TABLE} (
             standard,
@@ -157,7 +202,10 @@ def _insert_missing_rows_from_csv(conn: sqlite3.Connection, csv_path: Path) -> N
         """,
         rows,
     )
-    conn.commit()
+    try:
+        conn.commit()
+    finally:
+        cursor.close()
 
 
 def ensure_standards_database(
@@ -171,8 +219,8 @@ def ensure_standards_database(
     conn = _connect_db(target_db)
     try:
         _ensure_schema(conn)
-        if _table_row_count(conn) == 0 and target_csv.exists():
-            _seed_database_from_csv(conn, target_csv)
+        if target_csv.exists():
+            _insert_missing_rows_from_csv(conn, target_csv)
     finally:
         conn.close()
     return target_db
@@ -181,15 +229,25 @@ def ensure_standards_database(
 def load_standards(
     path: str | Path | None = None,
     db_path: str | Path | None = None,
+    ensure_missing_csv_rows: bool = True,
 ) -> pd.DataFrame:
     standards_csv_path = Path(path) if path is not None else default_standards_path()
-    standards_db_path = ensure_standards_database(
-        db_path=db_path,
-        standards_csv_path=standards_csv_path,
-    )
+    if ensure_missing_csv_rows:
+        standards_db_path = ensure_standards_database(
+            db_path=db_path,
+            standards_csv_path=standards_csv_path,
+        )
+    else:
+        standards_db_path = Path(db_path) if db_path is not None else default_standards_db_path()
+        standards_db_path = standards_db_path.resolve()
+        conn = _connect_db(standards_db_path)
+        try:
+            _ensure_schema(conn)
+        finally:
+            conn.close()
     conn = _connect_db(standards_db_path)
     try:
-        frame = pd.read_sql_query(
+        cursor = conn.execute(
             f"""
             SELECT
                 standard AS Standard,
@@ -199,7 +257,14 @@ def load_standards(
             FROM {_STANDARDS_TABLE}
             ORDER BY standard, isotopic_value_type
             """,
-            conn,
+        )
+        try:
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+        frame = pd.DataFrame(
+            rows,
+            columns=["Standard", "Isotopic_Value_Type", "Value", "Source"],
         )
     finally:
         conn.close()
@@ -302,7 +367,15 @@ class StandardsRepository:
         conn = _connect_db(self.database_path)
         try:
             _ensure_schema(conn)
-            conn.execute(
+            delete_cursor = conn.execute(
+                f"""
+                DELETE FROM {_DELETED_STANDARDS_TABLE}
+                WHERE standard = ? AND isotopic_value_type = ?
+                """,
+                (normalized_standard, normalized_isotopic_type),
+            )
+            delete_cursor.close()
+            cursor = conn.execute(
                 f"""
                 INSERT INTO {_STANDARDS_TABLE} (
                     standard,
@@ -320,7 +393,10 @@ class StandardsRepository:
                 """,
                 (normalized_standard, normalized_isotopic_type, numeric_value, source_value),
             )
-            conn.commit()
+            try:
+                conn.commit()
+            finally:
+                cursor.close()
         finally:
             conn.close()
         self.frame = load_standards(path=self.source_path, db_path=self.database_path)
@@ -339,15 +415,44 @@ class StandardsRepository:
             return 0
         conn = _connect_db(self.database_path)
         try:
+            _ensure_schema(conn)
             cursor = conn.execute(
                 f"DELETE FROM {_STANDARDS_TABLE} WHERE standard = ?",
                 (normalized_standard,),
             )
-            conn.commit()
-            deleted_rows = int(cursor.rowcount or 0)
+            try:
+                conn.commit()
+                deleted_rows = int(cursor.rowcount or 0)
+            finally:
+                cursor.close()
+            tombstones = [
+                (normalized_standard, isotopic_type)
+                for isotopic_type in (ISOTYPE_D13C, ISOTYPE_D18O)
+            ]
+            tombstone_cursor = conn.executemany(
+                f"""
+                INSERT INTO {_DELETED_STANDARDS_TABLE} (
+                    standard,
+                    isotopic_value_type,
+                    deleted_at
+                )
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(standard, isotopic_value_type)
+                DO UPDATE SET deleted_at = CURRENT_TIMESTAMP
+                """,
+                tombstones,
+            )
+            try:
+                conn.commit()
+            finally:
+                tombstone_cursor.close()
         finally:
             conn.close()
-        self.frame = load_standards(path=self.source_path, db_path=self.database_path)
+        self.frame = load_standards(
+            path=self.source_path,
+            db_path=self.database_path,
+            ensure_missing_csv_rows=False,
+        )
         return deleted_rows
 
     def delete_official_value(self, standard: str, isotopic_value_type: str) -> int:
@@ -359,6 +464,7 @@ class StandardsRepository:
             return 0
         conn = _connect_db(self.database_path)
         try:
+            _ensure_schema(conn)
             cursor = conn.execute(
                 f"""
                 DELETE FROM {_STANDARDS_TABLE}
@@ -366,8 +472,28 @@ class StandardsRepository:
                 """,
                 (normalized_standard, normalized_isotopic_type),
             )
-            conn.commit()
-            deleted_rows = int(cursor.rowcount or 0)
+            try:
+                conn.commit()
+                deleted_rows = int(cursor.rowcount or 0)
+            finally:
+                cursor.close()
+            tombstone_cursor = conn.execute(
+                f"""
+                INSERT INTO {_DELETED_STANDARDS_TABLE} (
+                    standard,
+                    isotopic_value_type,
+                    deleted_at
+                )
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(standard, isotopic_value_type)
+                DO UPDATE SET deleted_at = CURRENT_TIMESTAMP
+                """,
+                (normalized_standard, normalized_isotopic_type),
+            )
+            try:
+                conn.commit()
+            finally:
+                tombstone_cursor.close()
         finally:
             conn.close()
         self.frame = load_standards(path=self.source_path, db_path=self.database_path)

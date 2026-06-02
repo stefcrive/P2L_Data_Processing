@@ -43,3 +43,4 @@ DEFAULT_SIGNAL_RANGE = (0.0, 50.0)
 DEFAULT_SESSION_DATA_DIR = ".data/irms_api_sessions"
 DEFAULT_STANDARDS_DB_PATH = ".data/irms_standards.db"
 SESSION_RECORD_DIRNAME = "Session record"
+SESSION_STATE_FILENAME = "irms_session_state.json"

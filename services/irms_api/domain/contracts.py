@@ -349,12 +349,21 @@ class ProcessingWorkspace(BaseModel):
 
 class ProcessingLinearityPreviewRow(BaseModel):
     row_label: str
+    identifier1: str = ""
+    identifier2: str = ""
+    species: str = ""
+    collector_status: str = ""
     line: float | None = None
     d13_raw: float | None = None
     d18_raw: float | None = None
     d13_calibrated: float | None = None
     d18_calibrated: float | None = None
+    signal: float | None = None
+    leak_rate: float | None = None
+    d13_cycles_excluded: float | None = None
+    d18_cycles_excluded: float | None = None
     intensities: dict[str, float | None] = Field(default_factory=dict)
+    attributes: dict[str, str | float | None] = Field(default_factory=dict)
 
 
 class ProcessingLinearityPreviewData(BaseModel):

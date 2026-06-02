@@ -54,6 +54,11 @@ CARBONATE_ACID_FRACTIONATION_FACTORS: dict[str, float] = {
     "aragonite": 1.0091,
 }
 
+LINEARITY_D13_RESIDUAL_COL = "__linearity_residual_d13C"
+LINEARITY_D18_RESIDUAL_COL = "__linearity_residual_d18O"
+LINEARITY_D13_TRUE_COL = "__linearity_true_d13C"
+LINEARITY_D18_TRUE_COL = "__linearity_true_d18O"
+
 
 def identify_outliers(data: pd.DataFrame, column: str, sigma_level: float) -> pd.Series:
     if column not in data.columns:
@@ -345,6 +350,76 @@ def _filter_linearity_fit_input_by_max_intensity(
     intensity = pd.to_numeric(df[intensity_col], errors="coerce")
     mask = np.isfinite(intensity) & (intensity <= float(max_value))
     return df.loc[mask].copy()
+
+
+def _with_standard_linearity_residual_columns(
+    df: pd.DataFrame,
+    selected_standards: list[str],
+    repository: StandardsRepository | None = None,
+    carbonate_material: str = CARBONATE_REFERENCE_MATERIAL,
+) -> pd.DataFrame:
+    if df is None or df.empty or "Identifier 1" not in df.columns:
+        return df
+    standards = [str(item).strip().upper() for item in selected_standards if str(item).strip()]
+    if not standards:
+        return df
+    repo = repository or StandardsRepository.default()
+    work = df.copy()
+    id_values = work["Identifier 1"].fillna("").astype(str).str.strip().str.upper()
+
+    def _true_value_map(isotopic_type: str) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for standard in standards:
+            try:
+                true_value = repo.get_true_value(standard, isotopic_type)
+            except Exception:
+                continue
+            if isotopic_type == ISOTYPE_D18O:
+                true_value = _carbonate_adjusted_true_value(true_value, isotopic_type, carbonate_material)
+            numeric = pd.to_numeric(pd.Series([true_value]), errors="coerce").iloc[0]
+            if np.isfinite(numeric):
+                values[standard] = float(numeric)
+        return values
+
+    for raw_col, true_col, residual_col, isotope_type in (
+        ("d 13C/12C  Mean", LINEARITY_D13_TRUE_COL, LINEARITY_D13_RESIDUAL_COL, ISOTYPE_D13C),
+        ("d 18O/16O  Mean", LINEARITY_D18_TRUE_COL, LINEARITY_D18_RESIDUAL_COL, ISOTYPE_D18O),
+    ):
+        if raw_col not in work.columns:
+            continue
+        true_values = id_values.map(_true_value_map(isotope_type))
+        raw_values = pd.to_numeric(work[raw_col], errors="coerce")
+        true_numeric = pd.to_numeric(true_values, errors="coerce")
+        work[true_col] = true_numeric
+        work[residual_col] = (raw_values - true_numeric).where(np.isfinite(raw_values) & np.isfinite(true_numeric))
+    return work
+
+
+def _linearity_fit_y_column(df: pd.DataFrame, isotope_key: str, raw_col: str) -> str:
+    residual_col = LINEARITY_D13_RESIDUAL_COL if isotope_key == "d13C" else LINEARITY_D18_RESIDUAL_COL
+    if residual_col in df.columns:
+        residuals = pd.to_numeric(df[residual_col], errors="coerce")
+        if residuals.notna().any():
+            return residual_col
+    return raw_col
+
+
+def _compute_standard_linearity_fit(
+    clean_df: pd.DataFrame,
+    isotope_key: str,
+    raw_y_col: str,
+    x_col: str,
+    quadratic: bool = False,
+) -> dict[str, Any]:
+    y_col = _linearity_fit_y_column(clean_df, isotope_key, raw_y_col)
+    fit = _compute_linearity_fit(clean_df, y_col, x_col, quadratic=quadratic)
+    if y_col != raw_y_col:
+        fit = dict(fit)
+        fit["fit_y_col"] = y_col
+        fit["raw_y_col"] = raw_y_col
+        fit["fit_y_kind"] = "standard_residual"
+        fit["true_y_col"] = LINEARITY_D13_TRUE_COL if isotope_key == "d13C" else LINEARITY_D18_TRUE_COL
+    return fit
 
 
 def _resolve_linearity_fit_degree(fit: dict[str, Any] | None) -> int:

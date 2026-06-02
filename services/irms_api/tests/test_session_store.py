@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from services.irms_api.domain.constants import SESSION_STATE_FILENAME
 from services.irms_api.session_store import FileSessionStore
 
 
@@ -110,6 +111,37 @@ class SessionStoreTests(unittest.TestCase):
             self.assertTrue(index_path.exists())
             index_payload = json.loads(index_path.read_text(encoding="utf-8"))
             self.assertEqual(index_payload.get(session_id), str(expected_root))
+
+    def test_session_state_file_registers_existing_session_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_root = Path(temp_dir) / "workbooks"
+            source_root.mkdir(parents=True, exist_ok=True)
+            workbook_path = source_root / "source.xlsx"
+            workbook_bytes = b"dummy workbook bytes for portable state"
+            workbook_path.write_bytes(workbook_bytes)
+            source_spec = {
+                "name": workbook_path.name,
+                "size": len(workbook_bytes),
+                "md5": hashlib.md5(workbook_bytes).hexdigest().lower(),
+            }
+            with patch.dict(os.environ, {"IRMS_SOURCE_SEARCH_ROOTS": str(source_root)}):
+                first_store = FileSessionStore(Path(temp_dir) / "store_a")
+                session_id = first_store.create_session({"source_files": [source_spec]})
+                first_store.save_frames(session_id, pd.DataFrame({"a": [1, 2, 3]}))
+                metadata = first_store.load_metadata(session_id)
+                first_store.write_metadata(session_id, metadata)
+
+            state_path = source_root / SESSION_STATE_FILENAME
+            self.assertTrue(state_path.exists())
+            state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state_payload["session_id"], session_id)
+            self.assertEqual(Path(state_payload["source_data_dir"]), source_root.resolve())
+
+            second_store = FileSessionStore(Path(temp_dir) / "store_b")
+            opened_session_id = second_store.register_session_from_state(state_payload)
+            self.assertEqual(opened_session_id, session_id)
+            snapshot = second_store.build_snapshot(session_id)
+            self.assertEqual(snapshot["row_count"], 3)
 
     def test_source_search_roots_require_explicit_env(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

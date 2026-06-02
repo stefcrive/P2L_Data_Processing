@@ -249,12 +249,21 @@ export type ProcessingWorkspace = {
 
 export type LinearityPreviewRow = {
   row_label: string;
+  identifier1?: string;
+  identifier2?: string;
+  species?: string;
+  collector_status?: string;
   line?: number | null;
   d13_raw?: number | null;
   d18_raw?: number | null;
   d13_calibrated?: number | null;
   d18_calibrated?: number | null;
+  signal?: number | null;
+  leak_rate?: number | null;
+  d13_cycles_excluded?: number | null;
+  d18_cycles_excluded?: number | null;
   intensities: Record<string, number | null>;
+  attributes: Record<string, string | number | null>;
 };
 
 export type LinearityPreviewTrace = {

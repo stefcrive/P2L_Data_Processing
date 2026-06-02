@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import tempfile
 import unittest
+from pathlib import Path
 
 import pandas as pd
+from fastapi import UploadFile
 
 from services.irms_api.api import main as api_main
 from services.irms_api.session_store import FileSessionStore
@@ -56,10 +60,51 @@ class SessionLifecycleApiTests(unittest.TestCase):
         self.assertIn("snapshot_path", autosave)
         self.assertIn("log_path", autosave)
         self.assertIn("meta_path", autosave)
+        self.assertIn("session_state_path", autosave)
 
         discarded = api_main.discard_session(self.session_id)
         self.assertTrue(bool(discarded.get("deleted")))
         self.assertFalse(api_main.store.session_exists(self.session_id))
+
+    def test_open_session_file_endpoint_registers_manifest(self) -> None:
+        api_main.save_session(self.session_id)
+        paths = api_main.store._paths(self.session_id)
+        manifest_bytes = paths.session_state_path.read_bytes()
+        upload = UploadFile(filename="irms_session_state.json", file=io.BytesIO(manifest_bytes))
+
+        payload = asyncio.run(api_main.open_session_file(upload))
+
+        self.assertEqual(payload.session_id, self.session_id)
+        self.assertTrue(bool(payload.autosave.get("resumed")))
+
+    def test_open_session_folder_endpoint_restores_uploaded_record(self) -> None:
+        api_main.save_session(self.session_id)
+        paths = api_main.store._paths(self.session_id)
+        uploads = [
+            UploadFile(
+                filename=f"data/{paths.root.parent.name}/{self.session_id}/metadata.json",
+                file=io.BytesIO(paths.metadata_path.read_bytes()),
+            ),
+            UploadFile(
+                filename=f"data/{paths.root.parent.name}/{self.session_id}/snapshot.csv",
+                file=io.BytesIO(paths.snapshot_path.read_bytes()),
+            ),
+            UploadFile(
+                filename=f"data/{paths.root.parent.name}/{self.session_id}/cycles_snapshot.csv",
+                file=io.BytesIO(paths.cycles_snapshot_path.read_bytes()),
+            ),
+            UploadFile(
+                filename=f"data/{paths.root.parent.name}/{self.session_id}/irms_session_state.json",
+                file=io.BytesIO(paths.session_state_path.read_bytes()),
+            ),
+        ]
+        api_main.store = FileSessionStore(Path(self.temp_dir.name) / "portable_store")
+
+        payload = asyncio.run(api_main.open_session_folder(uploads))
+
+        self.assertEqual(payload.session_id, self.session_id)
+        self.assertEqual(payload.row_count, 2)
+        self.assertTrue(api_main.store.session_exists(self.session_id))
 
 
 if __name__ == "__main__":

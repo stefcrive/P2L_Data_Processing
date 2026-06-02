@@ -52,6 +52,7 @@ const ISOTOPE_KEYS: IsotopeKey[] = ["d13C", "d18O"];
 type IsotopeNumericMap = Record<IsotopeKey, number>;
 type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
 type LinearityOffsetDraftState = Record<LinearityOffsetField, string>;
+type SelectionDraftValueMap = Record<string, number>;
 type LinearityCycleIntensityAggregation = "run_median" | "first_valid_cycle" | "last_valid_cycle";
 const SATURATION_METHOD_OPTIONS: Array<{ value: SaturationCorrectionMethod; label: string }> = [
   { value: "cycle_mean", label: "Cycle mean" },
@@ -70,6 +71,7 @@ const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const RESTORE_STDEV_DEFAULT_CAP = 0.04;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const SELECTION_EDITOR_CHART_DEFER_MS = 350;
+const SELECTION_EDITOR_CLOSE_SUPPRESSION_MS = 5000;
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
@@ -131,6 +133,33 @@ type HoverPreviewState = {
   clientX: number;
   clientY: number;
 };
+type ProcessingPreviewRowState = {
+  rowLabel: string;
+  identifier1: string;
+  species: string;
+  d13: number | null;
+  d18: number | null;
+  signal: number | null;
+  leakRate: number | null;
+  status: string;
+};
+type ProcessingPreviewMasks = {
+  baseD13: Set<string>;
+  baseD18: Set<string>;
+  baseCross: Set<string>;
+  statisticalD13: Set<string>;
+  statisticalD18: Set<string>;
+  statisticalCombined: Set<string>;
+  d13Range: Set<string>;
+  d18Range: Set<string>;
+  signal: Set<string>;
+  leak: Set<string>;
+  manual: Set<string>;
+  partial: Set<string>;
+  partialExcluded: Set<string>;
+  full: Set<string>;
+  failed: Set<string>;
+};
 const DEFAULT_CHART_DISPLAY_STATE: ChartDisplayState = {
   hideCalibrated: true,
   hideSymbols: false,
@@ -150,6 +179,22 @@ const DEFAULT_PLOTLY_COLORWAY = [
   "#FECB52",
 ];
 const selectionSourceHighlightCache = new WeakMap<Record<string, unknown>, Map<string, Record<string, unknown> | undefined>>();
+
+function selectionDraftValueKey(rowLabel: string, isotopeKey: IsotopeKey): string {
+  return `${isotopeKey}|${String(rowLabel).trim()}`;
+}
+
+function selectionDraftValueFor(
+  values: SelectionDraftValueMap,
+  rowLabel: string | null | undefined,
+  isotopeKey: IsotopeKey,
+): number | null {
+  if (!rowLabel) {
+    return null;
+  }
+  const value = values[selectionDraftValueKey(rowLabel, isotopeKey)];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
 
 function getLinearityIntensityOptionLabel(value: string): string {
   if (value in LINEARITY_INTENSITY_OPTION_LABELS) {
@@ -633,6 +678,430 @@ function applyLinearityPreviewToFigure(
       }
       changed = true;
     }
+    return nextTrace;
+  });
+  return changed ? { ...cloned, data: nextData } : figure;
+}
+
+function applySelectionDraftPreviewToFigure(
+  figure: Record<string, unknown> | undefined,
+  draftValues: SelectionDraftValueMap,
+  processingConfig: ProcessingConfig | null | undefined,
+): Record<string, unknown> | undefined {
+  if (!figure || !processingConfig || !Object.keys(draftValues).length) {
+    return figure;
+  }
+  const cloned = cloneFigure(figure);
+  if (!Array.isArray(cloned.data)) {
+    return figure;
+  }
+  let changed = false;
+  const nextData = cloned.data.map((trace) => {
+    const customdata = coerceVector(trace.customdata);
+    if (!customdata?.length) {
+      return trace;
+    }
+    const x = coerceVector(trace.x);
+    const y = coerceVector(trace.y);
+    const z = coerceVector(trace.z);
+    let nextTrace = trace;
+    let nextX = x;
+    let nextY = y;
+    let nextZ = z;
+    let traceChanged = false;
+    for (let index = 0; index < customdata.length; index += 1) {
+      const rowLabel = customDataRowLabel(customdata[index]);
+      if (!rowLabel) {
+        continue;
+      }
+      const isotope = customDataIsotope(customdata[index]);
+      if (isotope === "cross") {
+        const d13 = selectionDraftValueFor(draftValues, rowLabel, "d13C");
+        const d18 = selectionDraftValueFor(draftValues, rowLabel, "d18O");
+        const patchedX = patchVectorValue(nextX, index, d18);
+        const patchedY = patchVectorValue(nextY, index, d13);
+        nextX = patchedX.values;
+        nextY = patchedY.values;
+        traceChanged = traceChanged || patchedX.changed || patchedY.changed;
+        if (processingConfig.z_axis === "d 13C/12C  Mean") {
+          const patchedZ = patchVectorValue(nextZ, index, d13);
+          nextZ = patchedZ.values;
+          traceChanged = traceChanged || patchedZ.changed;
+        } else if (processingConfig.z_axis === "d 18O/16O  Mean") {
+          const patchedZ = patchVectorValue(nextZ, index, d18);
+          nextZ = patchedZ.values;
+          traceChanged = traceChanged || patchedZ.changed;
+        }
+        continue;
+      }
+      if (isotope === "d13C" || isotope === "d18O") {
+        const value = selectionDraftValueFor(draftValues, rowLabel, isotope);
+        const patchedY = patchVectorValue(nextY, index, value);
+        nextY = patchedY.values;
+        traceChanged = traceChanged || patchedY.changed;
+      }
+    }
+    if (traceChanged) {
+      nextTrace = { ...trace };
+      if (nextX && nextX !== x) {
+        nextTrace.x = nextX;
+      }
+      if (nextY && nextY !== y) {
+        nextTrace.y = nextY;
+      }
+      if (nextZ && nextZ !== z) {
+        nextTrace.z = nextZ;
+      }
+      changed = true;
+    }
+    return nextTrace;
+  });
+  return changed ? { ...cloned, data: nextData } : figure;
+}
+
+function sortedFinite(values: Array<number | null>): number[] {
+  return values.filter((value): value is number => value != null && Number.isFinite(value)).sort((a, b) => a - b);
+}
+
+function quantile(values: number[], q: number): number | null {
+  if (!values.length) {
+    return null;
+  }
+  if (values.length === 1) {
+    return values[0];
+  }
+  const position = (values.length - 1) * q;
+  const lowerIndex = Math.floor(position);
+  const upperIndex = Math.ceil(position);
+  const lower = values[lowerIndex];
+  const upper = values[upperIndex];
+  if (lower == null || upper == null) {
+    return null;
+  }
+  return lower + (upper - lower) * (position - lowerIndex);
+}
+
+function statisticalOutlierRows(valuesByRow: Array<{ rowLabel: string; value: number | null }>, method: string, sigmaLevel: number, iqrMultiplier: number): Set<string> {
+  const finiteValues = sortedFinite(valuesByRow.map((item) => item.value));
+  const outliers = new Set<string>();
+  if (finiteValues.length <= 1) {
+    return outliers;
+  }
+  if (String(method).trim().toUpperCase() === "IQR") {
+    const q1 = quantile(finiteValues, 0.25);
+    const q3 = quantile(finiteValues, 0.75);
+    if (q1 == null || q3 == null) {
+      return outliers;
+    }
+    const iqr = q3 - q1;
+    const lower = q1 - iqrMultiplier * iqr;
+    const upper = q3 + iqrMultiplier * iqr;
+    for (const item of valuesByRow) {
+      if (item.value != null && (item.value < lower || item.value > upper)) {
+        outliers.add(item.rowLabel);
+      }
+    }
+    return outliers;
+  }
+  const mean = finiteValues.reduce((sum, value) => sum + value, 0) / finiteValues.length;
+  const variance =
+    finiteValues.length > 1
+      ? finiteValues.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (finiteValues.length - 1)
+      : 0;
+  const std = Math.sqrt(variance);
+  if (!Number.isFinite(mean) || !Number.isFinite(std) || std <= 0) {
+    return outliers;
+  }
+  const lower = mean - sigmaLevel * std;
+  const upper = mean + sigmaLevel * std;
+  for (const item of valuesByRow) {
+    if (item.value != null && (item.value < lower || item.value > upper)) {
+      outliers.add(item.rowLabel);
+    }
+  }
+  return outliers;
+}
+
+function rowIsInSelectedIdentifier(row: ProcessingPreviewRowState, config: ProcessingConfig): boolean {
+  return config.selected_identifier === "All" || row.identifier1 === String(config.selected_identifier);
+}
+
+function rowInRange(value: number | null, range: [number, number]): boolean {
+  if (value == null) {
+    return false;
+  }
+  const low = Math.min(range[0], range[1]);
+  const high = Math.max(range[0], range[1]);
+  return value >= low && value <= high;
+}
+
+function applyOverrideFalse(rowLabel: string, value: boolean, overrides: Record<string, boolean>): boolean {
+  return overrides[rowLabel] === false ? false : value;
+}
+
+function applyOverrideBoth(rowLabel: string, value: boolean, overrides: Record<string, boolean>): boolean {
+  if (overrides[rowLabel] === true) {
+    return true;
+  }
+  if (overrides[rowLabel] === false) {
+    return false;
+  }
+  return value;
+}
+
+function buildProcessingPreviewMasks(
+  previewData: ProcessingLinearityPreviewData | undefined,
+  linearity: CalibrationConfig["linearity"] | null | undefined,
+  config: ProcessingConfig | null | undefined,
+  editState: ProcessingWorkspace["edit_state"] | undefined,
+): ProcessingPreviewMasks | null {
+  if (!previewData || !linearity || !config) {
+    return null;
+  }
+  const effectiveFits = applyManualLinearityOffsetsForPreview(previewData.fits, linearity);
+  const editedRows = new Set((editState?.edited_rows ?? []).map((row) => String(row)));
+  const overrides = (editState?.manual_outlier_overrides ?? {}) as Record<string, boolean>;
+  const rows: ProcessingPreviewRowState[] = previewData.rows.map((row) => {
+    const rowLabel = String(row.row_label);
+    return {
+      rowLabel,
+      identifier1: String(row.identifier1 ?? "").trim(),
+      species: String(row.species ?? row.identifier1 ?? "").trim(),
+      d13: previewValueForRow(row, "d13C", linearity, previewData, effectiveFits, "raw"),
+      d18: previewValueForRow(row, "d18O", linearity, previewData, effectiveFits, "raw"),
+      signal: finiteNumber(row.signal),
+      leakRate: finiteNumber(row.leak_rate),
+      status: String(row.collector_status ?? "").trim(),
+    };
+  });
+
+  const masks: ProcessingPreviewMasks = {
+    baseD13: new Set(),
+    baseD18: new Set(),
+    baseCross: new Set(),
+    statisticalD13: new Set(),
+    statisticalD18: new Set(),
+    statisticalCombined: new Set(),
+    d13Range: new Set(),
+    d18Range: new Set(),
+    signal: new Set(),
+    leak: new Set(),
+    manual: new Set(),
+    partial: new Set(),
+    partialExcluded: new Set(),
+    full: new Set(),
+    failed: new Set(),
+  };
+
+  const rowsByGroup = new Map<string, ProcessingPreviewRowState[]>();
+  for (const row of rows) {
+    if (!rowIsInSelectedIdentifier(row, config)) {
+      continue;
+    }
+    const rowLabel = row.rowLabel;
+    const isEdited = editedRows.has(rowLabel);
+    const d13Range = !isEdited && applyOverrideFalse(rowLabel, row.d13 != null && !rowInRange(row.d13, config.d13c_range), overrides);
+    const d18Range = !isEdited && applyOverrideFalse(rowLabel, row.d18 != null && !rowInRange(row.d18, config.d18o_range), overrides);
+    const signalRange = !isEdited && applyOverrideFalse(rowLabel, row.signal != null && !rowInRange(row.signal, config.signal_range), overrides);
+    const leakRange = !isEdited && applyOverrideFalse(rowLabel, row.leakRate != null && !rowInRange(row.leakRate, config.leak_range), overrides);
+    const failed = !isEdited && applyOverrideFalse(rowLabel, row.status === "Failed Sample", overrides);
+    const full = !isEdited && applyOverrideFalse(rowLabel, row.status === "Fully Saturated Collectors", overrides);
+    const partialStatus = !isEdited && row.status === "Partially Saturated Collectors";
+    const partialExcluded = partialStatus && applyOverrideBoth(rowLabel, !Boolean(config.overlays.show_saturated_collectors), overrides);
+    if (d13Range) masks.d13Range.add(rowLabel);
+    if (d18Range) masks.d18Range.add(rowLabel);
+    if (signalRange) masks.signal.add(rowLabel);
+    if (leakRange) masks.leak.add(rowLabel);
+    if (failed) masks.failed.add(rowLabel);
+    if (full) masks.full.add(rowLabel);
+    if (partialStatus) masks.partial.add(rowLabel);
+    if (partialExcluded) masks.partialExcluded.add(rowLabel);
+    if (overrides[rowLabel] === true) masks.manual.add(rowLabel);
+
+    const commonRangeOrStatus = d13Range || d18Range || signalRange || leakRange || failed || full || partialExcluded;
+    if (!commonRangeOrStatus) {
+      const groupKey = `${row.identifier1}\u0000${row.species}`;
+      const groupRows = rowsByGroup.get(groupKey) ?? [];
+      groupRows.push(row);
+      rowsByGroup.set(groupKey, groupRows);
+    }
+  }
+
+  const sigmaLevel = finiteNumber(config.sigma_level_data) ?? 4;
+  const iqrMultiplier = finiteNumber(config.iqr_multiplier_data) ?? 1.5;
+  for (const groupRows of rowsByGroup.values()) {
+    const eligibleRows = groupRows.filter((row) => !editedRows.has(row.rowLabel));
+    const d13Outliers = statisticalOutlierRows(
+      eligibleRows.map((row) => ({ rowLabel: row.rowLabel, value: row.d13 })),
+      config.statistical_outlier_method,
+      sigmaLevel,
+      iqrMultiplier,
+    );
+    const d18Outliers = statisticalOutlierRows(
+      eligibleRows.map((row) => ({ rowLabel: row.rowLabel, value: row.d18 })),
+      config.statistical_outlier_method,
+      sigmaLevel,
+      iqrMultiplier,
+    );
+    for (const row of eligibleRows) {
+      const d13Stat = applyOverrideBoth(row.rowLabel, d13Outliers.has(row.rowLabel), overrides);
+      const d18Stat = applyOverrideBoth(row.rowLabel, d18Outliers.has(row.rowLabel), overrides);
+      if (d13Stat) masks.statisticalD13.add(row.rowLabel);
+      if (d18Stat) masks.statisticalD18.add(row.rowLabel);
+      if (d13Stat || d18Stat) masks.statisticalCombined.add(row.rowLabel);
+    }
+  }
+
+  for (const row of rows) {
+    if (!rowIsInSelectedIdentifier(row, config)) {
+      continue;
+    }
+    const rowLabel = row.rowLabel;
+    const commonRangeOrStatus =
+      masks.d13Range.has(rowLabel) ||
+      masks.d18Range.has(rowLabel) ||
+      masks.signal.has(rowLabel) ||
+      masks.leak.has(rowLabel) ||
+      masks.failed.has(rowLabel) ||
+      masks.full.has(rowLabel) ||
+      masks.partialExcluded.has(rowLabel);
+    if (!commonRangeOrStatus && !masks.statisticalD13.has(rowLabel)) {
+      masks.baseD13.add(rowLabel);
+    }
+    if (!commonRangeOrStatus && !masks.statisticalD18.has(rowLabel)) {
+      masks.baseD18.add(rowLabel);
+    }
+    if (!commonRangeOrStatus && !masks.statisticalCombined.has(rowLabel)) {
+      masks.baseCross.add(rowLabel);
+    }
+  }
+  return masks;
+}
+
+function filterTraceVector(vector: unknown, keepIndexes: number[], sourceLength: number): unknown {
+  const values = coerceVector(vector);
+  if (!values || values.length !== sourceLength) {
+    return vector;
+  }
+  return keepIndexes.map((index) => values[index]);
+}
+
+function filterTraceNestedVectors(record: Record<string, unknown> | undefined, keepIndexes: number[], sourceLength: number): Record<string, unknown> | undefined {
+  if (!record) {
+    return record;
+  }
+  let changed = false;
+  const next: Record<string, unknown> = { ...record };
+  for (const key of ["color", "size", "symbol", "text", "opacity"]) {
+    if (!(key in next)) {
+      continue;
+    }
+    const filtered = filterTraceVector(next[key], keepIndexes, sourceLength);
+    if (filtered !== next[key]) {
+      next[key] = filtered;
+      changed = true;
+    }
+  }
+  return changed ? next : record;
+}
+
+function traceOverlayRowSet(name: string, masks: ProcessingPreviewMasks, config: ProcessingConfig, isotope: IsotopeKey | "cross" | null): Set<string> | null {
+  if (name.includes("Statistical Outliers")) {
+    if (!config.overlays.show_statistical_outliers) return new Set();
+    if (isotope === "d13C") return masks.statisticalD13;
+    if (isotope === "d18O") return masks.statisticalD18;
+    return masks.statisticalCombined;
+  }
+  if (name.includes("Signal Intensity Range")) {
+    return config.overlays.show_range_outliers ? masks.signal : new Set();
+  }
+  if (name.includes("Leak Rate Range")) {
+    return config.overlays.show_range_outliers ? masks.leak : new Set();
+  }
+  if (name.includes("d13C Range")) {
+    return config.overlays.show_range_outliers ? masks.d13Range : new Set();
+  }
+  if (name.includes("d18O Range")) {
+    return config.overlays.show_range_outliers ? masks.d18Range : new Set();
+  }
+  if (name.includes("Manual Outliers")) {
+    return config.overlays.show_manual_outliers ? masks.manual : new Set();
+  }
+  if (name.includes("Partially Failed") || name.includes("Partially Saturated")) {
+    return config.overlays.show_saturated_collectors ? masks.partial : new Set();
+  }
+  if (name.includes("Fully Saturated")) {
+    return config.overlays.show_saturated_samples ? masks.full : new Set();
+  }
+  if (name.includes("Failed Samples") || name.includes("Failed Sample")) {
+    return config.overlays.show_failed_samples ? masks.failed : new Set();
+  }
+  return null;
+}
+
+function filterPlotlyTraceByRows(
+  trace: Record<string, unknown>,
+  rowSet: Set<string>,
+): Record<string, unknown> {
+  const customdata = coerceVector(trace.customdata);
+  if (!customdata?.length) {
+    return trace;
+  }
+  const keepIndexes: number[] = [];
+  for (let index = 0; index < customdata.length; index += 1) {
+    const rowLabel = customDataRowLabel(customdata[index]);
+    if (rowLabel && rowSet.has(rowLabel)) {
+      keepIndexes.push(index);
+    }
+  }
+  if (keepIndexes.length === customdata.length) {
+    return trace;
+  }
+  const nextTrace: Record<string, unknown> = { ...trace };
+  for (const key of ["x", "y", "z", "customdata", "text", "hovertext", "ids"]) {
+    if (key in nextTrace) {
+      nextTrace[key] = filterTraceVector(nextTrace[key], keepIndexes, customdata.length);
+    }
+  }
+  const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : undefined;
+  const nextMarker = filterTraceNestedVectors(marker, keepIndexes, customdata.length);
+  if (nextMarker && nextMarker !== marker) {
+    nextTrace.marker = nextMarker;
+  }
+  const errorY = trace.error_y && typeof trace.error_y === "object" ? (trace.error_y as Record<string, unknown>) : undefined;
+  const nextErrorY = filterTraceNestedVectors(errorY, keepIndexes, customdata.length);
+  if (nextErrorY && nextErrorY !== errorY) {
+    nextTrace.error_y = nextErrorY;
+  }
+  return nextTrace;
+}
+
+function applyProcessingConfigPreviewToFigure(
+  figure: Record<string, unknown> | undefined,
+  masks: ProcessingPreviewMasks | null,
+  config: ProcessingConfig | null | undefined,
+): Record<string, unknown> | undefined {
+  if (!figure || !masks || !config) {
+    return figure;
+  }
+  const cloned = cloneFigure(figure);
+  if (!Array.isArray(cloned.data)) {
+    return figure;
+  }
+  let changed = false;
+  const nextData = cloned.data.map((trace) => {
+    const customdata = coerceVector(trace.customdata);
+    if (!customdata?.length) {
+      return trace;
+    }
+    const firstIsotope = customDataIsotope(customdata[0]);
+    const traceName = String(trace.name ?? "");
+    const overlayRows = traceOverlayRowSet(traceName, masks, config, firstIsotope);
+    const rowSet =
+      overlayRows ??
+      (firstIsotope === "d13C" ? masks.baseD13 : firstIsotope === "d18O" ? masks.baseD18 : masks.baseCross);
+    const nextTrace = filterPlotlyTraceByRows(trace, rowSet);
+    changed = changed || nextTrace !== trace;
     return nextTrace;
   });
   return changed ? { ...cloned, data: nextData } : figure;
@@ -3271,6 +3740,8 @@ export default function ProcessingPage() {
   });
   const [multiOffsetD13, setMultiOffsetD13] = useState(0);
   const [multiOffsetD18, setMultiOffsetD18] = useState(0);
+  const [selectionDraftEdits, setSelectionDraftEdits] = useState<EditAction[]>([]);
+  const [selectionDraftValues, setSelectionDraftValues] = useState<SelectionDraftValueMap>({});
   const [linearityPreviewConfig, setLinearityPreviewConfig] = useState<CalibrationConfig["linearity"] | null>(null);
   const [linearityOffsetDrafts, setLinearityOffsetDrafts] = useState<LinearityOffsetDraftState>({
     line_1_offset_d13: "0",
@@ -3298,6 +3769,8 @@ export default function ProcessingPage() {
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
+  const selectionEditorOpenRef = useRef(false);
+  const selectionEditorSuppressEventsUntilRef = useRef(0);
   const preserveLinearityPreviewOnWorkspaceUpdateRef = useRef(false);
   const colorScaleFigureCacheRef = useRef<
     WeakMap<Record<string, unknown>, { rangeKey: string; figure: Record<string, unknown> | undefined }>
@@ -3451,9 +3924,31 @@ export default function ProcessingPage() {
       queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       setLinearityPreviewStale(false);
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
+      setSelectionDraftEdits([]);
+      setSelectionDraftValues({});
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
+    },
+  });
+
+  const commitSelectionDraftsMutation = useMutation({
+    mutationFn: async (drafts: EditAction[]) => {
+      let latestWorkspace: ProcessingWorkspace | null = null;
+      for (const draft of drafts) {
+        latestWorkspace = await api.editProcessing(sessionId!, draft, openSpeciesSectionList);
+      }
+      return latestWorkspace;
+    },
+    onSuccess: (workspace) => {
+      if (workspace) {
+        queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
+      }
+      queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
+      setLinearityPreviewStale(false);
+      void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
+      setSelectionDraftEdits([]);
+      setSelectionDraftValues({});
     },
   });
 
@@ -3467,6 +3962,8 @@ export default function ProcessingPage() {
       queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
       setLinearityPreviewStale(false);
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
+      setSelectionDraftEdits([]);
+      setSelectionDraftValues({});
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -3480,6 +3977,8 @@ export default function ProcessingPage() {
       setConfig(workspace.config);
       setLinearityPreviewStale(false);
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
+      setSelectionDraftEdits([]);
+      setSelectionDraftValues({});
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -3498,15 +3997,17 @@ export default function ProcessingPage() {
     }
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
-        setSelectionEditorOpen(false);
-        setSelectedTargets([]);
-        setActiveTargetIndex(0);
+        closeSelectionEditor();
         setExportModalOpen(false);
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [isSelectionEditorOpen, isExportModalOpen]);
+
+  useEffect(() => {
+    selectionEditorOpenRef.current = isSelectionEditorOpen;
+  }, [isSelectionEditorOpen]);
 
   useEffect(() => {
     return () => {
@@ -3533,19 +4034,6 @@ export default function ProcessingPage() {
       setHoverPreview(null);
     }
   }, [isExportModalOpen, isSelectionEditorOpen]);
-
-  useEffect(() => {
-    if (!sessionId || !config || !workspaceQuery.data || saveConfigMutation.isPending) {
-      return;
-    }
-    if (configEquals(config, workspaceQuery.data.config)) {
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      saveConfigMutation.mutate(config);
-    }, 500);
-    return () => window.clearTimeout(timer);
-  }, [config, saveConfigMutation, saveConfigMutation.isPending, sessionId, workspaceQuery.data]);
 
   const activeTarget = selectedTargets.length ? selectedTargets[Math.min(activeTargetIndex, selectedTargets.length - 1)] : null;
   const activeSampleTarget = activeTarget;
@@ -3649,8 +4137,59 @@ export default function ProcessingPage() {
     sampleD18DiagnosticsQuery.data?.cycle_mean,
   ]);
 
-  const workspace = workspaceQuery.data;
-  const activeConfig = config ?? workspace?.config ?? null;
+  const savedWorkspace = workspaceQuery.data;
+  const activeConfig = config ?? savedWorkspace?.config ?? null;
+  const hasPendingProcessingConfigChanges = Boolean(activeConfig && savedWorkspace?.config && !configEquals(activeConfig, savedWorkspace.config));
+  const workspace = savedWorkspace;
+  const hasUnsavedNavigationChanges = Boolean(
+    hasPendingProcessingConfigChanges ||
+      (sharedLinearityConfig &&
+        calibrationWorkspaceQuery.data?.config?.linearity &&
+        !linearityConfigEquals(sharedLinearityConfig, calibrationWorkspaceQuery.data.config.linearity)) ||
+      (linearityPreviewConfig &&
+        calibrationWorkspaceQuery.data?.config?.linearity &&
+        !linearityConfigEquals(linearityPreviewConfig, calibrationWorkspaceQuery.data.config.linearity)) ||
+      selectionDraftEdits.length > 0,
+  );
+
+  useEffect(() => {
+    if (!hasUnsavedNavigationChanges || typeof window === "undefined") {
+      return;
+    }
+    const message = "You have unsaved processing changes. Leave without saving?";
+
+    function onBeforeUnload(event: BeforeUnloadEvent) {
+      event.preventDefault();
+      event.returnValue = message;
+      return message;
+    }
+
+    function onDocumentClick(event: MouseEvent) {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+        return;
+      }
+      const target = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!(target instanceof HTMLAnchorElement)) {
+        return;
+      }
+      const url = new URL(target.href, window.location.href);
+      if (url.origin !== window.location.origin || url.pathname === window.location.pathname) {
+        return;
+      }
+      if (!window.confirm(message)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    }
+
+    window.addEventListener("beforeunload", onBeforeUnload);
+    document.addEventListener("click", onDocumentClick, true);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      document.removeEventListener("click", onDocumentClick, true);
+    };
+  }, [hasUnsavedNavigationChanges]);
+
   const colorScaleFigures = useMemo<Array<Record<string, unknown> | undefined>>(() => {
     if (!workspace) {
       return [];
@@ -3855,6 +4394,8 @@ export default function ProcessingPage() {
   }
 
   function closeSelectionEditor() {
+    selectionEditorOpenRef.current = false;
+    selectionEditorSuppressEventsUntilRef.current = Date.now() + SELECTION_EDITOR_CLOSE_SUPPRESSION_MS;
     setSelectionEditorOpen(false);
     setSelectedTargets([]);
     setActiveTargetIndex(0);
@@ -4153,6 +4694,9 @@ export default function ProcessingPage() {
   }
 
   function handleChartClick(chartKey: string, points: PlotlyPoint[]) {
+    if (Date.now() < selectionEditorSuppressEventsUntilRef.current) {
+      return;
+    }
     const targets = parseSelectedTargets(points, chartKey);
     if (targets.length) {
       setTargets(targets.slice(0, 1));
@@ -4160,6 +4704,9 @@ export default function ProcessingPage() {
   }
 
   function handleChartSelection(chartKey: string, points: PlotlyPoint[]) {
+    if (Date.now() < selectionEditorSuppressEventsUntilRef.current) {
+      return;
+    }
     const targets = parseSelectedTargets(points, chartKey);
     if (targets.length) {
       setTargets(targets);
@@ -4167,6 +4714,9 @@ export default function ProcessingPage() {
   }
 
   function handleSelectionSourceChartClick(chartKey: string, points: PlotlyPoint[]) {
+    if (!selectionEditorOpenRef.current) {
+      return;
+    }
     const targets = parseSelectedTargets(points, chartKey);
     if (targets.length) {
       setTargets(targets.slice(0, 1));
@@ -4174,6 +4724,9 @@ export default function ProcessingPage() {
   }
 
   function handleSelectionSourceChartSelection(chartKey: string, points: PlotlyPoint[]) {
+    if (!selectionEditorOpenRef.current) {
+      return;
+    }
     const targets = parseSelectedTargets(points, chartKey);
     if (targets.length > 1) {
       setTargets(targets);
@@ -4212,6 +4765,96 @@ export default function ProcessingPage() {
     return targets;
   }
 
+  function updateSelectedTargetDraftValues(updates: Array<{ rowLabel: string; isotopeKey: IsotopeKey; value: number }>) {
+    if (!updates.length) {
+      return;
+    }
+    const valueMap = new Map(updates.map((update) => [selectionDraftValueKey(update.rowLabel, update.isotopeKey), update.value]));
+    setSelectedTargets((current) =>
+      current.map((target) => {
+        const d13 = valueMap.get(selectionDraftValueKey(target.rowLabel, "d13C"));
+        const d18 = valueMap.get(selectionDraftValueKey(target.rowLabel, "d18O"));
+        if (d13 == null && d18 == null) {
+          return target;
+        }
+        if (target.isotopeKey === "cross") {
+          return {
+            ...target,
+            currentD13: d13 ?? target.currentD13,
+            currentD18: d18 ?? target.currentD18,
+          };
+        }
+        if (target.isotopeKey === "d13C" && d13 != null) {
+          return { ...target, currentValue: d13 };
+        }
+        if (target.isotopeKey === "d18O" && d18 != null) {
+          return { ...target, currentValue: d18 };
+        }
+        return target;
+      }),
+    );
+  }
+
+  function queueSelectionDraftEdit(action: EditAction, updates: Array<{ rowLabel: string; isotopeKey: IsotopeKey; value: number }> = []) {
+    setSelectionDraftEdits((current) => [...current, action]);
+    if (updates.length) {
+      setSelectionDraftValues((current) => {
+        const next = { ...current };
+        for (const update of updates) {
+          next[selectionDraftValueKey(update.rowLabel, update.isotopeKey)] = update.value;
+        }
+        return next;
+      });
+      updateSelectedTargetDraftValues(updates);
+    }
+  }
+
+  function clearSelectionDraftValuesForTargets(targets: EditAction["targets"]) {
+    if (!targets.length) {
+      return;
+    }
+    const keys = new Set(targets.map((target) => selectionDraftValueKey(target.row_label, target.isotope_key)));
+    setSelectionDraftValues((current) => {
+      if (!Object.keys(current).some((key) => keys.has(key))) {
+        return current;
+      }
+      const next = { ...current };
+      for (const key of keys) {
+        delete next[key];
+      }
+      return next;
+    });
+    setSelectedTargets((current) =>
+      current.map((target) => {
+        const d13Key = selectionDraftValueKey(target.rowLabel, "d13C");
+        const d18Key = selectionDraftValueKey(target.rowLabel, "d18O");
+        if (!keys.has(d13Key) && !keys.has(d18Key)) {
+          return target;
+        }
+        if (target.isotopeKey === "cross") {
+          return {
+            ...target,
+            currentD13: keys.has(d13Key) ? null : target.currentD13,
+            currentD18: keys.has(d18Key) ? null : target.currentD18,
+          };
+        }
+        if (target.isotopeKey === "d13C" && keys.has(d13Key)) {
+          return { ...target, currentValue: null };
+        }
+        if (target.isotopeKey === "d18O" && keys.has(d18Key)) {
+          return { ...target, currentValue: null };
+        }
+        return target;
+      }),
+    );
+  }
+
+  function draftBaseValueForTarget(target: SelectedTarget, isotopeKey: IsotopeKey): number {
+    return selectionDraftValueFor(selectionDraftValues, target.rowLabel, isotopeKey) ??
+      selectedTargetPointValue(target, isotopeKey) ??
+      fallbackTargetValue(target, isotopeKey);
+  }
+
   async function applyConfig() {
     if (!activeConfig) {
       return;
@@ -4224,8 +4867,13 @@ export default function ProcessingPage() {
     ) {
       await saveSharedLinearityMutation.mutateAsync(sharedLinearityConfig);
     }
-    preserveLinearityPreviewOnWorkspaceUpdateRef.current = shouldPreserveLinearityPreview;
-    await saveConfigMutation.mutateAsync(activeConfig);
+    if (hasPendingProcessingConfigChanges || hasUnsavedLinearityChanges) {
+      preserveLinearityPreviewOnWorkspaceUpdateRef.current = shouldPreserveLinearityPreview;
+      await saveConfigMutation.mutateAsync(activeConfig);
+    }
+    if (selectionDraftEdits.length) {
+      await commitSelectionDraftsMutation.mutateAsync(selectionDraftEdits);
+    }
   }
 
   function buildExportRequestPayload(outputType: "dataset" | "client_output"): ExportRequest {
@@ -4244,7 +4892,7 @@ export default function ProcessingPage() {
     if (!sessionId || !activeConfig) {
       return;
     }
-    await saveConfigMutation.mutateAsync(activeConfig);
+    await applyConfig();
     const { blob, filename } = await api.exportDataset(sessionId, buildExportRequestPayload(outputType));
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -4265,7 +4913,7 @@ export default function ProcessingPage() {
     }
     duplicateCheckMutation.reset();
     setDuplicateCheckResult(null);
-    await saveConfigMutation.mutateAsync(activeConfig);
+    await applyConfig();
     await duplicateCheckMutation.mutateAsync(buildExportRequestPayload("client_output"));
   }
 
@@ -4274,23 +4922,30 @@ export default function ProcessingPage() {
       return;
     }
     const payloadValue = resolveSetValuePayload(isotopeKey, singleValues[isotopeKey], singleValueSpaces[isotopeKey]);
-    await editMutation.mutateAsync({
-      action: "set_value",
-      targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
-      value: payloadValue,
-      stdev: singleStdevs[isotopeKey],
-    });
+    queueSelectionDraftEdit(
+      {
+        action: "set_value",
+        targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
+        value: payloadValue,
+        stdev: singleStdevs[isotopeKey],
+      },
+      [{ rowLabel: activeSampleTarget.rowLabel, isotopeKey, value: payloadValue }],
+    );
   }
 
   async function applySingleOffset(isotopeKey: IsotopeKey) {
     if (!sessionId || !activeSampleTarget) {
       return;
     }
-    await editMutation.mutateAsync({
-      action: "offset",
-      targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
-      offset: singleOffsets[isotopeKey],
-    });
+    const offset = singleOffsets[isotopeKey];
+    queueSelectionDraftEdit(
+      {
+        action: "offset",
+        targets: [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
+        offset,
+      },
+      [{ rowLabel: activeSampleTarget.rowLabel, isotopeKey, value: draftBaseValueForTarget(activeSampleTarget, isotopeKey) + offset }],
+    );
   }
 
   async function applySingleInterpolate(isotopeKey: IsotopeKey) {
@@ -4310,16 +4965,40 @@ export default function ProcessingPage() {
         : "";
     const interpolateBothIsotopes =
       isFailedSampleCollectorStatus(d13Status) || isFailedSampleCollectorStatus(d18Status);
-    await editMutation.mutateAsync({
-      action: "interpolate",
-      targets: interpolateBothIsotopes
-        ? [
-            { row_label: activeSampleTarget.rowLabel, isotope_key: "d13C" as const },
-            { row_label: activeSampleTarget.rowLabel, isotope_key: "d18O" as const },
-          ]
-        : [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }],
-      offset: singleOffsets[isotopeKey],
-    });
+    const targets = interpolateBothIsotopes
+      ? [
+          { row_label: activeSampleTarget.rowLabel, isotope_key: "d13C" as const },
+          { row_label: activeSampleTarget.rowLabel, isotope_key: "d18O" as const },
+        ]
+      : [{ row_label: activeSampleTarget.rowLabel, isotope_key: isotopeKey }];
+    const updates = targets
+      .map((target) => {
+        const diagnostics = target.isotope_key === "d13C" ? sampleD13DiagnosticsQuery.data : sampleD18DiagnosticsQuery.data;
+        const selectedCycleValue = asNumber((diagnostics?.cycle_mean ?? {})["selected_value"]);
+        if (selectedCycleValue == null) {
+          return null;
+        }
+        return {
+          rowLabel: target.row_label,
+          isotopeKey: target.isotope_key,
+          value: selectedCycleValue + singleOffsets[isotopeKey],
+        };
+      })
+      .filter((update): update is { rowLabel: string; isotopeKey: IsotopeKey; value: number } => update != null);
+    queueSelectionDraftEdit(
+      {
+        action: "interpolate",
+        targets,
+        offset: singleOffsets[isotopeKey],
+      },
+      updates,
+    );
+    if (updates.length < targets.length) {
+      const updatedKeys = new Set(updates.map((update) => selectionDraftValueKey(update.rowLabel, update.isotopeKey)));
+      clearSelectionDraftValuesForTargets(
+        targets.filter((target) => !updatedKeys.has(selectionDraftValueKey(target.row_label, target.isotope_key))),
+      );
+    }
   }
 
   async function applyMultiOffset(isotopeKey: "d13C" | "d18O", offset: number) {
@@ -4330,21 +5009,36 @@ export default function ProcessingPage() {
     if (!targets.length) {
       return;
     }
-    await editMutation.mutateAsync({
-      action: "offset",
-      targets,
-      offset,
+    const targetLookup = new Map(selectedTargets.map((target) => [target.rowLabel, target]));
+    const updates = targets.map((target) => {
+      const selectedTarget = targetLookup.get(target.row_label);
+      const baseValue = selectedTarget ? draftBaseValueForTarget(selectedTarget, isotopeKey) : 0;
+      return {
+        rowLabel: target.row_label,
+        isotopeKey,
+        value: baseValue + offset,
+      };
     });
+    queueSelectionDraftEdit(
+      {
+        action: "offset",
+        targets,
+        offset,
+      },
+      updates,
+    );
   }
 
   async function applyMultiInterpolate() {
     if (!sessionId || !selectedTargets.length) {
       return;
     }
-    await editMutation.mutateAsync({
+    const targets = buildTargetsForAction(selectedTargets);
+    queueSelectionDraftEdit({
       action: "interpolate",
-      targets: buildTargetsForAction(selectedTargets),
+      targets,
     });
+    clearSelectionDraftValuesForTargets(targets);
   }
 
   function buildRandomFailedSampleTargets(rows: Array<Record<string, unknown>>, ratePercent: number) {
@@ -4396,7 +5090,7 @@ export default function ProcessingPage() {
     if (!sessionId || !activeTarget) {
       return;
     }
-    await editMutation.mutateAsync({
+    queueSelectionDraftEdit({
       action: "set_outlier_override",
       targets: buildTargetsForAction([activeTarget], activeTarget.isotopeKey === "cross" ? "d13C" : undefined),
       is_outlier: isOutlier,
@@ -4422,10 +5116,12 @@ export default function ProcessingPage() {
     if (!sessionId || !selectedTargets.length) {
       return;
     }
-    await editMutation.mutateAsync({
+    const targets = buildTargetsForAction(selectedTargets);
+    queueSelectionDraftEdit({
       action: "reset_to_original",
-      targets: buildTargetsForAction(selectedTargets),
+      targets,
     });
+    clearSelectionDraftValuesForTargets(targets);
   }
 
   if (!sessionId) {
@@ -4454,6 +5150,7 @@ export default function ProcessingPage() {
   const busy =
     saveConfigMutation.isPending ||
     saveSharedLinearityMutation.isPending ||
+    commitSelectionDraftsMutation.isPending ||
     editMutation.isPending ||
     resetAllMutation.isPending ||
     removeCalibrationMutation.isPending ||
@@ -4466,28 +5163,46 @@ export default function ProcessingPage() {
       savedLinearity &&
       !linearityConfigEquals(sharedLinearityConfig, savedLinearity),
   );
+  const hasStickyLinearityChanges = Boolean(
+    linearityPreviewConfig &&
+      savedLinearity &&
+      !linearityConfigEquals(linearityPreviewConfig, savedLinearity),
+  );
+  const hasUnsavedLinearityChanges = hasPendingLinearityChanges || hasStickyLinearityChanges;
+  const hasPendingSelectionDrafts = selectionDraftEdits.length > 0;
+  const hasSaveableChanges = hasPendingProcessingConfigChanges || hasUnsavedLinearityChanges || hasPendingSelectionDrafts;
   const shouldApplyLinearityPreview = Boolean(linearityPreviewConfig) || hasPendingLinearityChanges || linearityPreviewStale;
-  const applyPreviewFigure = (figure: Record<string, unknown> | undefined) =>
-    shouldApplyLinearityPreview
+  const processingPreviewMasks = hasPendingProcessingConfigChanges
+    ? buildProcessingPreviewMasks(linearityPreviewDataQuery.data, previewLinearity, activeConfig, workspace.edit_state)
+    : null;
+  const applyPreviewFigure = (figure: Record<string, unknown> | undefined) => {
+    const linearityFigure = shouldApplyLinearityPreview
       ? applyLinearityPreviewToFigure(figure, linearityPreviewDataQuery.data, previewLinearity, activeConfig)
       : figure;
-  const selectedLinearityIntensityCol = activeLinearity
-    ? LINEARITY_INTENSITY_OPTIONS.includes(activeLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
-      ? activeLinearity.intensity_col
-      : activeLinearity.use_diff_intensity
+    const processingFigure = hasPendingProcessingConfigChanges
+      ? applyProcessingConfigPreviewToFigure(linearityFigure, processingPreviewMasks, activeConfig)
+      : linearityFigure;
+    return hasPendingSelectionDrafts
+      ? applySelectionDraftPreviewToFigure(processingFigure, selectionDraftValues, activeConfig)
+      : processingFigure;
+  };
+  const selectedLinearityIntensityCol = previewLinearity
+    ? LINEARITY_INTENSITY_OPTIONS.includes(previewLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
+      ? previewLinearity.intensity_col
+      : previewLinearity.use_diff_intensity
         ? LINEARITY_INTENSITY_DIFF44
         : LINEARITY_INTENSITY_SAMP44
     : LINEARITY_INTENSITY_SAMP44;
   const selectedLinearityCycleIntensityAggregation = LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.some(
-    (option) => option.value === activeLinearity?.cycle_intensity_aggregation,
+    (option) => option.value === previewLinearity?.cycle_intensity_aggregation,
   )
-    ? (activeLinearity?.cycle_intensity_aggregation as LinearityCycleIntensityAggregation)
+    ? (previewLinearity?.cycle_intensity_aggregation as LinearityCycleIntensityAggregation)
     : "run_median";
   const selectedLinearityBasisLabel = `${getLinearityIntensityOptionLabel(selectedLinearityIntensityCol)} · ${getLinearityCycleAggregationLabel(
     selectedLinearityCycleIntensityAggregation,
   )}`;
   const isTwoTermLinearityBasis = selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44;
-  const showSecondaryCoefficientOffset = Boolean(activeLinearity?.quadratic) || isTwoTermLinearityBasis;
+  const showSecondaryCoefficientOffset = Boolean(previewLinearity?.quadratic) || isTwoTermLinearityBasis;
   const d13Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d13C ?? {}) as Record<string, unknown>;
   const d18Fit = (calibrationWorkspaceQuery.data?.linearity_fits?.d18O ?? {}) as Record<string, unknown>;
   const d13FitSlope = asNumber(d13Fit.slope);
@@ -4498,12 +5213,12 @@ export default function ProcessingPage() {
   const standardPrecisionRows = (calibrationWorkspaceQuery.data?.precision_summaries ?? [])
     .filter((summary) => selectedStandards.includes(summary.standard))
     .slice(0, 6);
-  const coefficientOffsetEnabled = activeLinearity
+  const coefficientOffsetEnabled = previewLinearity
     ? [
-        Number(activeLinearity.manual_d13_per_10v ?? 0),
-        Number(activeLinearity.manual_d18_per_10v ?? 0),
-        ...(activeLinearity.quadratic || isTwoTermLinearityBasis
-          ? [Number(activeLinearity.manual_d13_per_10v2 ?? 0), Number(activeLinearity.manual_d18_per_10v2 ?? 0)]
+        Number(previewLinearity.manual_d13_per_10v ?? 0),
+        Number(previewLinearity.manual_d18_per_10v ?? 0),
+        ...(previewLinearity.quadratic || isTwoTermLinearityBasis
+          ? [Number(previewLinearity.manual_d13_per_10v2 ?? 0), Number(previewLinearity.manual_d18_per_10v2 ?? 0)]
           : []),
       ].some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12)
     : false;
@@ -4647,12 +5362,14 @@ export default function ProcessingPage() {
       : "";
   const d13CurrentRawValue = asNumber(d13TargetPayload["current_value"]);
   const d18CurrentRawValue = asNumber(d18TargetPayload["current_value"]);
+  const d13DraftCurrentValue = selectionDraftValueFor(selectionDraftValues, activeRowLabel, "d13C");
+  const d18DraftCurrentValue = selectionDraftValueFor(selectionDraftValues, activeRowLabel, "d18O");
   const d13LinearityCorrectedRawValue = asNumber(d13TargetPayload["linearity_corrected_value"]);
   const d18LinearityCorrectedRawValue = asNumber(d18TargetPayload["linearity_corrected_value"]);
   const d13Method = formatMethodLabel(d13TargetPayload["current_method"]);
   const d18Method = formatMethodLabel(d18TargetPayload["current_method"]);
-  const d13CurrentDisplayValue = d13CurrentRawValue ?? selectedPointD13;
-  const d18CurrentDisplayValue = d18CurrentRawValue ?? selectedPointD18;
+  const d13CurrentDisplayValue = d13DraftCurrentValue ?? d13CurrentRawValue ?? selectedPointD13;
+  const d18CurrentDisplayValue = d18DraftCurrentValue ?? d18CurrentRawValue ?? selectedPointD18;
   const d13LinearityCorrectedDisplayValue = d13LinearityCorrectedRawValue;
   const d18LinearityCorrectedDisplayValue = d18LinearityCorrectedRawValue;
   const effectiveOutlier =
@@ -4830,9 +5547,35 @@ export default function ProcessingPage() {
       <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
         <aside className="space-y-6 xl:sticky xl:top-6 xl:self-start">
           <Card>
-            <CardHeader>
-              <CardTitle>Processing Controls</CardTitle>
-              <CardDescription>Filters, outliers, and shared linearity controls synced with Calibration.</CardDescription>
+            <CardHeader className="gap-3">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <CardTitle>Processing Controls</CardTitle>
+                  <CardDescription>Filters, outliers, and shared linearity controls synced with Calibration.</CardDescription>
+                </div>
+                <Button onClick={applyConfig} disabled={busy || !hasSaveableChanges} size="sm">
+                  {busy ? "Saving..." : "Save changes"}
+                </Button>
+              </div>
+              {hasPendingProcessingConfigChanges || hasUnsavedLinearityChanges || hasPendingSelectionDrafts ? (
+                <div className="flex flex-wrap gap-2">
+                  {hasPendingProcessingConfigChanges ? (
+                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
+                      Preview active
+                    </span>
+                  ) : null}
+                  {hasUnsavedLinearityChanges ? (
+                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
+                      Unsaved linearity
+                    </span>
+                  ) : null}
+                  {hasPendingSelectionDrafts ? (
+                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
+                      Unsaved selection edits
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
             </CardHeader>
             <CardContent className="space-y-6 xl:max-h-[calc(100vh-12rem)] xl:overflow-y-auto xl:pr-4 [scrollbar-gutter:stable]">
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
@@ -5052,18 +5795,18 @@ export default function ProcessingPage() {
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-sm font-medium text-stone-800">Linearity (shared with calibration)</div>
                   <div className="flex flex-wrap items-center gap-2">
-                    {hasPendingLinearityChanges || linearityPreviewStale ? (
+                    {hasUnsavedLinearityChanges || linearityPreviewStale || linearityPreviewConfig ? (
                       <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
-                        {hasPendingLinearityChanges ? "Draft preview" : "Preview active"}
+                        {hasUnsavedLinearityChanges ? "Draft preview" : "Preview active"}
                       </span>
                     ) : null}
                     <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
                   </div>
                 </div>
-                {activeLinearity ? (
+                {previewLinearity ? (
                   <>
                     <CheckboxField
-                      checked={activeLinearity.apply}
+                      checked={previewLinearity.apply}
                       label="Enable linearity correction"
                       description="Uses the same basis, fits, and offsets as Calibration."
                       onChange={(checked) => updateSharedLinearity("apply", checked)}
@@ -5076,7 +5819,7 @@ export default function ProcessingPage() {
                     />
                     {!isTwoTermLinearityBasis ? (
                       <CheckboxField
-                        checked={Boolean(activeLinearity.quadratic)}
+                        checked={Boolean(previewLinearity.quadratic)}
                         label="Use quadratic linearity relationship"
                         description="Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I."
                         onChange={(checked) => updateSharedLinearity("quadratic", checked)}
@@ -5125,7 +5868,7 @@ export default function ProcessingPage() {
                           type="number"
                           step="0.1"
                           min={0}
-                          value={activeLinearity.max_sample_intensity ?? ""}
+                          value={previewLinearity.max_sample_intensity ?? ""}
                           onChange={(event) => {
                             const rawValue = event.target.value.trim();
                             if (rawValue === "") {
@@ -5177,7 +5920,7 @@ export default function ProcessingPage() {
                               {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                         </span>
                         <DecimalInput
-                          value={activeLinearity.manual_d13_per_10v ?? 0}
+                          value={previewLinearity.manual_d13_per_10v ?? 0}
                           onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "primary", value)}
                           className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
@@ -5187,7 +5930,7 @@ export default function ProcessingPage() {
                               {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
                         </span>
                         <DecimalInput
-                          value={activeLinearity.manual_d18_per_10v ?? 0}
+                          value={previewLinearity.manual_d18_per_10v ?? 0}
                           onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "primary", value)}
                           className="w-full rounded-lg border border-stone-300 px-3 py-2"
                         />
@@ -5200,7 +5943,7 @@ export default function ProcessingPage() {
                                 {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
                           </span>
                           <DecimalInput
-                            value={activeLinearity.manual_d13_per_10v2 ?? 0}
+                            value={previewLinearity.manual_d13_per_10v2 ?? 0}
                             onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "secondary", value)}
                             className="w-full rounded-lg border border-stone-300 px-3 py-2"
                           />
@@ -5210,7 +5953,7 @@ export default function ProcessingPage() {
                                 {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
                           </span>
                           <DecimalInput
-                            value={activeLinearity.manual_d18_per_10v2 ?? 0}
+                            value={previewLinearity.manual_d18_per_10v2 ?? 0}
                             onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "secondary", value)}
                             className="w-full rounded-lg border border-stone-300 px-3 py-2"
                           />
@@ -5284,7 +6027,7 @@ export default function ProcessingPage() {
                         </div>
                       </div>
                     </div>
-                    {activeLinearity.apply ? (
+                    {previewLinearity.apply ? (
                       <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
                         <div className="text-sm font-medium text-stone-800">Linearity-corrected standard precision</div>
                         {standardPrecisionRows.length ? (
@@ -5309,9 +6052,6 @@ export default function ProcessingPage() {
               </div>
 
               <div className="flex flex-wrap gap-2">
-                <Button onClick={applyConfig} disabled={busy}>
-                  {hasPendingLinearityChanges ? "Apply config + linearity" : "Apply config"}
-                </Button>
                 <Button
                   variant="outline"
                   onClick={() => {
@@ -5321,6 +6061,8 @@ export default function ProcessingPage() {
                     }
                     setLinearityPreviewConfig(null);
                     setLinearityPreviewStale(false);
+                    setSelectionDraftEdits([]);
+                    setSelectionDraftValues({});
                   }}
                   disabled={busy}
                 >
@@ -5394,7 +6136,7 @@ export default function ProcessingPage() {
                 className="flex max-h-[calc(100vh-2rem)] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
                 onClick={(event) => event.stopPropagation()}
               >
-                <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
+                <div className="relative z-20 flex items-center justify-between border-b border-stone-200 bg-white px-4 py-3">
                   <div>
                     <div className="text-base font-semibold text-stone-900">Export</div>
                     <div className="text-sm text-stone-500">Configure export options, then download either the entire dataset or client output.</div>
@@ -5596,9 +6338,25 @@ export default function ProcessingPage() {
                 <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
                   <div>
                     <div className="text-base font-semibold text-stone-900">Selection Editor</div>
-                    <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
+                    <div className="flex flex-wrap items-center gap-2 text-sm text-stone-500">
+                      <span>Sample editing and cycle diagnostics.</span>
+                      {hasPendingSelectionDrafts ? (
+                        <span className="rounded-md bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                          Draft preview
+                        </span>
+                      ) : null}
+                    </div>
                   </div>
-                  <Button variant="outline" size="sm" onPointerDown={closeSelectionEditor} onClick={closeSelectionEditor}>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      closeSelectionEditor();
+                    }}
+                  >
                     <X className="h-4 w-4" />
                     Close
                   </Button>
@@ -5620,10 +6378,8 @@ export default function ProcessingPage() {
                                 <div className="px-1 pb-2 text-sm font-medium text-stone-700">{item.title}</div>
                                 <PlotlyChart
                                   figure={item.figure}
-                                  className="h-[280px] w-full"
+                                  className="pointer-events-none h-[280px] w-full"
                                   deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                                  onPointClick={(points) => handleSelectionSourceChartClick(item.chartKey, points)}
-                                  onSelection={(points) => handleSelectionSourceChartSelection(item.chartKey, points)}
                                 />
                               </div>
                             ))}
@@ -5631,14 +6387,8 @@ export default function ProcessingPage() {
                         ) : selectionSourceChart.figure ? (
                           <PlotlyChart
                             figure={selectionSourceChart.figure}
-                            className="h-[360px] w-full"
+                            className="pointer-events-none h-[360px] w-full"
                             deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                            onPointClick={(points) =>
-                              handleSelectionSourceChartClick(selectionSourceChart.chartKey ?? activeSelectionChartKey ?? "", points)
-                            }
-                            onSelection={(points) =>
-                              handleSelectionSourceChartSelection(selectionSourceChart.chartKey ?? activeSelectionChartKey ?? "", points)
-                            }
                           />
                         ) : (
                           <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">

@@ -460,7 +460,7 @@ def _derive_working_frame(
     fits = calibration.get("linearity_fits", {})
     linearity_cfg = calibration.get("config", {}).get("linearity", {}) if isinstance(calibration.get("config"), dict) else {}
     linearity_enabled = bool(linearity_cfg.get("apply", False))
-    if linearity_enabled:
+    if linearity_enabled and "cycle_intensity_aggregation" in linearity_cfg:
         work = apply_run_level_linearity_basis_from_cycles(
             work,
             cycles_df,
