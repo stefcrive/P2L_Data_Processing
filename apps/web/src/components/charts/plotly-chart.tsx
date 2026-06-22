@@ -9,7 +9,7 @@ const Plot = dynamic(
   async () => {
     const [{ default: createPlotlyComponent }, { default: Plotly }] = await Promise.all([
       import("react-plotly.js/factory"),
-      import("plotly.js-dist-min"),
+      import("@/lib/plotly-core"),
     ]);
     return createPlotlyComponent(Plotly);
   },
@@ -31,7 +31,7 @@ export type PlotlyHoverPayload = {
   clientY: number;
 };
 
-type PlotlyChartProps = {
+export type PlotlyChartProps = {
   figure?: Record<string, unknown>;
   className?: string;
   fitContainer?: boolean;
@@ -285,6 +285,8 @@ export function PlotlyChart({
   const [renderRevision, setRenderRevision] = useState(0);
   const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
   const didRefreshAfterInitializeRef = useRef(false);
+  const pointerInteractionTokenRef = useRef(0);
+  const consumedPointerInteractionTokenRef = useRef(0);
   const shouldDeferRender = deferRenderMs > 0;
   const preparedFigure = useMemo(() => {
     if (!figure || Object.keys(figure).length === 0) {
@@ -351,6 +353,19 @@ export function PlotlyChart({
     }
   }
 
+  function registerPointerInteraction() {
+    pointerInteractionTokenRef.current += 1;
+  }
+
+  function consumePointerInteraction(): boolean {
+    const token = pointerInteractionTokenRef.current;
+    if (token <= consumedPointerInteractionTokenRef.current) {
+      return false;
+    }
+    consumedPointerInteractionTokenRef.current = token;
+    return true;
+  }
+
   if (!preparedFigure) {
     return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">No chart data yet.</div>;
   }
@@ -397,7 +412,7 @@ export function PlotlyChart({
         }
       : {};
   return (
-    <div className={cn("min-w-0 w-full", className)}>
+    <div className={cn("min-w-0 w-full", className)} onPointerDownCapture={registerPointerInteraction}>
       <Plot
         data={preparedFigure.data}
         layout={preparedFigure.layout}
@@ -408,8 +423,18 @@ export function PlotlyChart({
         useResizeHandler={preparedFigure.useResizeHandler}
         className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}
         style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%" }}
-        onClick={(event: { points?: PlotlyPoint[] }) => onPointClick?.(event.points ?? [])}
-        onSelected={(event: { points?: PlotlyPoint[] } | undefined) => onSelection?.(event?.points ?? [])}
+        onClick={(event: { points?: PlotlyPoint[] }) => {
+          if (!onPointClick || !consumePointerInteraction()) {
+            return;
+          }
+          onPointClick(event.points ?? []);
+        }}
+        onSelected={(event: { points?: PlotlyPoint[] } | undefined) => {
+          if (!onSelection || !consumePointerInteraction()) {
+            return;
+          }
+          onSelection(event?.points ?? []);
+        }}
         {...hoverHandlers}
       />
     </div>

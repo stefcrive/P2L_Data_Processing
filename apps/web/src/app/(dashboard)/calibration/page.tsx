@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Database, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
-import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
+import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import {
   SATURATION_COLOR_AXIS_OPTIONS,
@@ -102,7 +102,6 @@ const OFFICIAL_VALUE_TYPE_D18 = "VSMOW(18O)";
 const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const SELECTION_EDITOR_CHART_DEFER_MS = 350;
-const SELECTION_EDITOR_CLOSE_SUPPRESSION_MS = 5000;
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
@@ -2993,8 +2992,6 @@ export default function CalibrationPage() {
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
-  const selectionEditorOpenRef = useRef(false);
-  const selectionEditorSuppressEventsUntilRef = useRef(0);
   const colorScaledFigureCacheRef = useRef<WeakMap<Record<string, unknown>, Record<string, unknown>>>(new WeakMap());
   const colorScaleSignatureRef = useRef<string>("");
   const draftStorageKey = sessionId ? `calibration-config:${sessionId}` : null;
@@ -3008,10 +3005,6 @@ export default function CalibrationPage() {
       : hoverPreviewTarget.isotopeKey === "cross"
         ? { ...hoverPreviewTarget, isotopeKey: "d13C" }
         : hoverPreviewTarget;
-
-  useEffect(() => {
-    selectionEditorOpenRef.current = isSelectionEditorOpen;
-  }, [isSelectionEditorOpen]);
 
   useEffect(() => {
     if (!(isSelectionEditorOpen || isOfficialValuesModalOpen) || typeof window === "undefined") {
@@ -3579,25 +3572,12 @@ export default function CalibrationPage() {
   }
 
   function closeSelectionEditor() {
-    selectionEditorOpenRef.current = false;
-    selectionEditorSuppressEventsUntilRef.current = Date.now() + SELECTION_EDITOR_CLOSE_SUPPRESSION_MS;
     setSelectionEditorOpen(false);
     setSelectedTargets([]);
     setActiveTargetIndex(0);
   }
 
-  function openProcessingSelectionEditor(
-    chartKey: string,
-    points: PlotlyPoint[],
-    multi = false,
-    source: "main" | "selection_source" = "main",
-  ) {
-    if (source === "selection_source" && !selectionEditorOpenRef.current) {
-      return;
-    }
-    if (Date.now() < selectionEditorSuppressEventsUntilRef.current) {
-      return;
-    }
+  function openProcessingSelectionEditor(chartKey: string, points: PlotlyPoint[], multi = false) {
     const targets = parseSelectedTargets(points, chartKey);
     if (!targets.length) {
       return;

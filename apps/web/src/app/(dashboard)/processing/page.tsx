@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, SearchCheck, X } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
-import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/plotly-chart";
+import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import {
   SATURATION_COLOR_AXIS_OPTIONS,
@@ -71,7 +71,6 @@ const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const RESTORE_STDEV_DEFAULT_CAP = 0.04;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const SELECTION_EDITOR_CHART_DEFER_MS = 350;
-const SELECTION_EDITOR_CLOSE_SUPPRESSION_MS = 5000;
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
@@ -160,6 +159,7 @@ type ProcessingPreviewMasks = {
   full: Set<string>;
   failed: Set<string>;
 };
+type ProcessingPreviewRow = ProcessingLinearityPreviewData["rows"][number];
 const DEFAULT_CHART_DISPLAY_STATE: ChartDisplayState = {
   hideCalibrated: true,
   hideSymbols: false,
@@ -583,6 +583,378 @@ function customDataIsotope(value: unknown): IsotopeKey | "cross" | null {
     return normalizeIsotopeKey(payload.isotope_key ?? payload.isotopeKey ?? payload[1]);
   }
   return null;
+}
+
+function buildProcessingPreviewRowLookup(previewData: ProcessingLinearityPreviewData | undefined): Map<string, ProcessingPreviewRow> {
+  const rows = new Map<string, ProcessingPreviewRow>();
+  for (const row of previewData?.rows ?? []) {
+    const rowLabel = String(row.row_label ?? "").trim();
+    if (rowLabel) {
+      rows.set(rowLabel, row);
+    }
+  }
+  return rows;
+}
+
+function normalizeColumnKey(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function previewRowValueForColumn(row: ProcessingPreviewRow, column: string): unknown {
+  const key = normalizeColumnKey(column);
+  if (key === "identifier 1") return row.identifier1 ?? null;
+  if (key === "identifier 2") return row.identifier2 ?? null;
+  if (key === "species") return row.species ?? row.identifier1 ?? null;
+  if (key === "collector status") return row.collector_status ?? null;
+  if (key === "line") return row.line ?? row.attributes?.[column] ?? null;
+  if (key === "leak_rate" || key === "leak rate") return row.leak_rate ?? row.attributes?.[column] ?? null;
+  if (key === "d 13c/12c mean") return row.d13_raw ?? row.attributes?.[column] ?? null;
+  if (key === "d 18o/16o mean") return row.d18_raw ?? row.attributes?.[column] ?? null;
+  if (key === "d13c_calibrated") return row.d13_calibrated ?? row.attributes?.[column] ?? null;
+  if (key === "d18o_calibrated") return row.d18_calibrated ?? row.attributes?.[column] ?? null;
+  if (key === "d13c cycles excluded") return row.d13_cycles_excluded ?? row.attributes?.[column] ?? null;
+  if (key === "d18o cycles excluded") return row.d18_cycles_excluded ?? row.attributes?.[column] ?? null;
+  if (key === "1 cycle int samp 44") return row.signal ?? row.intensities?.[column] ?? row.attributes?.[column] ?? null;
+  if (row.attributes && column in row.attributes) return row.attributes[column];
+  if (row.intensities && column in row.intensities) return row.intensities[column];
+
+  const normalizedAttributeKey = Object.keys(row.attributes ?? {}).find((candidate) => normalizeColumnKey(candidate) === key);
+  if (normalizedAttributeKey) {
+    return row.attributes[normalizedAttributeKey];
+  }
+  const normalizedIntensityKey = Object.keys(row.intensities ?? {}).find((candidate) => normalizeColumnKey(candidate) === key);
+  if (normalizedIntensityKey) {
+    return row.intensities[normalizedIntensityKey];
+  }
+  return null;
+}
+
+function parseNumericToken(value: unknown): number | null {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  const normalized = String(value)
+    .trim()
+    .replace(/[\u2212\u2010\u2011\u2012\u2013\u2014]/g, "-");
+  if (!normalized) {
+    return null;
+  }
+  const match = normalized.match(/[-+]?[\d.,]+/);
+  if (!match) {
+    return null;
+  }
+  let token = match[0].replace(/[\s\u00A0\u2009]/g, "");
+  if (token.includes(",") && token.includes(".")) {
+    if (token.lastIndexOf(",") > token.lastIndexOf(".")) {
+      token = token.replace(/\./g, "").replace(",", ".");
+    } else {
+      token = token.replace(/,/g, "");
+    }
+  } else if (token.includes(",")) {
+    const parts = token.split(",");
+    if (parts.length > 2) {
+      token = token.replace(/,/g, "");
+    } else {
+      const [left, right] = parts;
+      if (/^\d+$/.test(right ?? "")) {
+        if ((right ?? "").length === 1 || (right ?? "").length === 2) {
+          token = `${left}.${right}`;
+        } else if ((right ?? "").length === 3 && /^\d+$/.test(left ?? "") && !["0", "+0", "-0"].includes(left ?? "")) {
+          token = `${left}${right}`;
+        } else {
+          token = `${left}.${right}`;
+        }
+      } else {
+        token = `${left}${right}`;
+      }
+    }
+  } else if (token.includes(".")) {
+    const parts = token.split(".");
+    if (parts.length > 2) {
+      token = token.replace(/\./g, "");
+    } else {
+      const [left, right] = parts;
+      if (/^\d+$/.test(right ?? "") && (right ?? "").length === 3 && /^\d+$/.test(left ?? "") && (left ?? "").length <= 3) {
+        token = `${left}${right}`;
+      }
+    }
+  }
+  const parsed = Number(token);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function pythonOrdinalFromDate(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return null;
+  }
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) {
+    return parseNumericToken(text);
+  }
+  return Math.floor(parsed / 86_400_000) + PYTHON_ORDINAL_UNIX_EPOCH;
+}
+
+function previewColorLabel(colorParam: string): string {
+  return normalizeColumnKey(colorParam) === "date_ordinal" || normalizeColumnKey(colorParam) === "date" ? "Date" : colorParam;
+}
+
+function formatPreviewColorHoverValue(value: unknown): string {
+  if (value == null || value === "") {
+    return "N/A";
+  }
+  const numeric = toFiniteNumber(value);
+  if (numeric != null) {
+    return numeric.toFixed(2);
+  }
+  return String(value);
+}
+
+function previewColorValuesForRows(
+  customdata: unknown[],
+  rowLookup: Map<string, ProcessingPreviewRow>,
+  colorParam: string,
+): {
+  values: Array<number | null>;
+  hoverValues: string[];
+  cmin: number;
+  cmax: number;
+  categoryTicks: { tickvals: number[]; ticktext: string[] } | null;
+  isDate: boolean;
+} | null {
+  const rawValues = customdata.map((item) => {
+    const row = rowLookup.get(customDataRowLabel(item));
+    return row ? previewRowValueForColumn(row, colorParam) : null;
+  });
+  const isDate = normalizeColumnKey(colorParam) === "date" || normalizeColumnKey(colorParam) === "date_ordinal";
+  const hoverValues = rawValues.map((value) => formatPreviewColorHoverValue(value));
+  const numericValues = isDate ? rawValues.map(pythonOrdinalFromDate) : rawValues.map(parseNumericToken);
+  const hasNumeric = numericValues.some((value) => value != null);
+  const values = hasNumeric
+    ? numericValues
+    : (() => {
+        const labels = rawValues.map((value) => (value == null || value === "" ? "Unknown" : String(value)));
+        const categories = Array.from(new Set(labels)).sort((left, right) => left.localeCompare(right));
+        const codeByCategory = new Map(categories.map((category, index) => [category, index]));
+        return labels.map((label) => codeByCategory.get(label) ?? null);
+      })();
+  const finiteValues = values.filter((value): value is number => value != null && Number.isFinite(value));
+  if (!finiteValues.length) {
+    return null;
+  }
+  const min = Math.min(...finiteValues);
+  const max = Math.max(...finiteValues);
+  const categoryTicks =
+    hasNumeric
+      ? null
+      : (() => {
+          const labels = rawValues.map((value) => (value == null || value === "" ? "Unknown" : String(value)));
+          const categories = Array.from(new Set(labels)).sort((left, right) => left.localeCompare(right));
+          return { tickvals: categories.map((_, index) => index), ticktext: categories };
+        })();
+  return {
+    values,
+    hoverValues,
+    cmin: min,
+    cmax: min === max ? min + 1 : max,
+    categoryTicks,
+    isDate,
+  };
+}
+
+function patchCustomdataHoverValues(customdata: unknown[], hoverValues: string[]): { values: unknown[]; changed: boolean } {
+  let changed = false;
+  const values = customdata.map((item, index) => {
+    const nextValue = hoverValues[index] ?? "N/A";
+    if (Array.isArray(item)) {
+      if (String(item[5] ?? "") === nextValue) {
+        return item;
+      }
+      const next = [...item];
+      next[5] = nextValue;
+      changed = true;
+      return next;
+    }
+    if (item && typeof item === "object") {
+      const payload = item as Record<string, unknown>;
+      if (String(payload.hover_color_value ?? payload.hoverColorValue ?? "") === nextValue) {
+        return item;
+      }
+      changed = true;
+      return { ...payload, hover_color_value: nextValue, hoverColorValue: nextValue };
+    }
+    return item;
+  });
+  return { values, changed };
+}
+
+function replaceCustomdataFiveLabel(template: unknown, label: string): unknown {
+  if (typeof template !== "string") {
+    return template;
+  }
+  const token = "%{customdata[5]}<br>";
+  const tokenIndex = template.indexOf(token);
+  if (tokenIndex < 0) {
+    return template;
+  }
+  const lineStart = template.lastIndexOf("<br>", tokenIndex);
+  const prefix = lineStart >= 0 ? template.slice(0, lineStart + 4) : "";
+  const suffix = template.slice(tokenIndex + token.length);
+  return `${prefix}${label}: ${token}${suffix}`;
+}
+
+function setPlotlyTitleText(existing: unknown, text: string): unknown {
+  if (existing && typeof existing === "object") {
+    return { ...(existing as Record<string, unknown>), text };
+  }
+  return { text };
+}
+
+function withAxisTitle(axis: unknown, title: string): Record<string, unknown> {
+  const record = axis && typeof axis === "object" ? (axis as Record<string, unknown>) : {};
+  return { ...record, title: setPlotlyTitleText(record.title, title) };
+}
+
+function axisRangeForValues(values: number[]): [number, number] | null {
+  const finiteValues = values.filter((value) => Number.isFinite(value));
+  if (!finiteValues.length) {
+    return null;
+  }
+  const min = Math.min(...finiteValues);
+  const max = Math.max(...finiteValues);
+  const span = max - min;
+  const pad = Number.isFinite(span) && span > 0 ? span * 0.05 : 0.5;
+  return [min - pad, max + pad];
+}
+
+function isProcessingOverlayTrace(traceName: string): boolean {
+  return [
+    "Statistical Outliers",
+    "Signal Intensity Range",
+    "Leak Rate Range",
+    "d13C Range",
+    "d18O Range",
+    "Manual Outliers",
+    "Partially Failed",
+    "Partially Saturated",
+    "Fully Saturated",
+    "Failed Samples",
+    "Restored Samples",
+    "Edited Samples",
+    "Selected sample",
+  ].some((label) => traceName.includes(label));
+}
+
+function applyProcessingChartOptionPreviewToTrace(
+  trace: Record<string, unknown>,
+  config: ProcessingConfig,
+  rowLookup: Map<string, ProcessingPreviewRow>,
+): { trace: Record<string, unknown>; zValues: number[] } {
+  const customdata = coerceVector(trace.customdata);
+  if (!customdata?.length || !rowLookup.size) {
+    return { trace, zValues: [] };
+  }
+
+  const isotope = customDataIsotope(customdata[0]);
+  const traceName = String(trace.name ?? "");
+  let nextTrace = trace;
+  let changed = false;
+  const zValues: number[] = [];
+
+  if (isotope === "d13C" || isotope === "d18O") {
+    const x = coerceVector(trace.x);
+    if (x && x.length === customdata.length) {
+      const nextX = customdata.map((item, index) => {
+        if (config.x_axis_option === "By Sequence") {
+          return index;
+        }
+        const row = rowLookup.get(customDataRowLabel(item));
+        return parseNumericToken(row?.identifier2 ?? (Array.isArray(item) ? item[3] : null)) ?? x[index];
+      });
+      if (nextX.some((value, index) => value !== x[index])) {
+        nextTrace = { ...nextTrace, x: nextX };
+        changed = true;
+      }
+    }
+  }
+
+  const marker = nextTrace.marker && typeof nextTrace.marker === "object" ? (nextTrace.marker as Record<string, unknown>) : null;
+  if (marker && !isProcessingOverlayTrace(traceName)) {
+    const colorPreview = previewColorValuesForRows(customdata, rowLookup, config.color_param);
+    if (colorPreview) {
+      const existingShowscale = Boolean(marker.showscale);
+      const nextMarker: Record<string, unknown> = {
+        ...marker,
+        color: colorPreview.values,
+        colorscale: "Viridis",
+        cauto: false,
+        cmin: colorPreview.cmin,
+        cmax: colorPreview.cmax,
+        showscale: existingShowscale,
+      };
+      if (existingShowscale) {
+        const existingColorbar = getColorbarRecord(marker) ?? {};
+        nextMarker.colorbar = {
+          ...existingColorbar,
+          title: setPlotlyTitleText(existingColorbar.title, previewColorLabel(config.color_param)),
+          ...(colorPreview.isDate
+            ? buildDateColorbarTicksForRange(colorPreview.cmin, colorPreview.cmax)
+            : colorPreview.categoryTicks ?? {}),
+          ...(colorPreview.isDate || colorPreview.categoryTicks ? { tickmode: "array" } : {}),
+        };
+      }
+      const patchedCustomdata = patchCustomdataHoverValues(customdata, colorPreview.hoverValues);
+      nextTrace = {
+        ...nextTrace,
+        marker: nextMarker,
+        ...(patchedCustomdata.changed ? { customdata: patchedCustomdata.values } : {}),
+        hovertemplate: replaceCustomdataFiveLabel(nextTrace.hovertemplate, previewColorLabel(config.color_param)),
+      };
+      changed = true;
+    }
+  }
+
+  const z = coerceVector(nextTrace.z);
+  if (z && z.length === customdata.length) {
+    const x = coerceVector(nextTrace.x);
+    const y = coerceVector(nextTrace.y);
+    const zColumn = config.z_axis;
+    const nextZ = customdata.map((item, index) => {
+      if (normalizeColumnKey(zColumn) === "d 13c/12c mean") {
+        return toFiniteNumber(y?.[index]) ?? z[index];
+      }
+      if (normalizeColumnKey(zColumn) === "d 18o/16o mean") {
+        return toFiniteNumber(x?.[index]) ?? z[index];
+      }
+      const row = rowLookup.get(customDataRowLabel(item));
+      return parseNumericToken(row ? previewRowValueForColumn(row, zColumn) : null) ?? z[index];
+    });
+    for (const value of nextZ) {
+      const numeric = toFiniteNumber(value);
+      if (numeric != null) {
+        zValues.push(numeric);
+      }
+    }
+    if (nextZ.some((value, index) => value !== z[index])) {
+      nextTrace = {
+        ...nextTrace,
+        z: nextZ,
+        hovertemplate:
+          typeof nextTrace.hovertemplate === "string"
+            ? nextTrace.hovertemplate.replace(/[^<]*: %\{z:\.3f\}<extra><\/extra>$/, `${zColumn}: %{z:.3f}<extra></extra>`)
+            : nextTrace.hovertemplate,
+      };
+      changed = true;
+    }
+  }
+
+  return { trace: changed ? nextTrace : trace, zValues };
 }
 
 function patchVectorValue(vector: unknown[] | null, index: number, value: number | null): { values: unknown[] | null; changed: boolean } {
@@ -1080,8 +1452,9 @@ function applyProcessingConfigPreviewToFigure(
   figure: Record<string, unknown> | undefined,
   masks: ProcessingPreviewMasks | null,
   config: ProcessingConfig | null | undefined,
+  rowLookup?: Map<string, ProcessingPreviewRow>,
 ): Record<string, unknown> | undefined {
-  if (!figure || !masks || !config) {
+  if (!figure || !config) {
     return figure;
   }
   const cloned = cloneFigure(figure);
@@ -1089,22 +1462,65 @@ function applyProcessingConfigPreviewToFigure(
     return figure;
   }
   let changed = false;
+  const previewZValues: number[] = [];
   const nextData = cloned.data.map((trace) => {
-    const customdata = coerceVector(trace.customdata);
+    let nextTrace = trace;
+    if (rowLookup?.size) {
+      const preview = applyProcessingChartOptionPreviewToTrace(nextTrace, config, rowLookup);
+      nextTrace = preview.trace;
+      previewZValues.push(...preview.zValues);
+      changed = changed || nextTrace !== trace;
+    }
+    if (!masks) {
+      return nextTrace;
+    }
+    const customdata = coerceVector(nextTrace.customdata);
     if (!customdata?.length) {
-      return trace;
+      return nextTrace;
     }
     const firstIsotope = customDataIsotope(customdata[0]);
-    const traceName = String(trace.name ?? "");
+    const traceName = String(nextTrace.name ?? "");
     const overlayRows = traceOverlayRowSet(traceName, masks, config, firstIsotope);
     const rowSet =
       overlayRows ??
       (firstIsotope === "d13C" ? masks.baseD13 : firstIsotope === "d18O" ? masks.baseD18 : masks.baseCross);
-    const nextTrace = filterPlotlyTraceByRows(trace, rowSet);
-    changed = changed || nextTrace !== trace;
-    return nextTrace;
+    const filteredTrace = filterPlotlyTraceByRows(nextTrace, rowSet);
+    changed = changed || filteredTrace !== nextTrace;
+    return filteredTrace;
   });
-  return changed ? { ...cloned, data: nextData } : figure;
+  let nextLayout = cloned.layout;
+  if (rowLookup?.size) {
+    const has2dIsotopeAxis = nextData.some((trace) => {
+      if (coerceVector(trace.z)) {
+        return false;
+      }
+      const customdata = coerceVector(trace.customdata);
+      const isotope = customdata?.length ? customDataIsotope(customdata[0]) : null;
+      return isotope === "d13C" || isotope === "d18O";
+    });
+    if (has2dIsotopeAxis) {
+      const xTitle = config.x_axis_option === "By Sequence" ? "Sample Number" : "Identifier 2";
+      nextLayout = {
+        ...nextLayout,
+        xaxis: withAxisTitle(nextLayout.xaxis, xTitle),
+      };
+    }
+    const has3d = nextData.some((trace) => coerceVector(trace.z));
+    if (has3d) {
+      const scene = nextLayout.scene && typeof nextLayout.scene === "object" ? (nextLayout.scene as Record<string, unknown>) : {};
+      const zaxis = withAxisTitle(scene.zaxis, config.z_axis);
+      const zRange = axisRangeForValues(previewZValues);
+      nextLayout = {
+        ...nextLayout,
+        scene: {
+          ...scene,
+          zaxis: zRange ? { ...zaxis, range: zRange } : zaxis,
+        },
+      };
+    }
+    changed = true;
+  }
+  return changed ? { ...cloned, data: nextData, layout: nextLayout } : figure;
 }
 
 function formatPrecisionMetric(value?: number | null): string {
@@ -3769,8 +4185,6 @@ export default function ProcessingPage() {
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
-  const selectionEditorOpenRef = useRef(false);
-  const selectionEditorSuppressEventsUntilRef = useRef(0);
   const preserveLinearityPreviewOnWorkspaceUpdateRef = useRef(false);
   const colorScaleFigureCacheRef = useRef<
     WeakMap<Record<string, unknown>, { rangeKey: string; figure: Record<string, unknown> | undefined }>
@@ -3794,9 +4208,13 @@ export default function ProcessingPage() {
   const linearityPreviewDataQuery = useQuery({
     queryKey: ["processing-linearity-preview-data", sessionId],
     queryFn: () => api.getProcessingLinearityPreviewData(sessionId!),
-    enabled: Boolean(sessionId && calibrationWorkspaceQuery.data?.config?.linearity),
+    enabled: Boolean(sessionId),
     staleTime: 60_000,
   });
+  const processingPreviewRowLookup = useMemo(
+    () => buildProcessingPreviewRowLookup(linearityPreviewDataQuery.data),
+    [linearityPreviewDataQuery.data],
+  );
 
   useEffect(() => {
     if (workspaceQuery.data) {
@@ -4004,10 +4422,6 @@ export default function ProcessingPage() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [isSelectionEditorOpen, isExportModalOpen]);
-
-  useEffect(() => {
-    selectionEditorOpenRef.current = isSelectionEditorOpen;
-  }, [isSelectionEditorOpen]);
 
   useEffect(() => {
     return () => {
@@ -4394,8 +4808,6 @@ export default function ProcessingPage() {
   }
 
   function closeSelectionEditor() {
-    selectionEditorOpenRef.current = false;
-    selectionEditorSuppressEventsUntilRef.current = Date.now() + SELECTION_EDITOR_CLOSE_SUPPRESSION_MS;
     setSelectionEditorOpen(false);
     setSelectedTargets([]);
     setActiveTargetIndex(0);
@@ -4694,9 +5106,6 @@ export default function ProcessingPage() {
   }
 
   function handleChartClick(chartKey: string, points: PlotlyPoint[]) {
-    if (Date.now() < selectionEditorSuppressEventsUntilRef.current) {
-      return;
-    }
     const targets = parseSelectedTargets(points, chartKey);
     if (targets.length) {
       setTargets(targets.slice(0, 1));
@@ -4704,31 +5113,8 @@ export default function ProcessingPage() {
   }
 
   function handleChartSelection(chartKey: string, points: PlotlyPoint[]) {
-    if (Date.now() < selectionEditorSuppressEventsUntilRef.current) {
-      return;
-    }
     const targets = parseSelectedTargets(points, chartKey);
     if (targets.length) {
-      setTargets(targets);
-    }
-  }
-
-  function handleSelectionSourceChartClick(chartKey: string, points: PlotlyPoint[]) {
-    if (!selectionEditorOpenRef.current) {
-      return;
-    }
-    const targets = parseSelectedTargets(points, chartKey);
-    if (targets.length) {
-      setTargets(targets.slice(0, 1));
-    }
-  }
-
-  function handleSelectionSourceChartSelection(chartKey: string, points: PlotlyPoint[]) {
-    if (!selectionEditorOpenRef.current) {
-      return;
-    }
-    const targets = parseSelectedTargets(points, chartKey);
-    if (targets.length > 1) {
       setTargets(targets);
     }
   }
@@ -5180,7 +5566,7 @@ export default function ProcessingPage() {
       ? applyLinearityPreviewToFigure(figure, linearityPreviewDataQuery.data, previewLinearity, activeConfig)
       : figure;
     const processingFigure = hasPendingProcessingConfigChanges
-      ? applyProcessingConfigPreviewToFigure(linearityFigure, processingPreviewMasks, activeConfig)
+      ? applyProcessingConfigPreviewToFigure(linearityFigure, processingPreviewMasks, activeConfig, processingPreviewRowLookup)
       : linearityFigure;
     return hasPendingSelectionDrafts
       ? applySelectionDraftPreviewToFigure(processingFigure, selectionDraftValues, activeConfig)

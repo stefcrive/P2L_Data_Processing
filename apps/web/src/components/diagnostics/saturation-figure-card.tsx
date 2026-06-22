@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { AlertTriangle, Info } from "lucide-react";
 
-import { PlotlyChart } from "@/components/charts/plotly-chart";
+import { PlotlyChart } from "@/components/charts/lazy-plotly-chart";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 
