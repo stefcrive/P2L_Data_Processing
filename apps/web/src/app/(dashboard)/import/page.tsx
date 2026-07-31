@@ -7,7 +7,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { api } from "@/lib/api";
+import { api, type UploadProgress } from "@/lib/api";
 import { describeSession, resolveSessionName } from "@/lib/session-label";
 import type { SessionSnapshot } from "@/lib/types";
 import { useSessionStore } from "@/store/use-session-store";
@@ -157,6 +157,7 @@ function detectMatchingSessionId(folderFiles: File[], sessions: SessionSnapshot[
 
 export default function ImportPage() {
   const [files, setFiles] = useState<File[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [browseInfo, setBrowseInfo] = useState<string | null>(null);
   const [browseError, setBrowseError] = useState<string | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
@@ -210,22 +211,26 @@ export default function ImportPage() {
   }, []);
 
   const importMutation = useMutation({
-    mutationFn: () => api.importSession(files),
+    mutationFn: () => api.importSession(files, setUploadProgress),
+    onMutate: () => setUploadProgress({ loaded: 0, total: null, percent: 0, phase: "uploading" }),
     onSuccess: async (result) => {
       setSessionId(result.session.session_id);
       await queryClient.invalidateQueries({ queryKey: ["session", result.session.session_id] });
       await queryClient.invalidateQueries({ queryKey: ["sessions"] });
       setFiles([]);
     },
+    onSettled: () => setUploadProgress(null),
   });
 
   const appendMutation = useMutation({
-    mutationFn: () => api.appendSession(sessionId!, files),
+    mutationFn: () => api.appendSession(sessionId!, files, setUploadProgress),
+    onMutate: () => setUploadProgress({ loaded: 0, total: null, percent: 0, phase: "uploading" }),
     onSuccess: async (result) => {
       await queryClient.invalidateQueries({ queryKey: ["session", result.session.session_id] });
       await queryClient.invalidateQueries({ queryKey: ["sessions"] });
       setFiles([]);
     },
+    onSettled: () => setUploadProgress(null),
   });
 
   const openMutation = useMutation({
@@ -355,6 +360,26 @@ export default function ImportPage() {
               {appendMutation.isPending ? "Adding..." : "Add files"}
             </Button>
           </div>
+          {uploadProgress ? (
+            <div className="space-y-2" aria-live="polite">
+              <div className="flex items-center justify-between text-xs text-stone-600">
+                <span>{uploadProgress.phase === "uploading" ? "Uploading workbooks" : "Processing workbooks on the server"}</span>
+                <span>{uploadProgress.percent == null ? "Working..." : `${uploadProgress.percent}%`}</span>
+              </div>
+              <div
+                className="h-2 overflow-hidden rounded-full bg-stone-200"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={uploadProgress.percent ?? undefined}
+              >
+                <div
+                  className={`h-full rounded-full bg-stone-900 transition-[width] duration-200 ${uploadProgress.percent == null ? "w-1/3 animate-pulse" : ""}`}
+                  style={uploadProgress.percent == null ? undefined : { width: `${uploadProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          ) : null}
           {files.length > 0 ? (
             <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-700">
               {files.length} file(s) selected: {files.map((file) => file.name).join(", ")}

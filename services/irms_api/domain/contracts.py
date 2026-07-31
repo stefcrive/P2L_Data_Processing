@@ -229,6 +229,12 @@ class EditAction(BaseModel):
     is_outlier: bool | None = None
 
 
+class EditBatchRequest(BaseModel):
+    """A group of edits that should be committed as one session update."""
+
+    edits: list[EditAction] = Field(min_length=1, max_length=100)
+
+
 class ChartBundle(BaseModel):
     session_id: str
     figures: dict[str, dict[str, Any]] = Field(default_factory=dict)

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, SearchCheck, X } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
@@ -4197,8 +4197,9 @@ export default function ProcessingPage() {
 
   const workspaceQuery = useQuery({
     queryKey: ["processing-workspace", sessionId, openSpeciesSectionKey],
-    queryFn: () => api.getProcessingWorkspace(sessionId!, openSpeciesSectionList),
+    queryFn: ({ signal }) => api.getProcessingWorkspace(sessionId!, openSpeciesSectionList, signal),
     enabled: Boolean(sessionId),
+    placeholderData: keepPreviousData,
   });
   const calibrationWorkspaceQuery = useQuery({
     queryKey: ["calibration-workspace", sessionId],
@@ -4351,13 +4352,7 @@ export default function ProcessingPage() {
   });
 
   const commitSelectionDraftsMutation = useMutation({
-    mutationFn: async (drafts: EditAction[]) => {
-      let latestWorkspace: ProcessingWorkspace | null = null;
-      for (const draft of drafts) {
-        latestWorkspace = await api.editProcessing(sessionId!, draft, openSpeciesSectionList);
-      }
-      return latestWorkspace;
-    },
+    mutationFn: (drafts: EditAction[]) => api.editProcessingBatch(sessionId!, drafts, openSpeciesSectionList),
     onSuccess: (workspace) => {
       if (workspace) {
         queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);

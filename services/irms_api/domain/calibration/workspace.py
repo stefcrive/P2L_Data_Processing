@@ -204,7 +204,7 @@ def _format_hover_color_value(value: Any) -> str:
             return "N/A"
     except Exception:
         pass
-    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    numeric = pd.to_numeric(value, errors="coerce")
     if pd.notna(numeric) and np.isfinite(float(numeric)):
         return f"{float(numeric):.2f}"
     return str(value)

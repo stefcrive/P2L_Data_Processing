@@ -3,13 +3,16 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
+import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -43,6 +46,7 @@ from ..domain.contracts import (
     CycleDiagnosticsPayload,
     CycleDiagnosticsRequest,
     EditAction,
+    EditBatchRequest,
     ExportRequest,
     ImportResult,
     LinearityConfig,
@@ -132,8 +136,20 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
+    expose_headers=["Content-Disposition", "Server-Timing", "X-Process-Time-Ms"],
 )
+
+
+@app.middleware("http")
+async def add_performance_headers(request: Request, call_next):
+    """Expose end-to-end server work so UI latency can be measured in place."""
+
+    started = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    response.headers["Server-Timing"] = f"app;dur={duration_ms:.1f}"
+    response.headers["X-Process-Time-Ms"] = f"{duration_ms:.1f}"
+    return response
 
 store = FileSessionStore()
 
@@ -795,6 +811,7 @@ def _persist_session_update(
 
     store.write_metadata(session_id, meta)
     store.append_log(session_id, action, payload or {})
+    _clear_processing_workspace_cache(session_id)
     return meta
 
 
@@ -818,6 +835,7 @@ def upsert_official_standard_value(payload: CalibrationOfficialValueUpsertReques
         value=payload.value,
         source=payload.source,
     )
+    _clear_processing_workspace_cache()
     return CalibrationOfficialValue.model_validate(record)
 
 
@@ -825,6 +843,7 @@ def upsert_official_standard_value(payload: CalibrationOfficialValueUpsertReques
 def delete_standard_official_values(standard: str) -> CalibrationOfficialValueDeleteResult:
     repo = StandardsRepository.default()
     deleted_rows = repo.delete_standard(standard)
+    _clear_processing_workspace_cache()
     return CalibrationOfficialValueDeleteResult(standard=standard, deleted_rows=deleted_rows)
 
 
@@ -838,6 +857,7 @@ def delete_single_official_value(
 ) -> CalibrationOfficialValueDeleteResult:
     repo = StandardsRepository.default()
     deleted_rows = repo.delete_official_value(standard, isotopic_value_type)
+    _clear_processing_workspace_cache()
     return CalibrationOfficialValueDeleteResult(
         standard=standard,
         isotopic_value_type=isotopic_value_type,
@@ -1099,6 +1119,7 @@ def close_session(session_id: str) -> SessionSnapshot:
 def discard_session(session_id: str) -> dict[str, Any]:
     if not store.delete_session(session_id):
         raise HTTPException(status_code=404, detail="Unknown session")
+    _clear_processing_workspace_cache(session_id)
     return {"session_id": session_id, "deleted": True}
 
 
@@ -1750,6 +1771,50 @@ def calibration_charts(session_id: str, color_param: str = Query("Date")) -> Cha
     return ChartBundle(session_id=session_id, figures=payload)
 
 
+_PROCESSING_WORKSPACE_CACHE_MAX_ENTRIES = 16
+_processing_workspace_cache: OrderedDict[tuple[Any, ...], ProcessingWorkspace] = OrderedDict()
+_processing_workspace_cache_lock = threading.RLock()
+
+
+def _processing_workspace_source_signature(session_id: str) -> tuple[Any, ...]:
+    paths = store._paths(session_id)
+
+    def _file_signature(path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return int(stat.st_mtime_ns), int(stat.st_size)
+
+    return (
+        str(paths.root),
+        _file_signature(paths.metadata_path),
+        _file_signature(paths.snapshot_path),
+        _file_signature(paths.cycles_snapshot_path),
+    )
+
+
+def _processing_workspace_cache_key(
+    session_id: str,
+    species_section_filter: set[str] | None,
+) -> tuple[Any, ...]:
+    normalized_filter = None if species_section_filter is None else tuple(sorted(species_section_filter))
+    return (str(session_id), _processing_workspace_source_signature(session_id), normalized_filter)
+
+
+def _clear_processing_workspace_cache(session_id: str | None = None) -> None:
+    """Drop cached workspaces after a mutation while retaining a small bounded LRU."""
+
+    with _processing_workspace_cache_lock:
+        if session_id is None:
+            _processing_workspace_cache.clear()
+            return
+        session_key = str(session_id)
+        for key in list(_processing_workspace_cache):
+            if key[0] == session_key:
+                _processing_workspace_cache.pop(key, None)
+
+
 def _build_processing_workspace_response(
     session_id: str,
     metadata: dict[str, Any] | None = None,
@@ -1757,10 +1822,29 @@ def _build_processing_workspace_response(
     cycles_df: pd.DataFrame | None = None,
     species_section_filter: set[str] | None = None,
 ) -> ProcessingWorkspace:
+    cache_key = _processing_workspace_cache_key(session_id, species_section_filter)
+    with _processing_workspace_cache_lock:
+        cached = _processing_workspace_cache.get(cache_key)
+        if cached is not None:
+            _processing_workspace_cache.move_to_end(cache_key)
+            return cached.model_copy(deep=True)
+
     meta = metadata if metadata is not None else store.load_metadata(session_id)
     frame = df if df is not None else store.load_frame(session_id)
     cycles_frame = cycles_df if cycles_df is not None else store.load_cycles_frame(session_id)
-    return build_processing_workspace(session_id, frame, cycles_frame, meta, species_section_filter=species_section_filter)
+    workspace = build_processing_workspace(
+        session_id,
+        frame,
+        cycles_frame,
+        meta,
+        species_section_filter=species_section_filter,
+    )
+    with _processing_workspace_cache_lock:
+        _processing_workspace_cache[cache_key] = workspace.model_copy(deep=True)
+        _processing_workspace_cache.move_to_end(cache_key)
+        while len(_processing_workspace_cache) > _PROCESSING_WORKSPACE_CACHE_MAX_ENTRIES:
+            _processing_workspace_cache.popitem(last=False)
+    return workspace
 
 
 def _processing_species_section_filter(
@@ -1984,19 +2068,18 @@ def set_processing_config(
     )
 
 
-@app.post("/sessions/{session_id}/processing/edit", response_model=ProcessingWorkspace)
-def edit_processing(
+def _apply_processing_edit_batch(
     session_id: str,
-    edit: EditAction,
-    include_all_species_sections: bool = Query(True),
-    species_section: list[str] | None = Query(None),
+    edits: list[EditAction],
+    *,
+    species_section_filter: set[str] | None,
 ) -> ProcessingWorkspace:
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
-    df = store.load_frame(session_id)
+    updated_df = store.load_frame(session_id)
     cycles_df = store.load_cycles_frame(session_id)
     config = _load_processing_config(metadata)
-    edit_state = metadata.setdefault(
+    updated_edit_state = metadata.setdefault(
         "edit_state",
         {
             "edited_rows": [],
@@ -2012,28 +2095,29 @@ def edit_processing(
     coeffs = calibration.get("coefficients", {})
     fits = calibration.get("linearity_fits", {})
     linearity_cfg = calibration.get("config", {}).get("linearity", {}) if isinstance(calibration.get("config"), dict) else {}
-    interpolation_source_df = (
-        _build_interpolation_source_frame(
-            df,
-            config,
-            calibration_meta=calibration,
-            edit_state=edit_state,
-            target_row_tokens={str(target.row_label) for target in edit.targets},
-            cycles_df=cycles_df,
-        )
-        if edit.action == "interpolate"
-        else None
-    )
     try:
-        updated_df, updated_edit_state = apply_edit_action(
-            df,
-            edit_state,
-            edit,
-            calibration_coefficients=coeffs,
-            linearity_fits=fits,
-            linearity_config=linearity_cfg,
-            interpolation_source_df=interpolation_source_df,
-        )
+        for edit in edits:
+            interpolation_source_df = (
+                _build_interpolation_source_frame(
+                    updated_df,
+                    config,
+                    calibration_meta=calibration,
+                    edit_state=updated_edit_state,
+                    target_row_tokens={str(target.row_label) for target in edit.targets},
+                    cycles_df=cycles_df,
+                )
+                if edit.action == "interpolate"
+                else None
+            )
+            updated_df, updated_edit_state = apply_edit_action(
+                updated_df,
+                updated_edit_state,
+                edit,
+                calibration_coefficients=coeffs,
+                linearity_fits=fits,
+                linearity_config=linearity_cfg,
+                interpolation_source_df=interpolation_source_df,
+            )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -2041,16 +2125,50 @@ def edit_processing(
     metadata["edit_state"] = updated_edit_state
     _persist_session_update(
         session_id,
-        action="processing_edit",
-        payload=edit.model_dump(),
+        action="processing_edit" if len(edits) == 1 else "processing_edit_batch",
+        payload=edits[0].model_dump() if len(edits) == 1 else {"edits": [edit.model_dump() for edit in edits]},
         metadata=metadata,
         df=updated_df,
-        cycles_df=store.load_cycles_frame(session_id),
+        cycles_df=cycles_df,
     )
     return _build_processing_workspace_response(
         session_id,
         metadata=metadata,
         df=updated_df,
+        cycles_df=cycles_df,
+        species_section_filter=species_section_filter,
+    )
+
+
+@app.post("/sessions/{session_id}/processing/edit", response_model=ProcessingWorkspace)
+def edit_processing(
+    session_id: str,
+    edit: EditAction,
+    include_all_species_sections: bool = Query(True),
+    species_section: list[str] | None = Query(None),
+) -> ProcessingWorkspace:
+    return _apply_processing_edit_batch(
+        session_id,
+        [edit],
+        species_section_filter=_processing_species_section_filter(
+            include_all_species_sections,
+            species_section,
+        ),
+    )
+
+
+@app.post("/sessions/{session_id}/processing/edits", response_model=ProcessingWorkspace)
+def edit_processing_batch(
+    session_id: str,
+    request: EditBatchRequest,
+    include_all_species_sections: bool = Query(True),
+    species_section: list[str] | None = Query(None),
+) -> ProcessingWorkspace:
+    """Apply several UI draft edits with one dataframe write and workspace rebuild."""
+
+    return _apply_processing_edit_batch(
+        session_id,
+        request.edits,
         species_section_filter=_processing_species_section_filter(
             include_all_species_sections,
             species_section,

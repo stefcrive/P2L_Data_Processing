@@ -22,10 +22,19 @@ export type UploadResponse = {
   result?: unknown;
 };
 
+export type UploadProgress = {
+  loaded: number;
+  total: number | null;
+  percent: number | null;
+  phase: "uploading" | "processing";
+};
+
 const API_BASE =
-  process.env.NEXT_PUBLIC_IRMS_API_URL ||
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
-  "http://localhost:8000";
+  (
+    process.env.NEXT_PUBLIC_IRMS_API_URL ||
+    process.env.NEXT_PUBLIC_API_BASE_URL ||
+    "/api/irms"
+  ).replace(/\/+$/, "");
 
 type DiagnosticsParams = {
   color_param?: string;
@@ -80,10 +89,20 @@ async function requestJson<T>(path: string, init?: RequestInit, params?: URLSear
     headers.set("Content-Type", "application/json");
   }
 
-  const response = await fetch(endpoint(path, params), {
-    ...init,
-    headers,
-  });
+  const url = endpoint(path, params);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw error;
+    }
+    const detail = error instanceof Error && error.message ? ` (${error.message})` : "";
+    throw new Error(`Could not reach the IRMS API through ${url}.${detail}`);
+  }
   if (!response.ok) {
     throw new Error(await parseError(response));
   }
@@ -98,6 +117,48 @@ function formDataFromFiles(files: File[], includeRelativePaths = false): FormDat
     form.append("files", file, filename);
   }
   return form;
+}
+
+function requestFormJsonWithProgress<T>(
+  path: string,
+  form: FormData,
+  onProgress?: (progress: UploadProgress) => void,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", endpoint(path));
+    request.responseType = "json";
+    request.upload.addEventListener("progress", (event) => {
+      const total = event.lengthComputable ? event.total : null;
+      onProgress?.({
+        loaded: event.loaded,
+        total,
+        percent: total && total > 0 ? Math.min(100, Math.round((event.loaded / total) * 100)) : null,
+        phase: "uploading",
+      });
+    });
+    request.upload.addEventListener("load", () => {
+      onProgress?.({ loaded: 0, total: null, percent: null, phase: "processing" });
+    });
+    request.addEventListener("load", () => {
+      const payload = request.response ?? (() => {
+        try {
+          return JSON.parse(request.responseText);
+        } catch {
+          return null;
+        }
+      })();
+      if (request.status >= 200 && request.status < 300) {
+        resolve(payload as T);
+        return;
+      }
+      const detail = typeof payload?.detail === "string" ? payload.detail : `${request.status} ${request.statusText}`.trim();
+      reject(new Error(detail || "IRMS API request failed"));
+    });
+    request.addEventListener("error", () => reject(new Error(`Could not reach the IRMS API through ${endpoint(path)}.`)));
+    request.addEventListener("abort", () => reject(new DOMException("Upload aborted", "AbortError")));
+    request.send(form);
+  });
 }
 
 function body(payload: unknown): string {
@@ -134,11 +195,8 @@ async function exportDataset(sessionId: string, payload: ExportRequest): Promise
 export const api = {
   listSessions: () => requestJson<SessionSnapshot[]>("/sessions"),
   getSession: (sessionId: string) => requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}`),
-  importSession: (files: File[]) =>
-    requestJson<ImportResult>("/sessions/import", {
-      method: "POST",
-      body: formDataFromFiles(files),
-    }),
+  importSession: (files: File[], onProgress?: (progress: UploadProgress) => void) =>
+    requestFormJsonWithProgress<ImportResult>("/sessions/import", formDataFromFiles(files), onProgress),
   openSessionFile: (file: File) => {
     const form = new FormData();
     form.append("file", file);
@@ -152,11 +210,12 @@ export const api = {
       method: "POST",
       body: formDataFromFiles(files, true),
     }),
-  appendSession: (sessionId: string, files: File[]) =>
-    requestJson<ImportResult>(`/sessions/${encodeURIComponent(sessionId)}/append`, {
-      method: "POST",
-      body: formDataFromFiles(files),
-    }),
+  appendSession: (sessionId: string, files: File[], onProgress?: (progress: UploadProgress) => void) =>
+    requestFormJsonWithProgress<ImportResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/append`,
+      formDataFromFiles(files),
+      onProgress,
+    ),
   openSession: (sessionId: string) =>
     requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/open`, { method: "POST" }),
   saveSession: (sessionId: string) =>
@@ -228,10 +287,10 @@ export const api = {
       method: "DELETE",
     }),
 
-  getProcessingWorkspace: (sessionId: string, speciesSections?: string[]) =>
+  getProcessingWorkspace: (sessionId: string, speciesSections?: string[], signal?: AbortSignal) =>
     requestJson<ProcessingWorkspace>(
       `/sessions/${encodeURIComponent(sessionId)}/processing/workspace`,
-      undefined,
+      { signal },
       appendSpeciesSectionParams(new URLSearchParams(), speciesSections),
     ),
   getProcessingLinearityPreviewData: (sessionId: string) =>
@@ -253,6 +312,15 @@ export const api = {
       {
         method: "POST",
         body: body(payload),
+      },
+      appendSpeciesSectionParams(new URLSearchParams(), speciesSections),
+    ),
+  editProcessingBatch: (sessionId: string, edits: EditAction[], speciesSections?: string[]) =>
+    requestJson<ProcessingWorkspace>(
+      `/sessions/${encodeURIComponent(sessionId)}/processing/edits`,
+      {
+        method: "POST",
+        body: body({ edits }),
       },
       appendSpeciesSectionParams(new URLSearchParams(), speciesSections),
     ),

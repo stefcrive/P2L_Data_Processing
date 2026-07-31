@@ -1,6 +1,17 @@
 @echo off
 setlocal
 
+call :run_app %*
+set "APP_EXIT_CODE=%ERRORLEVEL%"
+if not "%APP_EXIT_CODE%"=="0" (
+  echo.
+  echo IRMS application startup failed with exit code %APP_EXIT_CODE%.
+  echo Review the error above, then press any key to close this window.
+  pause >nul
+)
+endlocal & exit /b %APP_EXIT_CODE%
+
+:run_app
 for %%I in ("%~dp0.") do set "ROOT_DIR=%%~fI"
 set "WEB_DIR=%ROOT_DIR%\apps\web"
 set "BACKEND_LAUNCHER=%ROOT_DIR%\scripts\launch_backend.bat"
@@ -179,28 +190,30 @@ if /I "%RUN_MODE%"=="prod" (
   start "IRMS Backend :%BACKEND_PORT%" cmd /k ""%BACKEND_LAUNCHER%" "%ROOT_DIR%" "%VENV_PYTHON%" "%BACKEND_PORT%" "dev""
 )
 
-set "NEXT_PUBLIC_IRMS_API_URL=http://127.0.0.1:%BACKEND_PORT%"
+set "IRMS_API_PROXY_TARGET=http://127.0.0.1:%BACKEND_PORT%"
+set "NEXT_PUBLIC_IRMS_API_URL="
+set "NEXT_PUBLIC_API_BASE_URL="
 
 if /I "%RUN_MODE%"=="prod" (
-  if not exist ".next" (
-    echo Production build not found. Running npm run build...
-    npm run build
-    if errorlevel 1 (
-      echo npm run build failed.
-      popd
-      exit /b 1
-    )
+  rem The API proxy target is captured by next.config.ts during the build.
+  rem Always rebuild so it matches the backend port selected above.
+  echo Building frontend for backend port %BACKEND_PORT%...
+  npm run build
+  if errorlevel 1 (
+    echo npm run build failed.
+    popd
+    exit /b 1
   )
   npm run start -- --port %FRONTEND_PORT%
+  set "FRONTEND_EXIT_CODE=%ERRORLEVEL%"
 ) else (
   rem Launch Next.js in development mode in this window.
   npm run dev -- --port %FRONTEND_PORT%
+  set "FRONTEND_EXIT_CODE=%ERRORLEVEL%"
 )
 
 popd
-pause
-
-goto :eof
+exit /b %FRONTEND_EXIT_CODE%
 
 :parse_args
 if "%~1"=="" exit /b 0

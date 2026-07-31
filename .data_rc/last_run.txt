@@ -1,3 +1,0 @@
-Backend=http://127.0.0.1:8010
-Frontend=http://127.0.0.1:3010
-DataDir=C:\Users\stefa\Documents\VSCprojects\IRMSdataprocessing\.data_rc

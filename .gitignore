@@ -1,26 +1,51 @@
-# Large data files
+# Project-local data and runtime output
+/.data/
+/.data_rc/
+/tmp/
+/Backup/
+tmp_*.txt
+*.tmp
+*.bak
+*.log
+
+# Large local data files
 all_physical.tab
 all_isotopes.tab
 
-# Excluded files
+# Local-only legacy utilities
 Pangea_paleorecord_visualizer.py
 Browser_use.py
 
-# Backups / temp
-Backup/
-*.bak
-tmp_*.txt
-*.tmp
+# Environment and secret files
+.env
+.env.*
+!.env.example
+!.env.template
 
-# Python
+# Python bytecode, caches, environments, and build output
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+.venv/
+venv/
+ven/
+ENV/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 build/
-develop-eggs/
 dist/
+develop-eggs/
 downloads/
 eggs/
 .eggs/
@@ -34,24 +59,26 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
-ven/
-venv/
-ENV/
+# JavaScript / Next.js dependencies, builds, and generated metadata
+node_modules/
+.next/
+out/
+coverage/
+.turbo/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# IDE
+# Editors and operating systems
 .idea/
 .vscode/
 *.swp
 *.swo
-
-# JS / Next (legacy)
-node_modules/
-.next/
-out/
-
-# Misc
+*~
 .DS_Store
-.env
-.env.local
-.data/
+Thumbs.db
+Desktop.ini

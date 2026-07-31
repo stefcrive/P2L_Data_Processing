@@ -35,16 +35,17 @@ Run the dashboard:
 npm run dev
 ```
 
-The frontend expects the API at `http://localhost:8000` unless `NEXT_PUBLIC_IRMS_API_URL` is set.
+The frontend calls the same-origin `/api/irms` route. Next.js proxies that route to `http://127.0.0.1:8000` unless `IRMS_API_PROXY_TARGET` is set.
 
 ## One-Command Startup
 
 Use `start_app.bat` from repo root.
 
 - Default (`start_app.bat`): development mode (`uvicorn --reload` + `next dev`).
-- Faster runtime (`start_app.bat --prod`): production mode (`uvicorn` + `next start`, auto-builds once if needed).
+- Production runtime (`start_app.bat --prod`): production mode (`uvicorn` + `next start`); the frontend rebuilds so its embedded API port always matches the backend.
 - Optional ports: `start_app.bat --backend-port 8100 --frontend-port 3100`.
 - If a requested/default port is already in use, the script automatically selects the next free port and prints the final URLs.
+- Stop every process launched for this repository with `kill_app.bat`. Use `kill_app.bat --DryRun` to preview the targeted processes without stopping them.
 
 ## Streamlit Adapter
 

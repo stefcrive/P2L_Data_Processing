@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 
 from services.irms_api.api import main as api_main
 from services.irms_api.domain.constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, VALID_CYCLES_COL
-from services.irms_api.domain.contracts import CycleDiagnosticsRequest, EditAction, ExportRequest
+from services.irms_api.domain.contracts import CycleDiagnosticsRequest, EditAction, EditBatchRequest, ExportRequest
 from services.irms_api.domain.shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column
 from services.irms_api.session_store import FileSessionStore
 
@@ -111,6 +111,7 @@ class ProcessingApiTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_store = api_main.store
         api_main.store = FileSessionStore(self.temp_dir.name)
+        api_main._clear_processing_workspace_cache()
         self.session_id = api_main.store.create_session()
         metadata = api_main.store.load_metadata(self.session_id)
         metadata["processing"] = {"config": processing_config_payload()}
@@ -123,6 +124,7 @@ class ProcessingApiTests(unittest.TestCase):
         api_main.store.save_frames(self.session_id, sample_processing_df(), sample_cycles_df())
 
     def tearDown(self) -> None:
+        api_main._clear_processing_workspace_cache()
         api_main.store = self.original_store
         self.temp_dir.cleanup()
 
@@ -140,6 +142,53 @@ class ProcessingApiTests(unittest.TestCase):
         updated_df = api_main.store.load_frame(self.session_id)
         self.assertEqual(float(updated_df.loc[0, "d 13C/12C  Mean"]), 8.0)
         self.assertEqual(float(updated_df.loc[0, "d13C_calibrated"]), 9.0)
+
+    def test_processing_edit_batch_commits_all_edits_as_one_session_event(self) -> None:
+        before = api_main.store.load_metadata(self.session_id)
+        response = api_main.edit_processing_batch(
+            self.session_id,
+            EditBatchRequest(
+                edits=[
+                    EditAction(
+                        action="set_value",
+                        targets=[{"row_label": "0", "isotope_key": "d13C"}],
+                        value=8.0,
+                    ),
+                    EditAction(
+                        action="set_value",
+                        targets=[{"row_label": "0", "isotope_key": "d18O"}],
+                        value=-3.0,
+                    ),
+                ]
+            ),
+        )
+
+        self.assertEqual(response.session_id, self.session_id)
+        updated_df = api_main.store.load_frame(self.session_id)
+        self.assertEqual(float(updated_df.loc[0, "d 13C/12C  Mean"]), 8.0)
+        self.assertEqual(float(updated_df.loc[0, "d 18O/16O  Mean"]), -3.0)
+        after = api_main.store.load_metadata(self.session_id)
+        self.assertEqual(
+            int(after["autosave"]["event_count"]),
+            int(before.get("autosave", {}).get("event_count", 0)) + 1,
+        )
+        self.assertEqual(after["autosave"]["last_action"], "processing_edit_batch")
+
+    def test_processing_workspace_cache_returns_isolated_models(self) -> None:
+        first = api_main.processing_workspace(
+            self.session_id,
+            include_all_species_sections=False,
+            species_section=None,
+        )
+        first.config.selected_identifier = "changed-in-caller"
+
+        second = api_main.processing_workspace(
+            self.session_id,
+            include_all_species_sections=False,
+            species_section=None,
+        )
+
+        self.assertEqual(second.config.selected_identifier, "All")
 
     def test_cycle_diagnostics_linearity_corrected_value_matches_processing_working_frame(self) -> None:
         metadata = api_main.store.load_metadata(self.session_id)

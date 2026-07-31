@@ -165,7 +165,11 @@ def _format_hover_color_value(value):
             return "N/A"
     except Exception:
         pass
-    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    # ``pd.Series([value])`` is surprisingly expensive here because this helper
+    # is called once per point for every figure.  ``pd.to_numeric`` accepts a
+    # scalar directly and preserves the same coercion behaviour without
+    # allocating thousands of one-element Series objects.
+    numeric = pd.to_numeric(value, errors="coerce")
     if pd.notna(numeric) and np.isfinite(float(numeric)):
         return f"{float(numeric):.2f}"
     return str(value)

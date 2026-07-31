@@ -1,8 +1,0 @@
-Usage: start_app.bat [--dev|--prod] [--backend-port PORT] [--frontend-port PORT]
-
-  --dev             Start in development mode (default)
-  --prod            Start in production mode
-  --backend-port    Preferred backend port (default 8000)
-  --frontend-port   Preferred frontend port (default 3000)
-
-If a preferred port is busy, the script automatically picks the next free port.
