@@ -12,21 +12,39 @@ import type {
   ProcessingConfig,
   ProcessingLinearityPreviewData,
   ProcessingWorkspace,
+  SessionArtifactKind,
+  SessionArtifactPayload,
   SessionSnapshot,
+  SpeciesSection,
 } from "@/lib/types";
-
-export type UploadResponse = {
-  job_id: string;
-  task_id?: string;
-  status: string;
-  result?: unknown;
-};
 
 export type UploadProgress = {
   loaded: number;
   total: number | null;
   percent: number | null;
   phase: "uploading" | "processing";
+  message?: string;
+  jobId?: string;
+  cancellable?: boolean;
+};
+
+export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancel_requested" | "cancelled";
+
+export type JobSnapshot<TResult = Record<string, unknown>> = {
+  job_id: string;
+  kind: string;
+  state: JobState;
+  progress: number;
+  phase: string;
+  message: string;
+  session_id: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  result: TResult | null;
+  error: string | null;
+  revision: number;
+  cancellable: boolean;
 };
 
 const API_BASE =
@@ -57,7 +75,7 @@ function endpoint(path: string, params?: URLSearchParams): string {
 }
 
 function appendSpeciesSectionParams(params: URLSearchParams, speciesSections?: string[]): URLSearchParams {
-  if (speciesSections && speciesSections.length > 0) {
+  if (speciesSections !== undefined) {
     params.set("include_all_species_sections", "false");
     for (const section of speciesSections) {
       params.append("species_section", section);
@@ -119,6 +137,29 @@ function formDataFromFiles(files: File[], includeRelativePaths = false): FormDat
   return form;
 }
 
+function rejectEmptyFiles(files: File[]): void {
+  const emptyFiles = files.filter((file) => file.size === 0).map((file) => file.name);
+  if (emptyFiles.length > 0) {
+    throw new Error(
+      `The following workbook file is empty (0 bytes): ${emptyFiles.join(", ")}. Download or save it locally, then select it again.`,
+    );
+  }
+}
+
+function errorFromPayload(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== "object") return fallback;
+  const detail = (payload as { detail?: unknown }).detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    const errors = (detail as { errors?: unknown }).errors;
+    if (Array.isArray(errors)) {
+      const messages = errors.filter((error): error is string => typeof error === "string" && error.length > 0);
+      if (messages.length > 0) return messages.join("; ");
+    }
+  }
+  return fallback;
+}
+
 function requestFormJsonWithProgress<T>(
   path: string,
   form: FormData,
@@ -152,7 +193,7 @@ function requestFormJsonWithProgress<T>(
         resolve(payload as T);
         return;
       }
-      const detail = typeof payload?.detail === "string" ? payload.detail : `${request.status} ${request.statusText}`.trim();
+      const detail = errorFromPayload(payload, `${request.status} ${request.statusText}`.trim());
       reject(new Error(detail || "IRMS API request failed"));
     });
     request.addEventListener("error", () => reject(new Error(`Could not reach the IRMS API through ${endpoint(path)}.`)));
@@ -161,26 +202,116 @@ function requestFormJsonWithProgress<T>(
   });
 }
 
+function waitForJob<TResult>(
+  initial: JobSnapshot<TResult>,
+  onProgress?: (snapshot: JobSnapshot<TResult>) => void,
+): Promise<TResult> {
+  return new Promise<TResult>((resolve, reject) => {
+    let settled = false;
+    let polling = false;
+    let source: EventSource | null = null;
+
+    const finish = (snapshot: JobSnapshot<TResult>) => {
+      if (settled) return;
+      onProgress?.(snapshot);
+      if (snapshot.state === "succeeded") {
+        settled = true;
+        source?.close();
+        if (snapshot.result) {
+          resolve(snapshot.result);
+        } else {
+          reject(new Error("Background job completed without a result"));
+        }
+      } else if (snapshot.state === "failed" || snapshot.state === "cancelled") {
+        settled = true;
+        source?.close();
+        reject(new Error(snapshot.error || (snapshot.state === "cancelled" ? "Operation cancelled" : "Background job failed")));
+      }
+    };
+
+    const parseEvent = (event: Event) => {
+      if (!(event instanceof MessageEvent) || typeof event.data !== "string") return;
+      try {
+        finish(JSON.parse(event.data) as JobSnapshot<TResult>);
+      } catch {
+        // A malformed event will be superseded by the next revision or polling fallback.
+      }
+    };
+
+    const startPolling = () => {
+      if (polling || settled) return;
+      polling = true;
+      source?.close();
+      const poll = async () => {
+        while (!settled) {
+          try {
+            const snapshot = await requestJson<JobSnapshot<TResult>>(`/jobs/${encodeURIComponent(initial.job_id)}`);
+            finish(snapshot);
+          } catch (error) {
+            if (!settled) {
+              settled = true;
+              reject(error);
+            }
+            return;
+          }
+          if (!settled) {
+            await new Promise((resume) => window.setTimeout(resume, 500));
+          }
+        }
+      };
+      void poll();
+    };
+
+    onProgress?.(initial);
+    if (initial.state === "succeeded" || initial.state === "failed" || initial.state === "cancelled") {
+      finish(initial);
+      return;
+    }
+    if (typeof EventSource === "undefined") {
+      startPolling();
+      return;
+    }
+    source = new EventSource(endpoint(`/jobs/${encodeURIComponent(initial.job_id)}/events`));
+    source.addEventListener("progress", parseEvent);
+    source.addEventListener("complete", parseEvent);
+    source.addEventListener("cancelled", parseEvent);
+    source.addEventListener("error", (event) => {
+      if (event instanceof MessageEvent && event.data) {
+        parseEvent(event);
+        return;
+      }
+      startPolling();
+    });
+  });
+}
+
+async function submitJsonJob<TResult>(
+  path: string,
+  payload: unknown,
+  onProgress?: (snapshot: JobSnapshot<TResult>) => void,
+): Promise<TResult> {
+  const job = await requestJson<JobSnapshot<TResult>>(path, { method: "POST", body: body(payload) });
+  return waitForJob(job, onProgress);
+}
+
 function body(payload: unknown): string {
   return JSON.stringify(payload);
 }
 
-export async function uploadIRMSFile(file: File) {
-  const form = new FormData();
-  form.append("file", file);
-  return requestJson<UploadResponse>("/v1/irms/process", { method: "POST", body: form });
-}
-
-export async function fetchJobStatus(task_id: string) {
-  return requestJson<{ task_id: string; state: string; result?: unknown }>(`/v1/jobs/${encodeURIComponent(task_id)}`);
-}
-
-async function exportDataset(sessionId: string, payload: ExportRequest): Promise<{ blob: Blob; filename: string }> {
-  const response = await fetch(endpoint(`/sessions/${encodeURIComponent(sessionId)}/exports/dataset`), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body(payload),
-  });
+async function exportDataset(
+  sessionId: string,
+  payload: ExportRequest,
+  onProgress?: (snapshot: JobSnapshot<{ filename: string; download_url: string }>) => void,
+): Promise<{ blob: Blob; filename: string }> {
+  const job = await requestJson<JobSnapshot<{ filename: string; download_url: string }>>(
+    `/sessions/${encodeURIComponent(sessionId)}/exports/dataset/jobs`,
+    {
+      method: "POST",
+      body: body(payload),
+    },
+  );
+  const result = await waitForJob(job, onProgress);
+  const response = await fetch(endpoint(result.download_url || `/jobs/${encodeURIComponent(job.job_id)}/download`));
   if (!response.ok) {
     throw new Error(await parseError(response));
   }
@@ -188,15 +319,44 @@ async function exportDataset(sessionId: string, payload: ExportRequest): Promise
   const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
   return {
     blob: await response.blob(),
-    filename: filenameMatch?.[1] ?? "irms_export.xlsx",
+    filename: filenameMatch?.[1] ?? result.filename ?? "irms_export.xlsx",
   };
 }
 
 export const api = {
   listSessions: () => requestJson<SessionSnapshot[]>("/sessions"),
   getSession: (sessionId: string) => requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}`),
-  importSession: (files: File[], onProgress?: (progress: UploadProgress) => void) =>
-    requestFormJsonWithProgress<ImportResult>("/sessions/import", formDataFromFiles(files), onProgress),
+  getSessionArtifact: (sessionId: string, kind: SessionArtifactKind) =>
+    requestJson<SessionArtifactPayload>(
+      `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(kind)}`,
+    ),
+  updateAutosave: (sessionId: string, enabled: boolean) =>
+    requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/autosave`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+      headers: { "Content-Type": "application/json" },
+    }),
+  getJob: (jobId: string) => requestJson<JobSnapshot>(`/jobs/${encodeURIComponent(jobId)}`),
+  cancelJob: (jobId: string) => requestJson<JobSnapshot>(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" }),
+  importSession: async (files: File[], onProgress?: (progress: UploadProgress) => void) => {
+    rejectEmptyFiles(files);
+    const job = await requestFormJsonWithProgress<JobSnapshot<ImportResult>>(
+      "/sessions/import/jobs",
+      formDataFromFiles(files),
+      onProgress,
+    );
+    return waitForJob(job, (snapshot) =>
+      onProgress?.({
+        loaded: 0,
+        total: null,
+        percent: Math.round(snapshot.progress),
+        phase: "processing",
+        message: snapshot.message,
+        jobId: snapshot.job_id,
+        cancellable: snapshot.cancellable,
+      }),
+    );
+  },
   openSessionFile: (file: File) => {
     const form = new FormData();
     form.append("file", file);
@@ -210,12 +370,25 @@ export const api = {
       method: "POST",
       body: formDataFromFiles(files, true),
     }),
-  appendSession: (sessionId: string, files: File[], onProgress?: (progress: UploadProgress) => void) =>
-    requestFormJsonWithProgress<ImportResult>(
-      `/sessions/${encodeURIComponent(sessionId)}/append`,
+  appendSession: async (sessionId: string, files: File[], onProgress?: (progress: UploadProgress) => void) => {
+    rejectEmptyFiles(files);
+    const job = await requestFormJsonWithProgress<JobSnapshot<ImportResult>>(
+      `/sessions/${encodeURIComponent(sessionId)}/append/jobs`,
       formDataFromFiles(files),
       onProgress,
-    ),
+    );
+    return waitForJob(job, (snapshot) =>
+      onProgress?.({
+        loaded: 0,
+        total: null,
+        percent: Math.round(snapshot.progress),
+        phase: "processing",
+        message: snapshot.message,
+        jobId: snapshot.job_id,
+        cancellable: snapshot.cancellable,
+      }),
+    );
+  },
   openSession: (sessionId: string) =>
     requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/open`, { method: "POST" }),
   saveSession: (sessionId: string) =>
@@ -269,11 +442,12 @@ export const api = {
       params,
     );
   },
-  runCalibration: (sessionId: string, config: CalibrationConfig) =>
-    requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/calibration/run`, {
-      method: "POST",
-      body: body(config),
-    }),
+  runCalibration: (
+    sessionId: string,
+    config: CalibrationConfig,
+    onProgress?: (snapshot: JobSnapshot<SessionSnapshot>) => void,
+  ) =>
+    submitJsonJob<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/calibration/run/jobs`, config, onProgress),
   resetCalibration: (sessionId: string) =>
     requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/calibration/reset`, { method: "POST" }),
   listOfficialStandardValues: () => requestJson<CalibrationOfficialValue[]>("/standards/official-values"),
@@ -293,6 +467,14 @@ export const api = {
       { signal },
       appendSpeciesSectionParams(new URLSearchParams(), speciesSections),
     ),
+  getProcessingSpeciesSection: (sessionId: string, species: string, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ species });
+    return requestJson<SpeciesSection>(
+      `/sessions/${encodeURIComponent(sessionId)}/processing/species-section`,
+      { signal },
+      params,
+    );
+  },
   getProcessingLinearityPreviewData: (sessionId: string) =>
     requestJson<ProcessingLinearityPreviewData>(
       `/sessions/${encodeURIComponent(sessionId)}/processing/linearity-preview-data`,
@@ -315,6 +497,16 @@ export const api = {
       },
       appendSpeciesSectionParams(new URLSearchParams(), speciesSections),
     ),
+  setProcessingConfigJob: (
+    sessionId: string,
+    config: ProcessingConfig,
+    onProgress?: (snapshot: JobSnapshot<ProcessingWorkspace>) => void,
+  ) =>
+    submitJsonJob<ProcessingWorkspace>(
+      `/sessions/${encodeURIComponent(sessionId)}/processing/config/jobs`,
+      config,
+      onProgress,
+    ),
   editProcessingBatch: (sessionId: string, edits: EditAction[], speciesSections?: string[]) =>
     requestJson<ProcessingWorkspace>(
       `/sessions/${encodeURIComponent(sessionId)}/processing/edits`,
@@ -323,6 +515,16 @@ export const api = {
         body: body({ edits }),
       },
       appendSpeciesSectionParams(new URLSearchParams(), speciesSections),
+    ),
+  editProcessingBatchJob: (
+    sessionId: string,
+    edits: EditAction[],
+    onProgress?: (snapshot: JobSnapshot<ProcessingWorkspace>) => void,
+  ) =>
+    submitJsonJob<ProcessingWorkspace>(
+      `/sessions/${encodeURIComponent(sessionId)}/processing/edits/jobs`,
+      { edits },
+      onProgress,
     ),
   removeProcessingCalibration: (sessionId: string, speciesSections?: string[]) =>
     requestJson<ProcessingWorkspace>(

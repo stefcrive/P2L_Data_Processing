@@ -1,15 +1,16 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FileJson, FolderOpen, Plus, RefreshCw, Upload } from "lucide-react";
+import { Activity, Database, FileJson, FolderOpen, Plus, RefreshCw, Table2, Upload, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { PageHeader } from "@/components/ui/page-header";
 import { api, type UploadProgress } from "@/lib/api";
 import { describeSession, resolveSessionName } from "@/lib/session-label";
-import type { SessionSnapshot } from "@/lib/types";
+import type { JsonRecord, SessionArtifactKind, SessionArtifactPayload, SessionSnapshot } from "@/lib/types";
 import { useSessionStore } from "@/store/use-session-store";
 
 const WORKBOOK_EXTENSION_REGEX = /\.(xls|xlsx)$/i;
@@ -17,6 +18,116 @@ const SESSION_STATE_FILE_REGEX = /(^|\/)irms_session_state\.json$/i;
 const SESSION_RECORD_METADATA_REGEX = /(^|\/)session record\/[^/]+\/metadata\.json$/i;
 
 type FileWithRelativePath = File & { webkitRelativePath?: string };
+
+const SESSION_ARTIFACTS: Array<{ kind: SessionArtifactKind; label: string; description: string }> = [
+  { kind: "events", label: "Event log", description: "Session activity and saved actions" },
+  { kind: "snapshot", label: "Data snapshot", description: "Current processed rows" },
+  { kind: "cycles", label: "Cycle snapshot", description: "Current cycle-level rows" },
+  { kind: "metadata", label: "Metadata", description: "Session configuration and counts" },
+  { kind: "state", label: "State file", description: "Portable recovery state" },
+];
+
+function humanizeKey(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function HumanReadableValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
+  if (value == null) {
+    return <span className="text-slate-400">None</span>;
+  }
+  if (typeof value === "boolean") {
+    return <Badge>{value ? "Yes" : "No"}</Badge>;
+  }
+  if (typeof value === "string" || typeof value === "number") {
+    return <span className="break-words text-slate-800">{String(value)}</span>;
+  }
+  if (Array.isArray(value)) {
+    if (!value.length) {
+      return <span className="text-slate-400">Empty list</span>;
+    }
+    return (
+      <div className="space-y-1.5">
+        {value.map((item, index) => (
+          <div key={index} className="rounded-md border border-slate-200 bg-slate-50/70 px-3 py-2">
+            <HumanReadableValue value={item} depth={depth + 1} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (typeof value === "object") {
+    return (
+      <dl className={depth === 0 ? "divide-y divide-slate-100" : "space-y-2"}>
+        {Object.entries(value as Record<string, unknown>).map(([key, item]) => (
+          <div
+            key={key}
+            className={depth === 0 ? "grid gap-1 py-2.5 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-4" : "grid gap-1 sm:grid-cols-[140px_minmax(0,1fr)]"}
+          >
+            <dt className="text-xs font-semibold text-slate-500">{humanizeKey(key)}</dt>
+            <dd className="min-w-0 text-sm">
+              <HumanReadableValue value={item} depth={depth + 1} />
+            </dd>
+          </div>
+        ))}
+      </dl>
+    );
+  }
+  return <span className="text-slate-700">{String(value)}</span>;
+}
+
+function ArtifactViewer({ artifact }: { artifact: SessionArtifactPayload }) {
+  if (artifact.format === "table") {
+    return (
+      <div className="overflow-auto rounded-lg border border-slate-200">
+        <table className="min-w-max border-collapse text-left text-xs">
+          <thead className="sticky top-0 bg-slate-50 text-slate-600">
+            <tr>
+              {(artifact.columns ?? []).map((column) => (
+                <th key={column} className="border-b border-slate-200 px-3 py-2 font-semibold">
+                  {humanizeKey(column)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100 bg-white">
+            {(artifact.rows ?? []).map((row, index) => (
+              <tr key={index}>
+                {(artifact.columns ?? []).map((column) => (
+                  <td key={column} className="max-w-72 px-3 py-2 align-top text-slate-700">
+                    <HumanReadableValue value={row[column]} />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+  if (artifact.format === "events") {
+    const items = artifact.items ?? [];
+    return (
+      <ol className="space-y-2">
+        {[...items].reverse().map((item: JsonRecord, index) => (
+          <li key={`${String(item.timestamp ?? "")}-${index}`} className="rounded-lg border border-slate-200 bg-white px-4 py-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-sm font-semibold text-slate-900">{humanizeKey(String(item.action ?? "Event"))}</span>
+              <time className="font-mono text-[10px] text-slate-500">{formatTimestamp(item.timestamp)}</time>
+            </div>
+            {item.payload && typeof item.payload === "object" && Object.keys(item.payload as JsonRecord).length ? (
+              <div className="mt-2 border-t border-slate-100 pt-2">
+                <HumanReadableValue value={item.payload} />
+              </div>
+            ) : null}
+          </li>
+        ))}
+      </ol>
+    );
+  }
+  return <HumanReadableValue value={artifact.data} />;
+}
 
 function normalizeWorkbookName(value: string): string {
   const normalized = value.replace(/\\/g, "/");
@@ -111,7 +222,8 @@ function sourceFileDisplayName(sourceFile: Record<string, unknown>, index: numbe
   }
   const fallbackPath = stringValue(sourceFile.path) ?? stringValue(sourceFile.file_path) ?? stringValue(sourceFile.filepath);
   if (fallbackPath) {
-    return fallbackPath;
+    const normalized = fallbackPath.replace(/\\/g, "/");
+    return normalized.split("/").pop() ?? normalized;
   }
   return `source_file_${index + 1}`;
 }
@@ -160,6 +272,7 @@ export default function ImportPage() {
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [browseInfo, setBrowseInfo] = useState<string | null>(null);
   const [browseError, setBrowseError] = useState<string | null>(null);
+  const [activeArtifactKind, setActiveArtifactKind] = useState<SessionArtifactKind | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const sessionFileInputRef = useRef<HTMLInputElement | null>(null);
   const queryClient = useQueryClient();
@@ -176,19 +289,21 @@ export default function ImportPage() {
     queryKey: ["sessions"],
     queryFn: () => api.listSessions(),
   });
+  const artifactQuery = useQuery({
+    queryKey: ["session-artifact", sessionId, activeArtifactKind],
+    queryFn: () => api.getSessionArtifact(sessionId!, activeArtifactKind!),
+    enabled: Boolean(sessionId && activeArtifactKind),
+  });
+  const cancelJobMutation = useMutation({
+    mutationFn: (jobId: string) => api.cancelJob(jobId),
+  });
 
   const activeSession = sessionQuery.data;
   const autosave = activeSession?.autosave ?? {};
   const recentSessions = useMemo(() => (sessionsQuery.data ?? []).slice(0, 5), [sessionsQuery.data]);
-  const autosaveSaveDir = stringValue(autosave.save_dir);
   const autosaveEventCount = numberValue(autosave.event_count, 0);
   const autosaveResumed = booleanValue(autosave.resumed);
-  const autosaveEntries = [
-    { label: "Session event log", path: stringValue(autosave.log_path) },
-    { label: "Session snapshot", path: stringValue(autosave.snapshot_path) },
-    { label: "Session metadata", path: stringValue(autosave.meta_path) },
-    { label: "Session state file", path: stringValue(autosave.source_session_state_path) ?? stringValue(autosave.session_state_path) },
-  ];
+  const autosaveEnabled = typeof autosave.enabled === "undefined" ? Boolean(activeSession) : booleanValue(autosave.enabled);
   const sessionSourceFiles = useMemo(
     () =>
       (activeSession?.source_files ?? []).map((item, index) => {
@@ -209,6 +324,10 @@ export default function ImportPage() {
     input.setAttribute("webkitdirectory", "");
     input.setAttribute("directory", "");
   }, []);
+
+  useEffect(() => {
+    setActiveArtifactKind(null);
+  }, [sessionId]);
 
   const importMutation = useMutation({
     mutationFn: () => api.importSession(files, setUploadProgress),
@@ -332,10 +451,17 @@ export default function ImportPage() {
   };
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[1.1fr,0.9fr]">
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Session workspace"
+        title="Import"
+        description="Create a session from workbooks or reopen an existing analysis."
+        actions={<span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-[10px] text-slate-600">{recentSessions.length} recent sessions</span>}
+      />
+
       <Card>
         <CardHeader>
-          <CardTitle>Import Workbooks</CardTitle>
+          <CardTitle>Import workbooks</CardTitle>
           <CardDescription>Start a new session, add files to an open session, or reopen a saved session state file.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
@@ -363,7 +489,11 @@ export default function ImportPage() {
           {uploadProgress ? (
             <div className="space-y-2" aria-live="polite">
               <div className="flex items-center justify-between text-xs text-stone-600">
-                <span>{uploadProgress.phase === "uploading" ? "Uploading workbooks" : "Processing workbooks on the server"}</span>
+                <span>
+                  {uploadProgress.phase === "uploading"
+                    ? "Uploading workbooks"
+                    : uploadProgress.message || "Processing workbooks on the server"}
+                </span>
                 <span>{uploadProgress.percent == null ? "Working..." : `${uploadProgress.percent}%`}</span>
               </div>
               <div
@@ -378,6 +508,16 @@ export default function ImportPage() {
                   style={uploadProgress.percent == null ? undefined : { width: `${uploadProgress.percent}%` }}
                 />
               </div>
+              {uploadProgress.jobId && uploadProgress.cancellable ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => cancelJobMutation.mutate(uploadProgress.jobId!)}
+                  disabled={cancelJobMutation.isPending}
+                >
+                  {cancelJobMutation.isPending ? "Cancelling..." : "Cancel operation"}
+                </Button>
+              ) : null}
             </div>
           ) : null}
           {files.length > 0 ? (
@@ -385,136 +525,194 @@ export default function ImportPage() {
               {files.length} file(s) selected: {files.map((file) => file.name).join(", ")}
             </div>
           ) : null}
-          <div className="space-y-2 rounded-lg border border-stone-200 p-4">
-            <div className="form-section-title">Current Session Files</div>
-            {!sessionId ? (
-              <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-600">No open session.</div>
-            ) : sessionSourceFiles.length > 0 ? (
-              <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-stone-200 bg-stone-50 p-2">
-                {sessionSourceFiles.map((sourceFile) => (
-                  <div key={sourceFile.key} className="truncate font-mono text-xs text-stone-700">
-                    {sourceFile.name}
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-600">
-                Session has no loaded source files.
-              </div>
-            )}
-          </div>
           {(importMutation.error || appendMutation.error) && (
             <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
               {String(importMutation.error ?? appendMutation.error)}
             </div>
           )}
-
-          <div className="space-y-3 rounded-lg border border-stone-200 p-4">
-            <div className="form-section-title">Recent Sessions</div>
-            <div className="flex flex-wrap gap-3">
-              <Button
-                variant="outline"
-                onClick={handleBrowseFolderClick}
-                disabled={openMutation.isPending || openSessionFileMutation.isPending || openSessionFolderMutation.isPending}
-              >
-                <FolderOpen className="h-4 w-4" />
-                Browse folder
-              </Button>
-              <Button
-                variant="outline"
-                onClick={handleOpenSessionFileClick}
-                disabled={openSessionFileMutation.isPending || openSessionFolderMutation.isPending}
-              >
-                <FileJson className="h-4 w-4" />
-                Open session file
-              </Button>
-              <Button variant="secondary" onClick={() => sessionsQuery.refetch()} disabled={sessionsQuery.isFetching}>
-                <RefreshCw className="h-4 w-4" />
-                {sessionsQuery.isFetching ? "Refreshing..." : "Refresh"}
-              </Button>
-            </div>
-            <input ref={folderInputRef} type="file" multiple onChange={handleFolderSelected} className="hidden" />
-            <input
-              ref={sessionFileInputRef}
-              type="file"
-              accept=".json"
-              onChange={handleSessionFileSelected}
-              className="hidden"
-            />
-            {browseInfo ? <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">{browseInfo}</div> : null}
-            {browseError ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{browseError}</div> : null}
-            {recentSessions.length > 0 ? (
-              <div className="space-y-2">
-                {recentSessions.map((session) => {
-                  const isActive = session.session_id === sessionId;
-                  const isOpening = openMutation.isPending && openMutation.variables === session.session_id;
-                  return (
-                    <div key={session.session_id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-stone-200 px-3 py-2">
-                      <div className="text-sm text-stone-700">{describeSession(session)}</div>
-                      <Button
-                        variant={isActive ? "secondary" : "outline"}
-                        size="sm"
-                        onClick={() => openMutation.mutate(session.session_id)}
-                        disabled={openMutation.isPending}
-                      >
-                        {isOpening ? "Opening..." : isActive ? "Open Again" : "Open"}
-                      </Button>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-sm text-stone-600">No saved sessions yet.</div>
-            )}
-            {openMutation.error || openSessionFileMutation.error || openSessionFolderMutation.error ? (
-              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                {String(openMutation.error ?? openSessionFileMutation.error ?? openSessionFolderMutation.error)}
-              </div>
-            ) : null}
-          </div>
         </CardContent>
       </Card>
+
       <Card>
-        <CardHeader>
-          <CardTitle>Autosave Session</CardTitle>
-          <CardDescription>Autosave stores event logs, snapshots, metadata, and a portable session state file for this workbook set.</CardDescription>
+        <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+          <CardTitle>Session record</CardTitle>
+            <CardDescription>Review recovery artifacts and the workbooks attached to the active session.</CardDescription>
+          </div>
+          <div className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-700">
+            <span
+              className={`h-2.5 w-2.5 rounded-full ${autosaveEnabled ? "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.14)]" : "bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.12)]"}`}
+              aria-hidden="true"
+            />
+            Autosave {autosaveEnabled ? "on" : "off"}
+          </div>
         </CardHeader>
         <CardContent className="space-y-4 text-sm text-stone-600">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="rounded-lg border border-stone-200 bg-stone-50 p-3">
-              <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Active Session</div>
-              <div className="mt-1 break-all font-mono text-xs text-stone-800">{sessionId ?? "none"}</div>
+          <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-4">
+            <Badge>{autosaveEventCount} events</Badge>
+            <Badge>{autosaveResumed ? "Resumed" : "New session"}</Badge>
+            <span className="font-mono text-[10px] text-slate-500">{sessionId ?? "No active session"}</span>
+            <span className="ml-auto text-xs text-slate-500">Last saved {formatTimestamp(autosave.last_saved_at)}</span>
+          </div>
+
+          <div>
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Record views</div>
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+              {SESSION_ARTIFACTS.map((artifact) => {
+                const Icon =
+                  artifact.kind === "events"
+                    ? Activity
+                    : artifact.kind === "metadata"
+                      ? Database
+                      : artifact.kind === "state"
+                        ? FileJson
+                        : Table2;
+                return (
+                  <button
+                    key={artifact.kind}
+                    type="button"
+                    disabled={!sessionId}
+                    onClick={() => setActiveArtifactKind(artifact.kind)}
+                    className="group flex min-w-0 items-start gap-3 rounded-lg border border-slate-200 bg-white px-3 py-3 text-left transition hover:border-blue-300 hover:bg-blue-50/50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <span className="rounded-md bg-slate-100 p-1.5 text-slate-600 group-hover:bg-blue-100 group-hover:text-blue-700">
+                      <Icon className="h-4 w-4" />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-xs font-semibold text-slate-900">{artifact.label}</span>
+                      <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">{artifact.description}</span>
+                    </span>
+                  </button>
+                );
+              })}
             </div>
-            <div className="rounded-lg border border-stone-200 bg-stone-50 p-3">
-              <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Autosave Status</div>
-              <div className="mt-2 flex flex-wrap gap-2">
-                <Badge>{autosaveEventCount} events</Badge>
-                <Badge>{autosaveResumed ? "Resumed" : "New session"}</Badge>
+          </div>
+
+          <div className="border-t border-slate-200 pt-4">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Current session files</div>
+              <span className="font-mono text-[10px] text-slate-500">{sessionSourceFiles.length} files</span>
+            </div>
+            {!sessionId ? (
+              <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">No open session.</div>
+            ) : sessionSourceFiles.length > 0 ? (
+              <div className="grid gap-1.5 sm:grid-cols-2 xl:grid-cols-3">
+                {sessionSourceFiles.map((sourceFile) => (
+                  <div key={sourceFile.key} className="truncate rounded-md border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700" title={sourceFile.name}>
+                    {sourceFile.name}
+                  </div>
+                ))}
               </div>
-            </div>
-          </div>
-          <div className="rounded-lg border border-stone-200 bg-white p-3">
-            <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Session Record Folder</div>
-            <div className="mt-1 break-all font-mono text-xs text-stone-800">{autosaveSaveDir ?? "n/a"}</div>
-          </div>
-          <div className="space-y-2">
-            {autosaveEntries.map((entry) => (
-              <div key={entry.label} className="rounded-lg border border-stone-200 px-3 py-2">
-                <div className="text-xs font-medium text-stone-600">{entry.label}</div>
-                <div className="mt-1 break-all font-mono text-xs text-stone-800">{entry.path ?? "n/a"}</div>
+            ) : (
+              <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">
+                Session has no loaded source files.
               </div>
-            ))}
-          </div>
-          <div className="grid gap-2 text-xs sm:grid-cols-2">
-            <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-              Last autosave action: <span className="font-mono text-[11px] text-stone-800">{String(autosave.last_action ?? "n/a")}</span>
-            </div>
-            <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-              Last autosave timestamp: <span className="font-mono text-[11px] text-stone-800">{formatTimestamp(autosave.last_saved_at)}</span>
-            </div>
+            )}
           </div>
         </CardContent>
       </Card>
+
+      <Card>
+        <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle>Recent sessions</CardTitle>
+            <CardDescription>Open a known session or recover one from a session folder or state file.</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="outline"
+              onClick={handleBrowseFolderClick}
+              disabled={openMutation.isPending || openSessionFileMutation.isPending || openSessionFolderMutation.isPending}
+            >
+              <FolderOpen className="h-4 w-4" />
+              Browse folder
+            </Button>
+            <Button
+              variant="outline"
+              onClick={handleOpenSessionFileClick}
+              disabled={openSessionFileMutation.isPending || openSessionFolderMutation.isPending}
+            >
+              <FileJson className="h-4 w-4" />
+              Open state file
+            </Button>
+            <Button variant="secondary" onClick={() => sessionsQuery.refetch()} disabled={sessionsQuery.isFetching}>
+              <RefreshCw className="h-4 w-4" />
+              {sessionsQuery.isFetching ? "Refreshing..." : "Refresh"}
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <input ref={folderInputRef} type="file" multiple onChange={handleFolderSelected} className="hidden" />
+          <input ref={sessionFileInputRef} type="file" accept=".json" onChange={handleSessionFileSelected} className="hidden" />
+          {browseInfo ? <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">{browseInfo}</div> : null}
+          {browseError ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{browseError}</div> : null}
+          {recentSessions.length > 0 ? (
+            <div className="divide-y divide-slate-100 rounded-lg border border-slate-200">
+              {recentSessions.map((session) => {
+                const isActive = session.session_id === sessionId;
+                const isOpening = openMutation.isPending && openMutation.variables === session.session_id;
+                return (
+                  <div key={session.session_id} className="flex flex-wrap items-center justify-between gap-3 px-3 py-2.5">
+                    <div className="text-sm text-stone-700">{describeSession(session)}</div>
+                    <Button
+                      variant={isActive ? "secondary" : "outline"}
+                      size="sm"
+                      onClick={() => openMutation.mutate(session.session_id)}
+                      disabled={openMutation.isPending}
+                    >
+                      {isOpening ? "Opening..." : isActive ? "Open again" : "Open"}
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">No saved sessions yet.</div>
+          )}
+          {openMutation.error || openSessionFileMutation.error || openSessionFolderMutation.error ? (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+              {String(openMutation.error ?? openSessionFileMutation.error ?? openSessionFolderMutation.error)}
+            </div>
+          ) : null}
+        </CardContent>
+      </Card>
+
+      {activeArtifactKind ? (
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-slate-950/45 p-3 pt-6 sm:p-6" onClick={() => setActiveArtifactKind(null)}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Session record viewer"
+            className="flex max-h-[calc(100vh-3rem)] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-slate-300 bg-white shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-4 py-3">
+              <div>
+                <div className="text-base font-semibold text-slate-950">
+                  {artifactQuery.data?.label ?? SESSION_ARTIFACTS.find((item) => item.kind === activeArtifactKind)?.label}
+                </div>
+                <div className="mt-0.5 text-xs text-slate-500">
+                  {artifactQuery.data?.row_count != null ? `${artifactQuery.data.row_count.toLocaleString()} records` : "Session record"}
+                  {artifactQuery.data?.truncated ? " · showing a preview" : ""}
+                </div>
+              </div>
+              <Button variant="outline" size="sm" onClick={() => setActiveArtifactKind(null)}>
+                <X className="h-4 w-4" />
+                Close
+              </Button>
+            </div>
+            <div className="min-h-0 overflow-auto bg-slate-50/60 p-4">
+              {artifactQuery.isLoading ? <div className="text-sm text-slate-500">Loading session record…</div> : null}
+              {artifactQuery.error ? (
+                <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                  Unable to load this record: {String(artifactQuery.error)}
+                </div>
+              ) : null}
+              {artifactQuery.data ? <ArtifactViewer artifact={artifactQuery.data} /> : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

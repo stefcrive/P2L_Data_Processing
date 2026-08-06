@@ -22,6 +22,25 @@ SaturationCorrectionMethod = Literal[
     "cycle_plateau",
 ]
 
+JobState = Literal["queued", "running", "succeeded", "failed", "cancel_requested", "cancelled"]
+
+
+class JobSnapshot(BaseModel):
+    job_id: str
+    kind: str
+    state: JobState
+    progress: float = Field(default=0.0, ge=0.0, le=100.0)
+    phase: str = "queued"
+    message: str = ""
+    session_id: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    revision: int = 0
+    cancellable: bool = True
+
 
 class SessionSnapshot(BaseModel):
     session_id: str
@@ -40,6 +59,10 @@ class SessionSnapshot(BaseModel):
 
 class ImportResult(BaseModel):
     session: SessionSnapshot
+
+
+class AutosaveSettingsUpdate(BaseModel):
+    enabled: bool
 
 
 class FilterConfig(BaseModel):
@@ -185,6 +208,7 @@ class ProcessingWorkspaceConfig(BaseModel):
     color_param: str = "Date"
     z_axis: str = "1  Cycle Int  Samp  44"
     species_name_map: dict[str, str] = Field(default_factory=dict)
+    identifier1_name_map: dict[str, str] = Field(default_factory=dict)
     apply_shared_linearity_to_partially_saturated: bool = True
     enable_saturation_correction: bool = False
     saturation_correction_method: SaturationCorrectionMethod = "reference_gas_intensity"
@@ -289,6 +313,7 @@ class ProcessingSummary(BaseModel):
 class ProcessingAvailableValues(BaseModel):
     identifiers: list[str] = Field(default_factory=list)
     export_identifiers: list[str] = Field(default_factory=list)
+    identifier1_sources: list[str] = Field(default_factory=list)
     species: list[str] = Field(default_factory=list)
     color_params: list[str] = Field(default_factory=list)
     z_axis_options: list[str] = Field(default_factory=list)

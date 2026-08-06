@@ -17,7 +17,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { DecimalInput } from "@/components/ui/decimal-input";
+import { DualRangeField } from "@/components/ui/dual-range-field";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
+import { PageHeader } from "@/components/ui/page-header";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type { CalibrationConfig, CalibrationPrecisionSummary, CycleDiagnosticsPayload, EditAction } from "@/lib/types";
@@ -333,11 +335,6 @@ function isSignalIntensityColumnLabel(label: string): boolean {
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
-}
-
-function parseFinite(value: string, fallback: number) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function computeHoverPreviewPosition(
@@ -1179,7 +1176,8 @@ function DiagnosticsPanel({
             <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
               <PlotlyChart
                 figure={diagnosticsFigure}
-                className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
+                className="mx-auto h-[clamp(320px,42vw,560px)] w-full max-w-[560px]"
+                fitContainer
                 deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
               />
               <div className="min-w-0">
@@ -1592,51 +1590,16 @@ function RangeSliderControl({
   const high = clampNumber(Math.max(value?.[0] ?? minBound, value?.[1] ?? maxBound), minBound, maxBound);
 
   return (
-    <div className="rounded-lg border border-stone-200 bg-white/80 p-4">
-      <div className="flex items-center justify-between gap-2">
-        <div className="text-sm font-medium tracking-normal text-stone-700">{label}</div>
-        <div className="text-xs text-stone-500">
-          {low.toFixed(precision)} to {high.toFixed(precision)}
-        </div>
-      </div>
-      <div className="mt-3 space-y-2">
-        <label className="block text-xs text-stone-600">
-          Min
-          <input
-            type="range"
-            min={minBound}
-            max={maxBound}
-            step={step}
-            value={low}
-            onInput={(event) => {
-              const nextLow = parseFinite(event.currentTarget.value, low);
-              onChange([Math.min(nextLow, high), high]);
-            }}
-            className="mt-1.5 w-full accent-stone-900"
-          />
-        </label>
-        <label className="block text-xs text-stone-600">
-          Max
-          <input
-            type="range"
-            min={minBound}
-            max={maxBound}
-            step={step}
-            value={high}
-            onInput={(event) => {
-              const nextHigh = parseFinite(event.currentTarget.value, high);
-              onChange([low, Math.max(nextHigh, low)]);
-            }}
-            className="mt-1.5 w-full accent-stone-900"
-          />
-        </label>
-      </div>
-      {bounds ? (
-        <div className="mt-2 text-xs text-stone-500">
-          Data bounds: {bounds[0].toFixed(precision)} to {bounds[1].toFixed(precision)}
-        </div>
-      ) : null}
-    </div>
+    <DualRangeField
+      label={label}
+      value={[low, high]}
+      min={minBound}
+      max={maxBound}
+      step={step}
+      precision={precision}
+      description={bounds ? "Data bounds" : undefined}
+      onChange={onChange}
+    />
   );
 }
 
@@ -1748,11 +1711,12 @@ export default function DiagnosticsPage() {
     staleTime: 60_000,
   });
   const editMutation = useMutation({
-    mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload),
+    mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload, []),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["diagnostics", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["diagnostics-selection-cycle", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-species-section", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
     },
   });
@@ -2278,15 +2242,21 @@ export default function DiagnosticsPage() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
-        <aside className="space-y-6 xl:sticky xl:top-6 xl:max-h-[calc(100vh-2rem)] xl:self-start xl:overflow-y-auto xl:pr-1">
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Measurement review"
+        title="Diagnostics"
+        description="Filter measurements, inspect cycle behavior, and investigate anomalies."
+        actions={<span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-[10px] text-slate-600">Rows {Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}</span>}
+      />
+      <div className="workspace-grid">
+        <aside className="control-column">
           <Card>
             <CardHeader>
               <CardTitle>Diagnostics Controls</CardTitle>
               <CardDescription>Configure filters and visual encoding for the diagnostics charts.</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-6">
+            <CardContent className="space-y-4">
               <div className="space-y-3">
                 <div className="form-section-title">Parameter Selection</div>
                 <label className="form-field">
@@ -2336,9 +2306,6 @@ export default function DiagnosticsPage() {
                 />
               </div>
 
-              <div className="text-xs font-medium tracking-normal text-stone-500">
-                Rows in scope: {Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}
-              </div>
             </CardContent>
           </Card>
           <Card>
@@ -2593,6 +2560,7 @@ export default function DiagnosticsPage() {
                 <PlotlyChart
                   figure={displayedDiagnosticsFigure}
                   className="h-full w-full"
+                  fitContainer
                   onPointClick={handleDiagnosticsPointClick}
                   onPointHover={handleDiagnosticsPointHover}
                   onHoverEnd={scheduleHoverPreviewHide}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 import base64
 from pathlib import Path
@@ -15,6 +16,16 @@ from services.irms_api.domain.calibration.core import convert_d18o_carbonate_mat
 from services.irms_api.domain.constants import ISOTYPE_D13C, VALID_CYCLES_COL
 from services.irms_api.domain.contracts import CalibrationConfig, CalibrationOfficialValueUpsertRequest, LinearityConfig
 from services.irms_api.session_store import FileSessionStore
+
+
+def wait_for_calibration_job(job_id: str, timeout: float = 10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snapshot = api_main.job_registry.get(job_id)
+        if snapshot.state in {"succeeded", "failed", "cancelled"}:
+            return snapshot
+        time.sleep(0.02)
+    raise AssertionError(f"Calibration job {job_id} did not finish")
 
 
 def sample_calibration_df() -> pd.DataFrame:
@@ -118,6 +129,8 @@ class CalibrationApiTests(unittest.TestCase):
         self.assertEqual(len(preview.precision_summaries), 2)
         self.assertEqual(len(preview.standard_sections), 2)
         self.assertEqual(len(preview.selected_standard_official_values), 4)
+        outlier_colorbar = preview.standard_sections[0].d13_figure["layout"]["coloraxis"]["colorbar"]
+        self.assertEqual(outlier_colorbar["title"]["side"], "right")
         self.assertIn(VALID_CYCLES_COL, preview.available_values.color_params)
         shpl2_summary = next(item for item in preview.precision_summaries if item.standard == "SHP2L")
         self.assertIn("1", shpl2_summary.line_precisions)
@@ -128,6 +141,26 @@ class CalibrationApiTests(unittest.TestCase):
 
         metadata = api_main.store.load_metadata(self.session_id)
         self.assertEqual(metadata.get("calibration", {}), {})
+
+    def test_calibration_background_job_persists_and_returns_snapshot(self) -> None:
+        submitted = api_main.submit_calibration_job(
+            self.session_id,
+            CalibrationConfig(
+                selected_standards=["SHP2L", "NBS19"],
+                calibration_type="IQR",
+                sigma_level=1.0,
+                iqr_multiplier=1.5,
+                independent_isotope_outliers=True,
+                color_param="Date_ordinal",
+                z_axis="1  Cycle Int  Samp  44",
+            ),
+        )
+        completed = wait_for_calibration_job(submitted.job_id)
+
+        self.assertEqual(completed.state, "succeeded", completed.error)
+        self.assertEqual(completed.result["session_id"], self.session_id)
+        metadata = api_main.store.load_metadata(self.session_id)
+        self.assertEqual(metadata["calibration"]["selected_standards"], ["SHP2L", "NBS19"])
 
     def test_set_calibration_linearity_config_persists_shared_linearity_parameters(self) -> None:
         api_main.run_calibration(

@@ -1,7 +1,7 @@
 "use client";
 
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, SearchCheck, X } from "lucide-react";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronRight, Download, SearchCheck, X } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
@@ -17,8 +17,10 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { DecimalInput } from "@/components/ui/decimal-input";
+import { DualRangeField } from "@/components/ui/dual-range-field";
+import { PageHeader } from "@/components/ui/page-header";
 import { Tooltip } from "@/components/ui/tooltip";
-import { api } from "@/lib/api";
+import { api, type JobSnapshot } from "@/lib/api";
 import type {
   CalibrationConfig,
   CalibrationPrecisionSummary,
@@ -32,6 +34,7 @@ import type {
   ProcessingLinearityPreviewData,
   ProcessingWorkspace,
   SaturationCorrectionMethod,
+  SpeciesSection,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
@@ -101,6 +104,7 @@ type LinearityCoefficientTerm = "primary" | "secondary";
 
 type ChartDisplayState = {
   hideCalibrated: boolean;
+  overlayStandards: boolean;
   hideSymbols: boolean;
   runningAverage: boolean;
   runningAveragePeriod: number;
@@ -135,14 +139,18 @@ type HoverPreviewState = {
 type ProcessingPreviewRowState = {
   rowLabel: string;
   identifier1: string;
+  identifier2: string;
   species: string;
   d13: number | null;
   d18: number | null;
   signal: number | null;
   leakRate: number | null;
   status: string;
+  d13CyclesExcluded: number | null;
+  d18CyclesExcluded: number | null;
 };
 type ProcessingPreviewMasks = {
+  rowsByLabel: Map<string, ProcessingPreviewRowState>;
   baseD13: Set<string>;
   baseD18: Set<string>;
   baseCross: Set<string>;
@@ -162,6 +170,7 @@ type ProcessingPreviewMasks = {
 type ProcessingPreviewRow = ProcessingLinearityPreviewData["rows"][number];
 const DEFAULT_CHART_DISPLAY_STATE: ChartDisplayState = {
   hideCalibrated: true,
+  overlayStandards: false,
   hideSymbols: false,
   runningAverage: false,
   runningAveragePeriod: 5,
@@ -178,6 +187,7 @@ const DEFAULT_PLOTLY_COLORWAY = [
   "#FF97FF",
   "#FECB52",
 ];
+const STANDARD_MEASURED_TRACE_PREFIX = "Standard measured ";
 const selectionSourceHighlightCache = new WeakMap<Record<string, unknown>, Map<string, Record<string, unknown> | undefined>>();
 
 function selectionDraftValueKey(rowLabel: string, isotopeKey: IsotopeKey): string {
@@ -1235,19 +1245,25 @@ function buildProcessingPreviewMasks(
   const overrides = (editState?.manual_outlier_overrides ?? {}) as Record<string, boolean>;
   const rows: ProcessingPreviewRowState[] = previewData.rows.map((row) => {
     const rowLabel = String(row.row_label);
+    const sourceIdentifier1 = String(row.identifier1 ?? "").trim();
+    const sourceSpecies = String(row.species ?? sourceIdentifier1).trim();
     return {
       rowLabel,
-      identifier1: String(row.identifier1 ?? "").trim(),
-      species: String(row.species ?? row.identifier1 ?? "").trim(),
+      identifier1: normalizeSpeciesLabel(config.identifier1_name_map?.[sourceIdentifier1] ?? sourceIdentifier1),
+      identifier2: String(row.identifier2 ?? "").trim(),
+      species: normalizeSpeciesLabel(config.species_name_map?.[sourceSpecies] ?? sourceSpecies),
       d13: previewValueForRow(row, "d13C", linearity, previewData, effectiveFits, "raw"),
       d18: previewValueForRow(row, "d18O", linearity, previewData, effectiveFits, "raw"),
       signal: finiteNumber(row.signal),
       leakRate: finiteNumber(row.leak_rate),
       status: String(row.collector_status ?? "").trim(),
+      d13CyclesExcluded: finiteNumber(row.d13_cycles_excluded),
+      d18CyclesExcluded: finiteNumber(row.d18_cycles_excluded),
     };
   });
 
   const masks: ProcessingPreviewMasks = {
+    rowsByLabel: new Map(rows.map((row) => [row.rowLabel, row])),
     baseD13: new Set(),
     baseD18: new Set(),
     baseCross: new Set(),
@@ -1348,6 +1364,60 @@ function buildProcessingPreviewMasks(
     }
   }
   return masks;
+}
+
+function previewMaskForOutlierTable(name: string, masks: ProcessingPreviewMasks): Set<string> | null {
+  const maskByName: Record<string, Set<string>> = {
+    Statistical: masks.statisticalCombined,
+    "d13C Range": masks.d13Range,
+    "d18O Range": masks.d18Range,
+    "Signal Intensity": masks.signal,
+    "Leak Rate": masks.leak,
+    "Partially Saturated Collectors": masks.partialExcluded,
+    "Fully Saturated Collectors": masks.full,
+    "Failed Sample": masks.failed,
+    "Manual Override": masks.manual,
+  };
+  return maskByName[name] ?? null;
+}
+
+function processingPreviewTableRow(row: ProcessingPreviewRowState): Record<string, unknown> {
+  return {
+    __row_label: row.rowLabel,
+    "Identifier 1": row.identifier1,
+    "Identifier 2": row.identifier2,
+    Species: row.species,
+    "d 13C/12C  Mean": row.d13,
+    "d 18O/16O  Mean": row.d18,
+    [LINEARITY_INTENSITY_SAMP44]: row.signal,
+    leak_rate: row.leakRate,
+    "Collector Status": row.status,
+    "d13C Cycles Excluded": row.d13CyclesExcluded,
+    "d18O Cycles Excluded": row.d18CyclesExcluded,
+  };
+}
+
+function applyPreviewMasksToOutlierTables(
+  tables: OutlierTable[],
+  masks: ProcessingPreviewMasks | null,
+  species?: string,
+): OutlierTable[] {
+  if (!masks) {
+    return tables;
+  }
+  const normalizedSpecies = species ? normalizeSpeciesLabel(species) : "";
+  return tables.map((table) => {
+    const mask = previewMaskForOutlierTable(table.name, masks);
+    if (!mask) {
+      return table;
+    }
+    const rows = Array.from(mask)
+      .map((rowLabel) => masks.rowsByLabel.get(rowLabel))
+      .filter((row): row is ProcessingPreviewRowState => Boolean(row))
+      .filter((row) => !normalizedSpecies || normalizeSpeciesLabel(row.species) === normalizedSpecies)
+      .map(processingPreviewTableRow);
+    return { ...table, rows };
+  });
 }
 
 function filterTraceVector(vector: unknown, keepIndexes: number[], sourceLength: number): unknown {
@@ -1465,13 +1535,14 @@ function applyProcessingConfigPreviewToFigure(
   const previewZValues: number[] = [];
   const nextData = cloned.data.map((trace) => {
     let nextTrace = trace;
-    if (rowLookup?.size) {
+    const isStandardMeasurementTrace = String(nextTrace.name ?? "").startsWith(STANDARD_MEASURED_TRACE_PREFIX);
+    if (rowLookup?.size && !isStandardMeasurementTrace) {
       const preview = applyProcessingChartOptionPreviewToTrace(nextTrace, config, rowLookup);
       nextTrace = preview.trace;
       previewZValues.push(...preview.zValues);
       changed = changed || nextTrace !== trace;
     }
-    if (!masks) {
+    if (!masks || isStandardMeasurementTrace) {
       return nextTrace;
     }
     const customdata = coerceVector(nextTrace.customdata);
@@ -1569,6 +1640,7 @@ function normalizeDisplayState(state?: Partial<ChartDisplayState> | null): Chart
     hideCalibrated: hasCurrentShape
       ? Boolean(state?.hideCalibrated || state?.rawOnly)
       : Boolean(state?.hideCalibrated || state?.rawOnly || DEFAULT_CHART_DISPLAY_STATE.hideCalibrated),
+    overlayStandards: Boolean(state?.overlayStandards),
     hideSymbols: Boolean(state?.hideSymbols),
     runningAverage: Boolean(state?.runningAverage),
     runningAveragePeriod: clampRunningAveragePeriod(state?.runningAveragePeriod),
@@ -1579,6 +1651,7 @@ function chartDisplayStateKey(state: ChartDisplayState): string {
   const display = normalizeDisplayState(state);
   return [
     display.hideCalibrated ? "hide-calibrated" : "show-calibrated",
+    display.overlayStandards ? "overlay-standards" : "hide-standards",
     display.hideSymbols ? "hide-symbols" : "show-symbols",
     display.runningAverage ? "running-average" : "no-running-average",
     String(display.runningAveragePeriod),
@@ -1708,6 +1781,9 @@ function applyDisplayState(
   if (display.hideCalibrated) {
     traces = traces.filter(({ trace }) => !String(trace.name ?? "").startsWith("Calibrated"));
   }
+  if (!display.overlayStandards) {
+    traces = traces.filter(({ trace }) => !String(trace.name ?? "").startsWith(STANDARD_MEASURED_TRACE_PREFIX));
+  }
   if (display.hideSymbols) {
     traces = traces
       .map(({ trace, index }) => {
@@ -1723,16 +1799,29 @@ function applyDisplayState(
       .filter((trace): trace is Record<string, unknown> => trace != null);
     displayTraces = [...displayTraces, ...averageTraces];
   }
-  return { ...cloned, data: displayTraces };
+  const yaxis2 = cloned.layout.yaxis2;
+  const layout =
+    yaxis2 && typeof yaxis2 === "object"
+      ? {
+          ...cloned.layout,
+          yaxis2: {
+            ...(yaxis2 as Record<string, unknown>),
+            visible: display.overlayStandards,
+          },
+        }
+      : cloned.layout;
+  return { ...cloned, data: displayTraces, layout };
 }
 
 function TraceModeControl({
   state,
   hasCalibrated,
+  hasStandards,
   onChange,
 }: {
   state: ChartDisplayState;
   hasCalibrated: boolean;
+  hasStandards: boolean;
   onChange: (patch: Partial<ChartDisplayState>) => void;
 }) {
   const display = normalizeDisplayState(state);
@@ -1751,6 +1840,16 @@ function TraceModeControl({
           className="h-4 w-4"
         />
         Hide calibrated
+      </label>
+      <label className={cn("inline-flex items-center gap-2 font-medium", hasStandards ? "text-stone-700" : "text-stone-400")}>
+        <input
+          type="checkbox"
+          checked={hasStandards && display.overlayStandards}
+          disabled={!hasStandards}
+          onChange={(event) => onChange({ overlayStandards: event.target.checked })}
+          className="h-4 w-4"
+        />
+        Overlay standards
       </label>
       <label className="inline-flex items-center gap-2 font-medium text-stone-700">
         <input
@@ -2529,6 +2628,10 @@ function nextSpeciesNameMap(current: Record<string, string> | undefined, source:
   return next;
 }
 
+function nextIdentifier1NameMap(current: Record<string, string> | undefined, source: string, target: string) {
+  return nextSpeciesNameMap(current, source, target);
+}
+
 function fallbackTargetValue(target: SelectedTarget, isotopeKey: IsotopeKey): number {
   if (target.isotopeKey === "cross") {
     const crossValue = isotopeKey === "d13C" ? target.currentD13 : target.currentD18;
@@ -2784,16 +2887,6 @@ function parseFinite(value: string, fallback: number) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function parseNumericDraft(value: string): number | null {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return null;
-  }
-  const normalized = trimmed.replace(",", ".");
-  const parsed = Number(normalized);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
 function computeHoverPreviewPosition(
   clientX: number,
   clientY: number,
@@ -2914,122 +3007,18 @@ function RangeSliderField({
   const resolvedMax = Math.max(min, max);
   const low = clampNumber(Math.min(value[0], value[1]), resolvedMin, resolvedMax);
   const high = clampNumber(Math.max(value[0], value[1]), resolvedMin, resolvedMax);
-  const [lowDraft, setLowDraft] = useState(low.toFixed(precision));
-  const [highDraft, setHighDraft] = useState(high.toFixed(precision));
-
-  useEffect(() => {
-    setLowDraft(low.toFixed(precision));
-  }, [low, precision]);
-
-  useEffect(() => {
-    setHighDraft(high.toFixed(precision));
-  }, [high, precision]);
-
-  const commitLowDraft = () => {
-    const parsed = parseNumericDraft(lowDraft);
-    if (parsed == null) {
-      setLowDraft(low.toFixed(precision));
-      return;
-    }
-    const nextLow = clampNumber(parsed, resolvedMin, high);
-    onChange([nextLow, high]);
-  };
-
-  const commitHighDraft = () => {
-    const parsed = parseNumericDraft(highDraft);
-    if (parsed == null) {
-      setHighDraft(high.toFixed(precision));
-      return;
-    }
-    const nextHigh = clampNumber(parsed, low, resolvedMax);
-    onChange([low, nextHigh]);
-  };
 
   return (
-    <div className="rounded-lg border border-stone-200 bg-white p-3 text-sm">
-      <div className="flex items-center justify-between gap-2">
-        <span className="font-medium text-stone-700">{label}</span>
-        <span className="text-xs text-stone-500">
-          {low.toFixed(precision)} to {high.toFixed(precision)}
-        </span>
-      </div>
-      <div className="mt-3 space-y-2">
-        <label className="block text-xs text-stone-600">
-          Min
-          <div className={cn("mt-1", showManualInputs ? "flex items-center gap-2" : "block")}>
-            <input
-              type="range"
-              min={resolvedMin}
-              max={resolvedMax}
-              step={step}
-              value={low}
-              onInput={(event) => {
-                const nextLow = parseFinite(event.currentTarget.value, low);
-                onChange([Math.min(nextLow, high), high]);
-              }}
-              className={cn("w-full accent-stone-700", showManualInputs ? "min-w-0 flex-1" : "")}
-            />
-            {showManualInputs ? (
-              <input
-                type="number"
-                min={resolvedMin}
-                max={high}
-                step={step}
-                value={lowDraft}
-                onChange={(event) => setLowDraft(event.currentTarget.value)}
-                onBlur={commitLowDraft}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.currentTarget.blur();
-                  }
-                }}
-                className="w-20 shrink-0 rounded border border-stone-300 px-2 py-1 text-right text-xs text-stone-700"
-                aria-label={`${label} minimum value`}
-              />
-            ) : null}
-          </div>
-        </label>
-        <label className="block text-xs text-stone-600">
-          Max
-          <div className={cn("mt-1", showManualInputs ? "flex items-center gap-2" : "block")}>
-            <input
-              type="range"
-              min={resolvedMin}
-              max={resolvedMax}
-              step={step}
-              value={high}
-              onInput={(event) => {
-                const nextHigh = parseFinite(event.currentTarget.value, high);
-                onChange([low, Math.max(nextHigh, low)]);
-              }}
-              className={cn("w-full accent-stone-700", showManualInputs ? "min-w-0 flex-1" : "")}
-            />
-            {showManualInputs ? (
-              <input
-                type="number"
-                min={low}
-                max={resolvedMax}
-                step={step}
-                value={highDraft}
-                onChange={(event) => setHighDraft(event.currentTarget.value)}
-                onBlur={commitHighDraft}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.currentTarget.blur();
-                  }
-                }}
-                className="w-20 shrink-0 rounded border border-stone-300 px-2 py-1 text-right text-xs text-stone-700"
-                aria-label={`${label} maximum value`}
-              />
-            ) : null}
-          </div>
-        </label>
-      </div>
-      <div className="mt-2 flex items-center justify-between text-[11px] text-stone-400">
-        <span>{resolvedMin.toFixed(precision)}</span>
-        <span>{resolvedMax.toFixed(precision)}</span>
-      </div>
-    </div>
+    <DualRangeField
+      label={label}
+      value={[low, high]}
+      min={resolvedMin}
+      max={resolvedMax}
+      step={step}
+      precision={precision}
+      className={showManualInputs ? "bg-white" : undefined}
+      onChange={onChange}
+    />
   );
 }
 
@@ -3527,10 +3516,14 @@ function OutlierTablesPanel({
   title,
   tables,
   renderTableControls,
+  defaultOpen = false,
+  isPreview = false,
 }: {
   title: string;
   tables: OutlierTable[];
   renderTableControls?: (table: OutlierTable, context: { selectedRowLabels: string[] }) => ReactNode;
+  defaultOpen?: boolean;
+  isPreview?: boolean;
 }) {
   const [selectedRowsByTable, setSelectedRowsByTable] = useState<Record<string, string[]>>({});
 
@@ -3539,21 +3532,35 @@ function OutlierTablesPanel({
   }, [tables]);
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-        <CardDescription>Backend-generated outlier tables for the current processing workspace.</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
+    <details open={defaultOpen} className="group rounded-lg border border-stone-200 bg-white shadow-sm">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <ChevronRight className="h-4 w-4 shrink-0 text-blue-600 transition-transform group-open:rotate-90" aria-hidden="true" />
+          <div>
+            <div className="text-sm font-semibold text-stone-900">{title}</div>
+            <div className="text-xs text-stone-500">
+              {isPreview ? "Live preview from unsaved processing controls." : "Outlier categories and review actions."}
+            </div>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {isPreview ? <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">Preview</span> : null}
+          <span className="rounded-md bg-stone-100 px-2 py-1 text-xs font-medium text-stone-600">
+            {tables.reduce((total, table) => total + table.rows.length, 0)} rows
+          </span>
+        </div>
+      </summary>
+      <div className="space-y-3 border-t border-stone-200 p-4">
         {tables.length ? (
           tables.map((table, tableIndex) => {
             const tableKey = `${table.title ?? table.name}:${tableIndex}`;
             const failedSampleTable = isFailedSampleOutlierTable(table);
             const selectedRowLabels = selectedRowsByTable[tableKey] ?? [];
             return (
-              <details key={table.title ?? table.name} className="rounded-lg border border-stone-200 bg-white p-3">
-                <summary className="cursor-pointer text-sm font-medium text-stone-800">
-                  {table.title ?? table.name} ({table.rows.length})
+              <details open key={table.title ?? table.name} className="rounded-lg border border-stone-200 bg-white p-3">
+                <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-medium text-stone-800">
+                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-400" aria-hidden="true" />
+                  <span>{table.title ?? table.name} ({table.rows.length})</span>
                 </summary>
                 <div className="mt-3">
                   <DataTable
@@ -3582,8 +3589,8 @@ function OutlierTablesPanel({
         ) : (
           <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">No outlier tables returned for this scope.</div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </details>
   );
 }
 
@@ -3629,15 +3636,20 @@ function CheckboxField({
 function ProcessingSummaryHero({
   workspace,
   speciesNameMap,
+  identifier1NameMap,
   onSpeciesNameMapChange,
+  onIdentifier1NameMapChange,
   disabled = false,
 }: {
   workspace: ProcessingWorkspace;
   speciesNameMap: Record<string, string>;
+  identifier1NameMap: Record<string, string>;
   onSpeciesNameMapChange: (source: string, target: string) => void;
+  onIdentifier1NameMapChange: (source: string, target: string) => void;
   disabled?: boolean;
 }) {
   const [speciesDrafts, setSpeciesDrafts] = useState<Record<string, string>>({});
+  const [identifier1Drafts, setIdentifier1Drafts] = useState<Record<string, string>>({});
   const speciesRows = useMemo(() => {
     const labels = new Set<string>();
     for (const value of workspace.available_values.species ?? []) {
@@ -3657,10 +3669,33 @@ function ProcessingSummaryHero({
   const renamedSpeciesCount = Object.entries(speciesNameMap ?? {}).filter(
     ([source, target]) => normalizeSpeciesLabel(source) && normalizeSpeciesLabel(target) && normalizeSpeciesLabel(source) !== normalizeSpeciesLabel(target),
   ).length;
+  const identifier1Rows = useMemo(() => {
+    const labels = new Set<string>();
+    for (const value of workspace.available_values.identifier1_sources ?? []) {
+      const label = normalizeSpeciesLabel(String(value));
+      if (label) {
+        labels.add(label);
+      }
+    }
+    for (const value of Object.keys(identifier1NameMap ?? {})) {
+      const label = normalizeSpeciesLabel(value);
+      if (label) {
+        labels.add(label);
+      }
+    }
+    return Array.from(labels).sort((a, b) => a.localeCompare(b));
+  }, [identifier1NameMap, workspace.available_values.identifier1_sources]);
+  const renamedIdentifier1Count = Object.entries(identifier1NameMap ?? {}).filter(
+    ([source, target]) => normalizeSpeciesLabel(source) && normalizeSpeciesLabel(target) && normalizeSpeciesLabel(source) !== normalizeSpeciesLabel(target),
+  ).length;
 
   useEffect(() => {
     setSpeciesDrafts({});
   }, [speciesNameMap, workspace.available_values.species]);
+
+  useEffect(() => {
+    setIdentifier1Drafts({});
+  }, [identifier1NameMap, workspace.available_values.identifier1_sources]);
 
   if (!workspace.summary.metrics.length) {
     return null;
@@ -3674,111 +3709,202 @@ function ProcessingSummaryHero({
   ];
 
   return (
-    <Card className="border-stone-200 bg-white/90">
-      <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-        <div>
-          <CardTitle>Processing Summary</CardTitle>
-          <CardDescription>Detailed backend metrics used to build the current workspace state.</CardDescription>
+    <section className="overflow-hidden rounded-lg border border-stone-200 bg-white shadow-sm" aria-labelledby="processing-summary-title">
+      <div className="flex flex-col gap-2 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex items-center gap-3">
+          <div>
+            <h2 id="processing-summary-title" className="text-sm font-semibold text-stone-900">
+              Processing summary
+            </h2>
+            <div className="text-xs text-stone-500">Metrics, species naming, and sample identifiers.</div>
+          </div>
         </div>
-        <div className="flex flex-wrap gap-2 text-sm text-stone-600">
+        <div className="flex flex-wrap gap-1.5 text-xs text-stone-600">
           {summaryBadges.map((badge) => (
-            <span key={badge.label} className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
-              {badge.label}: {String(badge.value)}
+            <span key={badge.label} className="rounded-md bg-stone-100 px-2 py-1">
+              {badge.label} <strong className="font-semibold text-stone-800">{String(badge.value)}</strong>
             </span>
           ))}
         </div>
-      </CardHeader>
-      <CardContent className="pt-0">
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      </div>
+      <div className="border-t border-stone-200">
+        <div className="grid divide-y divide-stone-200 sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-4">
           {workspace.summary.metrics.map((metric) => (
-            <div key={metric.metric} className="rounded-lg border border-stone-200 bg-stone-50/70 px-4 py-3">
-              <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">{metric.metric}</div>
-              <div className="mt-1 text-2xl font-semibold text-stone-900">{String(metric.value)}</div>
-              <div className="mt-1 text-xs text-stone-600">{metric.details}</div>
+            <div key={metric.metric} className="min-w-0 px-3 py-2.5">
+              <div className="truncate text-[10px] font-semibold uppercase tracking-wide text-stone-500" title={metric.metric}>
+                {metric.metric}
+              </div>
+              <div className="mt-0.5 text-lg font-semibold leading-tight text-stone-900">{String(metric.value)}</div>
+              <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-stone-500" title={metric.details}>
+                {metric.details}
+              </div>
             </div>
           ))}
         </div>
-        {speciesRows.length ? (
-          <div className="mt-4 rounded-lg border border-stone-200 bg-white">
-            <div className="flex flex-col gap-2 border-b border-stone-200 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        {speciesRows.length || identifier1Rows.length ? (
+          <section className="border-t border-stone-200" aria-labelledby="species-names-title">
+            <div className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <div className="text-sm font-semibold text-stone-900">Species names</div>
-                <div className="text-xs text-stone-500">Corrected names are used for processing groups, charts, tables, and exports.</div>
+                <h3 id="species-names-title" className="text-sm font-semibold text-stone-900">
+                  Species and Identifier 1 names
+                </h3>
+                <div className="text-xs text-stone-500">Define the names used across groups, charts, tables, filters, and exports.</div>
               </div>
-              <span className="w-fit rounded-md bg-stone-50 px-2.5 py-1 text-xs text-stone-600 ring-1 ring-stone-200">
-                {renamedSpeciesCount} renamed
-              </span>
+              <div className="flex flex-wrap gap-1.5">
+                <span className="w-fit rounded-md bg-stone-50 px-2.5 py-1 text-xs text-stone-600 ring-1 ring-stone-200">
+                  {renamedSpeciesCount} species renamed
+                </span>
+                <span className="w-fit rounded-md bg-stone-50 px-2.5 py-1 text-xs text-stone-600 ring-1 ring-stone-200">
+                  {renamedIdentifier1Count} identifiers renamed
+                </span>
+              </div>
             </div>
-            <div className="divide-y divide-stone-100">
-              {speciesRows.map((source) => {
-                const savedTarget = speciesNameMap[source] ?? source;
-                const draftTarget = speciesDrafts[source] ?? savedTarget;
-                const isRenamed = normalizeSpeciesLabel(savedTarget) !== source;
-                const commitDraft = () => {
-                  const nextTarget = speciesDrafts[source] ?? savedTarget;
-                  onSpeciesNameMapChange(source, nextTarget);
-                };
-                return (
-                  <div key={source} className="grid gap-2 px-4 py-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
-                    <div className="min-w-0">
-                      <div className="text-xs font-medium uppercase tracking-normal text-stone-500">Source</div>
-                      <div className="truncate text-sm text-stone-800" title={source}>
-                        {source}
+            {speciesRows.length ? (
+              <div className="divide-y divide-stone-100 border-t border-stone-200">
+                <div className="bg-stone-50 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-stone-600">
+                  Species name
+                </div>
+                {speciesRows.map((source) => {
+                  const savedTarget = speciesNameMap[source] ?? source;
+                  const draftTarget = speciesDrafts[source] ?? savedTarget;
+                  const isRenamed = normalizeSpeciesLabel(savedTarget) !== source;
+                  const commitDraft = () => {
+                    const nextTarget = speciesDrafts[source] ?? savedTarget;
+                    onSpeciesNameMapChange(source, nextTarget);
+                  };
+                  return (
+                    <div key={source} className="grid gap-2 px-4 py-2.5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
+                      <div className="min-w-0">
+                        <div className="text-xs font-medium uppercase tracking-normal text-stone-500">Source</div>
+                        <div className="truncate text-sm text-stone-800" title={source}>
+                          {source}
+                        </div>
                       </div>
-                    </div>
-                    <label className="min-w-0 text-sm">
-                      <span className="sr-only">Corrected species name for {source}</span>
-                      <input
-                        type="text"
-                        value={draftTarget}
-                        disabled={disabled}
-                        onChange={(event) =>
-                          setSpeciesDrafts((current) => ({
-                            ...current,
-                            [source]: event.target.value,
-                          }))
-                        }
-                        onBlur={commitDraft}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") {
-                            event.preventDefault();
-                            commitDraft();
-                            event.currentTarget.blur();
+                      <label className="min-w-0 text-sm">
+                        <span className="mb-1 block text-xs font-medium text-stone-500">Defined species name</span>
+                        <input
+                          type="text"
+                          value={draftTarget}
+                          disabled={disabled}
+                          onChange={(event) =>
+                            setSpeciesDrafts((current) => ({
+                              ...current,
+                              [source]: event.target.value,
+                            }))
                           }
-                          if (event.key === "Escape") {
-                            event.preventDefault();
-                            setSpeciesDrafts((current) => {
-                              const next = { ...current };
-                              delete next[source];
-                              return next;
-                            });
-                            event.currentTarget.blur();
-                          }
+                          onBlur={commitDraft}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitDraft();
+                              event.currentTarget.blur();
+                            }
+                            if (event.key === "Escape") {
+                              event.preventDefault();
+                              setSpeciesDrafts((current) => {
+                                const next = { ...current };
+                                delete next[source];
+                                return next;
+                              });
+                              event.currentTarget.blur();
+                            }
+                          }}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm disabled:cursor-not-allowed disabled:bg-stone-100"
+                        />
+                      </label>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={disabled || !isRenamed}
+                        onClick={() => {
+                          setSpeciesDrafts((current) => ({ ...current, [source]: source }));
+                          onSpeciesNameMapChange(source, source);
                         }}
-                        className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm disabled:cursor-not-allowed disabled:bg-stone-100"
-                      />
-                    </label>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={disabled || !isRenamed}
-                      onClick={() => {
-                        setSpeciesDrafts((current) => ({ ...current, [source]: source }));
-                        onSpeciesNameMapChange(source, source);
-                      }}
-                    >
-                      <X className="h-4 w-4" />
-                      Reset
-                    </Button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+                      >
+                        <X className="h-4 w-4" />
+                        Reset
+                      </Button>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+            {identifier1Rows.length ? (
+              <div className="divide-y divide-stone-100 border-t border-stone-200">
+                <div className="bg-stone-50 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-stone-600">
+                  Identifier 1
+                </div>
+                {identifier1Rows.map((source) => {
+                  const savedTarget = identifier1NameMap[source] ?? source;
+                  const draftTarget = identifier1Drafts[source] ?? savedTarget;
+                  const isRenamed = normalizeSpeciesLabel(savedTarget) !== source;
+                  const commitDraft = () => {
+                    const nextTarget = identifier1Drafts[source] ?? savedTarget;
+                    onIdentifier1NameMapChange(source, nextTarget);
+                  };
+                  return (
+                    <div key={source} className="grid gap-2 px-4 py-2.5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
+                      <div className="min-w-0">
+                        <div className="text-xs font-medium uppercase tracking-normal text-stone-500">Source</div>
+                        <div className="truncate text-sm text-stone-800" title={source}>
+                          {source}
+                        </div>
+                      </div>
+                      <label className="min-w-0 text-sm">
+                        <span className="mb-1 block text-xs font-medium text-stone-500">Defined Identifier 1</span>
+                        <input
+                          type="text"
+                          value={draftTarget}
+                          disabled={disabled}
+                          onChange={(event) =>
+                            setIdentifier1Drafts((current) => ({
+                              ...current,
+                              [source]: event.target.value,
+                            }))
+                          }
+                          onBlur={commitDraft}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitDraft();
+                              event.currentTarget.blur();
+                            }
+                            if (event.key === "Escape") {
+                              event.preventDefault();
+                              setIdentifier1Drafts((current) => {
+                                const next = { ...current };
+                                delete next[source];
+                                return next;
+                              });
+                              event.currentTarget.blur();
+                            }
+                          }}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm disabled:cursor-not-allowed disabled:bg-stone-100"
+                        />
+                      </label>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={disabled || !isRenamed}
+                        onClick={() => {
+                          setIdentifier1Drafts((current) => ({ ...current, [source]: source }));
+                          onIdentifier1NameMapChange(source, source);
+                        }}
+                      >
+                        <X className="h-4 w-4" />
+                        Reset
+                      </Button>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </section>
         ) : null}
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }
 
@@ -4093,6 +4219,7 @@ function FigureCard({
   headerActions,
   cardClassName,
   chartClassName,
+  fitContainer = false,
   onPointClick,
   onSelection,
   onPointHover,
@@ -4105,13 +4232,14 @@ function FigureCard({
   headerActions?: ReactNode;
   cardClassName?: string;
   chartClassName?: string;
+  fitContainer?: boolean;
   onPointClick?: (points: PlotlyPoint[]) => void;
   onSelection?: (points: PlotlyPoint[]) => void;
   onPointHover?: (payload: PlotlyHoverPayload) => void;
   onHoverEnd?: () => void;
 }) {
   return (
-    <Card className={cardClassName}>
+    <Card className={cn("min-w-0 overflow-hidden", cardClassName)}>
       <CardHeader className="gap-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <CardTitle className="text-base">{title}</CardTitle>
@@ -4119,10 +4247,11 @@ function FigureCard({
         </div>
         <CardDescription>{description}</CardDescription>
       </CardHeader>
-      <CardContent>
+      <CardContent className="min-w-0 overflow-hidden">
         <PlotlyChart
           figure={figure}
           className={chartClassName ?? "min-h-[340px]"}
+          fitContainer={fitContainer}
           uiRevision={chartKey ? `processing:${chartKey}` : undefined}
           onPointClick={onPointClick}
           onSelection={onSelection}
@@ -4138,6 +4267,8 @@ export default function ProcessingPage() {
   const sessionId = useSessionStore((state) => state.sessionId);
   const queryClient = useQueryClient();
   const [config, setConfig] = useState<ProcessingConfig | null>(null);
+  const [activeBackgroundJob, setActiveBackgroundJob] = useState<JobSnapshot<unknown> | null>(null);
+  const [backgroundJobError, setBackgroundJobError] = useState<string | null>(null);
   const [sharedLinearityConfig, setSharedLinearityConfig] = useState<CalibrationConfig["linearity"] | null>(null);
   const [commentMapText, setCommentMapText] = useState("");
   const [selectedTargets, setSelectedTargets] = useState<SelectedTarget[]>([]);
@@ -4186,6 +4317,7 @@ export default function ProcessingPage() {
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
   const preserveLinearityPreviewOnWorkspaceUpdateRef = useRef(false);
+  const speciesDefaultsSessionRef = useRef<string | null>(null);
   const colorScaleFigureCacheRef = useRef<
     WeakMap<Record<string, unknown>, { rangeKey: string; figure: Record<string, unknown> | undefined }>
   >(new WeakMap());
@@ -4193,13 +4325,23 @@ export default function ProcessingPage() {
     new WeakMap(),
   );
   const openSpeciesSectionList = useMemo(() => Array.from(openSpeciesSections).sort(), [openSpeciesSections]);
-  const openSpeciesSectionKey = useMemo(() => openSpeciesSectionList.join("||"), [openSpeciesSectionList]);
 
   const workspaceQuery = useQuery({
-    queryKey: ["processing-workspace", sessionId, openSpeciesSectionKey],
-    queryFn: ({ signal }) => api.getProcessingWorkspace(sessionId!, openSpeciesSectionList, signal),
+    queryKey: ["processing-workspace", sessionId],
+    queryFn: ({ signal }) => api.getProcessingWorkspace(sessionId!, [], signal),
     enabled: Boolean(sessionId),
-    placeholderData: keepPreviousData,
+  });
+  const speciesSectionQueryState = useQueries({
+    queries: openSpeciesSectionList.map((species) => ({
+      queryKey: ["processing-species-section", sessionId, species],
+      queryFn: ({ signal }: { signal: AbortSignal }) => api.getProcessingSpeciesSection(sessionId!, species, signal),
+      enabled: Boolean(sessionId),
+    })),
+    combine: (results) => ({
+      sections: results.map((result) => result.data),
+      fetching: results.map((result) => result.isFetching),
+      errors: results.map((result) => result.error),
+    }),
   });
   const calibrationWorkspaceQuery = useQuery({
     queryKey: ["calibration-workspace", sessionId],
@@ -4228,6 +4370,14 @@ export default function ProcessingPage() {
       }
     }
   }, [workspaceQuery.data]);
+
+  useEffect(() => {
+    if (!workspaceQuery.data || !sessionId || speciesDefaultsSessionRef.current === sessionId) {
+      return;
+    }
+    speciesDefaultsSessionRef.current = sessionId;
+    setOpenSpeciesSections(new Set(workspaceQuery.data.species_sections.map((section) => section.species)));
+  }, [sessionId, workspaceQuery.data]);
 
   useEffect(() => {
     if (calibrationWorkspaceQuery.data?.config?.linearity) {
@@ -4291,10 +4441,15 @@ export default function ProcessingPage() {
     window.sessionStorage.setItem(`processing-display-state:${sessionId}`, JSON.stringify(displayState));
   }, [displayState, sessionId]);
 
+  function storeBaseProcessingWorkspace(workspace: ProcessingWorkspace) {
+    queryClient.setQueryData(["processing-workspace", sessionId], workspace);
+    void queryClient.invalidateQueries({ queryKey: ["processing-species-section", sessionId] });
+  }
+
   const saveConfigMutation = useMutation({
-    mutationFn: (nextConfig: ProcessingConfig) => api.setProcessingConfig(sessionId!, nextConfig, openSpeciesSectionList),
+    mutationFn: (nextConfig: ProcessingConfig) => api.setProcessingConfigJob(sessionId!, nextConfig, setActiveBackgroundJob),
     onSuccess: (workspace) => {
-      queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
+      storeBaseProcessingWorkspace(workspace);
       setConfig(workspace.config);
       if (!preserveLinearityPreviewOnWorkspaceUpdateRef.current) {
         setLinearityPreviewStale(false);
@@ -4302,6 +4457,7 @@ export default function ProcessingPage() {
       }
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
     },
+    onSettled: () => setActiveBackgroundJob(null),
   });
   const saveSharedLinearityMutation = useMutation({
     mutationFn: (nextLinearity: CalibrationConfig["linearity"]) =>
@@ -4337,9 +4493,9 @@ export default function ProcessingPage() {
   });
 
   const editMutation = useMutation({
-    mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload, openSpeciesSectionList),
+    mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload, []),
     onSuccess: (workspace) => {
-      queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
+      storeBaseProcessingWorkspace(workspace);
       queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       setLinearityPreviewStale(false);
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
@@ -4352,10 +4508,10 @@ export default function ProcessingPage() {
   });
 
   const commitSelectionDraftsMutation = useMutation({
-    mutationFn: (drafts: EditAction[]) => api.editProcessingBatch(sessionId!, drafts, openSpeciesSectionList),
+    mutationFn: (drafts: EditAction[]) => api.editProcessingBatchJob(sessionId!, drafts, setActiveBackgroundJob),
     onSuccess: (workspace) => {
       if (workspace) {
-        queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
+        storeBaseProcessingWorkspace(workspace);
       }
       queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       setLinearityPreviewStale(false);
@@ -4363,6 +4519,10 @@ export default function ProcessingPage() {
       setSelectionDraftEdits([]);
       setSelectionDraftValues({});
     },
+    onSettled: () => setActiveBackgroundJob(null),
+  });
+  const cancelBackgroundJobMutation = useMutation({
+    mutationFn: (jobId: string) => api.cancelJob(jobId),
   });
 
   const resetAllMutation = useMutation({
@@ -4370,9 +4530,9 @@ export default function ProcessingPage() {
       api.editProcessing(sessionId!, {
         action: "reset_all",
         targets: [],
-      }, openSpeciesSectionList),
+      }, []),
     onSuccess: (workspace) => {
-      queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
+      storeBaseProcessingWorkspace(workspace);
       setLinearityPreviewStale(false);
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       setSelectionDraftEdits([]);
@@ -4384,9 +4544,9 @@ export default function ProcessingPage() {
   });
 
   const removeCalibrationMutation = useMutation({
-    mutationFn: () => api.removeProcessingCalibration(sessionId!, openSpeciesSectionList),
+    mutationFn: () => api.removeProcessingCalibration(sessionId!, []),
     onSuccess: (workspace) => {
-      queryClient.setQueryData(["processing-workspace", sessionId, openSpeciesSectionKey], workspace);
+      storeBaseProcessingWorkspace(workspace);
       setConfig(workspace.config);
       setLinearityPreviewStale(false);
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
@@ -4550,6 +4710,27 @@ export default function ProcessingPage() {
   const activeConfig = config ?? savedWorkspace?.config ?? null;
   const hasPendingProcessingConfigChanges = Boolean(activeConfig && savedWorkspace?.config && !configEquals(activeConfig, savedWorkspace.config));
   const workspace = savedWorkspace;
+  const speciesSectionStateBySpecies = useMemo(() => {
+    const state = new Map<
+      string,
+      { section: SpeciesSection | undefined; isFetching: boolean; error: Error | null }
+    >();
+    openSpeciesSectionList.forEach((species, index) => {
+      state.set(species, {
+        section: speciesSectionQueryState.sections[index],
+        isFetching: speciesSectionQueryState.fetching[index] ?? false,
+        error: speciesSectionQueryState.errors[index] ?? null,
+      });
+    });
+    return state;
+  }, [openSpeciesSectionList, speciesSectionQueryState]);
+  const resolvedSpeciesSections = useMemo(
+    () =>
+      (workspace?.species_sections ?? []).map(
+        (section) => speciesSectionStateBySpecies.get(section.species)?.section ?? section,
+      ),
+    [speciesSectionStateBySpecies, workspace?.species_sections],
+  );
   const hasUnsavedNavigationChanges = Boolean(
     hasPendingProcessingConfigChanges ||
       (sharedLinearityConfig &&
@@ -4609,7 +4790,7 @@ export default function ProcessingPage() {
       workspace.overview_figures.d13_summary,
       workspace.overview_figures.d18_summary,
     ];
-    for (const section of workspace.species_sections) {
+    for (const section of resolvedSpeciesSections) {
       if (!openSpeciesSections.has(section.species)) {
         continue;
       }
@@ -4617,8 +4798,20 @@ export default function ProcessingPage() {
         figures.push(figureSet.d13c, figureSet.d18o);
       }
     }
-    return figures;
-  }, [openSpeciesSections, workspace]);
+    if (!hasPendingProcessingConfigChanges || !activeConfig) {
+      return figures;
+    }
+    return figures.map((figure) =>
+      applyProcessingConfigPreviewToFigure(figure, null, activeConfig, processingPreviewRowLookup),
+    );
+  }, [
+    activeConfig,
+    hasPendingProcessingConfigChanges,
+    openSpeciesSections,
+    processingPreviewRowLookup,
+    resolvedSpeciesSections,
+    workspace,
+  ]);
   const colorScaleBounds = useMemo(() => deriveColorScaleBounds(colorScaleFigures), [colorScaleFigures]);
   const colorScaleTwoSigmaRange = useMemo(() => {
     if (!colorScaleBounds) {
@@ -4661,7 +4854,7 @@ export default function ProcessingPage() {
     colorSliderBounds,
   );
   const colorScaleRangeKey = effectiveColorScaleRange
-    ? `${effectiveColorScaleRange[0]}:${effectiveColorScaleRange[1]}`
+    ? `${activeConfig?.color_param ?? "color"}:${effectiveColorScaleRange[0]}:${effectiveColorScaleRange[1]}`
     : "none";
   const withColorScaleRange = useMemo(() => {
     const range = effectiveColorScaleRange;
@@ -5273,19 +5466,30 @@ export default function ProcessingPage() {
     if (!sessionId || !activeConfig) {
       return;
     }
-    await applyConfig();
-    const { blob, filename } = await api.exportDataset(sessionId, buildExportRequestPayload(outputType));
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download =
-      filename ??
-      (outputType === "client_output" ? "client_output.xlsx" : workspace?.export_state.filename ?? "dataset.xlsx");
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
-    setExportModalOpen(false);
+    setBackgroundJobError(null);
+    try {
+      await applyConfig();
+      const { blob, filename } = await api.exportDataset(
+        sessionId,
+        buildExportRequestPayload(outputType),
+        setActiveBackgroundJob,
+      );
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download =
+        filename ??
+        (outputType === "client_output" ? "client_output.xlsx" : workspace?.export_state.filename ?? "dataset.xlsx");
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setExportModalOpen(false);
+    } catch (error) {
+      setBackgroundJobError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setActiveBackgroundJob(null);
+    }
   }
 
   async function handleDuplicateCheck() {
@@ -5535,7 +5739,12 @@ export default function ProcessingPage() {
     editMutation.isPending ||
     resetAllMutation.isPending ||
     removeCalibrationMutation.isPending ||
-    duplicateCheckMutation.isPending;
+    duplicateCheckMutation.isPending ||
+    activeBackgroundJob != null;
+  const processingOperationError =
+    backgroundJobError ??
+    (saveConfigMutation.error instanceof Error ? saveConfigMutation.error.message : null) ??
+    (commitSelectionDraftsMutation.error instanceof Error ? commitSelectionDraftsMutation.error.message : null);
   const savedLinearity = calibrationWorkspaceQuery.data?.config.linearity ?? null;
   const activeLinearity = sharedLinearityConfig ?? savedLinearity;
   const previewLinearity = linearityPreviewConfig ?? activeLinearity;
@@ -5556,6 +5765,16 @@ export default function ProcessingPage() {
   const processingPreviewMasks = hasPendingProcessingConfigChanges
     ? buildProcessingPreviewMasks(linearityPreviewDataQuery.data, previewLinearity, activeConfig, workspace.edit_state)
     : null;
+  const displayedDataOutlierTables = applyPreviewMasksToOutlierTables(
+    workspace.outlier_tables,
+    processingPreviewMasks,
+  );
+  const displayedSpeciesOutlierTables = new Map(
+    resolvedSpeciesSections.map((section) => [
+      section.species,
+      applyPreviewMasksToOutlierTables(section.outlier_tables, processingPreviewMasks, section.species),
+    ]),
+  );
   const applyPreviewFigure = (figure: Record<string, unknown> | undefined) => {
     const linearityFigure = shouldApplyLinearityPreview
       ? applyLinearityPreviewToFigure(figure, linearityPreviewDataQuery.data, previewLinearity, activeConfig)
@@ -5768,31 +5987,33 @@ export default function ProcessingPage() {
       key: "processing_3d",
       title: "3D Processing Overview",
       description: "Global 3D view for the filtered processing scope.",
-      figure: applyPreviewFigure(withColorScaleRange(workspace.overview_figures.processing_3d)),
+      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.processing_3d)),
     },
     d13Summary: {
       key: "d13_summary",
       title: "d13C Summary",
       description: "Summary curve for d13C across the active scope.",
-      figure: applyPreviewFigure(withColorScaleRange(workspace.overview_figures.d13_summary)),
+      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.d13_summary)),
     },
     d18Summary: {
       key: "d18_summary",
       title: "d18O Summary",
       description: "Summary curve for d18O across the active scope.",
-      figure: applyPreviewFigure(withColorScaleRange(workspace.overview_figures.d18_summary)),
+      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.d18_summary)),
     },
     crossplot: {
       key: "crossplot",
       title: "Crossplot",
       description: "d13C vs d18O selection surface for dual-isotope edits.",
-      figure: applyPreviewFigure(withColorScaleRange(workspace.overview_figures.crossplot)),
+      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.crossplot)),
     },
   };
   const d13SummaryState = normalizeDisplayState(displayState[overviewCards.d13Summary.key]);
   const d18SummaryState = normalizeDisplayState(displayState[overviewCards.d18Summary.key]);
   const d13SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d13Summary.figure, "Calibrated");
   const d18SummaryHasCalibrated = figureHasTracePrefix(overviewCards.d18Summary.figure, "Calibrated");
+  const d13SummaryHasStandards = figureHasTracePrefix(overviewCards.d13Summary.figure, STANDARD_MEASURED_TRACE_PREFIX);
+  const d18SummaryHasStandards = figureHasTracePrefix(overviewCards.d18Summary.figure, STANDARD_MEASURED_TRACE_PREFIX);
   const d13SummaryFigure = withDisplayState(overviewCards.d13Summary.figure, d13SummaryState);
   const d18SummaryFigure = withDisplayState(overviewCards.d18Summary.figure, d18SummaryState);
   const activeSelectionChartKey = isSelectionEditorOpen ? (activeTarget?.chartKey ?? selectedTargets[0]?.chartKey ?? null) : null;
@@ -5804,14 +6025,14 @@ export default function ProcessingPage() {
       if (activeSelectionChartKey !== overviewCards.crossplot.key || !activeTarget || activeTarget.isotopeKey !== "cross") {
         return null;
       }
-      for (const section of workspace.species_sections) {
+      for (const section of resolvedSpeciesSections) {
         for (const figureSet of section.identifier_figures) {
           const d13Key = `${section.species}|${figureSet.identifier}|d13C`;
           const d18Key = `${section.species}|${figureSet.identifier}|d18O`;
           const d13State = normalizeDisplayState(displayState[d13Key]);
           const d18State = normalizeDisplayState(displayState[d18Key]);
-          const d13FigureBase = withDisplayState(withColorScaleRange(figureSet.d13c), d13State);
-          const d18FigureBase = withDisplayState(withColorScaleRange(figureSet.d18o), d18State);
+          const d13FigureBase = withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d13c)), d13State);
+          const d18FigureBase = withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d18o)), d18State);
           const containsSelectedRow =
             figureContainsRowLabel(d13FigureBase, activeTarget.rowLabel) || figureContainsRowLabel(d18FigureBase, activeTarget.rowLabel);
           if (!containsSelectedRow) {
@@ -5882,7 +6103,7 @@ export default function ProcessingPage() {
     if (isotopeKey !== "d13C" && isotopeKey !== "d18O") {
       return null;
     }
-    const section = workspace.species_sections.find((item) => item.species === species);
+    const section = resolvedSpeciesSections.find((item) => item.species === species);
     const figureSet = section?.identifier_figures.find((item) => item.identifier === identifier);
     if (!figureSet) {
       return null;
@@ -5894,8 +6115,8 @@ export default function ProcessingPage() {
       chartKey: activeSelectionChartKey,
       figure: highlightSelectionSourceFigure(
         isotopeKey === "d13C"
-          ? applyPreviewFigure(withDisplayState(withColorScaleRange(figureSet.d13c), state))
-          : applyPreviewFigure(withDisplayState(withColorScaleRange(figureSet.d18o), state)),
+          ? withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d13c)), state)
+          : withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d18o)), state),
         activeTarget,
       ),
     };
@@ -5903,30 +6124,57 @@ export default function ProcessingPage() {
 
   return (
     <div className="space-y-6">
-      <Card className="border-stone-300 bg-stone-50">
-        <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <CardTitle>Data Processing Workspace</CardTitle>
-            <CardDescription>
-              Scientific processing is backend-owned. This page only drives filtering, selection, edits, diagnostics, and export.
-            </CardDescription>
-          </div>
-          <div className="flex flex-wrap items-center gap-2 text-sm text-stone-600">
+      <PageHeader
+        eyebrow="Analysis pipeline"
+        title="Processing"
+        description="Filter, edit, validate, and export the processed measurement set."
+        actions={
+          <>
             <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Edited rows: {workspace.edit_state.edited_rows.length}</span>
             <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">
               Manual overrides: {manualOverrideCount}
             </span>
-            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Selection: {selectedTargets.length}</span>
             <Button variant="secondary" size="sm" onClick={() => setExportModalOpen(true)} disabled={busy}>
               <Download className="h-4 w-4" />
-              Data export
+              Export
             </Button>
-          </div>
-        </CardHeader>
-      </Card>
+          </>
+        }
+      />
 
-      <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
-        <aside className="space-y-6 xl:sticky xl:top-6 xl:self-start">
+      {activeBackgroundJob ? (
+        <Card className="border-blue-200 bg-blue-50/70" aria-live="polite">
+          <CardContent className="space-y-3 pt-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
+              <span className="font-medium text-blue-950">{activeBackgroundJob.message || "Processing in background"}</span>
+              <div className="flex items-center gap-3">
+                <span className="text-blue-800">{Math.round(activeBackgroundJob.progress)}%</span>
+                {activeBackgroundJob.cancellable ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => cancelBackgroundJobMutation.mutate(activeBackgroundJob.job_id)}
+                    disabled={cancelBackgroundJobMutation.isPending}
+                  >
+                    {cancelBackgroundJobMutation.isPending ? "Cancelling..." : "Cancel"}
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-blue-100" role="progressbar" aria-valuenow={activeBackgroundJob.progress} aria-valuemin={0} aria-valuemax={100}>
+              <div className="h-full rounded-full bg-blue-700 transition-[width] duration-200" style={{ width: `${activeBackgroundJob.progress}%` }} />
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+      {processingOperationError ? (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+          Processing operation failed: {processingOperationError}
+        </div>
+      ) : null}
+
+      <div className="workspace-grid">
+        <aside className="control-column">
           <Card>
             <CardHeader className="gap-3">
               <div className="flex flex-wrap items-start justify-between gap-3">
@@ -5958,7 +6206,7 @@ export default function ProcessingPage() {
                 </div>
               ) : null}
             </CardHeader>
-            <CardContent className="space-y-6 xl:max-h-[calc(100vh-12rem)] xl:overflow-y-auto xl:pr-4 [scrollbar-gutter:stable]">
+            <CardContent className="space-y-4">
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
                 <label className="text-sm">
                   <span className="mb-1 block font-medium text-stone-700">Identifier scope</span>
@@ -6465,6 +6713,7 @@ export default function ProcessingPage() {
           <ProcessingSummaryHero
             workspace={workspace}
             speciesNameMap={activeConfig.species_name_map ?? {}}
+            identifier1NameMap={activeConfig.identifier1_name_map ?? {}}
             onSpeciesNameMapChange={(source, target) => {
               updateConfig("species_name_map", nextSpeciesNameMap(activeConfig.species_name_map, source, target));
               const sourceLabel = normalizeSpeciesLabel(source);
@@ -6481,6 +6730,32 @@ export default function ProcessingPage() {
                 });
               }
             }}
+            onIdentifier1NameMapChange={(source, target) => {
+              const sourceLabel = normalizeSpeciesLabel(source);
+              const targetLabel = normalizeSpeciesLabel(target);
+              setConfig((current) => {
+                if (!current) {
+                  return current;
+                }
+                const previousTarget = normalizeSpeciesLabel(current.identifier1_name_map?.[sourceLabel] ?? sourceLabel);
+                const nextSelectedIdentifier =
+                  current.selected_identifier === previousTarget && targetLabel
+                    ? targetLabel
+                    : current.selected_identifier;
+                const nextSelectedIds = current.export.selected_ids.map((value) =>
+                  value === previousTarget && targetLabel ? targetLabel : value,
+                );
+                return {
+                  ...current,
+                  selected_identifier: nextSelectedIdentifier,
+                  identifier1_name_map: nextIdentifier1NameMap(current.identifier1_name_map, source, target),
+                  export: {
+                    ...current.export,
+                    selected_ids: Array.from(new Set(nextSelectedIds)),
+                  },
+                };
+              });
+            }}
             disabled={busy}
           />
 
@@ -6492,7 +6767,8 @@ export default function ProcessingPage() {
                 title={overviewCards.processing3d.title}
                 description={overviewCards.processing3d.description}
                 figure={overviewCards.processing3d.figure}
-                chartClassName="min-h-[520px] xl:aspect-square"
+                chartClassName="h-[clamp(380px,42vw,620px)] w-full"
+                fitContainer
                 {...chartHoverProps(overviewCards.processing3d.key)}
                 onPointClick={(points) => handleChartClick(overviewCards.processing3d.key, points)}
                 onSelection={(points) => handleChartSelection(overviewCards.processing3d.key, points)}
@@ -6503,7 +6779,8 @@ export default function ProcessingPage() {
                 title={overviewCards.crossplot.title}
                 description={overviewCards.crossplot.description}
                 figure={overviewCards.crossplot.figure}
-                chartClassName="min-h-[520px] xl:aspect-square"
+                chartClassName="h-[clamp(380px,42vw,620px)] w-full"
+                fitContainer
                 {...chartHoverProps(overviewCards.crossplot.key)}
                 onPointClick={(points) => handleChartClick(overviewCards.crossplot.key, points)}
                 onSelection={(points) => handleChartSelection(overviewCards.crossplot.key, points)}
@@ -7034,6 +7311,7 @@ export default function ProcessingPage() {
                 <TraceModeControl
                   state={d13SummaryState}
                   hasCalibrated={d13SummaryHasCalibrated}
+                  hasStandards={d13SummaryHasStandards}
                   onChange={(patch) => updateChartDisplayState(overviewCards.d13Summary.key, patch)}
                 />
               }
@@ -7052,6 +7330,7 @@ export default function ProcessingPage() {
                 <TraceModeControl
                   state={d18SummaryState}
                   hasCalibrated={d18SummaryHasCalibrated}
+                  hasStandards={d18SummaryHasStandards}
                   onChange={(patch) => updateChartDisplayState(overviewCards.d18Summary.key, patch)}
                 />
               }
@@ -7064,15 +7343,19 @@ export default function ProcessingPage() {
 
           <OutlierTablesPanel
             title="Data outlier tables"
-            tables={workspace.outlier_tables}
+            tables={displayedDataOutlierTables}
+            isPreview={Boolean(processingPreviewMasks)}
             renderTableControls={renderFailedSampleTableControls}
           />
 
           <div className="space-y-6">
-            {workspace.species_sections.map((section) => {
+            {resolvedSpeciesSections.map((section) => {
               const isSectionOpen = openSpeciesSections.has(section.species);
               const identifierCount = section.identifier_count ?? section.identifier_figures.length;
-              const isLoadingSectionFigures = workspaceQuery.isFetching && isSectionOpen && identifierCount > 0 && section.identifier_figures.length === 0;
+              const sectionQueryState = speciesSectionStateBySpecies.get(section.species);
+              const isLoadingSectionFigures = Boolean(
+                sectionQueryState?.isFetching && isSectionOpen && identifierCount > 0 && section.identifier_figures.length === 0,
+              );
               return (
                 <details
                   key={section.species}
@@ -7088,6 +7371,11 @@ export default function ProcessingPage() {
                   {isLoadingSectionFigures ? (
                     <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
                       Loading species charts...
+                    </div>
+                  ) : null}
+                  {sectionQueryState?.error ? (
+                    <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+                      Failed to load species charts: {sectionQueryState.error.message}
                     </div>
                   ) : null}
                   {section.identifier_figures.map((figureSet) => {
@@ -7110,12 +7398,13 @@ export default function ProcessingPage() {
                                 <TraceModeControl
                                   state={d13State}
                                   hasCalibrated={figureSet.has_calibrated_d13c}
+                                  hasStandards={figureHasTracePrefix(figureSet.d13c, STANDARD_MEASURED_TRACE_PREFIX)}
                                   onChange={(patch) => updateChartDisplayState(d13Key, patch)}
                                 />
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
-                                  figure={withDisplayState(withColorScaleRange(figureSet.d13c), d13State)}
+                                  figure={withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d13c)), d13State)}
                                   className="h-full w-full"
                                   uiRevision={`processing:${d13Key}`}
                                   {...chartHoverProps(d13Key)}
@@ -7133,12 +7422,13 @@ export default function ProcessingPage() {
                                 <TraceModeControl
                                   state={d18State}
                                   hasCalibrated={figureSet.has_calibrated_d18o}
+                                  hasStandards={figureHasTracePrefix(figureSet.d18o, STANDARD_MEASURED_TRACE_PREFIX)}
                                   onChange={(patch) => updateChartDisplayState(d18Key, patch)}
                                 />
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
-                                  figure={withDisplayState(withColorScaleRange(figureSet.d18o), d18State)}
+                                  figure={withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d18o)), d18State)}
                                   className="h-full w-full"
                                   uiRevision={`processing:${d18Key}`}
                                   {...chartHoverProps(d18Key)}
@@ -7155,8 +7445,10 @@ export default function ProcessingPage() {
 
                   <OutlierTablesPanel
                     title={`${section.species} outlier tables`}
-                    tables={section.outlier_tables}
+                    tables={displayedSpeciesOutlierTables.get(section.species) ?? section.outlier_tables}
+                    isPreview={Boolean(processingPreviewMasks)}
                     renderTableControls={renderFailedSampleTableControls}
+                    defaultOpen
                   />
                     </div>
                   ) : null}

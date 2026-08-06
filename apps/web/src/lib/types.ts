@@ -27,6 +27,20 @@ export type SessionSnapshot = {
   preview: Array<JsonRecord>;
 };
 
+export type SessionArtifactKind = "events" | "snapshot" | "cycles" | "metadata" | "state";
+
+export type SessionArtifactPayload = {
+  kind: SessionArtifactKind;
+  label: string;
+  format: "events" | "table" | "object";
+  items?: Array<JsonRecord>;
+  columns?: string[];
+  rows?: Array<JsonRecord>;
+  data?: unknown;
+  row_count?: number;
+  truncated?: boolean;
+};
+
 export type ImportResult = {
   session: SessionSnapshot;
 };
@@ -134,6 +148,7 @@ export type ProcessingConfig = {
   color_param: string;
   z_axis: string;
   species_name_map: Record<string, string>;
+  identifier1_name_map: Record<string, string>;
   apply_shared_linearity_to_partially_saturated: boolean;
   enable_saturation_correction: boolean;
   saturation_correction_method: SaturationCorrectionMethod;
@@ -198,6 +213,7 @@ export type ProcessingSummary = {
 export type ProcessingAvailableValues = {
   identifiers: string[];
   export_identifiers: string[];
+  identifier1_sources: string[];
   species: string[];
   color_params: string[];
   z_axis_options: string[];

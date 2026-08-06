@@ -301,10 +301,10 @@ export function SaturationSharedColorbar({
   }, [colorAxis, figures]);
 
   return (
-    <div className="min-w-[220px] text-sm">
-      <div className="mb-1 text-stone-700">{axisLabel(colorAxis)} color scale</div>
-      <div className="h-3 rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]" />
-      <div className="mt-1 flex justify-between gap-3 text-xs tabular-nums text-stone-500">
+    <div className="w-full max-w-[280px] min-w-[180px] text-xs">
+      <div className="mb-1 text-stone-600">{axisLabel(colorAxis)} scale</div>
+      <div className="h-2 rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]" />
+      <div className="mt-0.5 flex justify-between gap-3 text-[10px] tabular-nums text-stone-500">
         <span>{range ? formatRangeValue(range.min) : "N/A"}</span>
         <span>{range ? formatRangeValue(range.max) : "N/A"}</span>
       </div>
@@ -370,6 +370,7 @@ export function SaturationFigureCard({ chartKey, title, description, figure, col
         key={`${chartKey}:${colorAxis}:${yAxis}:${swapped ? "swapped" : "normal"}`}
         figure={displayedFigure}
         className="h-[320px] w-full"
+        fitContainer
         deferRenderMs={deferRenderMs}
       />
     </div>

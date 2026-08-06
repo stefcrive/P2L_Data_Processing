@@ -152,6 +152,69 @@ function buildDefaultUiRevision(data: unknown, layout: Record<string, unknown>):
   return ["persist-ui", plotTitle, ...axisTokens, ...traceTokens].join("|");
 }
 
+function compactColorbar(value: unknown): Record<string, unknown> {
+  const colorbar = value && typeof value === "object" ? { ...(value as Record<string, unknown>) } : {};
+  const existingThickness = typeof colorbar.thickness === "number" ? colorbar.thickness : 10;
+  const existingLength = typeof colorbar.len === "number" ? colorbar.len : 0.68;
+  const tickfont = colorbar.tickfont && typeof colorbar.tickfont === "object" ? { ...(colorbar.tickfont as Record<string, unknown>) } : {};
+  tickfont.size = Math.min(typeof tickfont.size === "number" ? tickfont.size : 9, 9);
+  colorbar.tickfont = tickfont;
+  colorbar.thickness = Math.min(existingThickness, 10);
+  colorbar.len = Math.min(existingLength, 0.68);
+  colorbar.xpad = Math.min(typeof colorbar.xpad === "number" ? colorbar.xpad : 3, 3);
+  colorbar.ypad = Math.min(typeof colorbar.ypad === "number" ? colorbar.ypad : 2, 2);
+
+  if (typeof colorbar.title === "string") {
+    colorbar.title = { text: colorbar.title, font: { size: 10 } };
+  } else if (colorbar.title && typeof colorbar.title === "object") {
+    const title = { ...(colorbar.title as Record<string, unknown>) };
+    const titleFont = title.font && typeof title.font === "object" ? { ...(title.font as Record<string, unknown>) } : {};
+    titleFont.size = Math.min(typeof titleFont.size === "number" ? titleFont.size : 10, 10);
+    title.font = titleFont;
+    colorbar.title = title;
+  }
+  return colorbar;
+}
+
+function compactFigureColorbars(
+  data: unknown[],
+  layout: Record<string, unknown>,
+): { data: unknown[]; hasColorbar: boolean } {
+  let hasColorbar = false;
+  const compactData = data.map((traceValue) => {
+    if (!traceValue || typeof traceValue !== "object") {
+      return traceValue;
+    }
+    const trace = { ...(traceValue as Record<string, unknown>) };
+    if (trace.colorbar && typeof trace.colorbar === "object") {
+      trace.colorbar = compactColorbar(trace.colorbar);
+      hasColorbar = true;
+    }
+    if (trace.marker && typeof trace.marker === "object") {
+      const marker = { ...(trace.marker as Record<string, unknown>) };
+      if (marker.colorbar && typeof marker.colorbar === "object") {
+        marker.colorbar = compactColorbar(marker.colorbar);
+        hasColorbar = true;
+      }
+      trace.marker = marker;
+    }
+    return trace;
+  });
+
+  for (const [key, value] of Object.entries(layout)) {
+    if (!/^coloraxis\d*$/.test(key) || !value || typeof value !== "object") {
+      continue;
+    }
+    const colorAxis = { ...(value as Record<string, unknown>) };
+    if (colorAxis.showscale !== false) {
+      colorAxis.colorbar = compactColorbar(colorAxis.colorbar);
+      hasColorbar = true;
+    }
+    layout[key] = colorAxis;
+  }
+  return { data: compactData, hasColorbar };
+}
+
 function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
   if (typeof structuredClone === "function") {
     try {
@@ -294,29 +357,35 @@ export function PlotlyChart({
     }
     const figureData = Array.isArray(figure.data) ? figure.data : [];
     const layout = typeof figure.layout === "object" && figure.layout ? { ...(figure.layout as Record<string, unknown>) } : {};
+    const compacted = compactFigureColorbars(figureData, layout);
     applyD18AxisInversion(layout);
     const hoverLabel = layout.hoverlabel && typeof layout.hoverlabel === "object" ? { ...(layout.hoverlabel as Record<string, unknown>) } : {};
     hoverLabel.namelength = -1;
     layout.hoverlabel = hoverLabel;
-    const hasExplicitWidth = typeof (layout as { width?: unknown }).width === "number";
     const hasExplicitHeight = typeof (layout as { height?: unknown }).height === "number";
+    delete (layout as { width?: unknown }).width;
+    layout.autosize = true;
     if (fitContainer) {
-      delete (layout as { width?: unknown }).width;
       delete (layout as { height?: unknown }).height;
-      layout.autosize = true;
-    } else if (!hasExplicitWidth && !hasExplicitHeight && typeof (layout as { autosize?: unknown }).autosize !== "boolean") {
-      layout.autosize = true;
+    }
+    if (compacted.hasColorbar) {
+      const margin = layout.margin && typeof layout.margin === "object" ? { ...(layout.margin as Record<string, unknown>) } : {};
+      margin.r = Math.max(typeof margin.r === "number" ? margin.r : 0, 54);
+      margin.autoexpand = true;
+      layout.margin = margin;
     }
     if (uiRevision) {
       layout.uirevision = uiRevision;
     } else if (typeof (layout as { uirevision?: unknown }).uirevision === "undefined") {
-      layout.uirevision = buildDefaultUiRevision(figureData, layout);
+      layout.uirevision = buildDefaultUiRevision(compacted.data, layout);
     }
     applyPersistedViewport(layout, uiRevision ? persistedViewports.get(uiRevision) : undefined);
     return {
-      data: figureData as never[],
+      data: compacted.data as never[],
       layout: layout as never,
-      useResizeHandler: fitContainer || !hasExplicitHeight,
+      useResizeHandler: true,
+      fillContainerHeight: fitContainer,
+      hasExplicitHeight,
     };
   }, [figure, fitContainer, uiRevision]);
 
@@ -382,7 +451,7 @@ export function PlotlyChart({
       </div>
     );
   }
-  const shouldUseContainerHeight = preparedFigure.useResizeHandler;
+  const shouldUseContainerHeight = preparedFigure.fillContainerHeight;
   const hoverHandlers =
     onPointHover || onHoverEnd
       ? {
@@ -412,7 +481,7 @@ export function PlotlyChart({
         }
       : {};
   return (
-    <div className={cn("min-w-0 w-full", className)} onPointerDownCapture={registerPointerInteraction}>
+    <div className={cn("min-w-0 w-full overflow-hidden", className)} onPointerDownCapture={registerPointerInteraction}>
       <Plot
         data={preparedFigure.data}
         layout={preparedFigure.layout}

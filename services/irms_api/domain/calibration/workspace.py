@@ -299,7 +299,7 @@ def _build_standard_outlier_figure(
         "colorbar": {
             "title": {
                 "text": colorbar_title,
-                "side": "top",
+                "side": "right",
             },
             "thickness": 14,
             "len": 0.72,

@@ -49,6 +49,17 @@ def _measure(session_id: str, species_filter: set[str] | None, repeats: int) -> 
     return durations, payload_mb
 
 
+def _measure_species(session_id: str, species: str, repeats: int) -> tuple[list[float], float]:
+    durations: list[float] = []
+    payload_mb = 0.0
+    for _ in range(repeats):
+        started = time.perf_counter()
+        section = api_main._build_processing_species_section_response(session_id, species)
+        durations.append(time.perf_counter() - started)
+        payload_mb = len(section.model_dump_json()) / 1_000_000
+    return durations, payload_mb
+
+
 def _print_result(label: str, durations: list[float], payload_mb: float) -> None:
     print(
         f"{label:<20} "
@@ -86,7 +97,7 @@ def main() -> None:
     print(f"session={session_id} measurements={base_workspace.summary.total_measurements}")
     _print_result("base workspace", base_durations, base_payload)
     if first_species:
-        section_durations, section_payload = _measure(session_id, {first_species}, args.repeats)
+        section_durations, section_payload = _measure_species(session_id, first_species, args.repeats)
         _print_result(f"section {first_species}", section_durations, section_payload)
 
 

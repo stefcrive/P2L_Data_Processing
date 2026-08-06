@@ -61,7 +61,7 @@ wheels/
 
 # JavaScript / Next.js dependencies, builds, and generated metadata
 node_modules/
-.next/
+.next*/
 out/
 coverage/
 .turbo/

@@ -10,6 +10,7 @@ import pandas as pd
 from fastapi import UploadFile
 
 from services.irms_api.api import main as api_main
+from services.irms_api.domain.contracts import AutosaveSettingsUpdate
 from services.irms_api.session_store import FileSessionStore
 
 
@@ -105,6 +106,41 @@ class SessionLifecycleApiTests(unittest.TestCase):
         self.assertEqual(payload.session_id, self.session_id)
         self.assertEqual(payload.row_count, 2)
         self.assertTrue(api_main.store.session_exists(self.session_id))
+
+    def test_autosave_setting_disables_automatic_event_writes(self) -> None:
+        disabled = api_main.update_autosave(self.session_id, AutosaveSettingsUpdate(enabled=False))
+        self.assertFalse(bool(disabled.autosave.get("enabled")))
+        event_count = int(disabled.autosave.get("event_count", 0))
+
+        opened = api_main.open_session(self.session_id)
+        self.assertFalse(bool(opened.autosave.get("enabled")))
+        self.assertEqual(int(opened.autosave.get("event_count", 0)), event_count)
+
+        enabled = api_main.update_autosave(self.session_id, AutosaveSettingsUpdate(enabled=True))
+        self.assertTrue(bool(enabled.autosave.get("enabled")))
+        self.assertEqual(int(enabled.autosave.get("event_count", 0)), event_count + 1)
+
+    def test_session_artifact_endpoint_returns_human_readable_payloads(self) -> None:
+        api_main.save_session(self.session_id)
+
+        events = api_main.get_session_artifact(self.session_id, "events")
+        self.assertEqual(events["format"], "events")
+        self.assertEqual(events["items"][-1]["action"], "session_saved_manual")
+
+        snapshot = api_main.get_session_artifact(self.session_id, "snapshot")
+        self.assertEqual(snapshot["format"], "table")
+        self.assertEqual(snapshot["row_count"], 2)
+        self.assertIn("Identifier 1", snapshot["columns"])
+
+        cycles = api_main.get_session_artifact(self.session_id, "cycles")
+        self.assertEqual(cycles["row_count"], 2)
+
+        metadata = api_main.get_session_artifact(self.session_id, "metadata")
+        self.assertEqual(metadata["format"], "object")
+        self.assertEqual(metadata["data"]["session_id"], self.session_id)
+
+        state = api_main.get_session_artifact(self.session_id, "state")
+        self.assertEqual(state["data"]["session_id"], self.session_id)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,20 @@ npm run dev
 
 The frontend calls the same-origin `/api/irms` route. Next.js proxies that route to `http://127.0.0.1:8000` unless `IRMS_API_PROXY_TARGET` is set.
 
+## Background Jobs
+
+Workbook imports/appends, calibration runs, processing configuration/edit batches, and workbook exports use a bounded background worker pool. Progress is delivered through server-sent events, with polling fallback in the web client. Jobs that target the same session are serialized.
+
+Optional environment settings:
+
+- `IRMS_JOB_WORKERS` (default `2`): concurrent worker threads.
+- `IRMS_JOB_QUEUE_SIZE` (default `24`): queued jobs beyond active workers.
+- `IRMS_JOB_HISTORY_SIZE` (default `100`): retained terminal job records/artifacts.
+- `IRMS_JOB_RETENTION_SECONDS` (default `3600`): completed-job retention.
+- `IRMS_JOB_MAX_UPLOAD_BYTES` (default `536870912`): combined workbook upload limit per job.
+
+The in-process registry is intended for the current single-backend deployment. A multi-instance deployment should replace it with a shared durable queue and artifact store while retaining the `/jobs` API contract.
+
 ## One-Command Startup
 
 Use `start_app.bat` from repo root.

@@ -1,7 +1,8 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Database, X } from "lucide-react";
+import { ChevronRight, Database, X } from "lucide-react";
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
@@ -17,9 +18,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { DecimalInput } from "@/components/ui/decimal-input";
+import { DualRangeField } from "@/components/ui/dual-range-field";
 import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
+import { PageHeader } from "@/components/ui/page-header";
 import { Tooltip } from "@/components/ui/tooltip";
-import { api } from "@/lib/api";
+import { api, type JobSnapshot } from "@/lib/api";
 import type {
   CalibrationConfig,
   CalibrationOfficialValue,
@@ -28,6 +31,7 @@ import type {
   CycleDiagnosticsPayload,
   EditAction,
   ProcessingLinearityPreviewData,
+  SessionSnapshot,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
@@ -1706,6 +1710,13 @@ function patchedCalibrationAxisValue(
   if (!row) {
     return null;
   }
+  // Linearity figures use residuals (and, for corrected figures, corrected
+  // residuals) supplied by the same backend fit that draws their regression
+  // line. Replacing those values with the raw isotope means separates the
+  // samples from the fitted line.
+  if (chartKey?.startsWith("linearity|")) {
+    return null;
+  }
   const chartIsotope = isotopeFromChartKey(chartKey);
   if (chartIsotope === "cross") {
     if (axis === "x") {
@@ -1835,7 +1846,7 @@ function filterCalibrationTraceByRows(
   return changed ? nextTrace : trace;
 }
 
-function colorAxisLayout(color: CalibrationPreviewColorState | null): Record<string, unknown> | null {
+function colorAxisLayout(color: CalibrationPreviewColorState | null, verticalTitle = false): Record<string, unknown> | null {
   if (!color) {
     return null;
   }
@@ -1848,7 +1859,7 @@ function colorAxisLayout(color: CalibrationPreviewColorState | null): Record<str
     colorbar: {
       title: {
         text: color.param === "Date" ? "Date" : color.param,
-        side: "top",
+        side: verticalTitle ? "right" : "top",
       },
       ...(color.tickvals && color.ticktext ? { tickmode: "array", tickvals: color.tickvals, ticktext: color.ticktext } : {}),
     },
@@ -1879,7 +1890,7 @@ function applyCalibrationConfigPreviewToFigure(
     changed = changed || nextTrace !== trace;
     return nextTrace;
   });
-  const nextColorAxis = colorAxisLayout(masks.color);
+  const nextColorAxis = colorAxisLayout(masks.color, Boolean(chartKey?.includes("|d")));
   const nextLayout = nextColorAxis
     ? {
         ...cloned.layout,
@@ -1983,11 +1994,6 @@ function computeHoverPreviewPosition(
   return { left, top };
 }
 
-function parseFinite(value: string, fallback: number) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
 function RangeSliderField({
   label,
   value,
@@ -2011,50 +2017,15 @@ function RangeSliderField({
   const high = clampNumber(Math.max(value[0], value[1]), resolvedMin, resolvedMax);
 
   return (
-    <div className="rounded-lg border border-stone-200 bg-white p-3 text-sm">
-      <div className="flex items-center justify-between gap-2">
-        <span className="font-medium text-stone-700">{label}</span>
-        <span className="text-xs text-stone-500">
-          {low.toFixed(precision)} to {high.toFixed(precision)}
-        </span>
-      </div>
-      <div className="mt-3 space-y-2">
-        <label className="block text-xs text-stone-600">
-          Min
-          <input
-            type="range"
-            min={resolvedMin}
-            max={resolvedMax}
-            step={step}
-            value={low}
-            onInput={(event) => {
-              const nextLow = parseFinite(event.currentTarget.value, low);
-              onChange([Math.min(nextLow, high), high]);
-            }}
-            className="mt-1 w-full accent-stone-700"
-          />
-        </label>
-        <label className="block text-xs text-stone-600">
-          Max
-          <input
-            type="range"
-            min={resolvedMin}
-            max={resolvedMax}
-            step={step}
-            value={high}
-            onInput={(event) => {
-              const nextHigh = parseFinite(event.currentTarget.value, high);
-              onChange([low, Math.max(nextHigh, low)]);
-            }}
-            className="mt-1 w-full accent-stone-700"
-          />
-        </label>
-      </div>
-      <div className="mt-2 flex items-center justify-between text-[11px] text-stone-400">
-        <span>{resolvedMin.toFixed(precision)}</span>
-        <span>{resolvedMax.toFixed(precision)}</span>
-      </div>
-    </div>
+    <DualRangeField
+      label={label}
+      value={[low, high]}
+      min={resolvedMin}
+      max={resolvedMax}
+      step={step}
+      precision={precision}
+      onChange={onChange}
+    />
   );
 }
 
@@ -2959,6 +2930,7 @@ export default function CalibrationPage() {
   const sessionId = useSessionStore((state) => state.sessionId);
   const queryClient = useQueryClient();
   const [config, setConfig] = useState<CalibrationConfig | null>(null);
+  const [calibrationJob, setCalibrationJob] = useState<JobSnapshot<SessionSnapshot> | null>(null);
   const [hasLoadedDraft, setHasLoadedDraft] = useState(false);
   const [selectedTargets, setSelectedTargets] = useState<SelectedTarget[]>([]);
   const [activeTargetIndex, setActiveTargetIndex] = useState(0);
@@ -3325,13 +3297,17 @@ export default function CalibrationPage() {
   }, [activeColorParam, colorScaleBounds, colorScaleRangeParam, colorScaleTwoSigmaRange]);
 
   const runMutation = useMutation({
-    mutationFn: (payload: CalibrationConfig) => api.runCalibration(sessionId!, payload),
+    mutationFn: (payload: CalibrationConfig) => api.runCalibration(sessionId!, payload, setCalibrationJob),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration-workspace", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["calibration", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
     },
+    onSettled: () => setCalibrationJob(null),
+  });
+  const cancelCalibrationJobMutation = useMutation({
+    mutationFn: (jobId: string) => api.cancelJob(jobId),
   });
 
   const resetCalibrationMutation = useMutation({
@@ -3374,10 +3350,11 @@ export default function CalibrationPage() {
   });
 
   const editMutation = useMutation({
-    mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload),
+    mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload, []),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-species-section", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["processing-diagnostics-cross-d13", sessionId] });
@@ -3943,7 +3920,7 @@ export default function CalibrationPage() {
     colorScaleRange ?? colorScaleTwoSigmaRange ?? [colorSliderBounds.min, colorSliderBounds.max],
     colorSliderBounds,
   );
-  const colorScaleSignature = `${effectiveColorScaleRange[0]}:${effectiveColorScaleRange[1]}`;
+  const colorScaleSignature = `${activeConfig.color_param}:${effectiveColorScaleRange[0]}:${effectiveColorScaleRange[1]}`;
   if (colorScaleSignatureRef.current !== colorScaleSignature) {
     colorScaleSignatureRef.current = colorScaleSignature;
     colorScaledFigureCacheRef.current = new WeakMap();
@@ -4013,7 +3990,6 @@ export default function CalibrationPage() {
       ? [Number(activeConfig.linearity.manual_d13_per_10v2 ?? 0), Number(activeConfig.linearity.manual_d18_per_10v2 ?? 0)]
       : []),
   ].some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
-  const linePrecisionCount = precisionSummaries.reduce((count, summary) => count + Object.keys(summary.line_precisions).length, 0);
   const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
   const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
@@ -4144,26 +4120,20 @@ export default function CalibrationPage() {
 
   return (
     <div className="space-y-6">
-      <Card className="border-stone-200 bg-white/90">
-        <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <CardTitle>Calibration Workspace</CardTitle>
-            <CardDescription>
-              Streamlit-parity calibration controls, standard filtering, precision summaries, linearity diagnostics, and calibration charts.
-            </CardDescription>
-          </div>
-          <div className="flex flex-wrap gap-2 text-sm text-stone-600">
-            <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Standards: {selectedStandards.length}</span>
-            <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">Method: {activeConfig.calibration_type}</span>
-            <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
-              Linearity basis: {getLinearityIntensityOptionLabel(lineIntensityBasis)}
-            </span>
-            <span className="rounded-md bg-stone-50 px-3 py-1.5 ring-1 ring-stone-200">
+      <PageHeader
+        eyebrow="Analysis pipeline"
+        title="Calibration"
+        description="Configure standards, review precision, and apply calibration."
+        actions={
+          <>
+            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Standards: {selectedStandards.length}</span>
+            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Method: {activeConfig.calibration_type}</span>
+            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">
               {hasUnsavedPreview ? "Preview active" : "Saved config"}
             </span>
-          </div>
-        </CardHeader>
-      </Card>
+          </>
+        }
+      />
 
       {isOfficialValuesModalOpen ? (
         <div
@@ -4666,14 +4636,14 @@ export default function CalibrationPage() {
         </div>
       ) : null}
 
-      <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
-        <aside className="space-y-6 xl:sticky xl:top-6 xl:max-h-[calc(100vh-2rem)] xl:self-start xl:overflow-y-auto xl:pr-1">
+      <div className="workspace-grid">
+        <aside className="control-column">
           <Card>
             <CardHeader>
               <CardTitle>Calibration Controls</CardTitle>
               <CardDescription>Configure standards, visualization, linearity, outlier detection, and precision date range settings.</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-6">
+            <CardContent className="space-y-4">
               <MultiSelectDropdown
                 label="Selected standards"
                 options={displayedWorkspace.available_values.standards}
@@ -5079,9 +5049,11 @@ export default function CalibrationPage() {
                   <div className="text-sm font-semibold tracking-normal text-stone-800">Official standard values</div>
                   <div className="text-xs text-stone-500">Open database values used in calibration equations.</div>
                 </div>
-                <Button variant="outline" size="sm" onClick={() => setOfficialValuesModalOpen(true)}>
-                  <Database className="h-4 w-4" />
-                  Values
+                <Button asChild variant="outline" size="sm">
+                  <Link href="/settings">
+                    <Database className="h-4 w-4" />
+                    Settings
+                  </Link>
                 </Button>
               </div>
 
@@ -5099,7 +5071,27 @@ export default function CalibrationPage() {
                 >
                   {resetCalibrationMutation.isPending ? "Resetting..." : "Reset calibration"}
                 </Button>
+                {calibrationJob?.cancellable ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => cancelCalibrationJobMutation.mutate(calibrationJob.job_id)}
+                    disabled={cancelCalibrationJobMutation.isPending}
+                  >
+                    {cancelCalibrationJobMutation.isPending ? "Cancelling..." : "Cancel run"}
+                  </Button>
+                ) : null}
               </div>
+              {calibrationJob ? (
+                <div className="space-y-2" aria-live="polite">
+                  <div className="flex justify-between text-xs text-stone-600">
+                    <span>{calibrationJob.message || "Running calibration"}</span>
+                    <span>{Math.round(calibrationJob.progress)}%</span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-stone-200" role="progressbar" aria-valuenow={calibrationJob.progress} aria-valuemin={0} aria-valuemax={100}>
+                    <div className="h-full rounded-full bg-stone-900 transition-[width] duration-200" style={{ width: `${calibrationJob.progress}%` }} />
+                  </div>
+                </div>
+              ) : null}
               <div className="text-xs text-stone-500">Select exactly one or two standards to run calibration.</div>
               {runError ? <div className="text-xs text-red-600">Calibration error: {runError}</div> : null}
               {resetError ? <div className="text-xs text-red-600">Reset error: {resetError}</div> : null}
@@ -5109,24 +5101,10 @@ export default function CalibrationPage() {
 
         <div className="space-y-6">
           {precisionSummaries.length ? (
-            <div className="space-y-4">
-              <Card className="border-stone-200 bg-stone-50">
-                <CardHeader className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                  <div>
-                    <CardTitle>Calibration Summary</CardTitle>
-                    <CardDescription>Included standards, isotope precision, and per-line precision for the current preview configuration.</CardDescription>
-                  </div>
-                  <div className="flex flex-wrap gap-2 text-sm text-stone-600">
-                    <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Standards summarized: {precisionSummaries.length}</span>
-                    <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Line entries: {linePrecisionCount}</span>
-                  </div>
-                </CardHeader>
-              </Card>
-              <div className="grid gap-4">
-                {precisionSummaries.map((summary) => (
-                  <PrecisionCard key={summary.standard} summary={summary} linearityEnabled={Boolean(activeConfig.linearity.apply)} />
-                ))}
-              </div>
+            <div className="grid gap-3">
+              {precisionSummaries.map((summary) => (
+                <PrecisionCard key={summary.standard} summary={summary} linearityEnabled={Boolean(activeConfig.linearity.apply)} />
+              ))}
             </div>
           ) : (
             <Card>
@@ -5140,28 +5118,30 @@ export default function CalibrationPage() {
           {selectedStandards.length ? (
             <>
               <div className="grid gap-6 2xl:grid-cols-2">
-                <Card className="min-w-0 overflow-hidden">
+                <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
                     <CardTitle>d13C Calibration</CardTitle>
                   </CardHeader>
-                  <CardContent className="min-w-0 overflow-hidden">
+                  <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
                       figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VPDB(13C)"], "VPDB(13C)"))}
-                      className="aspect-square w-full"
+                      className="h-[clamp(380px,42vw,620px)] w-full"
+                      fitContainer
                       {...chartHoverProps("VPDB(13C)")}
                       onPointClick={(points) => openProcessingSelectionEditor("VPDB(13C)", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("VPDB(13C)", points, true)}
                     />
                   </CardContent>
                 </Card>
-                <Card className="min-w-0 overflow-hidden">
+                <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
                     <CardTitle>d18O Calibration</CardTitle>
                   </CardHeader>
-                  <CardContent className="min-w-0 overflow-hidden">
+                  <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
                       figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VSMOW(18O)"], "VSMOW(18O)"))}
-                      className="aspect-square w-full"
+                      className="h-[clamp(380px,42vw,620px)] w-full"
+                      fitContainer
                       {...chartHoverProps("VSMOW(18O)")}
                       onPointClick={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, true)}
@@ -5171,30 +5151,32 @@ export default function CalibrationPage() {
               </div>
 
               <div className="grid gap-6 xl:grid-cols-2">
-                <Card>
+                <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
                     <CardTitle>Calibration 3D Chart</CardTitle>
                     <CardDescription>Filtered standards in calibration space using the active color and Z-axis parameters.</CardDescription>
                   </CardHeader>
-                  <CardContent>
+                  <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
                       figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.calibration_3d, "calibration_3d"))}
-                      className="min-h-[520px] xl:aspect-square"
+                      className="h-[clamp(380px,42vw,620px)] w-full"
+                      fitContainer
                       {...chartHoverProps("calibration_3d")}
                       onPointClick={(points) => openProcessingSelectionEditor("calibration_3d", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("calibration_3d", points, true)}
                     />
                   </CardContent>
                 </Card>
-                <Card>
+                <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
                     <CardTitle>Calibration Crossplot</CardTitle>
                     <CardDescription>d13C vs d18O crossplot for the filtered standards set.</CardDescription>
                   </CardHeader>
-                  <CardContent>
+                  <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
                       figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.crossplot, "crossplot"))}
-                      className="min-h-[520px] xl:aspect-square"
+                      className="h-[clamp(380px,42vw,620px)] w-full"
+                      fitContainer
                       {...chartHoverProps("crossplot")}
                       onPointClick={(points) => openProcessingSelectionEditor("crossplot", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("crossplot", points, true)}
@@ -5203,7 +5185,7 @@ export default function CalibrationPage() {
                 </Card>
               </div>
 
-              <Card>
+              <Card className="overflow-hidden">
                 <CardHeader className="gap-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <CardTitle>Linearity Correction</CardTitle>
@@ -5215,66 +5197,90 @@ export default function CalibrationPage() {
                     Standards-only linearity fits built from the active precision date window and the selected basis used during calibration.
                   </CardDescription>
                 </CardHeader>
-                <CardContent className="grid gap-6 2xl:grid-cols-2">
-                  <PlotlyChart
-                    figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_raw, "linearity|d13_raw"))}
-                    className="min-h-[440px]"
-                    {...chartHoverProps("linearity|d13_raw")}
-                    onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, false)}
-                    onSelection={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, true)}
-                  />
-                  <PlotlyChart
-                    figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_corrected, "linearity|d13_corrected"))}
-                    className="min-h-[440px]"
-                    {...chartHoverProps("linearity|d13_corrected")}
-                    onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, false)}
-                    onSelection={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, true)}
-                  />
-                  <PlotlyChart
-                    figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_raw, "linearity|d18_raw"))}
-                    className="min-h-[440px]"
-                    {...chartHoverProps("linearity|d18_raw")}
-                    onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, false)}
-                    onSelection={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, true)}
-                  />
-                  <PlotlyChart
-                    figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_corrected, "linearity|d18_corrected"))}
-                    className="min-h-[440px]"
-                    {...chartHoverProps("linearity|d18_corrected")}
-                    onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, false)}
-                    onSelection={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, true)}
-                  />
+                <CardContent className="grid gap-px bg-stone-200 p-0 2xl:grid-cols-2">
+                  <div className="min-w-0 bg-white">
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">d13C · Raw</div>
+                    <PlotlyChart
+                      figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_raw, "linearity|d13_raw"))}
+                      className="h-[420px] w-full"
+                      fitContainer
+                      {...chartHoverProps("linearity|d13_raw")}
+                      onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, false)}
+                      onSelection={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, true)}
+                    />
+                  </div>
+                  <div className="min-w-0 bg-white">
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">d13C · Linearity corrected</div>
+                    <PlotlyChart
+                      figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_corrected, "linearity|d13_corrected"))}
+                      className="h-[420px] w-full"
+                      fitContainer
+                      {...chartHoverProps("linearity|d13_corrected")}
+                      onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, false)}
+                      onSelection={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, true)}
+                    />
+                  </div>
+                  <div className="min-w-0 bg-white">
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">d18O · Raw</div>
+                    <PlotlyChart
+                      figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_raw, "linearity|d18_raw"))}
+                      className="h-[420px] w-full"
+                      fitContainer
+                      {...chartHoverProps("linearity|d18_raw")}
+                      onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, false)}
+                      onSelection={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, true)}
+                    />
+                  </div>
+                  <div className="min-w-0 bg-white">
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">d18O · Linearity corrected</div>
+                    <PlotlyChart
+                      figure={withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_corrected, "linearity|d18_corrected"))}
+                      className="h-[420px] w-full"
+                      fitContainer
+                      {...chartHoverProps("linearity|d18_corrected")}
+                      onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, false)}
+                      onSelection={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, true)}
+                    />
+                  </div>
                 </CardContent>
               </Card>
 
               <div className="space-y-6">
                 {displayedWorkspace.standard_sections.map((section) => (
-                  <details key={section.standard} className="rounded-lg border border-stone-200 bg-white shadow-sm" open>
-                    <summary className="cursor-pointer px-6 py-4 text-lg font-semibold text-stone-900">{section.standard}</summary>
+                  <section
+                    key={section.standard}
+                    className="rounded-lg border border-stone-200 bg-white shadow-sm"
+                    aria-label={`${section.standard} calibration details`}
+                  >
+                    <h2 className="px-4 py-3 text-base font-semibold text-stone-900">
+                      {section.standard}
+                    </h2>
                     <div className="space-y-6 p-6 pt-0">
                       <div className="grid gap-6">
-                        <Card>
+                        <Card className="flex flex-col overflow-hidden">
                           <CardHeader>
                             <CardTitle className="text-base">d13C Outlier Trace</CardTitle>
                           </CardHeader>
-                          <CardContent>
+                          <CardContent className="min-h-0 flex-1 p-0">
                             <PlotlyChart
                               figure={withColorScaleRange(withCalibrationPreview(section.d13_figure, `${section.standard}|d13C`))}
-                              className="min-h-[340px]"
+                              className="h-[460px] w-full"
+                              fitContainer
                               {...chartHoverProps(`${section.standard}|d13C`)}
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, false)}
                               onSelection={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, true)}
                             />
                           </CardContent>
                         </Card>
-                        <Card>
+                        <Card className="flex flex-col overflow-hidden">
                           <CardHeader>
                             <CardTitle className="text-base">d18O Outlier Trace</CardTitle>
                           </CardHeader>
-                          <CardContent>
+                          <CardContent className="min-h-0 flex-1 p-0">
                             <PlotlyChart
                               figure={withColorScaleRange(withCalibrationPreview(section.d18_figure, `${section.standard}|d18O`))}
-                              className="min-h-[340px]"
+                              className="h-[460px] w-full"
+                              fitContainer
                               {...chartHoverProps(`${section.standard}|d18O`)}
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, false)}
                               onSelection={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, true)}
@@ -5284,16 +5290,18 @@ export default function CalibrationPage() {
                       </div>
                       <div className="grid gap-6 2xl:grid-cols-2">
                         <details className="rounded-lg border border-stone-200 bg-white shadow-sm">
-                          <summary className="cursor-pointer px-6 py-4 text-base font-semibold text-stone-900">
-                            d13C Outliers ({section.d13_outliers.length})
+                          <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold text-stone-900">
+                            <ChevronRight className="h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
+                            <span>d13C Outliers ({section.d13_outliers.length})</span>
                           </summary>
                           <div className="px-6 pb-6">
                             <DataTable rows={section.d13_outliers} emptyLabel="No d13C outliers for this standard." />
                           </div>
                         </details>
                         <details className="rounded-lg border border-stone-200 bg-white shadow-sm">
-                          <summary className="cursor-pointer px-6 py-4 text-base font-semibold text-stone-900">
-                            d18O Outliers ({section.d18_outliers.length})
+                          <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold text-stone-900">
+                            <ChevronRight className="h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
+                            <span>d18O Outliers ({section.d18_outliers.length})</span>
                           </summary>
                           <div className="px-6 pb-6">
                             <DataTable rows={section.d18_outliers} emptyLabel="No d18O outliers for this standard." />
@@ -5301,7 +5309,7 @@ export default function CalibrationPage() {
                         </details>
                       </div>
                     </div>
-                  </details>
+                  </section>
                 ))}
               </div>
             </>

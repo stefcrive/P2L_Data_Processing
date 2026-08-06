@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -33,6 +35,7 @@ from ..contracts import (
     ProcessingExportState,
     ProcessingLinearityOverrideConfig,
     ProcessingOverlayConfig,
+    SpeciesSection,
     ProcessingWorkspace,
     ProcessingWorkspaceConfig,
 )
@@ -115,6 +118,7 @@ def normalize_processing_config(raw: dict[str, Any] | None) -> ProcessingWorkspa
             "comment_map": payload.pop("comment_map", payload.pop("comment_replacements", {})) or {},
         }
     payload["species_name_map"] = _normalize_species_name_map(payload.get("species_name_map"))
+    payload["identifier1_name_map"] = _normalize_identifier1_name_map(payload.get("identifier1_name_map"))
     return ProcessingWorkspaceConfig.model_validate(payload)
 
 
@@ -131,6 +135,10 @@ def _normalize_species_name_map(raw: Any) -> dict[str, str]:
     return normalized
 
 
+def _normalize_identifier1_name_map(raw: Any) -> dict[str, str]:
+    return _normalize_species_name_map(raw)
+
+
 def _apply_species_name_map(df: pd.DataFrame, species_name_map: dict[str, str] | None) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -141,6 +149,26 @@ def _apply_species_name_map(df: pd.DataFrame, species_name_map: dict[str, str] |
     species = _get_species_series(work).reindex(work.index).fillna("").astype(str).map(str.strip)
     work["Species"] = species.map(lambda value: normalized_map.get(value, value))
     return work
+
+
+def _apply_identifier1_name_map(
+    df: pd.DataFrame,
+    identifier1_name_map: dict[str, str] | None,
+) -> pd.DataFrame:
+    if df is None or df.empty or "Identifier 1" not in df.columns:
+        return df
+    normalized_map = _normalize_identifier1_name_map(identifier1_name_map)
+    if not normalized_map:
+        return df
+    work = df.copy()
+    identifiers = work["Identifier 1"].fillna("").astype(str).map(str.strip)
+    work["Identifier 1"] = identifiers.map(lambda value: normalized_map.get(value, value))
+    return work
+
+
+def _mapped_identifier1(value: Any, identifier1_name_map: dict[str, str] | None) -> str:
+    label = str(value).strip()
+    return _normalize_identifier1_name_map(identifier1_name_map).get(label, label)
 
 
 def _build_export_filename(config: ProcessingWorkspaceConfig) -> str:
@@ -584,7 +612,8 @@ def _derive_working_frame(
         calibration_meta=calibration,
         edit_state=edit_state,
     )
-    return _apply_species_name_map(work, config.species_name_map)
+    work = _apply_species_name_map(work, config.species_name_map)
+    return _apply_identifier1_name_map(work, config.identifier1_name_map)
 
 
 def _build_plot_frames(
@@ -657,13 +686,28 @@ def _selected_processing_rows(df: pd.DataFrame, selected_ids: list[str]) -> pd.D
     return df[df["Identifier 1"].astype(str).isin({str(item) for item in selected_ids})].copy()
 
 
-def build_processing_workspace(
-    session_id: str,
+@dataclass(slots=True)
+class ProcessingWorkspaceContext:
+    """Revision-scoped processing state shared by base and species responses."""
+
+    config: ProcessingWorkspaceConfig
+    edit_state: dict[str, Any]
+    all_standards: list[str]
+    source_identifier1_values: list[str]
+    source_species_values: list[str]
+    available_color_params: list[str]
+    working_df: pd.DataFrame
+    standards_df: pd.DataFrame
+    filtered_df: pd.DataFrame
+    unfiltered_df: pd.DataFrame
+    range_config: RangeConfig
+
+
+def build_processing_context(
     df: pd.DataFrame,
     cycles_df: pd.DataFrame | None,
     metadata: dict[str, Any],
-    species_section_filter: set[str] | None = None,
-) -> ProcessingWorkspace:
+) -> ProcessingWorkspaceContext:
     config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
     edit_state = dict(
         metadata.get(
@@ -686,6 +730,23 @@ def build_processing_workspace(
     standards_repo = StandardsRepository.default()
     selected_standards = [str(item) for item in calibration.get("selected_standards", [])]
     all_standards = sorted(set(standards_repo.standards_list()) | set(selected_standards))
+    mapped_selected_standards = [
+        _mapped_identifier1(item, config.identifier1_name_map)
+        for item in selected_standards
+    ]
+    mapped_all_standards = sorted(
+        {
+            _mapped_identifier1(item, config.identifier1_name_map)
+            for item in all_standards
+        }
+    )
+    source_identifier1_values = sorted(
+        {
+            str(value).strip()
+            for value in df.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist()
+            if str(value).strip() != ""
+        }
+    )
     source_species_values = sorted(
         {
             str(value).strip()
@@ -701,10 +762,24 @@ def build_processing_workspace(
         edit_state=edit_state,
         cycles_df=cycles_df,
     )
+    selected_standard_keys = {
+        str(item).strip().upper()
+        for item in mapped_selected_standards
+        if str(item).strip()
+    }
+    if selected_standard_keys and "Identifier 1" in working_df.columns:
+        standard_identifiers = working_df["Identifier 1"].fillna("").astype(str).str.strip().str.upper()
+        standards_df = working_df.loc[standard_identifiers.isin(selected_standard_keys)].copy()
+    else:
+        standards_df = pd.DataFrame(columns=working_df.columns)
     available_color_params = _candidate_color_columns(working_df)
     if available_color_params and config.color_param not in available_color_params:
         config.color_param = "Date" if "Date" in available_color_params else available_color_params[0]
-    filtered_df, unfiltered_df = _build_plot_frames(working_df, config, standards_to_exclude=selected_standards)
+    filtered_df, unfiltered_df = _build_plot_frames(
+        working_df,
+        config,
+        standards_to_exclude=mapped_selected_standards,
+    )
     range_config = RangeConfig(
         signal_range=config.signal_range,
         leak_range=config.leak_range,
@@ -721,12 +796,39 @@ def build_processing_workspace(
         statistical_outlier_method=str(getattr(config, "statistical_outlier_method", "Z-Score")),
         iqr_multiplier=float(getattr(config, "iqr_multiplier_data", 1.5)),
     )
+
+    return ProcessingWorkspaceContext(
+        config=config,
+        edit_state=edit_state,
+        all_standards=mapped_all_standards,
+        source_identifier1_values=source_identifier1_values,
+        source_species_values=source_species_values,
+        available_color_params=available_color_params,
+        working_df=working_df,
+        standards_df=standards_df,
+        filtered_df=filtered_df,
+        unfiltered_df=unfiltered_df,
+        range_config=range_config,
+    )
+
+
+def build_processing_workspace_from_context(
+    session_id: str,
+    context: ProcessingWorkspaceContext,
+    species_section_filter: set[str] | None = None,
+) -> ProcessingWorkspace:
+    config = context.config.model_copy(deep=True)
+    edit_state = deepcopy(context.edit_state)
+    working_df = context.working_df
+    filtered_df = context.filtered_df
+    unfiltered_df = context.unfiltered_df
+    range_config = context.range_config
     data_to_process = _selected_processing_rows(working_df, list(config.export.selected_ids))
     summary = build_processing_summary(
         data_to_process,
         range_config,
         edit_state=edit_state,
-        standards_to_exclude=all_standards,
+        standards_to_exclude=context.all_standards,
         sigma_level=float(config.sigma_level_data),
         statistical_outlier_method=str(getattr(config, "statistical_outlier_method", "Z-Score")),
         iqr_multiplier=float(getattr(config, "iqr_multiplier_data", 1.5)),
@@ -754,6 +856,7 @@ def build_processing_workspace(
         scoped_unfiltered,
         config,
         edit_state=edit_state,
+        standards_df=context.standards_df,
     )
     species_sections = build_species_sections(
         filtered_df,
@@ -761,6 +864,7 @@ def build_processing_workspace(
         config,
         edit_state,
         species_section_filter=species_section_filter,
+        standards_df=context.standards_df,
     )
 
     identifiers = sorted(
@@ -780,8 +884,9 @@ def build_processing_workspace(
     available_values = ProcessingAvailableValues(
         identifiers=["All", *identifiers],
         export_identifiers=["All", *export_identifiers],
-        species=source_species_values,
-        color_params=available_color_params,
+        identifier1_sources=context.source_identifier1_values,
+        species=context.source_species_values,
+        color_params=context.available_color_params,
         z_axis_options=_candidate_z_columns(working_df),
     )
     export_state = ProcessingExportState(
@@ -801,4 +906,39 @@ def build_processing_workspace(
         outlier_tables=outlier_tables,
         edit_state=ProcessingEditState.model_validate(edit_state),
         export_state=export_state,
+    )
+
+
+def build_processing_species_section(
+    context: ProcessingWorkspaceContext,
+    species: str,
+) -> SpeciesSection | None:
+    """Build one expanded species section without rebuilding overview figures."""
+
+    normalized_species = str(species).strip()
+    if not normalized_species:
+        return None
+    sections = build_species_sections(
+        context.filtered_df,
+        context.unfiltered_df,
+        context.config.model_copy(deep=True),
+        deepcopy(context.edit_state),
+        species_section_filter={normalized_species},
+        standards_df=context.standards_df,
+    )
+    return next((section for section in sections if section.species == normalized_species), None)
+
+
+def build_processing_workspace(
+    session_id: str,
+    df: pd.DataFrame,
+    cycles_df: pd.DataFrame | None,
+    metadata: dict[str, Any],
+    species_section_filter: set[str] | None = None,
+) -> ProcessingWorkspace:
+    context = build_processing_context(df, cycles_df, metadata)
+    return build_processing_workspace_from_context(
+        session_id,
+        context,
+        species_section_filter=species_section_filter,
     )

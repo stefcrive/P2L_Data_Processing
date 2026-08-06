@@ -3,15 +3,18 @@ from __future__ import annotations
 import base64
 import io
 import tempfile
+import time
 import unittest
 
 import numpy as np
 import pandas as pd
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 
 from services.irms_api.api import main as api_main
 from services.irms_api.domain.constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, VALID_CYCLES_COL
-from services.irms_api.domain.contracts import CycleDiagnosticsRequest, EditAction, EditBatchRequest, ExportRequest
+from services.irms_api.domain.contracts import CycleDiagnosticsRequest, EditAction, EditBatchRequest, ExportRequest, ProcessingConfig
 from services.irms_api.domain.shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column
 from services.irms_api.session_store import FileSessionStore
 
@@ -106,6 +109,16 @@ def processing_config_payload() -> dict[str, object]:
     }
 
 
+def wait_for_api_job(job_id: str, timeout: float = 10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snapshot = api_main.job_registry.get(job_id)
+        if snapshot.state in {"succeeded", "failed", "cancelled"}:
+            return snapshot
+        time.sleep(0.02)
+    raise AssertionError(f"Background job {job_id} did not finish")
+
+
 class ProcessingApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -174,6 +187,42 @@ class ProcessingApiTests(unittest.TestCase):
         )
         self.assertEqual(after["autosave"]["last_action"], "processing_edit_batch")
 
+    def test_processing_config_background_job_returns_base_workspace(self) -> None:
+        submitted = api_main.submit_processing_config_job(
+            self.session_id,
+            ProcessingConfig.model_validate(processing_config_payload()),
+        )
+        completed = wait_for_api_job(submitted.job_id)
+
+        self.assertEqual(completed.state, "succeeded", completed.error)
+        self.assertEqual(completed.result["session_id"], self.session_id)
+        self.assertTrue(all(not section["identifier_figures"] for section in completed.result["species_sections"]))
+
+    def test_export_background_job_produces_downloadable_artifact(self) -> None:
+        submitted = api_main.submit_export_job(
+            self.session_id,
+            ExportRequest(
+                include_outliers=False,
+                selected_ids=["All"],
+                interpolate_outliers=False,
+                client_name="Client A",
+                output_type="dataset",
+            ),
+        )
+        completed = wait_for_api_job(submitted.job_id)
+
+        self.assertEqual(completed.state, "succeeded", completed.error)
+        self.assertIn("download_url", completed.result)
+        response = api_main.download_job_artifact(submitted.job_id)
+        self.assertGreater(len(response.body), 100)
+        workbook = pd.ExcelFile(io.BytesIO(response.body))
+        self.assertIn("Data", workbook.sheet_names)
+        event_response = TestClient(api_main.app).get(f"/jobs/{submitted.job_id}/events")
+        self.assertEqual(event_response.status_code, 200)
+        self.assertIn("text/event-stream", event_response.headers["content-type"])
+        self.assertIn("event: complete", event_response.text)
+        self.assertIn(submitted.job_id, event_response.text)
+
     def test_processing_workspace_cache_returns_isolated_models(self) -> None:
         first = api_main.processing_workspace(
             self.session_id,
@@ -189,6 +238,25 @@ class ProcessingApiTests(unittest.TestCase):
         )
 
         self.assertEqual(second.config.selected_identifier, "All")
+
+    def test_species_section_endpoint_builds_only_requested_section(self) -> None:
+        base = api_main.processing_workspace(
+            self.session_id,
+            include_all_species_sections=False,
+            species_section=None,
+        )
+        self.assertTrue(base.species_sections)
+        self.assertTrue(all(not section.identifier_figures for section in base.species_sections))
+
+        section = api_main.processing_species_section(self.session_id, species="Coral")
+
+        self.assertEqual(section.species, "Coral")
+        self.assertGreater(section.identifier_count, 0)
+        self.assertTrue(section.identifier_figures)
+
+    def test_species_section_endpoint_rejects_unknown_species(self) -> None:
+        with self.assertRaisesRegex(HTTPException, "Unknown species section"):
+            api_main.processing_species_section(self.session_id, species="Not a species")
 
     def test_cycle_diagnostics_linearity_corrected_value_matches_processing_working_frame(self) -> None:
         metadata = api_main.store.load_metadata(self.session_id)

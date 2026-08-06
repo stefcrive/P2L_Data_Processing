@@ -898,6 +898,36 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertNotIn("Corl", species_sections)
         self.assertIn("Corl", workspace.available_values.species)
 
+    def test_identifier1_name_map_updates_processing_outputs_and_preserves_sources(self) -> None:
+        df = sample_processing_df()
+        metadata = {
+            "processing": {
+                "config": {
+                    "identifier1_name_map": {"SampleA": "Sample Alpha"},
+                }
+            },
+            "edit_state": {
+                "edited_rows": [],
+                "original_delta_values": {},
+                "manual_outlier_overrides": {},
+            },
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
+
+        self.assertIn("Sample Alpha", workspace.available_values.identifiers)
+        self.assertIn("Sample Alpha", workspace.available_values.export_identifiers)
+        self.assertNotIn("SampleA", workspace.available_values.export_identifiers)
+        self.assertIn("SampleA", workspace.available_values.identifier1_sources)
+        section_identifiers = {
+            figure.identifier
+            for section in workspace.species_sections
+            for figure in section.identifier_figures
+        }
+        self.assertIn("Sample Alpha", section_identifiers)
+        self.assertNotIn("SampleA", section_identifiers)
+
     def test_run_level_linearity_basis_can_use_cycle_endpoint_intensities(self) -> None:
         df = sample_processing_df().iloc[[0]].copy()
         cycles = pd.DataFrame(
@@ -1628,6 +1658,113 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(len(d18_calibrated_legend_entries), 1)
         self.assertEqual(str(d13_calibrated_legend_entries[0].get("name", "")), "Calibrated")
         self.assertEqual(str(d18_calibrated_legend_entries[0].get("name", "")), "Calibrated")
+
+    def test_standard_measurements_are_date_aligned_in_summary_and_species_charts(self) -> None:
+        df = pd.concat([sample_processing_df().iloc[[0]]] * 5, ignore_index=True)
+        df["Identifier 1"] = ["SampleA", "SampleA", "SampleA", "SHP2L", "SHP2L"]
+        # The sample Identifier-2 values are intentionally non-monotonic by
+        # date. Standard lines must still connect in the normal chart's
+        # left-to-right x sequence.
+        df["Identifier 2"] = ["10", "40", "5", "501", "502"]
+        df["Species"] = ["Coral", "Coral", "Coral", "Reference", "Reference"]
+        df["Label"] = [
+            "SampleA - Coral",
+            "SampleA - Coral",
+            "SampleA - Coral",
+            "SHP2L - Reference",
+            "SHP2L - Reference",
+        ]
+        df["Date"] = ["2025-01-01", "2025-01-03", "2025-01-05", "2025-01-02", "2025-01-04"]
+        df["Date_ordinal"] = [739252, 739254, 739256, 739253, 739255]
+        df["d 13C/12C  Mean"] = [1.0, 1.1, 1.2, -0.8, -0.7]
+        df["d 18O/16O  Mean"] = [2.0, 2.1, 2.2, -5.8, -5.7]
+        df["Collector Status"] = ""
+
+        def _numeric_payload(payload: object) -> list[float]:
+            if isinstance(payload, dict) and "bdata" in payload:
+                dtype_name = str(payload.get("dtype", "f8"))
+                decoded = base64.b64decode(str(payload.get("bdata", "")))
+                return np.frombuffer(decoded, dtype=np.dtype(dtype_name)).astype(float).tolist()
+            if isinstance(payload, list):
+                return [float(value) for value in payload if value is not None]
+            return []
+
+        expected_by_axis = {
+            "By Identifier 2": [22.5, 25.0],
+            "By Sequence": [0.5, 1.5],
+        }
+        for x_axis_option, expected_x in expected_by_axis.items():
+            with self.subTest(x_axis_option=x_axis_option):
+                config = normalize_processing_config({}).model_dump()
+                config["selected_identifier"] = "SampleA"
+                config["x_axis_option"] = x_axis_option
+                config["sigma_level_data"] = 99.0
+                config["signal_range"] = [0.0, 100.0]
+                config["leak_range"] = [0.0, 1000.0]
+                config["d13c_range"] = [-100.0, 100.0]
+                config["d18o_range"] = [-100.0, 100.0]
+                metadata = {
+                    "processing": {"config": config},
+                    "edit_state": {
+                        "edited_rows": [],
+                        "original_delta_values": {},
+                        "manual_outlier_overrides": {},
+                    },
+                    "calibration": {"selected_standards": ["SHP2L"]},
+                }
+
+                workspace = build_processing_workspace("session-standards", df, sample_cycles_df(), metadata)
+                summary_trace = next(
+                    (
+                        trace
+                        for trace in workspace.overview_figures.get("d13_summary", {}).get("data", [])
+                        if str(trace.get("name", "")) == "Standard measured d13C - SHP2L"
+                    ),
+                    None,
+                )
+                self.assertIsNotNone(summary_trace)
+                self.assertEqual(str((summary_trace or {}).get("yaxis", "")), "y2")
+                self.assertTrue(
+                    np.allclose(_numeric_payload((summary_trace or {}).get("x")), expected_x)
+                )
+                self.assertEqual(
+                    workspace.overview_figures.get("d13_summary", {})
+                    .get("layout", {})
+                    .get("yaxis2", {})
+                    .get("overlaying"),
+                    "y",
+                )
+                self.assertEqual(
+                    [str(item[0]) for item in ((summary_trace or {}).get("customdata") or [])],
+                    ["", ""],
+                )
+
+                coral_section = next(
+                    (section for section in workspace.species_sections if section.species == "Coral"),
+                    None,
+                )
+                figure_set = next(
+                    (
+                        item
+                        for item in (coral_section.identifier_figures if coral_section else [])
+                        if item.identifier == "SampleA"
+                    ),
+                    None,
+                )
+                self.assertIsNotNone(figure_set)
+                species_trace = next(
+                    (
+                        trace
+                        for trace in (figure_set.d13c.get("data", []) if figure_set else [])
+                        if str(trace.get("name", "")) == "Standard measured d13C - SHP2L"
+                    ),
+                    None,
+                )
+                self.assertIsNotNone(species_trace)
+                self.assertEqual(str((species_trace or {}).get("yaxis", "")), "y2")
+                self.assertTrue(
+                    np.allclose(_numeric_payload((species_trace or {}).get("x")), expected_x)
+                )
 
     def test_overview_crossplot_and_3d_use_species_specific_marker_symbols(self) -> None:
         df = sample_processing_df().copy()

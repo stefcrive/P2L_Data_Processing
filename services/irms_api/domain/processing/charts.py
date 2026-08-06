@@ -194,9 +194,165 @@ def _build_processing_point_customdata(df: pd.DataFrame, isotope_key: str) -> np
     return _build_delta_point_customdata(df, isotope_key)
 
 
+def _build_standard_point_customdata(df: pd.DataFrame, isotope_key: str) -> np.ndarray | None:
+    """Build hover metadata without making standard points editable."""
+    customdata = _build_processing_point_customdata(df, isotope_key)
+    if customdata is None:
+        return None
+    customdata = customdata.copy()
+    customdata[:, 0] = ""
+    return customdata
+
+
+def _measurement_datetime_series(df: pd.DataFrame) -> pd.Series:
+    """Return the best available acquisition timestamp for each measurement."""
+    if df is None or df.empty:
+        return pd.Series(dtype="datetime64[ns]")
+
+    parsed = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    for date_col in ("Date", "Measurement Date", "Analysis Date"):
+        if date_col not in df.columns:
+            continue
+        candidate = pd.to_datetime(df[date_col], errors="coerce")
+        if candidate.notna().any():
+            parsed = candidate
+            break
+
+    if parsed.notna().any() and "Time" in df.columns:
+        time_delta = pd.to_timedelta(df["Time"].astype(str).str.strip(), errors="coerce")
+        has_time = time_delta.notna()
+        if has_time.any():
+            parsed = parsed.copy()
+            parsed.loc[has_time] = parsed.loc[has_time].dt.normalize() + time_delta.loc[has_time]
+
+    if parsed.notna().any():
+        return parsed
+
+    ordinal_values = pd.to_numeric(
+        df.get("Date_ordinal", pd.Series(index=df.index, dtype=float)),
+        errors="coerce",
+    )
+    if not ordinal_values.notna().any():
+        return parsed
+
+    def _from_ordinal(value: Any) -> pd.Timestamp | pd.NaT:
+        if pd.isna(value):
+            return pd.NaT
+        try:
+            return pd.Timestamp.fromordinal(int(value))
+        except (TypeError, ValueError, OverflowError):
+            return pd.NaT
+
+    return ordinal_values.map(_from_ordinal)
+
+
+def _date_aligned_standard_rows(
+    standards_df: pd.DataFrame | None,
+    reference_df: pd.DataFrame,
+    x_axis_option: str,
+    color_col: str,
+) -> pd.DataFrame:
+    """Position standards on a sample x-axis by interpolating acquisition dates."""
+    if standards_df is None or standards_df.empty or reference_df is None or reference_df.empty:
+        return pd.DataFrame()
+
+    reference = reference_df.copy()
+    if "x_axis" not in reference.columns:
+        reference["x_axis"] = _x_axis_series(reference, x_axis_option)
+    reference["__measurement_datetime"] = _measurement_datetime_series(reference)
+    reference["__axis_numeric"] = pd.to_numeric(reference["x_axis"], errors="coerce")
+    reference = reference.loc[
+        reference["__measurement_datetime"].notna() & reference["__axis_numeric"].notna()
+    ].copy()
+    if reference.empty:
+        return pd.DataFrame()
+
+    anchors = (
+        reference.groupby("__measurement_datetime", as_index=False)["__axis_numeric"]
+        .mean()
+        .sort_values("__measurement_datetime")
+    )
+    anchor_dates = anchors["__measurement_datetime"].astype("int64").to_numpy(dtype=float)
+    anchor_x = anchors["__axis_numeric"].to_numpy(dtype=float)
+
+    standards = _attach_hover_context(standards_df.copy(), color_col)
+    standards["__measurement_datetime"] = _measurement_datetime_series(standards)
+    standards = standards.loc[standards["__measurement_datetime"].notna()].copy()
+    if standards.empty:
+        return standards
+    standard_dates = standards["__measurement_datetime"].astype("int64").to_numpy(dtype=float)
+    if len(anchor_dates) == 1:
+        standards["x_axis"] = float(anchor_x[0])
+    else:
+        standards["x_axis"] = np.interp(standard_dates, anchor_dates, anchor_x)
+    return standards.sort_values(["__measurement_datetime", "Identifier 2"], na_position="last")
+
+
+def _add_standard_measurement_traces(
+    fig: go.Figure,
+    standards_df: pd.DataFrame | None,
+    reference_df: pd.DataFrame,
+    isotope_key: str,
+    y_col: str,
+    x_axis_option: str,
+    color_col: str,
+) -> None:
+    aligned = _date_aligned_standard_rows(
+        standards_df,
+        reference_df,
+        x_axis_option=x_axis_option,
+        color_col=color_col,
+    )
+    if aligned.empty:
+        return
+
+    palette = ["#0f766e", "#7c3aed", "#b45309", "#be123c", "#0369a1", "#4d7c0f"]
+    standard_labels = aligned.get(
+        "Identifier 1",
+        pd.Series("", index=aligned.index, dtype=object),
+    ).fillna("").astype(str)
+    traces_added = False
+    for color_index, standard in enumerate(sorted(label for label in standard_labels.unique() if label.strip())):
+        rows = aligned.loc[standard_labels == standard].copy()
+        y_values = pd.to_numeric(rows.get(y_col), errors="coerce")
+        rows = rows.loc[y_values.notna()].copy()
+        if rows.empty:
+            continue
+        # Match the normal data traces: connect points from left to right in
+        # the plotted sequence, not in acquisition-date order.
+        rows = rows.sort_values(["x_axis", "__measurement_datetime", "Identifier 2"], na_position="last")
+        color = palette[color_index % len(palette)]
+        fig.add_trace(
+            go.Scatter(
+                x=rows["x_axis"],
+                y=pd.to_numeric(rows.get(y_col), errors="coerce"),
+                yaxis="y2",
+                mode="lines+markers",
+                name=f"Standard measured {isotope_key} - {standard}",
+                legendgroup=f"standard-measured-{isotope_key}-{standard}",
+                line=dict(color=color, width=2, dash="dot"),
+                marker=dict(color=color, size=9, symbol="diamond", line=dict(color="white", width=1)),
+                customdata=_build_standard_point_customdata(rows, isotope_key),
+            )
+        )
+        traces_added = True
+
+    if traces_added:
+        fig.update_layout(
+            yaxis2=dict(
+                title=f"Standard {isotope_key}",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+                zeroline=False,
+                automargin=True,
+            )
+        )
+
+
 def _apply_processing_isotope_hover_templates(fig: go.Figure, isotope_key: str, color_col: str) -> None:
     color_label = _color_param_label(color_col)
-    template = (
+    sample_template = (
         "Identifier 1: %{customdata[2]}<br>"
         "Identifier 2: %{customdata[3]}<br>"
         "Species: %{customdata[4]}<br>"
@@ -204,10 +360,20 @@ def _apply_processing_isotope_hover_templates(fig: go.Figure, isotope_key: str, 
         f"{color_label}: %{{customdata[5]}}<br>"
         f"{isotope_key}: %{{y:.3f}}<extra></extra>"
     )
+    standard_template = (
+        "Standard: %{customdata[2]}<br>"
+        "Identifier 2: %{customdata[3]}<br>"
+        f"{color_label}: %{{customdata[5]}}<br>"
+        f"{isotope_key}: %{{y:.3f}}<extra></extra>"
+    )
     for trace in fig.data:
         if getattr(trace, "customdata", None) is None:
             continue
-        trace.hovertemplate = template
+        trace.hovertemplate = (
+            standard_template
+            if str(getattr(trace, "name", "")).startswith("Standard measured ")
+            else sample_template
+        )
         trace.hoverlabel = dict(namelength=-1)
 
 
@@ -287,6 +453,7 @@ def _build_summary_figure(
     x_axis_option: str,
     color_col: str,
     show_calibrated: bool = True,
+    standards_df: pd.DataFrame | None = None,
     overlay_df: pd.DataFrame | None = None,
     summary_masks: dict[str, pd.Series] | None = None,
     sat_masks: dict[str, pd.Series] | None = None,
@@ -346,6 +513,15 @@ def _build_summary_figure(
                 )
             )
             calibrated_legend_shown = True
+    _add_standard_measurement_traces(
+        fig,
+        standards_df,
+        work,
+        isotope_key=isotope_key,
+        y_col=y_col,
+        x_axis_option=x_axis_option,
+        color_col=color_col,
+    )
     _apply_processing_isotope_hover_templates(fig, isotope_key, color_col)
     if (
         config is not None
@@ -380,7 +556,7 @@ def _build_summary_figure(
         yaxis_title=isotope_key,
         hovermode="closest",
         legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0.0, xanchor="left"),
-        margin=dict(l=40, r=20, t=120, b=40),
+        margin=dict(l=40, r=76, t=120, b=40),
     )
     return _figure_json(fig)
 
@@ -1100,6 +1276,7 @@ def build_overview_figures(
     unfiltered_scoped_df: pd.DataFrame,
     config: Any,
     edit_state: dict[str, Any] | None = None,
+    standards_df: pd.DataFrame | None = None,
 ) -> dict[str, dict[str, Any]]:
     figures: dict[str, dict[str, Any]] = {}
     overlays_df = _attach_hover_context(unfiltered_scoped_df.copy(), config.color_param) if unfiltered_scoped_df is not None else pd.DataFrame()
@@ -1173,6 +1350,7 @@ def build_overview_figures(
         "d13C",
         config.x_axis_option,
         config.color_param,
+        standards_df=standards_df,
         overlay_df=overlays_df,
         summary_masks=summary_masks,
         sat_masks=sat_masks,
@@ -1185,6 +1363,7 @@ def build_overview_figures(
         "d18O",
         config.x_axis_option,
         config.color_param,
+        standards_df=standards_df,
         overlay_df=overlays_df,
         summary_masks=summary_masks,
         sat_masks=sat_masks,
@@ -1335,6 +1514,7 @@ def _build_identifier_figure(
     isotope_key: str,
     config: Any,
     edit_state: dict[str, Any] | None,
+    standards_df: pd.DataFrame | None = None,
 ) -> tuple[dict[str, Any], bool]:
     if go is None:
         return {}, False
@@ -1634,13 +1814,23 @@ def _build_identifier_figure(
                     customdata=_build_processing_point_customdata(filtered_identifier, isotope_key),
                 )
             )
+        _add_standard_measurement_traces(
+            fig,
+            standards_df,
+            filtered_identifier,
+            isotope_key=isotope_key,
+            y_col=y_col,
+            x_axis_option=config.x_axis_option,
+            color_col=config.color_param,
+        )
+        _apply_processing_isotope_hover_templates(fig, isotope_key, config.color_param)
         fig.update_layout(
             title=f"{identifier} - {isotope_key} for Species: {species_unfiltered[species_col].iloc[0] if species_col in species_unfiltered.columns and not species_unfiltered.empty else ''}",
             xaxis_title="Sample Number" if config.x_axis_option == "By Sequence" else "Identifier 2",
             yaxis_title=isotope_key,
             hovermode="closest",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0, xanchor="left"),
-            margin=dict(l=40, r=20, t=80, b=40),
+            margin=dict(l=40, r=76, t=80, b=40),
         )
         _apply_cycle_std_error_bars(fig, d13_std_lookup, d18_std_lookup)
         return _figure_json(fig), bool(has_calibrated)
@@ -1653,6 +1843,7 @@ def build_species_sections(
     config: Any,
     edit_state: dict[str, Any] | None,
     species_section_filter: set[str] | None = None,
+    standards_df: pd.DataFrame | None = None,
 ) -> list[SpeciesSection]:
     if filtered_df is None or unfiltered_df is None:
         return []
@@ -1687,8 +1878,24 @@ def build_species_sections(
             )
             continue
         for identifier in identifiers:
-            d13_fig, has_cal_d13 = _build_identifier_figure(species_df, species_unfiltered, identifier, "d13C", config, edit_state)
-            d18_fig, has_cal_d18 = _build_identifier_figure(species_df, species_unfiltered, identifier, "d18O", config, edit_state)
+            d13_fig, has_cal_d13 = _build_identifier_figure(
+                species_df,
+                species_unfiltered,
+                identifier,
+                "d13C",
+                config,
+                edit_state,
+                standards_df=standards_df,
+            )
+            d18_fig, has_cal_d18 = _build_identifier_figure(
+                species_df,
+                species_unfiltered,
+                identifier,
+                "d18O",
+                config,
+                edit_state,
+                standards_df=standards_df,
+            )
             if d13_fig or d18_fig:
                 identifier_figures.append(
                     IdentifierFigureSet(

@@ -2,7 +2,7 @@
 
 ## Scope and current architecture
 
-The active application is a Next.js 15 / React 19 dashboard using TanStack Query and Plotly. It calls a synchronous FastAPI service that keeps session metadata and pandas dataframes on disk. Processing, calibration, diagnostics, and chart JSON are computed on request.
+The active application is a Next.js 15 / React 19 dashboard using TanStack Query and Plotly. It calls a FastAPI service that keeps session metadata and pandas dataframes on disk. Interactive reads are computed on request; long-running mutations use a bounded background job protocol.
 
 The code already contained useful first steps: cached CSV reads, lazy Plotly loading, deferred chart rendering, React Query caching, and selective species chart generation. The main remaining constraint was that many UI interactions still rebuilt and transferred a complete processing workspace.
 
@@ -27,6 +27,14 @@ Profiling attributed most cold request time to Plotly workspace construction. Pe
 - Workbook uploads expose live byte progress. After transfer completes, the UI explicitly changes to a server-processing state.
 - Every HTTP response includes `Server-Timing` and `X-Process-Time-Ms`, making server latency visible in browser developer tools and suitable for later telemetry collection.
 - `scripts/benchmark_processing.py` provides a repeatable local benchmark against real saved sessions.
+- Base workspace and expanded species data now have separate response paths. The base response carries section metadata only; each open section fetches its charts independently.
+- A revision-scoped `ProcessingWorkspaceContext` caches normalized configuration plus derived working, filtered, and unfiltered frames. Base overview and species chart builders reuse that context.
+- Section queries are independently cached in React Query and FastAPI. Opening or closing one section no longer retransfers or replaces overview figures and other open sections.
+- Imports/appends, calibration, processing configuration/edit batches, and exports now run through a bounded worker pool. Jobs for the same session are serialized to protect file-backed state.
+- `/jobs/{id}/events` streams revisioned progress through SSE. The dashboard falls back to status polling if the stream is unavailable and presents operation phase, percentage, failures, and cancellation controls.
+- Cancellation is cooperative until a job enters its explicitly non-cancellable persistence phase, preventing a cancelled label from being shown after durable state was already changed.
+- Queued workbook uploads are staged to temporary disk instead of retained in process memory. Queue size, worker count, history, retention, and upload size are configurable.
+- Export workbooks are retained as bounded, temporary disk artifacts rather than process-memory blobs and downloaded through `/jobs/{id}/download` after completion.
 
 On the same session after these changes:
 
@@ -35,17 +43,19 @@ On the same session after these changes:
 | Base processing workspace | 0.602 s | 0.0065 s | 22% faster cold; 99% faster repeated |
 | One open species section | 0.599 s | 0.0112 s | 40% faster cold; 98% faster repeated |
 
+After separating species responses, the focused BTS section is 0.258 MB instead of the former 0.641 MB combined workspace. It takes about 0.212 s when the base context is already available and 0.004 s from the section cache. A section requested before the base workspace takes about 0.345 s because it must also construct the shared context.
+
 These are local measurements, not a production service-level objective. Run the benchmark on representative large workbooks before and after each optimization.
 
 ## Bottlenecks still present
 
-1. A cold species request still rebuilds the base workspace. The next backend boundary should separate base summary/overview data from `SpeciesSection` data and cache the derived working frames shared by both.
-2. Plotly payload size grows with every sample point and identifier chart. Add a payload budget, consider `scattergl`, and downsample display traces while preserving full-resolution edit targets server-side.
-3. Imports, calibration, processing edits, and exports run synchronously. Large jobs should move to a bounded worker pool with job records and server-sent events (SSE) for progress, completion, cancellation, and failure. Upload byte progress is only the first half of that protocol.
+1. Plotly payload size grows with every sample point and identifier chart. Add a payload budget, consider `scattergl`, and downsample display traces while preserving full-resolution edit targets server-side.
+2. The job registry and artifacts are process-local. Multi-process or multi-host deployment requires a durable shared queue, persistent job records, and external artifact storage behind the existing job API.
+3. Some scientific library calls cannot be interrupted mid-call, so cancellation occurs at safe checkpoints. Add deeper progress/cancellation checkpoints as domain functions are decomposed.
 4. Session persistence rewrites complete CSV snapshots and then refreshes the dataframe cache. Move snapshots to Parquet/Arrow or another typed columnar format, and write atomically. Keep CSV only as an export format.
 5. The processing, calibration, and diagnostics pages are very large client components. Split chart panels and controls into memoized feature components, then measure React commits with the Profiler before adding more state.
-6. Outlier masks and derived frames are recalculated several times within one cold workspace build. Introduce a request-scoped `ProcessingContext` containing normalized config, working frames, range masks, and lookup tables.
-7. Add load tests at 1x, 5x, 10x, and 25x representative data volume. Track cold p50/p95, cached p50/p95, response bytes, browser long tasks, and peak backend memory.
+6. Outlier masks and derived frames are still recalculated several times while assembling a cold base workspace. Extend `ProcessingWorkspaceContext` with reusable category masks and lookup tables.
+7. Add load tests at 1x, 5x, 10x, and 25x representative data volume. Track cold p50/p95, cached p50/p95, job queue wait, response bytes, browser long tasks, and peak backend memory.
 
 ## Suggested performance targets
 

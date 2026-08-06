@@ -933,12 +933,63 @@ def apply_run_level_linearity_basis_from_cycles(
         intensity_cols = [col for col in _find_cycle_intensity_columns(prepared) if col in prepared.columns]
         if intensity_cols:
             cycle_rows = prepared.loc[prepared["_cycle_order"] > 0].copy()
-            for group, group_cycles in cycle_rows.groupby("_cycle_group", sort=False):
-                if pd.isna(group) or group_cycles.empty:
-                    continue
-                group_cycles = group_cycles.sort_values("_cycle_order")
-                basis = _cycle_44_basis_frame(group_cycles, intensity_cols)
-                summary_by_group[group] = _basis_column_values(basis)
+            if aggregation_mode == "run_median":
+                # Column roles are stable within an imported workbook. Resolve
+                # them once per source file and aggregate all of its runs in one
+                # vectorized pass instead of constructing a DataFrame per run.
+                partition_col = "Excel File" if "Excel File" in cycle_rows.columns else None
+                partitions = (
+                    cycle_rows.groupby(partition_col, sort=False, dropna=False)
+                    if partition_col
+                    else [(None, cycle_rows)]
+                )
+                for _, partition in partitions:
+                    smp_col, ref_col = _pick_mass_role_columns(partition, intensity_cols, 44)
+                    if smp_col is None and ref_col is None:
+                        continue
+                    samp = (
+                        _normalize_signal_intensity(partition[smp_col])
+                        if smp_col is not None
+                        else pd.Series(np.nan, index=partition.index, dtype=float)
+                    ).replace([np.inf, -np.inf], np.nan)
+                    ref = (
+                        _normalize_signal_intensity(partition[ref_col])
+                        if ref_col is not None
+                        else pd.Series(np.nan, index=partition.index, dtype=float)
+                    ).replace([np.inf, -np.inf], np.nan)
+                    groups = partition["_cycle_group"]
+                    diff = samp - ref
+                    mean_intensity = (samp + ref) / 2.0
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        relative = diff / ref
+                        symmetric = diff / mean_intensity
+                        sample_reference = samp.groupby(groups).transform("median")
+                        weighted = 10.0 * relative * (samp / sample_reference)
+                    basis = pd.DataFrame(
+                        {
+                            CYCLE1_SIGNAL_SAMP44_COL: samp,
+                            CYCLE1_SIGNAL_DIFF44_COL: diff,
+                            CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL: mean_intensity,
+                            CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL: relative,
+                            CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL: symmetric,
+                            CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL: weighted,
+                            "_cycle_group": groups,
+                        },
+                        index=partition.index,
+                    ).replace([np.inf, -np.inf], np.nan)
+                    medians = basis.groupby("_cycle_group", sort=False).median(numeric_only=True)
+                    for group, values in medians.iterrows():
+                        summary_by_group[group] = {
+                            col: (float(values[col]) if pd.notna(values[col]) else None)
+                            for col in updates
+                        }
+            else:
+                for group, group_cycles in cycle_rows.groupby("_cycle_group", sort=False):
+                    if pd.isna(group) or group_cycles.empty:
+                        continue
+                    group_cycles = group_cycles.sort_values("_cycle_order")
+                    basis = _cycle_44_basis_frame(group_cycles, intensity_cols)
+                    summary_by_group[group] = _basis_column_values(basis)
         summary_cache[aggregation_mode] = summary_by_group
         cycles_df.attrs[_RUN_LEVEL_BASIS_SUMMARY_ATTR] = summary_cache
     if not summary_by_group:
@@ -954,49 +1005,62 @@ def apply_run_level_linearity_basis_from_cycles(
             pass
         return str(value).strip() != ""
 
-    for row_label in work.index:
-        processed_row = work.loc[row_label]
-        if isinstance(processed_row, pd.DataFrame):
-            processed_row = processed_row.iloc[0]
-        candidates = pre_rows
+    # Convert the small run-level lookup to Python records once. Repeated pandas
+    # boolean indexing here used to allocate several temporary frames per result
+    # row, which becomes very expensive for large imported workbooks.
+    pre_records = pre_rows.to_dict(orient="records")
+
+    def _text_matches(left: Any, right: Any) -> bool:
+        return str(left).strip() == str(right).strip()
+
+    def _date_matches(left: Any, right: Any) -> bool:
+        left_date = pd.to_datetime(left, errors="coerce")
+        right_date = pd.to_datetime(right, errors="coerce")
+        return bool(pd.notna(left_date) and pd.notna(right_date) and left_date == right_date)
+
+    for row_label, processed_row in work.iterrows():
+        candidates = pre_records
         for col in ["Excel File", "Identifier 1", "Identifier 2"]:
-            if col not in candidates.columns:
+            if col not in pre_rows.columns:
                 continue
-            value = processed_row[col] if col in processed_row.index else None
+            value = processed_row.get(col)
             if not _value_present(value):
                 continue
-            mask = candidates[col].astype(str).str.strip().eq(str(value).strip())
-            if mask.any():
-                candidates = candidates.loc[mask]
+            matches = [candidate for candidate in candidates if _text_matches(candidate.get(col), value)]
+            if matches:
+                candidates = matches
         for col in ["Run ID", "Line", "Date"]:
-            if col not in candidates.columns:
+            if col not in pre_rows.columns:
                 continue
-            value = processed_row[col] if col in processed_row.index else None
+            value = processed_row.get(col)
             if not _value_present(value):
                 continue
             if col == "Date":
-                p_date = pd.to_datetime(value, errors="coerce")
-                if pd.notna(p_date):
-                    c_dates = pd.to_datetime(candidates[col], errors="coerce")
-                    mask = c_dates.eq(p_date)
-                    if mask.any():
-                        candidates = candidates.loc[mask]
+                matches = [candidate for candidate in candidates if _date_matches(candidate.get(col), value)]
             else:
-                mask = candidates[col].astype(str).str.strip().eq(str(value).strip())
-                if mask.any():
-                    candidates = candidates.loc[mask]
-        if candidates.empty:
+                matches = [candidate for candidate in candidates if _text_matches(candidate.get(col), value)]
+            if matches:
+                candidates = matches
+        if not candidates:
             continue
         if len(candidates) == 1:
-            selected_pre = candidates.iloc[0]
+            selected_pre = candidates[0]
         else:
-            cand_source = candidates[target_col] if target_col in candidates.columns else pd.Series(np.nan, index=candidates.index)
-            cand_vals = pd.to_numeric(cand_source, errors="coerce")
-            proc_val = pd.to_numeric(pd.Series([processed_row.get(target_col)]), errors="coerce").iloc[0]
-            if pd.notna(proc_val) and cand_vals.notna().any():
-                selected_pre = candidates.loc[(cand_vals - float(proc_val)).abs().idxmin()]
-            else:
-                selected_pre = candidates.iloc[0]
+            proc_val = pd.to_numeric(processed_row.get(target_col), errors="coerce")
+            numeric_candidates = [
+                (candidate, pd.to_numeric(candidate.get(target_col), errors="coerce"))
+                for candidate in candidates
+            ]
+            finite_candidates = [
+                (candidate, float(value))
+                for candidate, value in numeric_candidates
+                if pd.notna(value) and np.isfinite(float(value))
+            ]
+            selected_pre = (
+                min(finite_candidates, key=lambda item: abs(item[1] - float(proc_val)))[0]
+                if pd.notna(proc_val) and np.isfinite(float(proc_val)) and finite_candidates
+                else candidates[0]
+            )
         group = selected_pre.get("_cycle_group")
         column_values = summary_by_group.get(group)
         if not isinstance(column_values, dict):

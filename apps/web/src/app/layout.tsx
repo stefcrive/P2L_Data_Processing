@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Plus_Jakarta_Sans, Space_Grotesk } from "next/font/google";
+import { Geist_Mono, Manrope, Space_Grotesk } from "next/font/google";
 import "./globals.css";
 
 import { BackToTopButton } from "@/components/layout/back-to-top-button";
@@ -10,7 +10,7 @@ export const metadata: Metadata = {
   description: "Next.js dashboard for the IRMS analyzer refactor",
 };
 
-const sans = Plus_Jakarta_Sans({
+const sans = Manrope({
   subsets: ["latin"],
   variable: "--font-sans",
   display: "swap",
@@ -22,10 +22,16 @@ const display = Space_Grotesk({
   display: "swap",
 });
 
+const mono = Geist_Mono({
+  subsets: ["latin"],
+  variable: "--font-mono",
+  display: "swap",
+});
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body className={`${sans.variable} ${display.variable}`}>
+      <body className={`${sans.variable} ${display.variable} ${mono.variable}`}>
         <QueryProvider>{children}</QueryProvider>
         <BackToTopButton />
       </body>

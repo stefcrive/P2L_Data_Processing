@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
+import re
+import shutil
 import threading
+import tempfile
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -14,7 +19,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from ..domain.calibration.core import (
     _apply_isotope_line_offsets,
@@ -35,6 +40,7 @@ from ..domain.calibration.core import (
     identify_outliers_iqr,
 )
 from ..domain.contracts import (
+    AutosaveSettingsUpdate,
     CalibrationConfig,
     CalibrationLinearityUpdateRequest,
     CalibrationOfficialValue,
@@ -49,12 +55,14 @@ from ..domain.contracts import (
     EditBatchRequest,
     ExportRequest,
     ImportResult,
+    JobSnapshot,
     LinearityConfig,
     ProcessingConfig,
     ProcessingExportConfig,
     ProcessingLinearityPreviewData,
     ProcessingWorkspace,
     SessionSnapshot,
+    SpeciesSection,
 )
 from ..domain.constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
@@ -107,7 +115,10 @@ from ..domain.processing.workspace import (
     _derive_working_frame,
     _exclude_outliers_from_plot_base,
     _selected_processing_rows,
-    build_processing_workspace,
+    ProcessingWorkspaceContext,
+    build_processing_context,
+    build_processing_species_section,
+    build_processing_workspace_from_context,
     normalize_processing_config,
 )
 from ..domain.shared.dataframe import _ensure_cycle1_signal_difference_columns
@@ -115,6 +126,7 @@ from ..domain.shared.json_compat import to_json_compatible
 from ..domain.shared.plotting import _build_isotope_3d_scatter
 from ..domain.standards import StandardsRepository
 from ..session_store import FileSessionStore
+from ..jobs import JobContext, JobQueueFullError, JobRegistry, TERMINAL_JOB_STATES
 
 app = FastAPI(title="IRMS API", version="0.1.0")
 
@@ -152,6 +164,7 @@ async def add_performance_headers(request: Request, call_next):
     return response
 
 store = FileSessionStore()
+job_registry = JobRegistry()
 
 
 class _NamedBytesIO(io.BytesIO):
@@ -790,11 +803,19 @@ def _persist_session_update(
     autosave = dict(meta.get("autosave", {}))
     autosave.update(_autosave_paths_payload(session_id))
     autosave.setdefault("initialized_at", datetime.now(timezone.utc).isoformat())
+    autosave.setdefault("enabled", True)
     if resumed is not None:
         autosave["resumed"] = bool(resumed)
-    autosave["last_action"] = action
-    autosave["last_saved_at"] = datetime.now(timezone.utc).isoformat()
-    autosave["event_count"] = int(autosave.get("event_count", 0)) + 1
+    should_record_autosave = bool(autosave["enabled"]) or action in {
+        "autosave_enabled",
+        "autosave_disabled",
+        "session_saved_manual",
+        "session_closed",
+    }
+    if should_record_autosave:
+        autosave["last_action"] = action
+        autosave["last_saved_at"] = datetime.now(timezone.utc).isoformat()
+        autosave["event_count"] = int(autosave.get("event_count", 0)) + 1
     meta["autosave"] = autosave
 
     frame = df
@@ -809,8 +830,9 @@ def _persist_session_update(
         meta["row_count"] = int(len(frame))
         meta["cycles_row_count"] = int(len(cycle_frame)) if cycle_frame is not None else 0
 
-    store.write_metadata(session_id, meta)
-    store.append_log(session_id, action, payload or {})
+    store.write_metadata(session_id, meta, write_session_state=should_record_autosave)
+    if should_record_autosave:
+        store.append_log(session_id, action, payload or {})
     _clear_processing_workspace_cache(session_id)
     return meta
 
@@ -818,6 +840,88 @@ def _persist_session_update(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _job_or_404(job_id: str) -> JobSnapshot:
+    try:
+        return job_registry.get(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown job") from exc
+
+
+def _submit_job(kind: str, runner, *, session_id: str | None = None) -> JobSnapshot:
+    try:
+        return job_registry.submit(kind, runner, session_id=session_id)
+    except JobQueueFullError as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "2"}) from exc
+
+
+@app.get("/jobs/{job_id}", response_model=JobSnapshot)
+def get_job(job_id: str) -> JobSnapshot:
+    return _job_or_404(job_id)
+
+
+@app.delete("/jobs/{job_id}", response_model=JobSnapshot)
+def cancel_job(job_id: str) -> JobSnapshot:
+    _job_or_404(job_id)
+    return job_registry.cancel(job_id)
+
+
+@app.get("/jobs/{job_id}/events")
+async def stream_job_events(job_id: str, request: Request) -> StreamingResponse:
+    _job_or_404(job_id)
+
+    async def _events():
+        last_revision = -1
+        last_keepalive = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                return
+            snapshot = _job_or_404(job_id)
+            if snapshot.revision != last_revision:
+                event_name = (
+                    "complete"
+                    if snapshot.state == "succeeded"
+                    else "error"
+                    if snapshot.state == "failed"
+                    else "cancelled"
+                    if snapshot.state == "cancelled"
+                    else "progress"
+                )
+                payload = json.dumps(snapshot.model_dump(mode="json"), separators=(",", ":"))
+                yield f"id: {snapshot.revision}\nevent: {event_name}\ndata: {payload}\n\n"
+                last_revision = snapshot.revision
+                last_keepalive = time.monotonic()
+            if snapshot.state in TERMINAL_JOB_STATES:
+                return
+            if time.monotonic() - last_keepalive >= 15.0:
+                yield ": keepalive\n\n"
+                last_keepalive = time.monotonic()
+            await asyncio.sleep(0.2)
+
+    return StreamingResponse(
+        _events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/jobs/{job_id}/download")
+def download_job_artifact(job_id: str) -> Response:
+    snapshot = _job_or_404(job_id)
+    if snapshot.state != "succeeded":
+        raise HTTPException(status_code=409, detail="Job output is not ready")
+    artifact = job_registry.get_artifact(job_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Job has no downloadable output")
+    return Response(
+        content=artifact.path.read_bytes(),
+        media_type=artifact.media_type,
+        headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+    )
 
 
 @app.get("/standards/official-values", response_model=list[CalibrationOfficialValue])
@@ -865,17 +969,65 @@ def delete_single_official_value(
     )
 
 
-@app.post("/sessions/import", response_model=ImportResult)
-async def import_session(files: list[UploadFile] = File(...)) -> ImportResult:
-    uploaded = []
+async def _read_uploaded_workbook_bytes(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+    maximum_bytes = max(1, int(os.getenv("IRMS_JOB_MAX_UPLOAD_BYTES", str(512 * 1024 * 1024))))
+    total_bytes = 0
     raw_uploads: list[tuple[str, bytes]] = []
     for file in files:
         content = await file.read()
+        total_bytes += len(content)
+        if total_bytes > maximum_bytes:
+            raise HTTPException(status_code=413, detail="Uploaded workbooks exceed the configured size limit")
         raw_uploads.append((file.filename or "upload.xlsx", content))
-        uploaded.append(_NamedBytesIO(content, file.filename or "upload.xlsx"))
+    return raw_uploads
+
+
+async def _stage_uploaded_workbooks(files: list[UploadFile]) -> tuple[Path, list[tuple[str, Path]]]:
+    """Spool queued job inputs to disk so the bounded queue does not retain upload bytes in RAM."""
+
+    maximum_bytes = max(1, int(os.getenv("IRMS_JOB_MAX_UPLOAD_BYTES", str(512 * 1024 * 1024))))
+    stage_root = Path(tempfile.mkdtemp(prefix="irms-job-upload-"))
+    staged: list[tuple[str, Path]] = []
+    total_bytes = 0
+    try:
+        for index, file in enumerate(files):
+            filename = file.filename or "upload.xlsx"
+            target = stage_root / f"{index:05d}.workbook"
+            with target.open("wb") as handle:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > maximum_bytes:
+                        raise HTTPException(status_code=413, detail="Uploaded workbooks exceed the configured size limit")
+                    handle.write(chunk)
+            staged.append((filename, target))
+        return stage_root, staged
+    except Exception:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        raise
+
+
+def _read_staged_workbooks(staged: list[tuple[str, Path]]) -> list[tuple[str, bytes]]:
+    return [(filename, path.read_bytes()) for filename, path in staged]
+
+
+def _import_session_from_bytes(
+    raw_uploads: list[tuple[str, bytes]],
+    context: JobContext | None = None,
+) -> ImportResult:
+    uploaded = []
+    for filename, content in raw_uploads:
+        uploaded.append(_NamedBytesIO(content, filename))
+    if context is not None:
+        context.report(15, "parsing_workbooks", f"Parsing {len(uploaded)} workbook(s)")
     df, cycles_df, specs, errors = _load_uploaded_workbooks(uploaded)
     if df is None:
         raise HTTPException(status_code=400, detail={"errors": errors or ["No workbook rows were loaded"]})
+    if context is not None:
+        context.raise_if_cancelled()
+        context.begin_commit(70, "saving_session", "Saving imported session")
     session_name = _build_session_name_from_source_files(specs)
     session_id = store.create_session({"session_name": session_name, "source_files": specs, "errors": errors})
     for filename, content in raw_uploads:
@@ -896,23 +1048,28 @@ async def import_session(files: list[UploadFile] = File(...)) -> ImportResult:
     return ImportResult(session=_to_session_snapshot(session_id))
 
 
-@app.post("/sessions/{session_id}/append", response_model=ImportResult)
-async def append_session(session_id: str, files: list[UploadFile] = File(...)) -> ImportResult:
+def _append_session_from_bytes(
+    session_id: str,
+    raw_uploads: list[tuple[str, bytes]],
+    context: JobContext | None = None,
+) -> ImportResult:
     _session_exists_or_404(session_id)
     current_df = store.load_frame(session_id)
     current_cycles = store.load_cycles_frame(session_id)
     metadata = store.load_metadata(session_id)
     uploaded = []
-    raw_uploads: list[tuple[str, bytes]] = []
-    for file in files:
-        content = await file.read()
-        raw_uploads.append((file.filename or "upload.xlsx", content))
-        uploaded.append(_NamedBytesIO(content, file.filename or "upload.xlsx"))
+    for filename, content in raw_uploads:
+        uploaded.append(_NamedBytesIO(content, filename))
+    if context is not None:
+        context.report(15, "parsing_workbooks", f"Parsing {len(uploaded)} workbook(s)")
     append_df, append_cycles, specs, errors = _load_uploaded_workbooks(uploaded)
     if append_df is None:
         raise HTTPException(status_code=400, detail={"errors": errors or ["No workbook rows were appended"]})
     merged = _append_rows_preserve_existing_index(current_df, append_df)
     merged_cycles = _append_cycles_source(current_cycles, append_cycles)
+    if context is not None:
+        context.raise_if_cancelled()
+        context.begin_commit(70, "saving_session", "Saving appended workbooks")
     for filename, content in raw_uploads:
         store.save_upload(session_id, filename, content)
     metadata["source_files"] = list(metadata.get("source_files", [])) + specs
@@ -929,6 +1086,51 @@ async def append_session(session_id: str, files: list[UploadFile] = File(...)) -
     return ImportResult(session=_to_session_snapshot(session_id))
 
 
+@app.post("/sessions/import", response_model=ImportResult)
+async def import_session(files: list[UploadFile] = File(...)) -> ImportResult:
+    return _import_session_from_bytes(await _read_uploaded_workbook_bytes(files))
+
+
+@app.post("/sessions/import/jobs", response_model=JobSnapshot, status_code=202)
+async def submit_import_session_job(files: list[UploadFile] = File(...)) -> JobSnapshot:
+    stage_root, staged = await _stage_uploaded_workbooks(files)
+
+    def _runner(context: JobContext) -> dict[str, Any]:
+        try:
+            return _import_session_from_bytes(_read_staged_workbooks(staged), context).model_dump(mode="json")
+        finally:
+            shutil.rmtree(stage_root, ignore_errors=True)
+
+    try:
+        return _submit_job("session_import", _runner)
+    except Exception:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        raise
+
+
+@app.post("/sessions/{session_id}/append", response_model=ImportResult)
+async def append_session(session_id: str, files: list[UploadFile] = File(...)) -> ImportResult:
+    return _append_session_from_bytes(session_id, await _read_uploaded_workbook_bytes(files))
+
+
+@app.post("/sessions/{session_id}/append/jobs", response_model=JobSnapshot, status_code=202)
+async def submit_append_session_job(session_id: str, files: list[UploadFile] = File(...)) -> JobSnapshot:
+    _session_exists_or_404(session_id)
+    stage_root, staged = await _stage_uploaded_workbooks(files)
+
+    def _runner(context: JobContext) -> dict[str, Any]:
+        try:
+            return _append_session_from_bytes(session_id, _read_staged_workbooks(staged), context).model_dump(mode="json")
+        finally:
+            shutil.rmtree(stage_root, ignore_errors=True)
+
+    try:
+        return _submit_job("session_append", _runner, session_id=session_id)
+    except Exception:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        raise
+
+
 @app.get("/sessions", response_model=list[SessionSnapshot])
 def list_sessions(limit: int = Query(50, ge=1, le=500)) -> list[SessionSnapshot]:
     return [SessionSnapshot.model_validate(item) for item in store.list_sessions(limit=limit)]
@@ -938,6 +1140,90 @@ def list_sessions(limit: int = Query(50, ge=1, le=500)) -> list[SessionSnapshot]
 def get_session(session_id: str) -> SessionSnapshot:
     _session_exists_or_404(session_id)
     return _to_session_snapshot(session_id)
+
+
+@app.patch("/sessions/{session_id}/autosave", response_model=SessionSnapshot)
+def update_autosave(session_id: str, request: AutosaveSettingsUpdate) -> SessionSnapshot:
+    _session_exists_or_404(session_id)
+    metadata = store.load_metadata(session_id)
+    autosave = dict(metadata.get("autosave", {}))
+    autosave.update(_autosave_paths_payload(session_id))
+    autosave["enabled"] = bool(request.enabled)
+    metadata["autosave"] = autosave
+    _persist_session_update(
+        session_id,
+        action="autosave_enabled" if request.enabled else "autosave_disabled",
+        payload={"enabled": bool(request.enabled)},
+        metadata=metadata,
+    )
+    return _to_session_snapshot(session_id)
+
+
+@app.get("/sessions/{session_id}/artifacts/{artifact_kind}")
+def get_session_artifact(session_id: str, artifact_kind: str) -> dict[str, Any]:
+    _session_exists_or_404(session_id)
+    paths = store._paths(session_id)
+    artifact_labels = {
+        "events": "Event log",
+        "snapshot": "Data snapshot",
+        "cycles": "Cycle snapshot",
+        "metadata": "Session metadata",
+        "state": "Session state",
+    }
+    if artifact_kind not in artifact_labels:
+        raise HTTPException(status_code=404, detail="Unknown session artifact")
+
+    if artifact_kind == "events":
+        if not paths.log_path.exists():
+            raise HTTPException(status_code=404, detail="Event log is not available")
+        items: list[dict[str, Any]] = []
+        for line in paths.log_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                item = {"timestamp": None, "action": "unparsed_event", "payload": {"text": line}}
+            if isinstance(item, dict):
+                items.append(item)
+        visible_items = items[-250:]
+        return {
+            "kind": artifact_kind,
+            "label": artifact_labels[artifact_kind],
+            "format": "events",
+            "items": to_json_compatible(visible_items),
+            "row_count": len(items),
+            "truncated": len(items) > len(visible_items),
+        }
+
+    if artifact_kind in {"snapshot", "cycles"}:
+        csv_path = paths.snapshot_path if artifact_kind == "snapshot" else paths.cycles_snapshot_path
+        if not csv_path.exists():
+            raise HTTPException(status_code=404, detail=f"{artifact_labels[artifact_kind]} is not available")
+        frame = pd.read_csv(csv_path, nrows=100, low_memory=False)
+        return {
+            "kind": artifact_kind,
+            "label": artifact_labels[artifact_kind],
+            "format": "table",
+            "columns": [str(column) for column in frame.columns],
+            "rows": to_json_compatible(frame.to_dict(orient="records")),
+            "row_count": store._csv_row_count(csv_path),
+            "truncated": store._csv_row_count(csv_path) > len(frame),
+        }
+
+    json_path = paths.metadata_path if artifact_kind == "metadata" else paths.session_state_path
+    if not json_path.exists():
+        raise HTTPException(status_code=404, detail=f"{artifact_labels[artifact_kind]} is not available")
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"{artifact_labels[artifact_kind]} is invalid JSON") from exc
+    return {
+        "kind": artifact_kind,
+        "label": artifact_labels[artifact_kind],
+        "format": "object",
+        "data": to_json_compatible(data),
+    }
 
 
 def _clean_uploaded_relative_path(filename: str | None) -> list[str]:
@@ -1205,9 +1491,14 @@ def diagnostics(
     )
 
 
-@app.post("/sessions/{session_id}/calibration/run", response_model=SessionSnapshot)
-def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapshot:
+def _run_calibration_sync(
+    session_id: str,
+    config: CalibrationConfig,
+    context: JobContext | None = None,
+) -> SessionSnapshot:
     _session_exists_or_404(session_id)
+    if context is not None:
+        context.report(5, "loading_session", "Loading calibration data")
     config = normalize_calibration_config(config.model_dump())
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
@@ -1287,6 +1578,8 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         standards_repo,
         carbonate_material=config.carbonate_material,
     )
+    if context is not None:
+        context.report(30, "fitting_linearity", "Computing linearity fits")
     outlier_reference_df = outlier_input_df
     fits: dict[str, Any] = {}
     if linearity_enabled:
@@ -1358,6 +1651,8 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         config.independent_isotope_outliers,
         outlier_reference_df=outlier_reference_df,
     )
+    if context is not None:
+        context.report(60, "calibrating", "Applying calibration coefficients")
     standards_source = clean_stds if not clean_stds.empty else standards_for_calibration
     calibration_source = outlier_input_df
     if linearity_enabled and fits:
@@ -1433,6 +1728,8 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         "selected_standards": config.selected_standards,
     }
     _set_processing_apply_calibration(metadata, True)
+    if context is not None:
+        context.begin_commit(90, "saving_calibration", "Saving calibrated session")
     _persist_session_update(
         session_id,
         action="calibration_run",
@@ -1442,6 +1739,27 @@ def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapsh
         cycles_df=store.load_cycles_frame(session_id),
     )
     return _to_session_snapshot(session_id)
+
+
+@app.post("/sessions/{session_id}/calibration/run", response_model=SessionSnapshot)
+def run_calibration(session_id: str, config: CalibrationConfig) -> SessionSnapshot:
+    return _run_calibration_sync(session_id, config)
+
+
+@app.post("/sessions/{session_id}/calibration/run/jobs", response_model=JobSnapshot, status_code=202)
+def submit_calibration_job(session_id: str, config: CalibrationConfig) -> JobSnapshot:
+    _session_exists_or_404(session_id)
+    config_payload = config.model_dump()
+
+    def _runner(context: JobContext) -> dict[str, Any]:
+        snapshot = _run_calibration_sync(
+            session_id,
+            CalibrationConfig.model_validate(config_payload),
+            context,
+        )
+        return snapshot.model_dump(mode="json")
+
+    return _submit_job("calibration_run", _runner, session_id=session_id)
 
 
 @app.post("/sessions/{session_id}/calibration/reset", response_model=SessionSnapshot)
@@ -1772,7 +2090,11 @@ def calibration_charts(session_id: str, color_param: str = Query("Date")) -> Cha
 
 
 _PROCESSING_WORKSPACE_CACHE_MAX_ENTRIES = 16
+_PROCESSING_CONTEXT_CACHE_MAX_ENTRIES = 4
+_PROCESSING_SPECIES_CACHE_MAX_ENTRIES = 24
 _processing_workspace_cache: OrderedDict[tuple[Any, ...], ProcessingWorkspace] = OrderedDict()
+_processing_context_cache: OrderedDict[tuple[Any, ...], ProcessingWorkspaceContext] = OrderedDict()
+_processing_species_cache: OrderedDict[tuple[Any, ...], SpeciesSection] = OrderedDict()
 _processing_workspace_cache_lock = threading.RLock()
 
 
@@ -1808,11 +2130,44 @@ def _clear_processing_workspace_cache(session_id: str | None = None) -> None:
     with _processing_workspace_cache_lock:
         if session_id is None:
             _processing_workspace_cache.clear()
+            _processing_context_cache.clear()
+            _processing_species_cache.clear()
             return
         session_key = str(session_id)
-        for key in list(_processing_workspace_cache):
-            if key[0] == session_key:
-                _processing_workspace_cache.pop(key, None)
+        for cache in (
+            _processing_workspace_cache,
+            _processing_context_cache,
+            _processing_species_cache,
+        ):
+            for key in list(cache):
+                if key[0] == session_key:
+                    cache.pop(key, None)
+
+
+def _get_processing_context(
+    session_id: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+    df: pd.DataFrame | None = None,
+    cycles_df: pd.DataFrame | None = None,
+) -> ProcessingWorkspaceContext:
+    cache_key = (str(session_id), _processing_workspace_source_signature(session_id))
+    with _processing_workspace_cache_lock:
+        cached = _processing_context_cache.get(cache_key)
+        if cached is not None:
+            _processing_context_cache.move_to_end(cache_key)
+            return cached
+
+    meta = metadata if metadata is not None else store.load_metadata(session_id)
+    frame = df if df is not None else store.load_frame(session_id)
+    cycles_frame = cycles_df if cycles_df is not None else store.load_cycles_frame(session_id)
+    context = build_processing_context(frame, cycles_frame, meta)
+    with _processing_workspace_cache_lock:
+        _processing_context_cache[cache_key] = context
+        _processing_context_cache.move_to_end(cache_key)
+        while len(_processing_context_cache) > _PROCESSING_CONTEXT_CACHE_MAX_ENTRIES:
+            _processing_context_cache.popitem(last=False)
+    return context
 
 
 def _build_processing_workspace_response(
@@ -1829,14 +2184,15 @@ def _build_processing_workspace_response(
             _processing_workspace_cache.move_to_end(cache_key)
             return cached.model_copy(deep=True)
 
-    meta = metadata if metadata is not None else store.load_metadata(session_id)
-    frame = df if df is not None else store.load_frame(session_id)
-    cycles_frame = cycles_df if cycles_df is not None else store.load_cycles_frame(session_id)
-    workspace = build_processing_workspace(
+    context = _get_processing_context(
         session_id,
-        frame,
-        cycles_frame,
-        meta,
+        metadata=metadata,
+        df=df,
+        cycles_df=cycles_df,
+    )
+    workspace = build_processing_workspace_from_context(
+        session_id,
+        context,
         species_section_filter=species_section_filter,
     )
     with _processing_workspace_cache_lock:
@@ -1845,6 +2201,31 @@ def _build_processing_workspace_response(
         while len(_processing_workspace_cache) > _PROCESSING_WORKSPACE_CACHE_MAX_ENTRIES:
             _processing_workspace_cache.popitem(last=False)
     return workspace
+
+
+def _build_processing_species_section_response(session_id: str, species: str) -> SpeciesSection:
+    normalized_species = str(species).strip()
+    cache_key = (
+        str(session_id),
+        _processing_workspace_source_signature(session_id),
+        normalized_species,
+    )
+    with _processing_workspace_cache_lock:
+        cached = _processing_species_cache.get(cache_key)
+        if cached is not None:
+            _processing_species_cache.move_to_end(cache_key)
+            return cached.model_copy(deep=True)
+
+    context = _get_processing_context(session_id)
+    section = build_processing_species_section(context, normalized_species)
+    if section is None:
+        raise HTTPException(status_code=404, detail=f"Unknown species section: {normalized_species}")
+    with _processing_workspace_cache_lock:
+        _processing_species_cache[cache_key] = section.model_copy(deep=True)
+        _processing_species_cache.move_to_end(cache_key)
+        while len(_processing_species_cache) > _PROCESSING_SPECIES_CACHE_MAX_ENTRIES:
+            _processing_species_cache.popitem(last=False)
+    return section
 
 
 def _processing_species_section_filter(
@@ -1873,9 +2254,14 @@ def _workspace_to_chart_bundle(workspace: ProcessingWorkspace) -> ChartBundle:
 
 
 def _numeric_or_none(value: Any) -> float | None:
-    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.notna(parsed) and np.isfinite(parsed):
-        return float(parsed)
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isfinite(parsed):
+        return parsed
     return None
 
 
@@ -1953,9 +2339,12 @@ def _processing_linearity_preview_rows(
                 return str(value.isoformat())
             except Exception:
                 pass
-        numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-        if pd.notna(numeric) and np.isfinite(float(numeric)):
-            return float(numeric)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None and np.isfinite(numeric):
+            return numeric
         return str(value)
 
     line_col = next((col for col in df.columns if str(col).strip().lower() == "line"), None)
@@ -2009,6 +2398,15 @@ def processing_workspace(
             species_section,
         ),
     )
+
+
+@app.get("/sessions/{session_id}/processing/species-section", response_model=SpeciesSection)
+def processing_species_section(
+    session_id: str,
+    species: str = Query(min_length=1),
+) -> SpeciesSection:
+    _session_exists_or_404(session_id)
+    return _build_processing_species_section_response(session_id, species)
 
 
 @app.get("/sessions/{session_id}/processing/linearity-preview-data", response_model=ProcessingLinearityPreviewData)
@@ -2068,13 +2466,34 @@ def set_processing_config(
     )
 
 
+@app.post("/sessions/{session_id}/processing/config/jobs", response_model=JobSnapshot, status_code=202)
+def submit_processing_config_job(session_id: str, config: ProcessingConfig) -> JobSnapshot:
+    _session_exists_or_404(session_id)
+    config_payload = config.model_dump()
+
+    def _runner(context: JobContext) -> dict[str, Any]:
+        context.begin_commit(10, "saving_config", "Saving processing configuration")
+        workspace = set_processing_config(
+            session_id,
+            ProcessingConfig.model_validate(config_payload),
+            include_all_species_sections=False,
+            species_section=None,
+        )
+        return workspace.model_dump(mode="json")
+
+    return _submit_job("processing_config", _runner, session_id=session_id)
+
+
 def _apply_processing_edit_batch(
     session_id: str,
     edits: list[EditAction],
     *,
     species_section_filter: set[str] | None,
+    context: JobContext | None = None,
 ) -> ProcessingWorkspace:
     _session_exists_or_404(session_id)
+    if context is not None:
+        context.report(5, "loading_session", "Loading processing data")
     metadata = store.load_metadata(session_id)
     updated_df = store.load_frame(session_id)
     cycles_df = store.load_cycles_frame(session_id)
@@ -2096,7 +2515,10 @@ def _apply_processing_edit_batch(
     fits = calibration.get("linearity_fits", {})
     linearity_cfg = calibration.get("config", {}).get("linearity", {}) if isinstance(calibration.get("config"), dict) else {}
     try:
-        for edit in edits:
+        for index, edit in enumerate(edits):
+            if context is not None:
+                progress = 15.0 + (55.0 * index / max(1, len(edits)))
+                context.report(progress, "applying_edits", f"Applying edit {index + 1} of {len(edits)}")
             interpolation_source_df = (
                 _build_interpolation_source_frame(
                     updated_df,
@@ -2123,6 +2545,8 @@ def _apply_processing_edit_batch(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     metadata["edit_state"] = updated_edit_state
+    if context is not None:
+        context.begin_commit(75, "saving_edits", "Saving processing edits")
     _persist_session_update(
         session_id,
         action="processing_edit" if len(edits) == 1 else "processing_edit_batch",
@@ -2174,6 +2598,23 @@ def edit_processing_batch(
             species_section,
         ),
     )
+
+
+@app.post("/sessions/{session_id}/processing/edits/jobs", response_model=JobSnapshot, status_code=202)
+def submit_processing_edit_batch_job(session_id: str, request: EditBatchRequest) -> JobSnapshot:
+    _session_exists_or_404(session_id)
+    edits_payload = [edit.model_dump() for edit in request.edits]
+
+    def _runner(context: JobContext) -> dict[str, Any]:
+        workspace = _apply_processing_edit_batch(
+            session_id,
+            [EditAction.model_validate(payload) for payload in edits_payload],
+            species_section_filter=set(),
+            context=context,
+        )
+        return workspace.model_dump(mode="json")
+
+    return _submit_job("processing_edits", _runner, session_id=session_id)
 
 
 @app.post("/sessions/{session_id}/processing/cycle-diagnostics", response_model=CycleDiagnosticsPayload)
@@ -2327,9 +2768,14 @@ def check_client_output_duplicates(session_id: str, request: ExportRequest) -> C
     )
 
 
-@app.post("/sessions/{session_id}/exports/dataset")
-def export_dataset(session_id: str, request: ExportRequest) -> Response:
+def _export_dataset_sync(
+    session_id: str,
+    request: ExportRequest,
+    context: JobContext | None = None,
+) -> Response:
     _session_exists_or_404(session_id)
+    if context is not None:
+        context.report(5, "loading_session", "Loading export data")
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
     cycles_df = store.load_cycles_frame(session_id)
@@ -2347,6 +2793,8 @@ def export_dataset(session_id: str, request: ExportRequest) -> Response:
         cycles_df=cycles_df,
     )
     data_to_process = _selected_processing_rows(working_df, list(config.export.selected_ids))
+    if context is not None:
+        context.report(30, "filtering_rows", "Filtering export rows")
     range_config = RangeConfig(
         signal_range=config.signal_range,
         leak_range=config.leak_range,
@@ -2375,6 +2823,8 @@ def export_dataset(session_id: str, request: ExportRequest) -> Response:
     )
     outlier_types = build_outlier_type_labels(data_to_process, category_masks)
     effective_outlier_mask = outlier_types.astype(str).str.strip().replace({"": np.nan}).notna()
+    if context is not None:
+        context.report(55, "preparing_workbook", "Preparing workbook tables")
 
     if bool(config.export.include_outliers):
         main_data = data_to_process.copy()
@@ -2417,6 +2867,8 @@ def export_dataset(session_id: str, request: ExportRequest) -> Response:
         for metric in summary.metrics
     ]
     output_type = request.output_type
+    if context is not None:
+        context.report(70, "writing_workbook", "Writing Excel workbook")
     if output_type == "client_output":
         restore_stdev_cap = float(request.restore_stdev_cap)
         if request.restore_stdev and not np.isfinite(restore_stdev_cap):
@@ -2454,6 +2906,8 @@ def export_dataset(session_id: str, request: ExportRequest) -> Response:
             client_name=config.export.client_name,
             statistics_rows=statistics_rows,
         )
+    if context is not None:
+        context.begin_commit(95, "finalizing_export", "Finalizing export")
     _persist_session_update(
         session_id,
         action="dataset_exported",
@@ -2465,3 +2919,31 @@ def export_dataset(session_id: str, request: ExportRequest) -> Response:
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.post("/sessions/{session_id}/exports/dataset")
+def export_dataset(session_id: str, request: ExportRequest) -> Response:
+    return _export_dataset_sync(session_id, request)
+
+
+@app.post("/sessions/{session_id}/exports/dataset/jobs", response_model=JobSnapshot, status_code=202)
+def submit_export_job(session_id: str, request: ExportRequest) -> JobSnapshot:
+    _session_exists_or_404(session_id)
+    request_payload = request.model_dump()
+
+    def _runner(context: JobContext) -> dict[str, Any]:
+        response = _export_dataset_sync(
+            session_id,
+            ExportRequest.model_validate(request_payload),
+            context,
+        )
+        disposition = response.headers.get("Content-Disposition", "")
+        filename_match = re.search(r'filename="?([^";]+)"?', disposition, flags=re.IGNORECASE)
+        filename = filename_match.group(1) if filename_match else "irms_export.xlsx"
+        context.set_artifact(bytes(response.body), filename, response.media_type or "application/octet-stream")
+        return {
+            "filename": filename,
+            "download_url": f"/jobs/{context.job_id}/download",
+        }
+
+    return _submit_job("dataset_export", _runner, session_id=session_id)

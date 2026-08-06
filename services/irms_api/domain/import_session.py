@@ -206,28 +206,32 @@ def _load_uploaded_workbooks(uploaded_files):
     load_errors = []
 
     for uploaded_file in (uploaded_files or []):
+        filename = str(getattr(uploaded_file, 'name', 'uploaded workbook'))
+        size = getattr(uploaded_file, 'size', None)
+        if size == 0:
+            load_errors.append(
+                f"Failed to read Excel file '{filename}': the file is empty (0 bytes). "
+                "Download or save the workbook locally, then select it again."
+            )
+            continue
+
         try:
             uploaded_file.seek(0)
         except Exception:
             pass
 
+        extension = Path(filename).suffix.lower()
+        engine = 'xlrd' if extension == '.xls' else 'openpyxl'
+
         try:
-            raw = pd.read_excel(uploaded_file, header=None, engine='openpyxl')
+            raw = pd.read_excel(uploaded_file, header=None, engine=engine)
             df = _parse_new_table_layout(raw)
             if df is None:
                 uploaded_file.seek(0)
-                df = pd.read_excel(uploaded_file, engine='openpyxl')
-        except Exception:
-            try:
-                uploaded_file.seek(0)
-                raw = pd.read_excel(uploaded_file, header=None, engine='xlrd')
-                df = _parse_new_table_layout(raw)
-                if df is None:
-                    uploaded_file.seek(0)
-                    df = pd.read_excel(uploaded_file, engine='xlrd')
-            except Exception as exc:
-                load_errors.append(f"Failed to read Excel file '{uploaded_file.name}': {exc}")
-                continue
+                df = pd.read_excel(uploaded_file, engine=engine)
+        except Exception as exc:
+            load_errors.append(f"Failed to read Excel file '{filename}': {exc}")
+            continue
 
         df = _coalesce_duplicate_columns(df)
         df = df.convert_dtypes()

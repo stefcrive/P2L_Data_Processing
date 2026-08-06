@@ -429,14 +429,21 @@ class FileSessionStore:
     def session_exists(self, session_id: str) -> bool:
         return self._paths(session_id).metadata_path.exists()
 
-    def write_metadata(self, session_id: str, metadata: dict[str, Any]) -> None:
+    def write_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, Any],
+        *,
+        write_session_state: bool = True,
+    ) -> None:
         paths = self._paths(session_id)
         paths.root.mkdir(parents=True, exist_ok=True)
         payload = dict(metadata)
         payload["session_id"] = session_id
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         paths.metadata_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        self.write_session_state_file(session_id, payload)
+        if write_session_state:
+            self.write_session_state_file(session_id, payload)
 
     def load_metadata(self, session_id: str) -> dict[str, Any]:
         paths = self._paths(session_id)

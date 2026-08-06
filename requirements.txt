@@ -4,6 +4,7 @@ numpy
 matplotlib
 seaborn
 openpyxl
+xlrd>=2.0.1
 plotly
 scikit-learn
 reportlab

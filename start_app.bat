@@ -193,6 +193,9 @@ if /I "%RUN_MODE%"=="prod" (
 set "IRMS_API_PROXY_TARGET=http://127.0.0.1:%BACKEND_PORT%"
 set "NEXT_PUBLIC_IRMS_API_URL="
 set "NEXT_PUBLIC_API_BASE_URL="
+rem Give every frontend instance its own artifacts. Next dev/build mutates its
+rem output directory, so sharing .next can break an already-running server.
+set "NEXT_DIST_DIR=.next-%RUN_MODE%"
 
 if /I "%RUN_MODE%"=="prod" (
   rem The API proxy target is captured by next.config.ts during the build.
