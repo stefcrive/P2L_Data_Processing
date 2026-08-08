@@ -1216,21 +1216,27 @@ function DiagnosticsPanel({
                       ))}
                     </select>
                   </label>
-                  <SaturationSharedColorbar figures={saturationFigureItems.map((item) => item.figure)} colorAxis={saturationColorAxis} />
                 </div>
-                <div className="grid gap-4 xl:grid-cols-2">
-                  {saturationFigureItems.map((item) => (
-                    <SaturationFigureCard
-                      key={item.key}
-                      chartKey={item.key}
-                      title={item.title}
-                      description={item.description}
-                      figure={item.figure}
-                      colorAxis={saturationColorAxis}
-                      yAxis={saturationYAxis}
-                      deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                    />
-                  ))}
+                <div className="grid items-start gap-3 xl:grid-cols-[minmax(0,1fr)_6rem]">
+                  <div className="grid gap-4 xl:grid-cols-2">
+                    {saturationFigureItems.map((item) => (
+                      <SaturationFigureCard
+                        key={item.key}
+                        chartKey={item.key}
+                        title={item.title}
+                        description={item.description}
+                        figure={item.figure}
+                        colorAxis={saturationColorAxis}
+                        yAxis={saturationYAxis}
+                        deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+                      />
+                    ))}
+                  </div>
+                  <SaturationSharedColorbar
+                    figures={saturationFigureItems.map((item) => item.figure)}
+                    colorAxis={saturationColorAxis}
+                    orientation="vertical"
+                  />
                 </div>
               </>
             ) : null}
@@ -1455,6 +1461,34 @@ function deriveColorScaleBounds(figure?: Record<string, unknown>): ColorScaleBou
   return { min, max };
 }
 
+function formatDiagnosticsColorbarValue(value: number, colorParam: string): string {
+  if (colorParam.trim().toLowerCase() === "date") {
+    const epochOrdinal = 719163;
+    const date = new Date((value - epochOrdinal) * 86400000);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toISOString().slice(0, 10);
+    }
+  }
+  return value.toLocaleString(undefined, { maximumSignificantDigits: 5 });
+}
+
+function diagnosticsColorParameterLabel(colorParam: string): string {
+  const key = colorParam.trim().toLowerCase().replace(/\s+/g, " ");
+  if (key === "date" || key === "date_ordinal") return "Date";
+  if (key === "1 cycle int samp 44") return "Initial sample intensity";
+  if (key === "1 cycle int ref 44") return "Initial reference gas intensity";
+  if (key === "p_no_acid") return "P no Acid";
+  if (key === "total_co2") return "total CO2";
+  if (key === "p_gases") return "P gasses";
+  return colorParam;
+}
+
+function diagnosticsColorScaleTicks(range: [number, number], count = 6): number[] {
+  const [start, end] = range;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || count < 2) return [];
+  return Array.from({ length: count }, (_, index) => start + ((end - start) * index) / (count - 1));
+}
+
 function normalizeColorScaleRange(range: [number, number], bounds: ColorScaleBounds): [number, number] {
   const low = clampNumber(Math.min(range[0], range[1]), bounds.min, bounds.max);
   const high = clampNumber(Math.max(range[0], range[1]), bounds.min, bounds.max);
@@ -1553,19 +1587,39 @@ function applyColorScaleRangeToFigure(
   return ensureFigureUiRevision(hasColorMapping ? cloned : figure, revisionScope);
 }
 
-function resolveFigureHeight(figure: unknown, fallback: number): number {
-  if (!figure || typeof figure !== "object") {
-    return fallback;
+function applySymbolSizeToFigure(
+  figure: Record<string, unknown> | undefined,
+  symbolSize: number,
+  revisionScope = "diagnostics:matrix",
+): Record<string, unknown> | undefined {
+  if (!figure) {
+    return figure;
   }
-  const layout = (figure as { layout?: unknown }).layout;
-  if (!layout || typeof layout !== "object") {
-    return fallback;
-  }
-  const rawHeight = Number((layout as { height?: unknown }).height);
-  if (!Number.isFinite(rawHeight) || rawHeight < 200) {
-    return fallback;
-  }
-  return rawHeight;
+  const cloned: FigureShape = {
+    ...(figure as FigureShape),
+    data: Array.isArray((figure as FigureShape).data)
+      ? ((figure as FigureShape).data as Array<Record<string, unknown>>).map((trace) => ({ ...trace }))
+      : [],
+    layout: typeof (figure as FigureShape).layout === "object" && (figure as FigureShape).layout
+      ? { ...((figure as FigureShape).layout as Record<string, unknown>) }
+      : {},
+  };
+  let hasMarkers = false;
+  cloned.data = cloned.data.map((trace) => {
+    const marker = trace.marker && typeof trace.marker === "object" ? (trace.marker as Record<string, unknown>) : null;
+    if (!marker) {
+      return trace;
+    }
+    hasMarkers = true;
+    return {
+      ...trace,
+      marker: {
+        ...marker,
+        size: symbolSize,
+      },
+    };
+  });
+  return ensureFigureUiRevision(hasMarkers ? cloned : figure, revisionScope);
 }
 
 function RangeSliderControl({
@@ -1607,6 +1661,7 @@ export default function DiagnosticsPage() {
   const sessionId = useSessionStore((state) => state.sessionId);
   const queryClient = useQueryClient();
   const [colorParam, setColorParam] = useState("Date");
+  const [symbolSize, setSymbolSize] = useState(8);
   const [identifierFilter, setIdentifierFilter] = useState<string[]>([]);
   const [d13Range, setD13Range] = useState<[number, number] | null>(null);
   const [d18Range, setD18Range] = useState<[number, number] | null>(null);
@@ -1730,17 +1785,38 @@ export default function DiagnosticsPage() {
   const d13Bounds = useMemo(() => asRange(summary.d13_bounds), [summary.d13_bounds]);
   const d18Bounds = useMemo(() => asRange(summary.d18_bounds), [summary.d18_bounds]);
   const diagnosticsFigure = data?.figures?.diagnostics as Record<string, unknown> | undefined;
+  const diagnosticGridItems = useMemo(() => {
+    const rawItems = Array.isArray(summary.diagnostic_grid) ? summary.diagnostic_grid : [];
+    return rawItems.flatMap((item) => {
+      if (!item || typeof item !== "object") {
+        return [];
+      }
+      const key = asString((item as Record<string, unknown>).key).trim();
+      const figure = key ? (data?.figures?.[key] as Record<string, unknown> | undefined) : undefined;
+      if (!key || !figure) {
+        return [];
+      }
+      return [{ key, title: asString((item as Record<string, unknown>).title), figure }];
+    });
+  }, [data?.figures, summary.diagnostic_grid]);
   const colorScaleBounds = useMemo(() => deriveColorScaleBounds(diagnosticsFigure), [diagnosticsFigure]);
   const colorSliderBounds: ColorScaleBounds = colorScaleBounds ?? { min: 0, max: 1 };
   const effectiveColorScaleRange = normalizeColorScaleRange(
     colorScaleRange ?? [colorSliderBounds.min, colorSliderBounds.max],
     colorSliderBounds,
   );
-  const displayedDiagnosticsFigure = useMemo(
-    () => applyColorScaleRangeToFigure(diagnosticsFigure, effectiveColorScaleRange, "diagnostics:matrix"),
-    [diagnosticsFigure, effectiveColorScaleRange],
+  const displayedDiagnosticGridItems = useMemo(
+    () =>
+      diagnosticGridItems.map((item) => ({
+        ...item,
+        figure: applySymbolSizeToFigure(
+          applyColorScaleRangeToFigure(item.figure, effectiveColorScaleRange, `diagnostics:grid:${item.key}`),
+          symbolSize,
+          `diagnostics:grid:${item.key}`,
+        ),
+      })),
+    [diagnosticGridItems, effectiveColorScaleRange, symbolSize],
   );
-  const diagnosticsMatrixHeight = useMemo(() => resolveFigureHeight(data?.figures?.diagnostics, 2600), [data?.figures?.diagnostics]);
   const activeLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config?.linearity ?? null;
   const selectedLinearityIntensityCol = activeLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(activeLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
@@ -2171,7 +2247,10 @@ export default function DiagnosticsPage() {
     }, 140);
   }
 
-  function handleDiagnosticsPointHover(payload: PlotlyHoverPayload) {
+  function handleDiagnosticsPointHover(
+    payload: PlotlyHoverPayload,
+    sourceFigure: Record<string, unknown> | undefined,
+  ) {
     if (isSelectionEditorOpen) {
       return;
     }
@@ -2183,7 +2262,7 @@ export default function DiagnosticsPage() {
       return;
     }
     clearHoverPreviewHideTimer();
-    const inferredIsotope = inferDiagnosticsIsotopeFromPoint(payload.points[0], displayedDiagnosticsFigure);
+    const inferredIsotope = inferDiagnosticsIsotopeFromPoint(payload.points[0], sourceFigure);
     const target = {
       ...targets[0],
       isotopeKey: inferredIsotope,
@@ -2213,7 +2292,10 @@ export default function DiagnosticsPage() {
     }, HOVER_PREVIEW_SHOW_DELAY_MS);
   }
 
-  function handleDiagnosticsPointClick(points: PlotlyPoint[]) {
+  function handleDiagnosticsPointClick(
+    points: PlotlyPoint[],
+    sourceFigure: Record<string, unknown> | undefined,
+  ) {
     if (!sessionId) {
       return;
     }
@@ -2221,7 +2303,10 @@ export default function DiagnosticsPage() {
     if (!targets.length) {
       return;
     }
-    setSelectionTarget(targets[0]);
+    setSelectionTarget({
+      ...targets[0],
+      isotopeKey: inferDiagnosticsIsotopeFromPoint(points[0], sourceFigure),
+    });
     setSelectionEditorOpen(true);
   }
 
@@ -2249,6 +2334,23 @@ export default function DiagnosticsPage() {
         description="Filter measurements, inspect cycle behavior, and investigate anomalies."
         actions={<span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-[10px] text-slate-600">Rows {Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}</span>}
       />
+      {colorScaleBounds ? (
+        <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
+          <div className="mb-1 font-semibold text-stone-900">{diagnosticsColorParameterLabel(colorParam)}</div>
+          <div
+            className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
+            role="img"
+            aria-label={`${diagnosticsColorParameterLabel(colorParam)} color scale from ${effectiveColorScaleRange[0]} to ${effectiveColorScaleRange[1]}`}
+          />
+          <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
+            {diagnosticsColorScaleTicks(effectiveColorScaleRange).map((tick, index, ticks) => (
+              <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
+                {formatDiagnosticsColorbarValue(tick, colorParam)}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
       <div className="workspace-grid">
         <aside className="control-column">
           <Card>
@@ -2259,16 +2361,31 @@ export default function DiagnosticsPage() {
             <CardContent className="space-y-4">
               <div className="space-y-3">
                 <div className="form-section-title">Parameter Selection</div>
-                <label className="form-field">
-                  <span className="form-label">Choose a parameter to color the dots</span>
-                  <select value={colorParam} onChange={(event) => setColorParam(event.target.value)} className="form-control">
-                    {(availableColorParams.length ? availableColorParams : [colorParam]).map((option) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <div className="grid grid-cols-[minmax(0,1fr)_7rem] gap-3">
+                  <label className="form-field min-w-0">
+                    <span className="form-label">Choose a parameter to color the dots</span>
+                    <select value={colorParam} onChange={(event) => setColorParam(event.target.value)} className="form-control">
+                      {(availableColorParams.length ? availableColorParams : [colorParam]).map((option) => (
+                        <option key={option} value={option}>
+                          {diagnosticsColorParameterLabel(option)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="form-field">
+                    <span className="form-label">Symbol size</span>
+                    <input
+                      type="number"
+                      min={2}
+                      max={30}
+                      step={1}
+                      value={symbolSize}
+                      onChange={(event) => setSymbolSize(clampNumber(Number(event.target.value) || 2, 2, 30))}
+                      className="form-control"
+                      aria-label="Symbol size for chart dots"
+                    />
+                  </label>
+                </div>
                 <RangeSliderControl
                   label="Color scale interval"
                   bounds={[colorSliderBounds.min, colorSliderBounds.max]}
@@ -2370,12 +2487,11 @@ export default function DiagnosticsPage() {
                         ))}
                       </select>
                     </label>
-                    <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600">
-                      <span className="font-medium text-stone-700">Basis formula:</span>{" "}
-                      <code className="font-mono">
-                        {getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
-                      </code>
-                    </div>
+                    <Tooltip label={getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)} align="start">
+                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">
+                        Basis formula
+                      </span>
+                    </Tooltip>
                   {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">Max sample intensity</span>
@@ -2398,8 +2514,8 @@ export default function DiagnosticsPage() {
                     </label>
                   ) : null}
                   <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                      <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficients</div>
+                    <div className="border-t border-stone-200 pt-2 text-sm">
+                      <div className="text-xs font-medium text-stone-500">d13C fitted coefficients</div>
                       <div className="mt-1 space-y-1 font-semibold text-stone-900">
                         <div>
                           <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -2413,8 +2529,8 @@ export default function DiagnosticsPage() {
                         ) : null}
                       </div>
                     </div>
-                    <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                      <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficients</div>
+                    <div className="border-t border-stone-200 pt-2 text-sm">
+                      <div className="text-xs font-medium text-stone-500">d18O fitted coefficients</div>
                       <div className="mt-1 space-y-1 font-semibold text-stone-900">
                         <div>
                           <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -2523,8 +2639,10 @@ export default function DiagnosticsPage() {
                     </div>
                   </div>
                   {activeLinearity.apply ? (
-                    <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
-                      <div className="text-sm font-medium text-stone-800">Linearity-corrected standard precision</div>
+                    <div className="space-y-1 border-t border-stone-200 pt-2">
+                      <Tooltip label="Precision after applying the shared linearity correction to each selected standard." align="start">
+                        <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">Corrected precision</span>
+                      </Tooltip>
                       {standardPrecisionRows.length ? (
                         standardPrecisionRows.map((item: CalibrationPrecisionSummary) => (
                           <div key={item.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
@@ -2551,21 +2669,31 @@ export default function DiagnosticsPage() {
         <div className="space-y-6">
           {error && <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">{String(error)}</div>}
           <Card>
-            <CardHeader>
-              <CardTitle>Diagnostics Matrix</CardTitle>
-              <CardDescription>Click any sample point to open the Selection Editor modal on this page.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="w-full" style={{ height: diagnosticsMatrixHeight }}>
-                <PlotlyChart
-                  figure={displayedDiagnosticsFigure}
-                  className="h-full w-full"
-                  fitContainer
-                  onPointClick={handleDiagnosticsPointClick}
-                  onPointHover={handleDiagnosticsPointHover}
-                  onHoverEnd={scheduleHoverPreviewHide}
-                />
-              </div>
+            <CardContent className="space-y-3 p-3">
+              {displayedDiagnosticGridItems.length ? (
+                <div className="overflow-x-auto">
+                  <div className="grid min-w-[960px] grid-cols-3 gap-3">
+                    {displayedDiagnosticGridItems.map((item) => (
+                      <div
+                        key={item.key}
+                        className="aspect-square min-w-0 overflow-hidden rounded-lg border border-stone-200 bg-white"
+                      >
+                        <PlotlyChart
+                          figure={item.figure}
+                          className="h-full w-full"
+                          fitContainer
+                          uiRevision={`diagnostics-grid:${item.key}`}
+                          onPointClick={(points) => handleDiagnosticsPointClick(points, item.figure)}
+                          onPointHover={(payload) => handleDiagnosticsPointHover(payload, item.figure)}
+                          onHoverEnd={scheduleHoverPreviewHide}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3 text-sm text-stone-500">No diagnostic charts.</div>
+              )}
             </CardContent>
           </Card>
         </div>

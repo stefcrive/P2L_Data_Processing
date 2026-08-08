@@ -10,6 +10,7 @@ from services.irms_api.domain.constants import (
     CYCLE1_SIGNAL_DIFF44_COL,
     CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+    CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     VALID_CYCLES_COL,
 )
@@ -24,6 +25,7 @@ from services.irms_api.domain.processing.cycles import (
     apply_run_level_linearity_basis_from_cycles,
     build_cycle_diagnostics_payload,
     build_target_info,
+    get_cycles_for_selected_point,
 )
 from services.irms_api.domain.processing.edits import (
     _interpolate_single_target_within_identifier_group,
@@ -93,6 +95,35 @@ def sample_cycles_df() -> pd.DataFrame:
 
 
 class ProcessingCoreTests(unittest.TestCase):
+    def test_cycle_lookup_does_not_borrow_cycles_from_another_workbook(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Identifier 1": ["ResultOnly"],
+                "Identifier 2": ["41"],
+                "Excel File": ["result-only.xls"],
+                "d 13C/12C  Mean": [-34.291],
+                "d 18O/16O  Mean": [-14.274],
+            }
+        )
+        cycles = pd.DataFrame(
+            {
+                "Cycle Number": ["Pre", "Cycle 1", "Cycle 2"],
+                "Identifier 1": ["OtherSample"] * 3,
+                "Identifier 2": ["1"] * 3,
+                "Excel File": ["cycles.xls"] * 3,
+                "d 13C/12C  Mean": [-13.7] * 3,
+                "d 18O/16O  Mean": [-9.3] * 3,
+            }
+        )
+
+        d13_cycles, d13_pre = get_cycles_for_selected_point(df, cycles, 0, "d 13C/12C  Mean")
+        d18_cycles, d18_pre = get_cycles_for_selected_point(df, cycles, 0, "d 18O/16O  Mean")
+
+        self.assertIsNone(d13_cycles)
+        self.assertIsNone(d13_pre)
+        self.assertIsNone(d18_cycles)
+        self.assertIsNone(d18_pre)
+
     def test_range_outlier_mask(self) -> None:
         df = pd.DataFrame(
             {
@@ -846,6 +877,8 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertIn("All", workspace.available_values.identifiers)
         self.assertGreaterEqual(workspace.summary.total_measurements, 1)
         self.assertIn(VALID_CYCLES_COL, workspace.available_values.color_params)
+        self.assertIn(CYCLE1_SIGNAL_SAMP44_COL, workspace.available_values.color_params)
+        self.assertIn(CYCLE1_SIGNAL_REF44_COL, workspace.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, workspace.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, workspace.available_values.z_axis_options)
 
@@ -927,6 +960,72 @@ class ProcessingCoreTests(unittest.TestCase):
         }
         self.assertIn("Sample Alpha", section_identifiers)
         self.assertNotIn("SampleA", section_identifiers)
+
+    def test_all_range_outlier_species_remains_visible_after_identifier_rename(self) -> None:
+        df = sample_processing_df().iloc[:3].copy()
+        df["d 13C/12C  Mean"] = [-13.7, -13.6, -13.5]
+        df["d 18O/16O  Mean"] = [-27.9, -27.8, -27.7]
+        metadata = {
+            "processing": {
+                "config": {
+                    "identifier1_name_map": {"SampleA": "Renamed sample"},
+                    "species_name_map": {"Coral": "Species 1"},
+                    "d13c_range": [-10.0, 10.0],
+                    "d18o_range": [-10.0, 10.0],
+                    "overlays": {"show_range_outliers": False},
+                }
+            },
+            "edit_state": {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("all-range-outliers", df, sample_cycles_df(), metadata)
+
+        section = next(item for item in workspace.species_sections if item.species == "Species 1")
+        figure_set = next(item for item in section.identifier_figures if item.identifier == "Renamed sample")
+        d13_trace_names = {str(trace.get("name", "")) for trace in figure_set.d13c.get("data", [])}
+        self.assertIn("d13C Range", d13_trace_names)
+        self.assertTrue(figure_set.d13c.get("layout", {}).get("annotations"))
+
+    def test_mapped_standard_only_session_still_builds_processing_summary_traces(self) -> None:
+        df = sample_processing_df().iloc[:3].copy()
+        df["Identifier 1"] = "Reference batch"
+        df["Identifier 2"] = ["1", "2", "3"]
+        df["Species"] = "Reference"
+        df["Collector Status"] = ""
+        df["d 13C/12C  Mean"] = [-0.80, -0.78, -0.74]
+        df["d 18O/16O  Mean"] = [-5.90, -5.70, -5.65]
+        metadata = {
+            "processing": {
+                "config": {
+                    "identifier1_name_map": {"Reference batch": "SHP2L"},
+                    "signal_range": [0.0, 100.0],
+                    "leak_range": [0.0, 1000.0],
+                    "d13c_range": [-100.0, 100.0],
+                    "d18o_range": [-100.0, 100.0],
+                    "sigma_level_data": 99.0,
+                }
+            },
+            "edit_state": {
+                "edited_rows": [],
+                "original_delta_values": {},
+                "manual_outlier_overrides": {},
+            },
+            "calibration": {"selected_standards": ["SHP2L"]},
+        }
+
+        workspace = build_processing_workspace("standard-only", df, pd.DataFrame(), metadata)
+
+        d13_trace_names = {
+            str(trace.get("name", ""))
+            for trace in workspace.overview_figures.get("d13_summary", {}).get("data", [])
+        }
+        d18_trace_names = {
+            str(trace.get("name", ""))
+            for trace in workspace.overview_figures.get("d18_summary", {}).get("data", [])
+        }
+        self.assertIn("Standard measured d13C - SHP2L", d13_trace_names)
+        self.assertIn("Standard measured d18O - SHP2L", d18_trace_names)
 
     def test_run_level_linearity_basis_can_use_cycle_endpoint_intensities(self) -> None:
         df = sample_processing_df().iloc[[0]].copy()
@@ -1735,6 +1834,13 @@ class ProcessingCoreTests(unittest.TestCase):
                     "y",
                 )
                 self.assertEqual(
+                    workspace.overview_figures.get("d13_summary", {})
+                    .get("layout", {})
+                    .get("yaxis2", {})
+                    .get("tickmode"),
+                    "auto",
+                )
+                self.assertEqual(
                     [str(item[0]) for item in ((summary_trace or {}).get("customdata") or [])],
                     ["", ""],
                 )
@@ -1764,6 +1870,10 @@ class ProcessingCoreTests(unittest.TestCase):
                 self.assertEqual(str((species_trace or {}).get("yaxis", "")), "y2")
                 self.assertTrue(
                     np.allclose(_numeric_payload((species_trace or {}).get("x")), expected_x)
+                )
+                self.assertEqual(
+                    (figure_set.d13c.get("layout", {}).get("yaxis2", {}) if figure_set else {}).get("tickmode"),
+                    "auto",
                 )
 
     def test_overview_crossplot_and_3d_use_species_specific_marker_symbols(self) -> None:
@@ -2398,6 +2508,53 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(first_target_trace.get("mode"), "markers")
         self.assertIn("annotations", ref_fig.get("layout", {}))
         self.assertIn("annotations", first_fig.get("layout", {}))
+
+    def test_cycle_diagnostics_uses_signal_ratio_proxy_when_export_repeats_run_mean(self) -> None:
+        df = sample_processing_df().copy()
+        cycles_df = pd.DataFrame(
+            {
+                "Cycle Number": ["pre", "1", "2", "3", "4", "5"],
+                "Identifier 1": ["SampleA"] * 6,
+                "Identifier 2": ["1"] * 6,
+                "Species": ["Coral"] * 6,
+                "Excel File": ["run1.xlsx"] * 6,
+                "Run ID": ["run-1"] * 6,
+                "Date": ["2025-01-01"] * 6,
+                "d 13C/12C  Mean": [1.0] * 6,
+                "d 13C/12C  Std Dev": [0.1] * 6,
+                "d 18O/16O  Mean": [2.0] * 6,
+                "d 18O/16O  Std Dev": [0.2] * 6,
+                "Cycle Intensity Samp 44": [15.0, 15.0, 14.0, 13.0, 12.0, 11.0],
+                "Cycle Intensity Ref 44": [10.0] * 6,
+                "Cycle Intensity Samp 45": [0.50, 0.50, 0.47, 0.43, 0.39, 0.35],
+                "Cycle Intensity Ref 45": [0.40] * 6,
+                "Cycle Intensity Samp 46": [0.30, 0.30, 0.28, 0.26, 0.24, 0.22],
+                "Cycle Intensity Ref 46": [0.20] * 6,
+            }
+        )
+        target = build_target_info(
+            df,
+            0,
+            "d13C",
+            {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+        )
+        self.assertIsNotNone(target)
+
+        payload = build_cycle_diagnostics_payload(
+            session_id="session-1",
+            df=df,
+            cycles_df=cycles_df,
+            target=target,
+            config=RangeConfig(),
+            edit_state={"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+        )
+
+        self.assertTrue(bool(payload.cycle_mean["value_source"]["is_proxy"]))
+        self.assertGreater(len({round(float(row["d13C"]), 6) for row in payload.table}), 1)
+        self.assertTrue(bool(payload.intensity_linearity["available"]))
+        self.assertGreater(float(payload.intensity_linearity["issue_index"]), 0.0)
+        mean_intensity_figure = payload.saturation_correction["figures"]["cycle_mean_intensity"]
+        self.assertIn("internal signal proxy", mean_intensity_figure["layout"]["yaxis"]["title"]["text"])
 
     def test_cycle_intensity_weighted_mismatch_uses_quadratic_horizontal_target(self) -> None:
         df = sample_processing_df().copy()

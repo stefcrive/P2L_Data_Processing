@@ -31,6 +31,12 @@ def _parse_numeric_token(token):
     """Parse a numeric token with optional thousands/decimal separators."""
     if token is None or pd.isna(token):
         return None
+    # Numeric workbook cells are already unambiguous. Converting them to text
+    # first made values such as 19.987 look like a thousands-formatted string
+    # and changed them to 19987.
+    if isinstance(token, (int, float, np.integer, np.floating)) and not isinstance(token, (bool, np.bool_)):
+        value = float(token)
+        return value if np.isfinite(value) else None
     text = str(token).strip()
     # Normalize common unicode sign characters to preserve numeric polarity.
     text = (
@@ -96,14 +102,13 @@ def _extract_numeric(series):
     return pd.to_numeric(parsed, errors='coerce')
 
 def _normalize_signal_intensity(series):
-    """Normalize signal intensity to volts when values appear to be in mV."""
+    """Normalize signal intensity to volts, including mixed V/mV exports."""
     numeric = _extract_numeric(series)
-    max_val = numeric.max(skipna=True)
-    # Treat clearly mV-scale values as millivolts (e.g., 48000 mV -> 48 V).
-    # Keep normal volt-scale cycle values (e.g., 52 V) unchanged.
-    if pd.notna(max_val) and max_val > 1000:
-        numeric = numeric / 1000.0
-    return numeric
+    # ISODAT can switch units between acquisitions in the same column. Scale
+    # each cell independently so a 14574 mV row and a 19.987 V row both become
+    # correct volts. This also makes repeated normalization idempotent.
+    millivolt_mask = numeric.abs() > 1000.0
+    return numeric.where(~millivolt_mask, numeric / 1000.0)
 
 def _ensure_valid_cycles_column(df):
     """Ensure a per-sample valid-cycle count is available for color mapping."""
@@ -1215,7 +1220,9 @@ def _split_label_species(label):
     """Split Label into identifier and species using 'Label - Species' convention."""
     if not isinstance(label, str):
         return label, None
-    parts = label.split('-', 1)
+    # A separator must include whitespace after the hyphen so identifiers such
+    # as ``MD23-3678`` remain intact.
+    parts = re.split(r'\s*-\s+', label, maxsplit=1)
     if len(parts) == 2:
         ident = parts[0].strip() or label
         species = parts[1].strip() or None

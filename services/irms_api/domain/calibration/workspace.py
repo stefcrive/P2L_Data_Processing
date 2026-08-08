@@ -17,6 +17,7 @@ from ..constants import (
     CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+    CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
     VALID_CYCLES_COL,
@@ -34,6 +35,7 @@ from ..contracts import (
 )
 from ..shared.dataframe import _ensure_cycle1_signal_difference_columns, _find_column, _parse_numeric_token
 from ..shared.json_compat import to_json_compatible
+from ..shared.naming import apply_identifier1_name_map
 from ..shared.plotting import (
     _build_date_colorbar_ticks,
     _build_isotope_3d_scatter,
@@ -84,13 +86,12 @@ def _figure_json(fig: go.Figure | None) -> dict[str, Any]:
 def _candidate_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         "Date",
-        "Identifier 1",
-        "Identifier 2",
-        "Species",
-        "Comment",
-        "Label",
-        VALID_CYCLES_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
+        CYCLE1_SIGNAL_REF44_COL,
+        "p_no_acid",
+        "total_co2",
+        "p_gases",
+        VALID_CYCLES_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
         CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
         CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
@@ -171,7 +172,12 @@ def _standard_outlier_masks(
 def _sequence_axis(df: pd.DataFrame) -> pd.Series:
     if "Identifier 2" in df.columns:
         values = df["Identifier 2"].apply(_parse_numeric_token)
-        if values.notna().any():
+        # Identifier 2 is often a material label (for example ``CaCO3``) or
+        # repeats across acquisition batches.  Numeric-token extraction turns
+        # those labels into a handful of shared coordinates, hiding valid
+        # measurements underneath one another.  Preserve Identifier 2 as the
+        # sequence only when it supplies one usable coordinate per row.
+        if values.notna().all() and values.is_unique:
             return values
     return pd.Series(np.arange(1, len(df) + 1), index=df.index, dtype=float)
 
@@ -193,7 +199,13 @@ def _outlier_rows(std_df: pd.DataFrame, mask: pd.Series, value_col: str) -> list
 
 
 def _color_param_label(color_param: str) -> str:
-    return "Date" if _is_date_color_column(color_param) else str(color_param)
+    if _is_date_color_column(color_param):
+        return "Date"
+    if color_param == CYCLE1_SIGNAL_SAMP44_COL:
+        return "Initial sample intensity"
+    if color_param == CYCLE1_SIGNAL_REF44_COL:
+        return "Initial reference gas intensity"
+    return str(color_param)
 
 
 def _format_hover_color_value(value: Any) -> str:
@@ -888,6 +900,13 @@ def build_calibration_workspace(
         line_2_offset_d13=getattr(config.linearity, "line_2_offset_d13", None),
         line_2_offset_d18=getattr(config.linearity, "line_2_offset_d18", None),
     )
+    processing_config = metadata.get("processing", {}).get("config", {})
+    identifier1_name_map = (
+        processing_config.get("identifier1_name_map", {})
+        if isinstance(processing_config, dict)
+        else {}
+    )
+    work_df = apply_identifier1_name_map(work_df, identifier1_name_map)
     standards_repo = StandardsRepository.default()
     standards_reference = carbonate_adjusted_standards_reference(
         standards_repo.frame,
@@ -1011,8 +1030,17 @@ def build_calibration_workspace(
     if available_color_params and config.color_param not in available_color_params:
         config.color_param = "Date" if "Date" in available_color_params else available_color_params[0]
     min_date, max_date, _ = _date_bounds(work_df)
+    dataset_identifier1_values = {
+        str(value).strip()
+        for value in work_df.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist()
+        if str(value).strip()
+    }
+    available_standards = sorted(
+        dataset_identifier1_values | set(standards_repo.standards_list()),
+        key=lambda value: (value.casefold(), value),
+    )
     available_values = CalibrationAvailableValues(
-        standards=standards_repo.standards_list(),
+        standards=available_standards,
         color_params=available_color_params,
         z_axis_options=_candidate_z_columns(work_df),
         min_date=min_date,

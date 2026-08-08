@@ -10,7 +10,16 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { PageHeader } from "@/components/ui/page-header";
 import { api, type UploadProgress } from "@/lib/api";
 import { describeSession, resolveSessionName } from "@/lib/session-label";
-import type { JsonRecord, SessionArtifactKind, SessionArtifactPayload, SessionSnapshot } from "@/lib/types";
+import type {
+  ImportFieldParsingRule,
+  ImportNamingWorkspace,
+  ImportParsingConfig,
+  ImportWorkbookParsingConfig,
+  JsonRecord,
+  SessionArtifactKind,
+  SessionArtifactPayload,
+  SessionSnapshot,
+} from "@/lib/types";
 import { useSessionStore } from "@/store/use-session-store";
 
 const WORKBOOK_EXTENSION_REGEX = /\.(xls|xlsx)$/i;
@@ -267,8 +276,268 @@ function detectMatchingSessionId(folderFiles: File[], sessions: SessionSnapshot[
   return candidates[0]?.session.session_id ?? null;
 }
 
+function normalizeNameLabel(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function nextNameMap(current: Record<string, string>, source: string, target: string): Record<string, string> {
+  const sourceLabel = normalizeNameLabel(source);
+  const targetLabel = normalizeNameLabel(target);
+  const next = { ...current };
+  if (!sourceLabel || !targetLabel || sourceLabel === targetLabel) {
+    delete next[sourceLabel];
+  } else {
+    next[sourceLabel] = targetLabel;
+  }
+  return next;
+}
+
+function parsePreviewValue(row: JsonRecord, rule: ImportFieldParsingRule): string {
+  const sourceColumn = String(rule.source_column ?? "").trim();
+  const raw = sourceColumn ? row[sourceColumn] : null;
+  const text = raw == null ? "" : String(raw).trim();
+  if (!text) {
+    return "";
+  }
+  if (rule.mode === "direct") {
+    return text;
+  }
+  if (rule.mode === "split") {
+    if (!rule.delimiter) {
+      return "";
+    }
+    const parts = text.split(rule.delimiter);
+    const index = rule.part_index < 0 ? parts.length + rule.part_index : rule.part_index;
+    return index >= 0 && index < parts.length ? parts[index].trim() : "";
+  }
+  if (!rule.regex_pattern) {
+    return "";
+  }
+  try {
+    const match = text.match(new RegExp(rule.regex_pattern));
+    if (!match) {
+      return "";
+    }
+    const group = typeof rule.regex_group === "number" ? rule.regex_group : Number(rule.regex_group);
+    return Number.isInteger(group) && group >= 0 ? String(match[group] ?? "").trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function parsingRuleIsValid(rule: ImportFieldParsingRule): boolean {
+  if (!String(rule.source_column ?? "").trim()) {
+    return false;
+  }
+  if (rule.mode === "split") {
+    return rule.delimiter.length > 0 && Number.isInteger(rule.part_index) && rule.part_index >= 0;
+  }
+  if (rule.mode === "regex") {
+    try {
+      new RegExp(rule.regex_pattern);
+      return rule.regex_pattern.length > 0 && Number(rule.regex_group) >= 0;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function ParsingFieldEditor({
+  label,
+  columns,
+  rule,
+  onChange,
+}: {
+  label: string;
+  columns: string[];
+  rule: ImportFieldParsingRule;
+  onChange: (next: ImportFieldParsingRule) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-3">
+      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-600">{label}</div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <label className="text-xs text-slate-600">
+          Source column
+          <select
+            value={rule.source_column ?? ""}
+            onChange={(event) => onChange({ ...rule, source_column: event.target.value || null })}
+            className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm text-slate-800"
+          >
+            <option value="">Not available</option>
+            {columns.map((column) => (
+              <option key={column} value={column}>
+                {column}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="text-xs text-slate-600">
+          Extraction
+          <select
+            value={rule.mode}
+            onChange={(event) =>
+              onChange({
+                ...rule,
+                mode: event.target.value as ImportFieldParsingRule["mode"],
+              })
+            }
+            className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm text-slate-800"
+          >
+            <option value="direct">Use whole value</option>
+            <option value="split">Split into parts</option>
+            <option value="regex">Regular expression</option>
+          </select>
+        </label>
+        {rule.mode === "split" ? (
+          <>
+            <label className="text-xs text-slate-600">
+              Delimiter
+              <input
+                type="text"
+                value={rule.delimiter}
+                onChange={(event) => onChange({ ...rule, delimiter: event.target.value })}
+                className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 font-mono text-sm text-slate-800"
+              />
+            </label>
+            <label className="text-xs text-slate-600">
+              Part number
+              <input
+                type="number"
+                min={1}
+                value={rule.part_index + 1}
+                onChange={(event) =>
+                  onChange({
+                    ...rule,
+                    part_index: Math.max(0, Number(event.target.value || 1) - 1),
+                  })
+                }
+                className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm text-slate-800"
+              />
+            </label>
+          </>
+        ) : null}
+        {rule.mode === "regex" ? (
+          <>
+            <label className="text-xs text-slate-600 sm:col-span-2">
+              Regular expression
+              <input
+                type="text"
+                value={rule.regex_pattern}
+                onChange={(event) => onChange({ ...rule, regex_pattern: event.target.value })}
+                placeholder="Example: ^(.+?)\s+-\s+(.+)$"
+                className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 font-mono text-sm text-slate-800"
+              />
+            </label>
+            <label className="text-xs text-slate-600">
+              Capture group
+              <input
+                type="number"
+                min={0}
+                value={Number(rule.regex_group)}
+                onChange={(event) => onChange({ ...rule, regex_group: Number(event.target.value || 0) })}
+                className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm text-slate-800"
+              />
+            </label>
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function NamingRows({
+  title,
+  definedLabel,
+  sources,
+  mapping,
+  disabled,
+  onChange,
+}: {
+  title: string;
+  definedLabel: string;
+  sources: string[];
+  mapping: Record<string, string>;
+  disabled: boolean;
+  onChange: (next: Record<string, string>) => void;
+}) {
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  useEffect(() => {
+    setDrafts({});
+  }, [mapping, sources]);
+  if (!sources.length) {
+    return null;
+  }
+  return (
+    <div className="divide-y divide-slate-100 border-t border-slate-200">
+      <div className="bg-slate-50 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">{title}</div>
+      {sources.map((source) => {
+        const target = mapping[source] ?? source;
+        const draft = drafts[source] ?? target;
+        const isRenamed = normalizeNameLabel(target) !== normalizeNameLabel(source);
+        const commitDraft = () => onChange(nextNameMap(mapping, source, draft));
+        return (
+          <div key={source} className="grid gap-2 px-4 py-2.5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-end">
+            <div className="min-w-0">
+              <div className="text-xs font-medium text-slate-500">Source</div>
+              <div className="truncate text-sm text-slate-800" title={source}>
+                {source}
+              </div>
+            </div>
+            <label className="min-w-0 text-xs text-slate-600">
+              {definedLabel}
+              <input
+                type="text"
+                value={draft}
+                disabled={disabled}
+                onChange={(event) =>
+                  setDrafts((current) => ({ ...current, [source]: event.target.value }))
+                }
+                onBlur={commitDraft}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitDraft();
+                    event.currentTarget.blur();
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setDrafts((current) => {
+                      const next = { ...current };
+                      delete next[source];
+                      return next;
+                    });
+                    event.currentTarget.blur();
+                  }
+                }}
+                className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm text-slate-800 disabled:bg-slate-100"
+              />
+            </label>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={disabled || !isRenamed}
+              onClick={() => {
+                setDrafts((current) => ({ ...current, [source]: source }));
+                onChange(nextNameMap(mapping, source, source));
+              }}
+            >
+              <X className="h-4 w-4" />
+              Reset
+            </Button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function ImportPage() {
   const [files, setFiles] = useState<File[]>([]);
+  const [parsingConfig, setParsingConfig] = useState<ImportParsingConfig | null>(null);
+  const [namingDraft, setNamingDraft] = useState<ImportNamingWorkspace | null>(null);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [browseInfo, setBrowseInfo] = useState<string | null>(null);
   const [browseError, setBrowseError] = useState<string | null>(null);
@@ -284,6 +553,11 @@ export default function ImportPage() {
     queryFn: () => api.getSession(sessionId!),
     enabled: Boolean(sessionId),
   });
+  const namingQuery = useQuery({
+    queryKey: ["import-naming", sessionId],
+    queryFn: () => api.getImportNaming(sessionId!),
+    enabled: Boolean(sessionId),
+  });
 
   const sessionsQuery = useQuery({
     queryKey: ["sessions"],
@@ -297,8 +571,52 @@ export default function ImportPage() {
   const cancelJobMutation = useMutation({
     mutationFn: (jobId: string) => api.cancelJob(jobId),
   });
+  const previewImportMutation = useMutation({
+    mutationFn: (selectedFiles: File[]) => api.previewImport(selectedFiles),
+    onSuccess: (preview) => {
+      setParsingConfig({
+        files: preview.files
+          .map((file) => file.suggested_config)
+          .sort((left, right) => Number(left.file_index ?? 0) - Number(right.file_index ?? 0)),
+      });
+    },
+    onError: () => setParsingConfig(null),
+  });
+  const saveNamingMutation = useMutation({
+    mutationFn: (draft: ImportNamingWorkspace) =>
+      api.setImportNaming(sessionId!, {
+        species_name_map: draft.species_name_map,
+        identifier1_name_map: draft.identifier1_name_map,
+      }),
+    onSuccess: async (saved) => {
+      setNamingDraft(saved);
+      await queryClient.invalidateQueries({ queryKey: ["import-naming", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-workspace", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+    },
+  });
 
   const activeSession = sessionQuery.data;
+  const importPreview = previewImportMutation.data;
+  const parsingReady = Boolean(
+    files.length > 0
+      && importPreview
+      && importPreview.files.length === files.length
+      && parsingConfig
+      && parsingConfig.files.length === importPreview.files.length
+      && parsingConfig.files.every((config) =>
+        [config.identifier1, config.identifier2, config.species].every(parsingRuleIsValid),
+      ),
+  );
+  const namingSaved = namingQuery.data;
+  const namingDirty = Boolean(
+    namingDraft
+      && namingSaved
+      && (
+        JSON.stringify(namingDraft.species_name_map) !== JSON.stringify(namingSaved.species_name_map)
+        || JSON.stringify(namingDraft.identifier1_name_map) !== JSON.stringify(namingSaved.identifier1_name_map)
+      ),
+  );
   const autosave = activeSession?.autosave ?? {};
   const recentSessions = useMemo(() => (sessionsQuery.data ?? []).slice(0, 5), [sessionsQuery.data]);
   const autosaveEventCount = numberValue(autosave.event_count, 0);
@@ -311,10 +629,30 @@ export default function ImportPage() {
         return {
           key: `${name}-${index}`,
           name,
+          index,
         };
       }),
     [activeSession?.source_files],
   );
+
+  function updateParsingRule(
+    fileIndex: number,
+    field: "identifier1" | "identifier2" | "species",
+    rule: ImportFieldParsingRule,
+  ) {
+    setParsingConfig((current) => {
+      if (!current) {
+        return current;
+      }
+      return {
+        files: current.files.map((config) =>
+          Number(config.file_index) === fileIndex
+            ? { ...config, [field]: rule }
+            : config,
+        ),
+      };
+    });
+  }
 
   useEffect(() => {
     const input = folderInputRef.current;
@@ -326,27 +664,46 @@ export default function ImportPage() {
   }, []);
 
   useEffect(() => {
+    setParsingConfig(null);
+    previewImportMutation.reset();
+    if (files.length > 0) {
+      previewImportMutation.mutate(files);
+    }
+    // Preview only when the selected File objects change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files]);
+
+  useEffect(() => {
     setActiveArtifactKind(null);
+    setNamingDraft(null);
   }, [sessionId]);
 
+  useEffect(() => {
+    if (namingQuery.data) {
+      setNamingDraft(namingQuery.data);
+    }
+  }, [namingQuery.data]);
+
   const importMutation = useMutation({
-    mutationFn: () => api.importSession(files, setUploadProgress),
+    mutationFn: () => api.importSession(files, parsingConfig, setUploadProgress),
     onMutate: () => setUploadProgress({ loaded: 0, total: null, percent: 0, phase: "uploading" }),
     onSuccess: async (result) => {
       setSessionId(result.session.session_id);
       await queryClient.invalidateQueries({ queryKey: ["session", result.session.session_id] });
       await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      await queryClient.invalidateQueries({ queryKey: ["import-naming", result.session.session_id] });
       setFiles([]);
     },
     onSettled: () => setUploadProgress(null),
   });
 
   const appendMutation = useMutation({
-    mutationFn: () => api.appendSession(sessionId!, files, setUploadProgress),
+    mutationFn: () => api.appendSession(sessionId!, files, parsingConfig, setUploadProgress),
     onMutate: () => setUploadProgress({ loaded: 0, total: null, percent: 0, phase: "uploading" }),
     onSuccess: async (result) => {
       await queryClient.invalidateQueries({ queryKey: ["session", result.session.session_id] });
       await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      await queryClient.invalidateQueries({ queryKey: ["import-naming", result.session.session_id] });
       setFiles([]);
     },
     onSettled: () => setUploadProgress(null),
@@ -358,6 +715,14 @@ export default function ImportPage() {
       setSessionId(result.session_id);
       setBrowseError(null);
       await queryClient.invalidateQueries({ queryKey: ["session", result.session_id] });
+      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    },
+  });
+
+  const excludeSessionFileMutation = useMutation({
+    mutationFn: (fileIndex: number) => api.excludeSessionFile(sessionId!, fileIndex),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({ queryKey: ["session", result.session.session_id] });
       await queryClient.invalidateQueries({ queryKey: ["sessions"] });
     },
   });
@@ -472,18 +837,141 @@ export default function ImportPage() {
             onChange={(event) => setFiles(Array.from(event.target.files ?? []))}
             className="form-control block w-full text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-stone-900 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-white hover:file:bg-stone-800"
           />
+          {previewImportMutation.isPending ? (
+            <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">
+              Inspecting workbook columns and detecting ISODAT/Qtegra layouts...
+            </div>
+          ) : null}
+          {importPreview && parsingConfig ? (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="text-sm font-semibold text-slate-900">Identity-field parsing</div>
+                  <div className="text-xs text-slate-500">
+                    Configure only Identifier 1, Identifier 2, and Species. Cycle layouts are standardized automatically by software.
+                  </div>
+                </div>
+                <Button type="button" variant="outline" size="sm" onClick={() => previewImportMutation.mutate(files)}>
+                  <RefreshCw className="h-4 w-4" />
+                  Inspect again
+                </Button>
+              </div>
+              {importPreview.files.map((filePreview) => {
+                const config = parsingConfig.files.find(
+                  (item) => Number(item.file_index) === filePreview.file_index,
+                );
+                if (!config) {
+                  return null;
+                }
+                const parsedRows = filePreview.sample_rows
+                  .map((row) => ({
+                    identifier1: parsePreviewValue(row, config.identifier1),
+                    identifier2: parsePreviewValue(row, config.identifier2),
+                    species: parsePreviewValue(row, config.species),
+                  }))
+                  .filter((row) => row.identifier1 || row.identifier2 || row.species);
+                const uniqueParsedRows = Array.from(
+                  new Map(
+                    parsedRows.map((row) => [
+                      `${row.identifier1}\u0000${row.identifier2}\u0000${row.species}`,
+                      row,
+                    ]),
+                  ).values(),
+                ).slice(0, 5);
+                return (
+                  <section key={filePreview.file_index} className="overflow-hidden rounded-lg border border-slate-200 bg-slate-50/60">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-3">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-semibold text-slate-900" title={filePreview.file_name}>
+                          {filePreview.file_name}
+                        </div>
+                        <div className="text-xs text-slate-500">
+                          {filePreview.row_count.toLocaleString()} source rows · {filePreview.columns.length} columns
+                        </div>
+                      </div>
+                      <Badge>{filePreview.software === "qtegra" ? "Qtegra" : filePreview.software === "isodat" ? "ISODAT" : "Generic Excel"}</Badge>
+                    </div>
+                    <div className="grid gap-3 p-3 xl:grid-cols-3">
+                      <ParsingFieldEditor
+                        label="Identifier 1"
+                        columns={filePreview.columns}
+                        rule={config.identifier1}
+                        onChange={(rule) => updateParsingRule(filePreview.file_index, "identifier1", rule)}
+                      />
+                      <ParsingFieldEditor
+                        label="Identifier 2"
+                        columns={filePreview.columns}
+                        rule={config.identifier2}
+                        onChange={(rule) => updateParsingRule(filePreview.file_index, "identifier2", rule)}
+                      />
+                      <ParsingFieldEditor
+                        label="Species"
+                        columns={filePreview.columns}
+                        rule={config.species}
+                        onChange={(rule) => updateParsingRule(filePreview.file_index, "species", rule)}
+                      />
+                    </div>
+                    <div className="border-t border-slate-200 bg-white px-4 py-3">
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Parsed preview</div>
+                      {uniqueParsedRows.length ? (
+                        <div className="overflow-auto rounded-md border border-slate-200">
+                          <table className="min-w-full text-left text-xs">
+                            <thead className="bg-slate-50 text-slate-600">
+                              <tr>
+                                <th className="px-3 py-2 font-semibold">Identifier 1</th>
+                                <th className="px-3 py-2 font-semibold">Identifier 2</th>
+                                <th className="px-3 py-2 font-semibold">Species</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100">
+                              {uniqueParsedRows.map((row, index) => (
+                                <tr key={`${row.identifier1}-${row.identifier2}-${row.species}-${index}`}>
+                                  <td className="px-3 py-2 text-slate-800">{row.identifier1 || "—"}</td>
+                                  <td className="px-3 py-2 text-slate-800">{row.identifier2 || "—"}</td>
+                                  <td className="px-3 py-2 text-slate-800">{row.species || "—"}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div className="rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs text-amber-800">
+                          No identity values could be parsed with this configuration.
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                );
+              })}
+              {importPreview.errors.length ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                  {importPreview.errors.join("; ")}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {previewImportMutation.error ? (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+              Unable to inspect the selected workbook(s): {String(previewImportMutation.error)}
+            </div>
+          ) : null}
+          {files.length > 0 && importPreview && !previewImportMutation.isPending && !parsingReady ? (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              Choose a valid source and extraction rule for all three identity fields before importing.
+            </div>
+          ) : null}
           <div className="flex flex-wrap gap-3">
-            <Button onClick={() => importMutation.mutate()} disabled={files.length === 0 || importMutation.isPending}>
+            <Button onClick={() => importMutation.mutate()} disabled={!parsingReady || importMutation.isPending}>
               <Upload className="h-4 w-4" />
-              {importMutation.isPending ? "Importing..." : "Create session"}
+              {importMutation.isPending ? "Importing..." : previewImportMutation.isPending ? "Inspecting..." : "Create session"}
             </Button>
             <Button
               variant="outline"
               onClick={() => appendMutation.mutate()}
-              disabled={!sessionId || files.length === 0 || appendMutation.isPending}
+              disabled={!sessionId || !parsingReady || appendMutation.isPending}
             >
               <Plus className="h-4 w-4" />
-              {appendMutation.isPending ? "Adding..." : "Add files"}
+              {appendMutation.isPending ? "Adding..." : previewImportMutation.isPending ? "Inspecting..." : "Add files"}
             </Button>
           </div>
           {uploadProgress ? (
@@ -533,31 +1021,116 @@ export default function ImportPage() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div>
-          <CardTitle>Session record</CardTitle>
-            <CardDescription>Review recovery artifacts and the workbooks attached to the active session.</CardDescription>
-          </div>
-          <div className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-700">
-            <span
-              className={`h-2.5 w-2.5 rounded-full ${autosaveEnabled ? "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.14)]" : "bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.12)]"}`}
-              aria-hidden="true"
-            />
-            Autosave {autosaveEnabled ? "on" : "off"}
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-4 text-sm text-stone-600">
-          <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-4">
-            <Badge>{autosaveEventCount} events</Badge>
-            <Badge>{autosaveResumed ? "Resumed" : "New session"}</Badge>
-            <span className="font-mono text-[10px] text-slate-500">{sessionId ?? "No active session"}</span>
-            <span className="ml-auto text-xs text-slate-500">Last saved {formatTimestamp(autosave.last_saved_at)}</span>
-          </div>
+      <div className="grid items-start gap-5 xl:grid-cols-2">
+        <Card>
+          <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <CardTitle>Species and Identifier 1 names</CardTitle>
+              <CardDescription>
+                Define corrected names after import. These names are used in processing groups, filters, charts, tables, and exports.
+              </CardDescription>
+            </div>
+            {namingDraft ? (
+              <div className="flex flex-wrap gap-1.5">
+                <Badge>{Object.keys(namingDraft.species_name_map).length} species renamed</Badge>
+                <Badge>{Object.keys(namingDraft.identifier1_name_map).length} identifiers renamed</Badge>
+              </div>
+            ) : null}
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {!sessionId ? (
+              <div className="rounded-lg border border-dashed border-slate-300 p-3 text-sm text-slate-500">
+                Create or open a session to define names.
+              </div>
+            ) : namingQuery.error ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                Unable to load imported names: {String(namingQuery.error)}
+              </div>
+            ) : namingQuery.isLoading || !namingDraft ? (
+              <div className="text-sm text-slate-500">Loading imported names...</div>
+            ) : (
+              <div className="overflow-hidden rounded-lg border border-slate-200">
+                <NamingRows
+                  title="Species name"
+                  definedLabel="Defined species name"
+                  sources={namingDraft.species_sources}
+                  mapping={namingDraft.species_name_map}
+                  disabled={saveNamingMutation.isPending}
+                  onChange={(speciesNameMap) =>
+                    setNamingDraft((current) =>
+                      current ? { ...current, species_name_map: speciesNameMap } : current,
+                    )
+                  }
+                />
+                <NamingRows
+                  title="Identifier 1"
+                  definedLabel="Defined Identifier 1"
+                  sources={namingDraft.identifier1_sources}
+                  mapping={namingDraft.identifier1_name_map}
+                  disabled={saveNamingMutation.isPending}
+                  onChange={(identifier1NameMap) =>
+                    setNamingDraft((current) =>
+                      current ? { ...current, identifier1_name_map: identifier1NameMap } : current,
+                    )
+                  }
+                />
+              </div>
+            )}
+            {sessionId && namingDraft ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  onClick={() => saveNamingMutation.mutate(namingDraft)}
+                  disabled={!namingDirty || saveNamingMutation.isPending}
+                >
+                  {saveNamingMutation.isPending ? "Saving names..." : "Save names"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={!namingDirty || saveNamingMutation.isPending}
+                  onClick={() => namingSaved && setNamingDraft(namingSaved)}
+                >
+                  Restore saved
+                </Button>
+                <span className="text-xs text-slate-500">
+                  {namingDirty ? "Unsaved naming changes" : "Names are saved"}
+                </span>
+              </div>
+            ) : null}
+            {saveNamingMutation.error ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                Unable to save names: {String(saveNamingMutation.error)}
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
 
-          <div>
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Record views</div>
-            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+        <Card>
+          <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <CardTitle>Session record</CardTitle>
+              <CardDescription>Review recovery artifacts and the workbooks attached to the active session.</CardDescription>
+            </div>
+            <div className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-700">
+              <span
+                className={`h-2.5 w-2.5 rounded-full ${autosaveEnabled ? "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.14)]" : "bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.12)]"}`}
+                aria-hidden="true"
+              />
+              Autosave {autosaveEnabled ? "on" : "off"}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4 text-sm text-stone-600">
+            <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-4">
+              <Badge>{autosaveEventCount} events</Badge>
+              <Badge>{autosaveResumed ? "Resumed" : "New session"}</Badge>
+              <span className="font-mono text-[10px] text-slate-500">{sessionId ?? "No active session"}</span>
+              <span className="ml-auto text-xs text-slate-500">Last saved {formatTimestamp(autosave.last_saved_at)}</span>
+            </div>
+
+            <div>
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Record views</div>
+              <div className="grid gap-2 sm:grid-cols-2 2xl:grid-cols-3">
               {SESSION_ARTIFACTS.map((artifact) => {
                 const Icon =
                   artifact.kind === "events"
@@ -585,32 +1158,45 @@ export default function ImportPage() {
                   </button>
                 );
               })}
+              </div>
             </div>
-          </div>
 
-          <div className="border-t border-slate-200 pt-4">
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Current session files</div>
-              <span className="font-mono text-[10px] text-slate-500">{sessionSourceFiles.length} files</span>
+            <div className="border-t border-slate-200 pt-4">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Current session files</div>
+                <span className="font-mono text-[10px] text-slate-500">{sessionSourceFiles.length} files</span>
+              </div>
+              {!sessionId ? (
+                <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">No open session.</div>
+              ) : sessionSourceFiles.length > 0 ? (
+                <div className="grid gap-1.5 sm:grid-cols-2">
+                  {sessionSourceFiles.map((sourceFile) => (
+                    <div key={sourceFile.key} className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700" title={sourceFile.name}>
+                      <span className="min-w-0 flex-1 truncate">{sourceFile.name}</span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 shrink-0 px-2 text-red-600 hover:bg-red-50 hover:text-red-700"
+                        onClick={() => excludeSessionFileMutation.mutate(sourceFile.index)}
+                        disabled={excludeSessionFileMutation.isPending}
+                        aria-label={`Exclude ${sourceFile.name}`}
+                        title={`Exclude ${sourceFile.name}`}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">
+                  Session has no loaded source files.
+                </div>
+              )}
             </div>
-            {!sessionId ? (
-              <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">No open session.</div>
-            ) : sessionSourceFiles.length > 0 ? (
-              <div className="grid gap-1.5 sm:grid-cols-2 xl:grid-cols-3">
-                {sessionSourceFiles.map((sourceFile) => (
-                  <div key={sourceFile.key} className="truncate rounded-md border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700" title={sourceFile.name}>
-                    {sourceFile.name}
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">
-                Session has no loaded source files.
-              </div>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+      </div>
 
       <Card>
         <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -646,6 +1232,7 @@ export default function ImportPage() {
           <input ref={sessionFileInputRef} type="file" accept=".json" onChange={handleSessionFileSelected} className="hidden" />
           {browseInfo ? <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">{browseInfo}</div> : null}
           {browseError ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{browseError}</div> : null}
+          {excludeSessionFileMutation.error ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">Unable to exclude file: {String(excludeSessionFileMutation.error)}</div> : null}
           {recentSessions.length > 0 ? (
             <div className="divide-y divide-slate-100 rounded-lg border border-slate-200">
               {recentSessions.map((session) => {

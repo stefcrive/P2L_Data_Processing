@@ -24,6 +24,7 @@ from ..constants import (
     CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+    CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
     VALID_CYCLES_COL,
@@ -40,6 +41,11 @@ from ..contracts import (
     ProcessingWorkspaceConfig,
 )
 from ..shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column, _get_species_series, _parse_numeric_token
+from ..shared.naming import (
+    apply_identifier1_name_map as _apply_identifier1_name_map,
+    mapped_identifier1 as _mapped_identifier1,
+    normalize_identifier1_name_map as _normalize_identifier1_name_map,
+)
 from ..standards import StandardsRepository
 from .cycles import (
     apply_run_level_linearity_basis_from_cycles,
@@ -135,10 +141,6 @@ def _normalize_species_name_map(raw: Any) -> dict[str, str]:
     return normalized
 
 
-def _normalize_identifier1_name_map(raw: Any) -> dict[str, str]:
-    return _normalize_species_name_map(raw)
-
-
 def _apply_species_name_map(df: pd.DataFrame, species_name_map: dict[str, str] | None) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -149,26 +151,6 @@ def _apply_species_name_map(df: pd.DataFrame, species_name_map: dict[str, str] |
     species = _get_species_series(work).reindex(work.index).fillna("").astype(str).map(str.strip)
     work["Species"] = species.map(lambda value: normalized_map.get(value, value))
     return work
-
-
-def _apply_identifier1_name_map(
-    df: pd.DataFrame,
-    identifier1_name_map: dict[str, str] | None,
-) -> pd.DataFrame:
-    if df is None or df.empty or "Identifier 1" not in df.columns:
-        return df
-    normalized_map = _normalize_identifier1_name_map(identifier1_name_map)
-    if not normalized_map:
-        return df
-    work = df.copy()
-    identifiers = work["Identifier 1"].fillna("").astype(str).map(str.strip)
-    work["Identifier 1"] = identifiers.map(lambda value: normalized_map.get(value, value))
-    return work
-
-
-def _mapped_identifier1(value: Any, identifier1_name_map: dict[str, str] | None) -> str:
-    label = str(value).strip()
-    return _normalize_identifier1_name_map(identifier1_name_map).get(label, label)
 
 
 def _build_export_filename(config: ProcessingWorkspaceConfig) -> str:
@@ -190,13 +172,12 @@ def _build_export_filename(config: ProcessingWorkspaceConfig) -> str:
 def _candidate_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         "Date",
-        "Identifier 1",
-        "Identifier 2",
-        "Species",
-        "Comment",
-        "Label",
-        VALID_CYCLES_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
+        CYCLE1_SIGNAL_REF44_COL,
+        "p_no_acid",
+        "total_co2",
+        "p_gases",
+        VALID_CYCLES_COL,
         "1  Cycle Int  Diff Samp-Ref  44",
         CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
         CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,

@@ -156,6 +156,34 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertEqual(float(updated_df.loc[0, "d 13C/12C  Mean"]), 8.0)
         self.assertEqual(float(updated_df.loc[0, "d13C_calibrated"]), 9.0)
 
+    def test_processing_workspace_initializes_legacy_ranges_to_four_sigma(self) -> None:
+        metadata = api_main.store.load_metadata(self.session_id)
+        metadata["source_files"] = [{"name": "source.xlsx"}]
+        metadata["processing"].pop("ranges_source", None)
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        workspace = api_main.processing_workspace(self.session_id)
+
+        frame = sample_processing_df()
+        expected_ranges = {
+            "signal_range": frame["1  Cycle Int  Samp  44"],
+            "leak_range": frame["leak_rate"],
+            "d13c_range": frame["d 13C/12C  Mean"],
+            "d18o_range": frame["d 18O/16O  Mean"],
+        }
+        for field_name, values in expected_ranges.items():
+            mean = float(values.mean())
+            standard_deviation = float(values.std(ddof=1))
+            if standard_deviation > 0:
+                expected = (mean - (4.0 * standard_deviation), mean + (4.0 * standard_deviation))
+                self.assertTrue(np.allclose(getattr(workspace.config, field_name), expected))
+            else:
+                actual = getattr(workspace.config, field_name)
+                self.assertLess(actual[0], mean)
+                self.assertGreater(actual[1], mean)
+        stored_metadata = api_main.store.load_metadata(self.session_id)
+        self.assertEqual(stored_metadata["processing"]["ranges_source"], "four_sigma_import")
+
     def test_processing_edit_batch_commits_all_edits_as_one_session_event(self) -> None:
         before = api_main.store.load_metadata(self.session_id)
         response = api_main.edit_processing_batch(
@@ -748,10 +776,85 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertIn("d13C vs Diff Signal Intensity", subplot_titles)
         self.assertIn("d18O vs Pressure-Adjusted Signal Intensity Diff", subplot_titles)
         self.assertIn("d13C vs Pressure-Adjusted Signal Intensity Diff", subplot_titles)
-        self.assertLess(_idx("Signal Intensity vs d18O"), _idx("d18O vs Diff Signal Intensity"))
-        self.assertLess(_idx("d18O vs Diff Signal Intensity"), _idx("d13C vs Diff Signal Intensity"))
-        self.assertLess(_idx("d13C vs Diff Signal Intensity"), _idx("d18O vs Pressure-Adjusted Signal Intensity Diff"))
-        self.assertLess(_idx("d18O vs Pressure-Adjusted Signal Intensity Diff"), _idx("d13C vs Pressure-Adjusted Signal Intensity Diff"))
+        self.assertLess(_idx("Signal Intensity vs d13C"), _idx("Signal Intensity vs d18O"))
+        self.assertLess(_idx("Signal Intensity vs d18O"), _idx("d13C vs Diff Signal Intensity"))
+        self.assertLess(_idx("d13C vs Diff Signal Intensity"), _idx("d18O vs Diff Signal Intensity"))
+        self.assertLess(_idx("d18O vs Diff Signal Intensity"), _idx("d13C vs Pressure-Adjusted Signal Intensity Diff"))
+        self.assertLess(_idx("d13C vs Pressure-Adjusted Signal Intensity Diff"), _idx("d18O vs Pressure-Adjusted Signal Intensity Diff"))
+
+        isotope_group_headers = {
+            title
+            for title in subplot_titles
+            if title in {"<b>CARBON ISOTOPE (d13C)</b>", "<b>OXYGEN ISOTOPE (d18O)</b>"}
+        }
+        self.assertEqual(
+            isotope_group_headers,
+            {"<b>CARBON ISOTOPE (d13C)</b>", "<b>OXYGEN ISOTOPE (d18O)</b>"},
+        )
+        section_headers = {
+            title
+            for title in subplot_titles
+            if title in {
+                "SAMPLE CONDITIONS",
+                "SIGNAL RESPONSE",
+                "LINE EFFECTS",
+                "INSTRUMENT RELATIONSHIPS",
+                "MULTIVARIATE OVERVIEW",
+            }
+        }
+        self.assertEqual(
+            section_headers,
+            {
+                "SAMPLE CONDITIONS",
+                "SIGNAL RESPONSE",
+                "LINE EFFECTS",
+                "INSTRUMENT RELATIONSHIPS",
+                "MULTIVARIATE OVERVIEW",
+            },
+        )
+
+    def test_diagnostics_grid_uses_calibration_selected_standards_and_visible_gridlines(self) -> None:
+        df = sample_processing_df().copy()
+        df["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
+        df["total_co2"] = [1.0, 1.1, 1.2, 1.3]
+        df["p_gases"] = [201.0, 202.0, 203.0, 204.0]
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        metadata = api_main.store.load_metadata(self.session_id)
+        calibration = dict(metadata.get("calibration", {}))
+        calibration["config"] = {
+            **dict(calibration.get("config", {})),
+            "selected_standards": ["SampleA"],
+        }
+        metadata["calibration"] = calibration
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        bundle = api_main.diagnostics(
+            self.session_id,
+            color_param="Date",
+            identifier_filter=[],
+            d13_min=None,
+            d13_max=None,
+            d18_min=None,
+            d18_max=None,
+        )
+
+        grid_meta = bundle.summary.get("diagnostic_grid", [])
+        self.assertEqual(len(grid_meta), 23)
+        self.assertEqual(bundle.summary.get("selected_standards"), ["SampleA"])
+
+        first_key = grid_meta[0]["key"]
+        first_figure = bundle.figures[first_key]
+        first_trace = first_figure["data"][0]
+        self.assertEqual(
+            list(first_trace["marker"]["symbol"]),
+            ["circle-open", "circle-open", "circle-open", "circle"],
+        )
+        self.assertTrue(first_figure["layout"]["xaxis"]["showgrid"])
+        self.assertTrue(first_figure["layout"]["yaxis"]["showgrid"])
+        self.assertEqual(first_figure["layout"]["xaxis"]["gridcolor"], "#cbd5e1")
+        self.assertEqual(first_figure["layout"]["yaxis"]["gridcolor"], "#cbd5e1")
+        self.assertIsNone(bundle.figures["diagnostics"]["layout"].get("title", {}).get("text"))
 
     def test_diagnostics_endpoint_marks_partially_saturated_collectors_with_orange_diamond_outline(self) -> None:
         df = sample_processing_df().copy()

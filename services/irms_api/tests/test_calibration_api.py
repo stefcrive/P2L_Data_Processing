@@ -13,7 +13,13 @@ from fastapi import HTTPException
 
 from services.irms_api.api import main as api_main
 from services.irms_api.domain.calibration.core import convert_d18o_carbonate_material
-from services.irms_api.domain.constants import ISOTYPE_D13C, VALID_CYCLES_COL
+from services.irms_api.domain.calibration.workspace import _sequence_axis
+from services.irms_api.domain.constants import (
+    CYCLE1_SIGNAL_REF44_COL,
+    CYCLE1_SIGNAL_SAMP44_COL,
+    ISOTYPE_D13C,
+    VALID_CYCLES_COL,
+)
 from services.irms_api.domain.contracts import CalibrationConfig, CalibrationOfficialValueUpsertRequest, LinearityConfig
 from services.irms_api.session_store import FileSessionStore
 
@@ -132,6 +138,8 @@ class CalibrationApiTests(unittest.TestCase):
         outlier_colorbar = preview.standard_sections[0].d13_figure["layout"]["coloraxis"]["colorbar"]
         self.assertEqual(outlier_colorbar["title"]["side"], "right")
         self.assertIn(VALID_CYCLES_COL, preview.available_values.color_params)
+        self.assertIn(CYCLE1_SIGNAL_SAMP44_COL, preview.available_values.color_params)
+        self.assertIn(CYCLE1_SIGNAL_REF44_COL, preview.available_values.color_params)
         shpl2_summary = next(item for item in preview.precision_summaries if item.standard == "SHP2L")
         self.assertIn("1", shpl2_summary.line_precisions)
         line1 = shpl2_summary.line_precisions["1"]
@@ -141,6 +149,61 @@ class CalibrationApiTests(unittest.TestCase):
 
         metadata = api_main.store.load_metadata(self.session_id)
         self.assertEqual(metadata.get("calibration", {}), {})
+
+    def test_available_standards_include_dataset_identifiers_and_database_materials(self) -> None:
+        preview = api_main.calibration_workspace_preview(
+            self.session_id,
+            CalibrationConfig(),
+        )
+
+        self.assertIn("SampleA", preview.available_values.standards)
+        self.assertIn("NBS18", preview.available_values.standards)
+        self.assertEqual(preview.available_values.standards.count("SHP2L"), 1)
+
+    def test_standard_sequence_axis_keeps_repeated_alphanumeric_identifiers_visible(self) -> None:
+        rows = pd.DataFrame(
+            {
+                "Identifier 2": ["CaCO3", "CaCO3", "NBS-19", "NBS-18", "IAEA-CO-8"],
+            }
+        )
+
+        self.assertEqual(_sequence_axis(rows).tolist(), [1.0, 2.0, 3.0, 4.0, 5.0])
+
+    def test_import_identifier_alias_is_used_for_calibration_without_rewriting_snapshot(self) -> None:
+        source_df = sample_calibration_df()
+        source_df.loc[source_df["Identifier 1"] == "SHP2L", "Identifier 1"] = "Reference batch"
+        api_main.store.save_frames(self.session_id, source_df, pd.DataFrame())
+        metadata = api_main.store.load_metadata(self.session_id)
+        metadata["processing"] = {
+            "config": {
+                "identifier1_name_map": {"Reference batch": "SHP2L"},
+            }
+        }
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        config = CalibrationConfig(
+            selected_standards=["SHP2L", "NBS19"],
+            calibration_type="IQR",
+            sigma_level=1.0,
+            iqr_multiplier=1.5,
+            independent_isotope_outliers=True,
+            color_param="Date_ordinal",
+            z_axis="1  Cycle Int  Samp  44",
+        )
+        preview = api_main.calibration_workspace_preview(self.session_id, config)
+
+        shp2l_summary = next(item for item in preview.precision_summaries if item.standard == "SHP2L")
+        self.assertEqual(shp2l_summary.total_rows, 3)
+
+        api_main.run_calibration(self.session_id, config)
+        stored_df = api_main.store.load_frame(self.session_id)
+        self.assertEqual(
+            int((stored_df["Identifier 1"].astype(str) == "Reference batch").sum()),
+            3,
+        )
+        reference_rows = stored_df["Identifier 1"].astype(str) == "Reference batch"
+        self.assertTrue(stored_df.loc[reference_rows, "d13C_calibrated"].isna().all())
+        self.assertTrue(stored_df.loc[reference_rows, "d18O_calibrated"].isna().all())
 
     def test_calibration_background_job_persists_and_returns_snapshot(self) -> None:
         submitted = api_main.submit_calibration_job(

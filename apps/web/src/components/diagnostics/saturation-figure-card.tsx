@@ -16,12 +16,12 @@ export const SATURATION_COLOR_AXIS_OPTIONS: Array<{ value: SaturationAxisKey; la
   { value: "ref44", label: "Ref44" },
   { value: "mean44", label: "Mean44" },
   { value: "mismatch", label: "Mismatch" },
-  { value: "d13C", label: "d13C" },
-  { value: "d18O", label: "d18O" },
+  { value: "d13C", label: "d13C cycle signal" },
+  { value: "d18O", label: "d18O cycle signal" },
 ];
 
 const SATURATION_AXIS_HELP_TEXT =
-  "Cycle: valid cycle number. Samp44: sample m/z 44 intensity. Ref44: reference-gas m/z 44 intensity. Mean44: average of Samp44 and Ref44. Mismatch: symmetric Samp-Ref mismatch, (Samp44 - Ref44) / ((Samp44 + Ref44) / 2). d13C and d18O: cycle isotope values.";
+  "Cycle: valid cycle number. Samp44: sample m/z 44 intensity. Ref44: reference-gas m/z 44 intensity. Mean44: average of Samp44 and Ref44. Mismatch: symmetric Samp-Ref mismatch. The isotope axes use exported cycle values when available; when the export repeats only a run mean, they use an internal rare/44 sample-to-reference signal proxy centered on that mean.";
 
 type SaturationFigureCardProps = {
   chartKey: string;
@@ -228,6 +228,7 @@ function prepareFigure(
   }
   const keepModelTraces = sameNumericValues(selectedY, originalY);
   yaxis.title = setTitle(selectedYTitle);
+  yaxis.tickformat = ".3f";
   layout.yaxis = yaxis;
   if (!swapped) {
     const recoloredTrace = {
@@ -288,9 +289,11 @@ export function saturationAxisDefaultFromDiagnostics(diagnostics?: { target?: Re
 export function SaturationSharedColorbar({
   figures,
   colorAxis,
+  orientation = "horizontal",
 }: {
   figures: Array<Record<string, unknown> | undefined>;
   colorAxis: SaturationAxisKey;
+  orientation?: "horizontal" | "vertical";
 }) {
   const range = useMemo(() => {
     const values = figures.flatMap((figure) => valuesForFigureAxis(figure, colorAxis)).filter((value) => Number.isFinite(value));
@@ -300,6 +303,20 @@ export function SaturationSharedColorbar({
     return { min: Math.min(...values), max: Math.max(...values) };
   }, [colorAxis, figures]);
 
+  if (orientation === "vertical") {
+    return (
+      <div className="flex min-h-[260px] flex-col items-center justify-center gap-2 text-xs">
+        <div className="text-center text-stone-600">{axisLabel(colorAxis)} scale</div>
+        <div className="flex items-center gap-2">
+          <div className="flex h-44 w-2 flex-col justify-between text-[10px] tabular-nums text-stone-500">
+            <span>{range ? formatRangeValue(range.max) : "N/A"}</span>
+            <span>{range ? formatRangeValue(range.min) : "N/A"}</span>
+          </div>
+          <div className="h-44 w-2 rounded-full border border-stone-300 bg-[linear-gradient(0deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]" />
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="w-full max-w-[280px] min-w-[180px] text-xs">
       <div className="mb-1 text-stone-600">{axisLabel(colorAxis)} scale</div>
@@ -336,26 +353,7 @@ export function SaturationFigureCard({ chartKey, title, description, figure, col
 
   return (
     <div className="rounded-lg border border-stone-200 p-2">
-      <div className="flex flex-wrap items-start justify-between gap-2 px-1 pb-2">
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          {description ? (
-            <Tooltip label={description} align="start" contentClassName="w-96">
-              <button type="button" className="truncate text-left text-sm font-medium text-stone-700 underline decoration-stone-300 underline-offset-4">
-                {title}
-              </button>
-            </Tooltip>
-          ) : (
-            <div className="truncate text-sm font-medium text-stone-700">{title}</div>
-          )}
-          {swapped ? (
-            <Tooltip label={swappedMessage} align="end" contentClassName="w-80">
-              <button type="button" className="inline-flex h-7 w-7 items-center justify-center rounded-md text-amber-700 hover:bg-amber-50">
-                <AlertTriangle className="h-4 w-4" />
-                <span className="sr-only">{swappedMessage}</span>
-              </button>
-            </Tooltip>
-          ) : null}
-        </div>
+      <div className="flex flex-wrap items-start justify-end gap-2 px-1 pb-2">
         <Button
           type="button"
           variant="outline"
@@ -373,6 +371,25 @@ export function SaturationFigureCard({ chartKey, title, description, figure, col
         fitContainer
         deferRenderMs={deferRenderMs}
       />
+      <div className="flex min-w-0 items-center gap-2 px-1 pt-2">
+        {description ? (
+          <Tooltip label={description} align="start" contentClassName="w-96">
+            <button type="button" className="truncate text-left text-sm font-medium text-stone-700 underline decoration-stone-300 underline-offset-4">
+              {title}
+            </button>
+          </Tooltip>
+        ) : (
+          <div className="truncate text-sm font-medium text-stone-700">{title}</div>
+        )}
+        {swapped ? (
+          <Tooltip label={swappedMessage} align="end" contentClassName="w-80">
+            <button type="button" className="inline-flex h-7 w-7 items-center justify-center rounded-md text-amber-700 hover:bg-amber-50">
+              <AlertTriangle className="h-4 w-4" />
+              <span className="sr-only">{swappedMessage}</span>
+            </button>
+          </Tooltip>
+        ) : null}
+      </div>
     </div>
   );
 }

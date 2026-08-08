@@ -1240,7 +1240,13 @@ def create_calibration_plots(
     color_param: str,
 ) -> dict[str, go.Figure]:
     def _color_param_label(param: str) -> str:
-        return "Date" if _is_date_color_column(param) else str(param)
+        if _is_date_color_column(param):
+            return "Date"
+        if param == CYCLE1_SIGNAL_SAMP44_COL:
+            return "Initial sample intensity"
+        if param == CYCLE1_SIGNAL_REF44_COL:
+            return "Initial reference gas intensity"
+        return str(param)
 
     def _format_hover_color_value(value: Any) -> str:
         if value is None:

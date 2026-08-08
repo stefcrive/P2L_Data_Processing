@@ -170,7 +170,7 @@ type ProcessingPreviewMasks = {
 type ProcessingPreviewRow = ProcessingLinearityPreviewData["rows"][number];
 const DEFAULT_CHART_DISPLAY_STATE: ChartDisplayState = {
   hideCalibrated: true,
-  overlayStandards: false,
+  overlayStandards: true,
   hideSymbols: false,
   runningAverage: false,
   runningAveragePeriod: 5,
@@ -712,7 +712,14 @@ function pythonOrdinalFromDate(value: unknown): number | null {
 }
 
 function previewColorLabel(colorParam: string): string {
-  return normalizeColumnKey(colorParam) === "date_ordinal" || normalizeColumnKey(colorParam) === "date" ? "Date" : colorParam;
+  const key = normalizeColumnKey(colorParam);
+  if (key === "date_ordinal" || key === "date") return "Date";
+  if (key === "1 cycle int samp 44") return "Initial sample intensity";
+  if (key === "1 cycle int ref 44") return "Initial reference gas intensity";
+  if (key === "p_no_acid") return "P no Acid";
+  if (key === "total_co2") return "total CO2";
+  if (key === "p_gases") return "P gasses";
+  return colorParam;
 }
 
 function formatPreviewColorHoverValue(value: unknown): string {
@@ -1640,7 +1647,10 @@ function normalizeDisplayState(state?: Partial<ChartDisplayState> | null): Chart
     hideCalibrated: hasCurrentShape
       ? Boolean(state?.hideCalibrated || state?.rawOnly)
       : Boolean(state?.hideCalibrated || state?.rawOnly || DEFAULT_CHART_DISPLAY_STATE.hideCalibrated),
-    overlayStandards: Boolean(state?.overlayStandards),
+    overlayStandards:
+      state != null && "overlayStandards" in state
+        ? Boolean(state.overlayStandards)
+        : DEFAULT_CHART_DISPLAY_STATE.overlayStandards,
     hideSymbols: Boolean(state?.hideSymbols),
     runningAverage: Boolean(state?.runningAverage),
     runningAveragePeriod: clampRunningAveragePeriod(state?.runningAveragePeriod),
@@ -1811,6 +1821,23 @@ function applyDisplayState(
         }
       : cloned.layout;
   return { ...cloned, data: displayTraces, layout };
+}
+
+function normalizeProcessingMarkerOpacity(figure: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!figure) {
+    return figure;
+  }
+  const cloned = cloneFigure(figure);
+  let changed = false;
+  const data = cloned.data.map((trace) => {
+    const marker = trace.marker && typeof trace.marker === "object" ? trace.marker as Record<string, unknown> : null;
+    if (!marker || marker.opacity === 1) {
+      return trace;
+    }
+    changed = true;
+    return { ...trace, marker: { ...marker, opacity: 1 } };
+  });
+  return changed ? { ...cloned, data } : figure;
 }
 
 function TraceModeControl({
@@ -2616,22 +2643,6 @@ function normalizeSpeciesLabel(value: string) {
   return value.trim().replace(/\s+/g, " ");
 }
 
-function nextSpeciesNameMap(current: Record<string, string> | undefined, source: string, target: string) {
-  const sourceLabel = normalizeSpeciesLabel(source);
-  const targetLabel = normalizeSpeciesLabel(target);
-  const next = { ...(current ?? {}) };
-  if (!sourceLabel || !targetLabel || sourceLabel === targetLabel) {
-    delete next[sourceLabel];
-  } else {
-    next[sourceLabel] = targetLabel;
-  }
-  return next;
-}
-
-function nextIdentifier1NameMap(current: Record<string, string> | undefined, source: string, target: string) {
-  return nextSpeciesNameMap(current, source, target);
-}
-
 function fallbackTargetValue(target: SelectedTarget, isotopeKey: IsotopeKey): number {
   if (target.isotopeKey === "cross") {
     const crossValue = isotopeKey === "d13C" ? target.currentD13 : target.currentD18;
@@ -3205,6 +3216,69 @@ function pythonOrdinalToIsoDate(value: number): string {
   return date.toISOString().slice(0, 10);
 }
 
+function formatProcessingColorScaleValue(value: number, colorParam: string | null | undefined): string {
+  if (String(colorParam ?? "").trim().toLowerCase() === "date") {
+    return pythonOrdinalToIsoDate(value);
+  }
+  return value.toLocaleString(undefined, { maximumSignificantDigits: 5 });
+}
+
+function processingColorScaleTicks(range: [number, number], count = 6): number[] {
+  const [start, end] = range;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || count < 2) return [];
+  return Array.from({ length: count }, (_, index) => start + ((end - start) * index) / (count - 1));
+}
+
+function ProcessingColorScaleBar({
+  colorParam,
+  range,
+}: {
+  colorParam: string | null | undefined;
+  range: [number, number];
+}) {
+  const label = previewColorLabel(colorParam ?? "Color");
+  const ticks = processingColorScaleTicks(range);
+  return (
+    <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
+      <div className="mb-1 font-semibold text-stone-900">{label}</div>
+      <div
+        className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
+        role="img"
+        aria-label={`${label} color scale from ${range[0]} to ${range[1]}`}
+      />
+      <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
+        {ticks.map((tick, index) => (
+          <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
+            {formatProcessingColorScaleValue(tick, colorParam)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function hideEmbeddedColorbars(figure: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!figure) {
+    return figure;
+  }
+  const cloned = cloneFigure(figure);
+  const data = cloned.data.map((trace) => {
+    const marker = trace.marker && typeof trace.marker === "object" ? trace.marker as Record<string, unknown> : null;
+    return marker ? { ...trace, marker: { ...marker, showscale: false } } : trace;
+  });
+  const layout = { ...cloned.layout };
+  for (const key of Object.keys(layout)) {
+    if (!key.toLowerCase().startsWith("coloraxis")) {
+      continue;
+    }
+    const axis = layout[key];
+    if (axis && typeof axis === "object") {
+      layout[key] = { ...(axis as Record<string, unknown>), showscale: false };
+    }
+  }
+  return { ...cloned, data, layout };
+}
+
 function buildDateColorbarTicksForRange(cmin: number, cmax: number, maxTicks = 6): { tickvals: number[]; ticktext: string[] } {
   const low = Math.min(cmin, cmax);
   const high = Math.max(cmin, cmax);
@@ -3617,86 +3691,27 @@ function CheckboxField({
   disabled?: boolean;
 }) {
   return (
-    <label className={cn("flex items-start gap-3 rounded-lg border border-stone-200 p-3", disabled ? "cursor-not-allowed opacity-60" : "")}>
+    <label className={cn("flex items-center gap-2 py-1.5 text-sm", disabled ? "cursor-not-allowed opacity-60" : "")}>
       <input
         type="checkbox"
         checked={checked}
         disabled={disabled}
         onChange={(event) => onChange(event.target.checked)}
-        className="mt-1 h-4 w-4"
+        className="h-4 w-4"
       />
-      <span className="space-y-1">
-        <span className="block text-sm font-medium text-stone-800">{label}</span>
-        {description ? <span className="block text-xs text-stone-500">{description}</span> : null}
-      </span>
+      <span className="font-medium text-stone-800">{label}</span>
+      {description ? (
+        <Tooltip label={description}>
+          <span tabIndex={0} aria-label={`More information about ${label}`} className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">
+            ?
+          </span>
+        </Tooltip>
+      ) : null}
     </label>
   );
 }
 
-function ProcessingSummaryHero({
-  workspace,
-  speciesNameMap,
-  identifier1NameMap,
-  onSpeciesNameMapChange,
-  onIdentifier1NameMapChange,
-  disabled = false,
-}: {
-  workspace: ProcessingWorkspace;
-  speciesNameMap: Record<string, string>;
-  identifier1NameMap: Record<string, string>;
-  onSpeciesNameMapChange: (source: string, target: string) => void;
-  onIdentifier1NameMapChange: (source: string, target: string) => void;
-  disabled?: boolean;
-}) {
-  const [speciesDrafts, setSpeciesDrafts] = useState<Record<string, string>>({});
-  const [identifier1Drafts, setIdentifier1Drafts] = useState<Record<string, string>>({});
-  const speciesRows = useMemo(() => {
-    const labels = new Set<string>();
-    for (const value of workspace.available_values.species ?? []) {
-      const label = normalizeSpeciesLabel(String(value));
-      if (label) {
-        labels.add(label);
-      }
-    }
-    for (const value of Object.keys(speciesNameMap ?? {})) {
-      const label = normalizeSpeciesLabel(value);
-      if (label) {
-        labels.add(label);
-      }
-    }
-    return Array.from(labels).sort((a, b) => a.localeCompare(b));
-  }, [speciesNameMap, workspace.available_values.species]);
-  const renamedSpeciesCount = Object.entries(speciesNameMap ?? {}).filter(
-    ([source, target]) => normalizeSpeciesLabel(source) && normalizeSpeciesLabel(target) && normalizeSpeciesLabel(source) !== normalizeSpeciesLabel(target),
-  ).length;
-  const identifier1Rows = useMemo(() => {
-    const labels = new Set<string>();
-    for (const value of workspace.available_values.identifier1_sources ?? []) {
-      const label = normalizeSpeciesLabel(String(value));
-      if (label) {
-        labels.add(label);
-      }
-    }
-    for (const value of Object.keys(identifier1NameMap ?? {})) {
-      const label = normalizeSpeciesLabel(value);
-      if (label) {
-        labels.add(label);
-      }
-    }
-    return Array.from(labels).sort((a, b) => a.localeCompare(b));
-  }, [identifier1NameMap, workspace.available_values.identifier1_sources]);
-  const renamedIdentifier1Count = Object.entries(identifier1NameMap ?? {}).filter(
-    ([source, target]) => normalizeSpeciesLabel(source) && normalizeSpeciesLabel(target) && normalizeSpeciesLabel(source) !== normalizeSpeciesLabel(target),
-  ).length;
-
-  useEffect(() => {
-    setSpeciesDrafts({});
-  }, [speciesNameMap, workspace.available_values.species]);
-
-  useEffect(() => {
-    setIdentifier1Drafts({});
-  }, [identifier1NameMap, workspace.available_values.identifier1_sources]);
-
+function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }) {
   if (!workspace.summary.metrics.length) {
     return null;
   }
@@ -3716,7 +3731,7 @@ function ProcessingSummaryHero({
             <h2 id="processing-summary-title" className="text-sm font-semibold text-stone-900">
               Processing summary
             </h2>
-            <div className="text-xs text-stone-500">Metrics, species naming, and sample identifiers.</div>
+            <div className="text-xs text-stone-500">Metrics for the current processing configuration.</div>
           </div>
         </div>
         <div className="flex flex-wrap gap-1.5 text-xs text-stone-600">
@@ -3741,168 +3756,6 @@ function ProcessingSummaryHero({
             </div>
           ))}
         </div>
-        {speciesRows.length || identifier1Rows.length ? (
-          <section className="border-t border-stone-200" aria-labelledby="species-names-title">
-            <div className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <h3 id="species-names-title" className="text-sm font-semibold text-stone-900">
-                  Species and Identifier 1 names
-                </h3>
-                <div className="text-xs text-stone-500">Define the names used across groups, charts, tables, filters, and exports.</div>
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                <span className="w-fit rounded-md bg-stone-50 px-2.5 py-1 text-xs text-stone-600 ring-1 ring-stone-200">
-                  {renamedSpeciesCount} species renamed
-                </span>
-                <span className="w-fit rounded-md bg-stone-50 px-2.5 py-1 text-xs text-stone-600 ring-1 ring-stone-200">
-                  {renamedIdentifier1Count} identifiers renamed
-                </span>
-              </div>
-            </div>
-            {speciesRows.length ? (
-              <div className="divide-y divide-stone-100 border-t border-stone-200">
-                <div className="bg-stone-50 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-stone-600">
-                  Species name
-                </div>
-                {speciesRows.map((source) => {
-                  const savedTarget = speciesNameMap[source] ?? source;
-                  const draftTarget = speciesDrafts[source] ?? savedTarget;
-                  const isRenamed = normalizeSpeciesLabel(savedTarget) !== source;
-                  const commitDraft = () => {
-                    const nextTarget = speciesDrafts[source] ?? savedTarget;
-                    onSpeciesNameMapChange(source, nextTarget);
-                  };
-                  return (
-                    <div key={source} className="grid gap-2 px-4 py-2.5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
-                      <div className="min-w-0">
-                        <div className="text-xs font-medium uppercase tracking-normal text-stone-500">Source</div>
-                        <div className="truncate text-sm text-stone-800" title={source}>
-                          {source}
-                        </div>
-                      </div>
-                      <label className="min-w-0 text-sm">
-                        <span className="mb-1 block text-xs font-medium text-stone-500">Defined species name</span>
-                        <input
-                          type="text"
-                          value={draftTarget}
-                          disabled={disabled}
-                          onChange={(event) =>
-                            setSpeciesDrafts((current) => ({
-                              ...current,
-                              [source]: event.target.value,
-                            }))
-                          }
-                          onBlur={commitDraft}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter") {
-                              event.preventDefault();
-                              commitDraft();
-                              event.currentTarget.blur();
-                            }
-                            if (event.key === "Escape") {
-                              event.preventDefault();
-                              setSpeciesDrafts((current) => {
-                                const next = { ...current };
-                                delete next[source];
-                                return next;
-                              });
-                              event.currentTarget.blur();
-                            }
-                          }}
-                          className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm disabled:cursor-not-allowed disabled:bg-stone-100"
-                        />
-                      </label>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        disabled={disabled || !isRenamed}
-                        onClick={() => {
-                          setSpeciesDrafts((current) => ({ ...current, [source]: source }));
-                          onSpeciesNameMapChange(source, source);
-                        }}
-                      >
-                        <X className="h-4 w-4" />
-                        Reset
-                      </Button>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : null}
-            {identifier1Rows.length ? (
-              <div className="divide-y divide-stone-100 border-t border-stone-200">
-                <div className="bg-stone-50 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-stone-600">
-                  Identifier 1
-                </div>
-                {identifier1Rows.map((source) => {
-                  const savedTarget = identifier1NameMap[source] ?? source;
-                  const draftTarget = identifier1Drafts[source] ?? savedTarget;
-                  const isRenamed = normalizeSpeciesLabel(savedTarget) !== source;
-                  const commitDraft = () => {
-                    const nextTarget = identifier1Drafts[source] ?? savedTarget;
-                    onIdentifier1NameMapChange(source, nextTarget);
-                  };
-                  return (
-                    <div key={source} className="grid gap-2 px-4 py-2.5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
-                      <div className="min-w-0">
-                        <div className="text-xs font-medium uppercase tracking-normal text-stone-500">Source</div>
-                        <div className="truncate text-sm text-stone-800" title={source}>
-                          {source}
-                        </div>
-                      </div>
-                      <label className="min-w-0 text-sm">
-                        <span className="mb-1 block text-xs font-medium text-stone-500">Defined Identifier 1</span>
-                        <input
-                          type="text"
-                          value={draftTarget}
-                          disabled={disabled}
-                          onChange={(event) =>
-                            setIdentifier1Drafts((current) => ({
-                              ...current,
-                              [source]: event.target.value,
-                            }))
-                          }
-                          onBlur={commitDraft}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter") {
-                              event.preventDefault();
-                              commitDraft();
-                              event.currentTarget.blur();
-                            }
-                            if (event.key === "Escape") {
-                              event.preventDefault();
-                              setIdentifier1Drafts((current) => {
-                                const next = { ...current };
-                                delete next[source];
-                                return next;
-                              });
-                              event.currentTarget.blur();
-                            }
-                          }}
-                          className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm disabled:cursor-not-allowed disabled:bg-stone-100"
-                        />
-                      </label>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        disabled={disabled || !isRenamed}
-                        onClick={() => {
-                          setIdentifier1Drafts((current) => ({ ...current, [source]: source }));
-                          onIdentifier1NameMapChange(source, source);
-                        }}
-                      >
-                        <X className="h-4 w-4" />
-                        Reset
-                      </Button>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : null}
-          </section>
-        ) : null}
       </div>
     </section>
   );
@@ -3960,6 +3813,18 @@ function DiagnosticsPanel({
   const lastValidCycleDisplay = lastValidCycleRaw == null ? null : lastValidCycleRaw + displayDelta;
   const lastValidCycleCardValue = isPartiallySaturated ? lastValidCycleRaw : lastValidCycleDisplay;
   const reason = asString(cycleMean.reason);
+  const intensityLinearity =
+    diagnostics?.intensity_linearity && typeof diagnostics.intensity_linearity === "object"
+      ? diagnostics.intensity_linearity
+      : {};
+  const linearityIssueIndex = asNumber(intensityLinearity.issue_index);
+  const linearitySlopePer10v = asNumber(intensityLinearity.slope_per_10v);
+  const linearityRSquared = asNumber(intensityLinearity.r_squared);
+  const linearitySeverity = asString(intensityLinearity.severity);
+  const usesSignalProxy =
+    cycleMean.value_source &&
+    typeof cycleMean.value_source === "object" &&
+    Boolean((cycleMean.value_source as Record<string, unknown>).is_proxy);
   const diagnosticsFigure = ensureCollectorIntensityTraces(diagnostics?.figure, diagnostics?.table ?? []);
   const saturationFiguresRaw =
     Object.keys(saturationCorrection).length
@@ -4080,16 +3945,76 @@ function DiagnosticsPanel({
 
   return (
     <Card className="border-stone-300">
-      <CardHeader>
-        <CardTitle className="text-base">{title}</CardTitle>
-        <CardDescription>Cycle-level intensity and exclusion diagnostics for the active sample.</CardDescription>
+      <CardHeader className="px-3 py-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0">
+            <CardTitle className="truncate text-sm">{title}</CardTitle>
+            <CardDescription>Cycle intensity, precision, and correction evidence.</CardDescription>
+          </div>
+          {diagnostics ? (
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-stone-600">
+              <span className="rounded-md bg-stone-100 px-2 py-1">{validCycleCount ?? 0} valid cycles</span>
+              {usesSignalProxy ? <span className="rounded-md bg-blue-50 px-2 py-1 text-blue-700">Internal signal proxy</span> : null}
+            </div>
+          ) : null}
+        </div>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3 p-3">
         {loading ? <div className="text-sm text-stone-500">Loading cycle diagnostics...</div> : null}
 
         {diagnostics ? (
           <>
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+            <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-stone-50/60 sm:grid-cols-3 sm:divide-x sm:divide-stone-200">
+              <div className="px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">Valid-cycle mean</div>
+                <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
+                  {validMeanCardValue == null ? "N/A" : formatDeltaValue(validMeanCardValue)}
+                </div>
+              </div>
+              <div className="border-t border-stone-200 px-3 py-2.5 sm:border-t-0">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">Valid-cycle spread</div>
+                <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
+                  {validStdDev == null ? "N/A" : formatDeltaValue(validStdDev)}
+                </div>
+              </div>
+              <div className="border-t border-stone-200 px-3 py-2.5 sm:border-t-0">
+                <div className="flex items-center justify-between gap-2">
+                  <Tooltip
+                    label="Fitted isotope-signal movement across the observed mean m/z 44 intensity range, divided by the instrument's internal standard deviation. Below 1× σ is low, 1–2× σ is a watch, and 2× σ or more is high."
+                    align="start"
+                    contentClassName="w-80"
+                  >
+                    <span tabIndex={0} className="text-[10px] font-semibold uppercase tracking-wide text-stone-500 underline decoration-dotted underline-offset-2">
+                      Intensity-linearity drift
+                    </span>
+                  </Tooltip>
+                  {linearitySeverity && linearitySeverity !== "unavailable" ? (
+                    <span
+                      className={cn(
+                        "rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                        linearitySeverity === "high"
+                          ? "bg-red-100 text-red-700"
+                          : linearitySeverity === "watch"
+                            ? "bg-amber-100 text-amber-700"
+                            : "bg-emerald-100 text-emerald-700",
+                      )}
+                    >
+                      {linearitySeverity}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
+                  {linearityIssueIndex == null ? "N/A" : `${linearityIssueIndex.toFixed(2)}× σ`}
+                </div>
+                <div className="mt-0.5 text-[11px] text-stone-500">
+                  {linearitySlopePer10v == null || linearityRSquared == null
+                    ? "Needs at least three varying valid cycles."
+                    : `${linearitySlopePer10v >= 0 ? "+" : ""}${linearitySlopePer10v.toFixed(3)}‰ / 10 V · R² ${linearityRSquared.toFixed(2)}`}
+                </div>
+              </div>
+            </div>
+
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
               {suggestionCards.map((item) => {
                 const value = item.value;
                 const blockedByLinearityCycleCount = item.linearity && hasTooFewLinearityCycles && value != null;
@@ -4117,13 +4042,13 @@ function DiagnosticsPanel({
                     disabled={value == null}
                     aria-disabled={!canPick}
                     className={cn(
-                      "rounded-lg border border-stone-200 p-3 text-left transition",
+                      "rounded-lg border border-stone-200 p-2 text-left transition",
                       canPick ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
                       blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
                     )}
                   >
-                    <div className="text-xs uppercase tracking-normal text-stone-500">{item.label}</div>
-                    <div className="mt-1 text-lg font-semibold">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{item.label}</div>
+                    <div className="mt-0.5 text-base font-semibold">
                       {blockedByLinearityCycleCount ? (
                         <Tooltip label="not enough cycles for linearity calculation" align="start">
                           {valueElement}
@@ -4133,7 +4058,7 @@ function DiagnosticsPanel({
                       )}
                     </div>
                     {item.stdev != null ? (
-                      <div className="mt-1 text-xs text-stone-500">Std dev: {formatDeltaValue(item.stdev)}</div>
+                      <div className="mt-0.5 text-[11px] text-stone-500">σ {formatDeltaValue(item.stdev)}</div>
                     ) : null}
                   </button>
                 );
@@ -5950,6 +5875,10 @@ export default function ProcessingPage() {
       settableIsotope,
     };
   });
+  const activeTargetMetadataItems = activeTargetInlineDisplayItems.filter((item) => {
+    const normalized = normalizeInlineLabel(item.label);
+    return normalized !== "d13c values" && normalized !== "d18o values";
+  });
   const d13TargetPayload = sampleD13DiagnosticsQuery.data?.target ?? {};
   const d18TargetPayload = sampleD18DiagnosticsQuery.data?.target ?? {};
   const d13ActiveStatus =
@@ -5966,12 +5895,16 @@ export default function ProcessingPage() {
   const d18DraftCurrentValue = selectionDraftValueFor(selectionDraftValues, activeRowLabel, "d18O");
   const d13LinearityCorrectedRawValue = asNumber(d13TargetPayload["linearity_corrected_value"]);
   const d18LinearityCorrectedRawValue = asNumber(d18TargetPayload["linearity_corrected_value"]);
+  const d13InternalStdDev = asNumber(d13TargetPayload["internal_std_dev"]);
+  const d18InternalStdDev = asNumber(d18TargetPayload["internal_std_dev"]);
   const d13Method = formatMethodLabel(d13TargetPayload["current_method"]);
   const d18Method = formatMethodLabel(d18TargetPayload["current_method"]);
   const d13CurrentDisplayValue = d13DraftCurrentValue ?? d13CurrentRawValue ?? selectedPointD13;
   const d18CurrentDisplayValue = d18DraftCurrentValue ?? d18CurrentRawValue ?? selectedPointD18;
   const d13LinearityCorrectedDisplayValue = d13LinearityCorrectedRawValue;
   const d18LinearityCorrectedDisplayValue = d18LinearityCorrectedRawValue;
+  const activeCurrentDelta = selectionEditorTab === "d13C" ? d13CurrentDisplayValue : d18CurrentDisplayValue;
+  const activeInternalStdDev = selectionEditorTab === "d13C" ? d13InternalStdDev : d18InternalStdDev;
   const effectiveOutlier =
     typeof sampleD18DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
       ? (sampleD18DiagnosticsQuery.data.target.effective_outlier as boolean)
@@ -6244,10 +6177,15 @@ export default function ProcessingPage() {
                       .filter((option) => option !== "Date_ordinal")
                       .map((option) => (
                       <option key={option} value={option}>
-                        {option}
+                        {previewColorLabel(option)}
                       </option>
                     ))}
                   </select>
+                  {colorScaleBounds ? (
+                    <div className="mt-2">
+                      <ProcessingColorScaleBar colorParam={activeConfig?.color_param} range={effectiveColorScaleRange} />
+                    </div>
+                  ) : null}
                   <div className="mt-2">
                     <RangeSliderField
                       label="Color scale interval"
@@ -6484,12 +6422,11 @@ export default function ProcessingPage() {
                         ))}
                       </select>
                     </label>
-                    <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600">
-                      <span className="font-medium text-stone-700">Basis formula:</span>{" "}
-                      <code className="font-mono">
-                        {getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
-                      </code>
-                    </div>
+                    <Tooltip label={getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)} align="start">
+                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">
+                        Basis formula
+                      </span>
+                    </Tooltip>
                     {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">Max sample intensity</span>
@@ -6512,8 +6449,8 @@ export default function ProcessingPage() {
                       </label>
                     ) : null}
                     <div className="grid gap-3 sm:grid-cols-2">
-                      <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                        <div className="text-xs uppercase tracking-normal text-stone-500">d13C fitted coefficients</div>
+                      <div className="border-t border-stone-200 pt-2 text-sm">
+                        <div className="text-xs font-medium text-stone-500">d13C fitted coefficients</div>
                         <div className="mt-1 space-y-1 font-semibold text-stone-900">
                           <div>
                             <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -6527,8 +6464,8 @@ export default function ProcessingPage() {
                           ) : null}
                         </div>
                       </div>
-                      <div className="rounded-lg border border-stone-200 p-3 text-sm">
-                        <div className="text-xs uppercase tracking-normal text-stone-500">d18O fitted coefficients</div>
+                      <div className="border-t border-stone-200 pt-2 text-sm">
+                        <div className="text-xs font-medium text-stone-500">d18O fitted coefficients</div>
                         <div className="mt-1 space-y-1 font-semibold text-stone-900">
                           <div>
                             <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -6657,8 +6594,10 @@ export default function ProcessingPage() {
                       </div>
                     </div>
                     {previewLinearity.apply ? (
-                      <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
-                        <div className="text-sm font-medium text-stone-800">Linearity-corrected standard precision</div>
+                      <div className="space-y-1 border-t border-stone-200 pt-2">
+                        <Tooltip label="Precision after applying the shared linearity correction to each selected standard." align="start">
+                          <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">Corrected precision</span>
+                        </Tooltip>
                         {standardPrecisionRows.length ? (
                           standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
                             <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
@@ -6710,54 +6649,7 @@ export default function ProcessingPage() {
         </aside>
 
         <div className="space-y-6">
-          <ProcessingSummaryHero
-            workspace={workspace}
-            speciesNameMap={activeConfig.species_name_map ?? {}}
-            identifier1NameMap={activeConfig.identifier1_name_map ?? {}}
-            onSpeciesNameMapChange={(source, target) => {
-              updateConfig("species_name_map", nextSpeciesNameMap(activeConfig.species_name_map, source, target));
-              const sourceLabel = normalizeSpeciesLabel(source);
-              const targetLabel = normalizeSpeciesLabel(target);
-              if (sourceLabel && targetLabel && sourceLabel !== targetLabel) {
-                setOpenSpeciesSections((current) => {
-                  if (!current.has(sourceLabel)) {
-                    return current;
-                  }
-                  const next = new Set(current);
-                  next.delete(sourceLabel);
-                  next.add(targetLabel);
-                  return next;
-                });
-              }
-            }}
-            onIdentifier1NameMapChange={(source, target) => {
-              const sourceLabel = normalizeSpeciesLabel(source);
-              const targetLabel = normalizeSpeciesLabel(target);
-              setConfig((current) => {
-                if (!current) {
-                  return current;
-                }
-                const previousTarget = normalizeSpeciesLabel(current.identifier1_name_map?.[sourceLabel] ?? sourceLabel);
-                const nextSelectedIdentifier =
-                  current.selected_identifier === previousTarget && targetLabel
-                    ? targetLabel
-                    : current.selected_identifier;
-                const nextSelectedIds = current.export.selected_ids.map((value) =>
-                  value === previousTarget && targetLabel ? targetLabel : value,
-                );
-                return {
-                  ...current,
-                  selected_identifier: nextSelectedIdentifier,
-                  identifier1_name_map: nextIdentifier1NameMap(current.identifier1_name_map, source, target),
-                  export: {
-                    ...current.export,
-                    selected_ids: Array.from(new Set(nextSelectedIds)),
-                  },
-                };
-              });
-            }}
-            disabled={busy}
-          />
+          <ProcessingSummaryHero workspace={workspace} />
 
           <div className="space-y-6">
             <div className="grid gap-6 xl:grid-cols-2">
@@ -6766,25 +6658,27 @@ export default function ProcessingPage() {
                 chartKey={overviewCards.processing3d.key}
                 title={overviewCards.processing3d.title}
                 description={overviewCards.processing3d.description}
-                figure={overviewCards.processing3d.figure}
+                figure={hideEmbeddedColorbars(overviewCards.processing3d.figure)}
                 chartClassName="h-[clamp(380px,42vw,620px)] w-full"
                 fitContainer
                 {...chartHoverProps(overviewCards.processing3d.key)}
                 onPointClick={(points) => handleChartClick(overviewCards.processing3d.key, points)}
                 onSelection={(points) => handleChartSelection(overviewCards.processing3d.key, points)}
               />
-              <FigureCard
-                key={overviewCards.crossplot.key}
-                chartKey={overviewCards.crossplot.key}
-                title={overviewCards.crossplot.title}
-                description={overviewCards.crossplot.description}
-                figure={overviewCards.crossplot.figure}
-                chartClassName="h-[clamp(380px,42vw,620px)] w-full"
-                fitContainer
-                {...chartHoverProps(overviewCards.crossplot.key)}
-                onPointClick={(points) => handleChartClick(overviewCards.crossplot.key, points)}
-                onSelection={(points) => handleChartSelection(overviewCards.crossplot.key, points)}
-              />
+              <div className="min-w-0">
+                <FigureCard
+                  key={overviewCards.crossplot.key}
+                  chartKey={overviewCards.crossplot.key}
+                  title={overviewCards.crossplot.title}
+                  description={overviewCards.crossplot.description}
+                  figure={hideEmbeddedColorbars(overviewCards.crossplot.figure)}
+                  chartClassName="h-[clamp(380px,42vw,620px)] w-full"
+                  fitContainer
+                  {...chartHoverProps(overviewCards.crossplot.key)}
+                  onPointClick={(points) => handleChartClick(overviewCards.crossplot.key, points)}
+                  onSelection={(points) => handleChartSelection(overviewCards.crossplot.key, points)}
+                />
+              </div>
             </div>
           </div>
 
@@ -6993,11 +6887,11 @@ export default function ProcessingPage() {
                 className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
                 onClick={(event) => event.stopPropagation()}
               >
-                <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
-                  <div>
-                    <div className="text-base font-semibold text-stone-900">Selection Editor</div>
-                    <div className="flex flex-wrap items-center gap-2 text-sm text-stone-500">
-                      <span>Sample editing and cycle diagnostics.</span>
+                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-3 py-2">
+                  <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                    <div className="text-sm font-semibold text-stone-900">Selection Editor</div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500">
+                      <span>Edit values and inspect cycles.</span>
                       {hasPendingSelectionDrafts ? (
                         <span className="rounded-md bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
                           Draft preview
@@ -7016,59 +6910,24 @@ export default function ProcessingPage() {
                     }}
                   >
                     <X className="h-4 w-4" />
-                    Close
+                    <span className="hidden sm:inline">Close</span>
                   </Button>
                 </div>
-                <div className="min-h-0 space-y-4 overflow-y-auto p-4">
-                  {selectionSourceChart?.figure || selectionSourceChart?.stackedFigures?.length ? (
-                    <Card className="border-stone-300">
-                      <CardHeader>
-                        <CardTitle className="text-base">Selection Source Chart</CardTitle>
-                        <CardDescription>
-                          {selectionSourceChart.title} {selectionSourceChart.description}
-                        </CardDescription>
-                      </CardHeader>
-                      <CardContent>
-                        {selectionSourceChart.stackedFigures?.length ? (
-                          <div className="space-y-3">
-                            {selectionSourceChart.stackedFigures.map((item) => (
-                              <div key={item.key} className="rounded-lg border border-stone-200 p-2">
-                                <div className="px-1 pb-2 text-sm font-medium text-stone-700">{item.title}</div>
-                                <PlotlyChart
-                                  figure={item.figure}
-                                  className="pointer-events-none h-[280px] w-full"
-                                  deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                                />
-                              </div>
-                            ))}
-                          </div>
-                        ) : selectionSourceChart.figure ? (
-                          <PlotlyChart
-                            figure={selectionSourceChart.figure}
-                            className="pointer-events-none h-[360px] w-full"
-                            deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                          />
-                        ) : (
-                          <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                            Source chart preview unavailable for this selection.
-                          </div>
-                        )}
-                      </CardContent>
-                    </Card>
-                  ) : null}
-
+                <div className="min-h-0 space-y-3 overflow-y-auto p-3">
                   {selectedTargets.length ? (
                     <>
-                      <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/50 p-4">
-                        <div className="flex flex-wrap items-start justify-between gap-3">
-                          <div className="space-y-1">
-                            <div className="text-sm font-semibold text-stone-700">
-                              Active target {activeTargetIndex + 1} / {selectedTargets.length}
-                            </div>
-                            <div className="text-xl font-semibold text-stone-900">
-                              {(activeTarget?.identifier1 || "No Identifier 1").trim()} | {(activeTarget?.identifier2 || "No Identifier 2").trim()} |{" "}
-                              {(activeTarget?.rowLabel || "").trim()}
-                            </div>
+                      <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50/50 px-3 py-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                            <span className="text-xs font-semibold text-stone-500">
+                              {activeTargetIndex + 1}/{selectedTargets.length}
+                            </span>
+                            <span className="truncate text-sm font-semibold text-stone-900">
+                              {(activeTarget?.identifier1 || "No Identifier 1").trim()} · {(activeTarget?.identifier2 || "No Identifier 2").trim()}
+                            </span>
+                            <span className="rounded-md bg-white px-1.5 py-0.5 text-[11px] text-stone-500 ring-1 ring-stone-200">
+                              Row {(activeTarget?.rowLabel || "").trim()}
+                            </span>
                           </div>
                           <div className="flex gap-2">
                             <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>
@@ -7084,53 +6943,105 @@ export default function ProcessingPage() {
                             </Button>
                           </div>
                         </div>
-                        {activeTargetInlineDisplayItems.length ? (
-                          <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
-                            {activeTargetInlineDisplayItems.map((item, index) => (
-                              <div
-                                key={`${item.label}:${item.value}:${index}`}
-                                onClick={() => {
-                                  if (item.canSetSingleValue && item.setValue != null && item.settableIsotope) {
-                                    setSingleValueFromSuggestion(item.settableIsotope, item.setValue, "raw");
-                                  }
-                                }}
-                                className={cn(
-                                  "min-h-[88px] rounded-lg border border-stone-200 bg-white px-3 py-2.5",
-                                  item.canSetSingleValue ? "cursor-pointer hover:border-fuchsia-300 hover:bg-fuchsia-50/50" : "",
-                                )}
-                              >
-                                <div className="text-[11px] font-semibold uppercase tracking-normal text-stone-500">
-                                  {item.label}
-                                  {item.unit ? ` (${item.unit})` : ""}
-                                </div>
-                                <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{item.value}</div>
-                              </div>
+                        <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-white sm:grid-cols-[1.2fr_1fr_1fr] sm:divide-x sm:divide-stone-200">
+                          <div className="px-3 py-2">
+                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{selectionEditorTab} delta</div>
+                            <div className="mt-0.5 text-3xl font-semibold leading-none tabular-nums text-stone-950">
+                              {activeCurrentDelta == null ? "N/A" : formatDeltaValue(activeCurrentDelta)}
+                            </div>
+                          </div>
+                          <div className="border-t border-stone-200 px-3 py-2 sm:border-t-0">
+                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">Internal standard deviation</div>
+                            <div className="mt-0.5 text-2xl font-semibold leading-none tabular-nums text-stone-950">
+                              {activeInternalStdDev == null ? "N/A" : formatDeltaValue(activeInternalStdDev)}
+                            </div>
+                          </div>
+                          <div className="border-t border-stone-200 px-3 py-2 sm:border-t-0">
+                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
+                              {selectionEditorTab === "d13C" ? "d18O delta" : "d13C delta"}
+                            </div>
+                            <div className="mt-0.5 text-2xl font-semibold leading-none tabular-nums text-stone-800">
+                              {(selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue) == null
+                                ? "N/A"
+                                : formatDeltaValue(selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue)}
+                            </div>
+                          </div>
+                        </div>
+                        {activeTargetMetadataItems.length ? (
+                          <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-stone-600">
+                            {activeTargetMetadataItems.map((item, index) => (
+                              <span key={`${item.label}:${item.value}:${index}`} className="max-w-full truncate" title={`${item.label}: ${item.value}`}>
+                                <span className="font-medium text-stone-500">{item.label}:</span> {item.value}
+                                {item.unit ? ` ${item.unit}` : ""}
+                              </span>
                             ))}
                           </div>
                         ) : null}
-                        <div className="flex flex-wrap gap-2">
-                          {selectedRowLabels.map((label) => (
-                            <span
-                              key={label}
-                              className={cn(
-                                "rounded-md px-3 py-1 text-xs ring-1 ring-stone-200",
-                                label === `${activeTarget?.rowLabel}:${activeTarget?.isotopeKey}` ? "bg-stone-900 text-white" : "bg-white text-stone-700",
-                              )}
-                            >
-                              {label}
-                            </span>
-                          ))}
-                        </div>
+                        {selectedRowLabels.length > 1 ? (
+                          <div className="flex flex-wrap gap-1.5">
+                            {selectedRowLabels.map((label) => (
+                              <span
+                                key={label}
+                                className={cn(
+                                  "rounded-md px-2 py-0.5 text-[11px] ring-1 ring-stone-200",
+                                  label === `${activeTarget?.rowLabel}:${activeTarget?.isotopeKey}` ? "bg-stone-900 text-white" : "bg-white text-stone-700",
+                                )}
+                              >
+                                {label}
+                              </span>
+                            ))}
+                          </div>
+                        ) : null}
                       </div>
+
+                      {selectionSourceChart?.figure || selectionSourceChart?.stackedFigures?.length ? (
+                        <details className="group rounded-lg border border-stone-200 bg-white">
+                          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-400 transition-transform group-open:rotate-90" />
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold text-stone-800">Selection source chart</div>
+                                <div className="truncate text-[11px] text-stone-500">{selectionSourceChart.title}</div>
+                              </div>
+                            </div>
+                            <span className="shrink-0 text-[11px] text-stone-500">Expand</span>
+                          </summary>
+                          <div className="border-t border-stone-200 p-3">
+                            {selectionSourceChart.stackedFigures?.length ? (
+                              <div className="space-y-3">
+                                {selectionSourceChart.stackedFigures.map((item) => (
+                                  <div key={item.key} className="rounded-lg border border-stone-200 p-2">
+                                    <div className="px-1 pb-2 text-sm font-medium text-stone-700">{item.title}</div>
+                                    <PlotlyChart
+                                      figure={item.figure}
+                                      className="pointer-events-none h-[280px] w-full"
+                                      deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+                                    />
+                                  </div>
+                                ))}
+                              </div>
+                            ) : selectionSourceChart.figure ? (
+                              <PlotlyChart
+                                figure={selectionSourceChart.figure}
+                                className="pointer-events-none h-[360px] w-full"
+                                deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+                              />
+                            ) : null}
+                          </div>
+                        </details>
+                      ) : null}
 
                       {activeTarget ? (
                         <div className="space-y-4">
-                          <div className="space-y-2">
-                            <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Details</div>
-                            <div className="grid gap-3 md:grid-cols-2">
-                              <div className="rounded-lg border border-stone-200 bg-stone-50/50 p-4">
-                                <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">d13C</div>
-                                <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
+                          <details className="group rounded-lg border border-stone-200 bg-white">
+                            <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-semibold text-stone-700">
+                              <ChevronRight className="h-3.5 w-3.5 text-stone-400 transition-transform group-open:rotate-90" />
+                              Isotope method details
+                            </summary>
+                            <div className="grid gap-2 border-t border-stone-200 p-3 md:grid-cols-2">
+                              <div className="rounded-lg bg-stone-50/70 p-3">
+                                <div className="text-xs font-semibold text-stone-700">d13C</div>
+                                <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
                                   <div className="text-stone-500">Current</div>
                                   <div className="text-right font-medium text-stone-900">
                                     {d13CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d13CurrentDisplayValue)}
@@ -7143,9 +7054,9 @@ export default function ProcessingPage() {
                                   <div className="text-right font-medium text-stone-900">{d13Method}</div>
                                 </div>
                               </div>
-                              <div className="rounded-lg border border-stone-200 bg-stone-50/50 p-4">
-                                <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">d18O</div>
-                                <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
+                              <div className="rounded-lg bg-stone-50/70 p-3">
+                                <div className="text-xs font-semibold text-stone-700">d18O</div>
+                                <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
                                   <div className="text-stone-500">Current</div>
                                   <div className="text-right font-medium text-stone-900">
                                     {d18CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d18CurrentDisplayValue)}
@@ -7159,7 +7070,7 @@ export default function ProcessingPage() {
                                 </div>
                               </div>
                             </div>
-                          </div>
+                          </details>
 
                           <div className="inline-flex rounded-lg border border-stone-300 bg-white p-1 shadow-sm">
                             {ISOTOPE_KEYS.map((isotopeKey) => {
@@ -7300,45 +7211,47 @@ export default function ProcessingPage() {
             </div>
           ) : null}
 
-          <div className="space-y-6">
-            <FigureCard
-              key={overviewCards.d13Summary.key}
-              chartKey={overviewCards.d13Summary.key}
-              title={overviewCards.d13Summary.title}
-              description={overviewCards.d13Summary.description}
-              figure={d13SummaryFigure}
-              headerActions={
-                <TraceModeControl
-                  state={d13SummaryState}
-                  hasCalibrated={d13SummaryHasCalibrated}
-                  hasStandards={d13SummaryHasStandards}
-                  onChange={(patch) => updateChartDisplayState(overviewCards.d13Summary.key, patch)}
-                />
-              }
-              chartClassName="h-[460px] w-full"
-              {...chartHoverProps(overviewCards.d13Summary.key)}
-              onPointClick={(points) => handleChartClick(overviewCards.d13Summary.key, points)}
-              onSelection={(points) => handleChartSelection(overviewCards.d13Summary.key, points)}
-            />
-            <FigureCard
-              key={overviewCards.d18Summary.key}
-              chartKey={overviewCards.d18Summary.key}
-              title={overviewCards.d18Summary.title}
-              description={overviewCards.d18Summary.description}
-              figure={d18SummaryFigure}
-              headerActions={
-                <TraceModeControl
-                  state={d18SummaryState}
-                  hasCalibrated={d18SummaryHasCalibrated}
-                  hasStandards={d18SummaryHasStandards}
-                  onChange={(patch) => updateChartDisplayState(overviewCards.d18Summary.key, patch)}
-                />
-              }
-              chartClassName="h-[460px] w-full"
-              {...chartHoverProps(overviewCards.d18Summary.key)}
-              onPointClick={(points) => handleChartClick(overviewCards.d18Summary.key, points)}
-              onSelection={(points) => handleChartSelection(overviewCards.d18Summary.key, points)}
-            />
+          <div className="space-y-3">
+            <div className="space-y-6">
+              <FigureCard
+                key={overviewCards.d13Summary.key}
+                chartKey={overviewCards.d13Summary.key}
+                title={overviewCards.d13Summary.title}
+                description={overviewCards.d13Summary.description}
+                figure={hideEmbeddedColorbars(d13SummaryFigure)}
+                headerActions={
+                  <TraceModeControl
+                    state={d13SummaryState}
+                    hasCalibrated={d13SummaryHasCalibrated}
+                    hasStandards={d13SummaryHasStandards}
+                    onChange={(patch) => updateChartDisplayState(overviewCards.d13Summary.key, patch)}
+                  />
+                }
+                chartClassName="h-[460px] w-full"
+                {...chartHoverProps(overviewCards.d13Summary.key)}
+                onPointClick={(points) => handleChartClick(overviewCards.d13Summary.key, points)}
+                onSelection={(points) => handleChartSelection(overviewCards.d13Summary.key, points)}
+              />
+              <FigureCard
+                key={overviewCards.d18Summary.key}
+                chartKey={overviewCards.d18Summary.key}
+                title={overviewCards.d18Summary.title}
+                description={overviewCards.d18Summary.description}
+                figure={hideEmbeddedColorbars(d18SummaryFigure)}
+                headerActions={
+                  <TraceModeControl
+                    state={d18SummaryState}
+                    hasCalibrated={d18SummaryHasCalibrated}
+                    hasStandards={d18SummaryHasStandards}
+                    onChange={(patch) => updateChartDisplayState(overviewCards.d18Summary.key, patch)}
+                  />
+                }
+                chartClassName="h-[460px] w-full"
+                {...chartHoverProps(overviewCards.d18Summary.key)}
+                onPointClick={(points) => handleChartClick(overviewCards.d18Summary.key, points)}
+                onSelection={(points) => handleChartSelection(overviewCards.d18Summary.key, points)}
+              />
+            </div>
           </div>
 
           <OutlierTablesPanel
@@ -7404,7 +7317,7 @@ export default function ProcessingPage() {
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
-                                  figure={withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d13c)), d13State)}
+                                  figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d13c))), d13State)}
                                   className="h-full w-full"
                                   uiRevision={`processing:${d13Key}`}
                                   {...chartHoverProps(d13Key)}
@@ -7428,7 +7341,7 @@ export default function ProcessingPage() {
                               </div>
                               <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
-                                  figure={withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d18o)), d18State)}
+                                  figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d18o))), d18State)}
                                   className="h-full w-full"
                                   uiRevision={`processing:${d18Key}`}
                                   {...chartHoverProps(d18Key)}

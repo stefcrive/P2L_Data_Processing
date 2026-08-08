@@ -61,6 +61,53 @@ class ImportResult(BaseModel):
     session: SessionSnapshot
 
 
+class ImportFieldParsingRule(BaseModel):
+    source_column: str | None = None
+    mode: Literal["direct", "split", "regex"] = "direct"
+    delimiter: str = " - "
+    part_index: int = 0
+    regex_pattern: str = ""
+    regex_group: int | str = 1
+
+
+class ImportWorkbookParsingConfig(BaseModel):
+    file_index: int | None = Field(default=None, ge=0)
+    file_name: str = ""
+    software: Literal["qtegra", "isodat", "generic"] = "generic"
+    identifier1: ImportFieldParsingRule = Field(default_factory=ImportFieldParsingRule)
+    identifier2: ImportFieldParsingRule = Field(default_factory=ImportFieldParsingRule)
+    species: ImportFieldParsingRule = Field(default_factory=ImportFieldParsingRule)
+
+
+class ImportParsingConfig(BaseModel):
+    files: list[ImportWorkbookParsingConfig] = Field(default_factory=list)
+
+
+class ImportFilePreview(BaseModel):
+    file_index: int
+    file_name: str
+    software: Literal["qtegra", "isodat", "generic"] = "generic"
+    columns: list[str] = Field(default_factory=list)
+    row_count: int = 0
+    sample_rows: list[dict[str, Any]] = Field(default_factory=list)
+    suggested_config: ImportWorkbookParsingConfig
+
+
+class ImportPreviewResponse(BaseModel):
+    files: list[ImportFilePreview] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class ImportNamingUpdate(BaseModel):
+    species_name_map: dict[str, str] = Field(default_factory=dict)
+    identifier1_name_map: dict[str, str] = Field(default_factory=dict)
+
+
+class ImportNamingWorkspace(ImportNamingUpdate):
+    identifier1_sources: list[str] = Field(default_factory=list)
+    species_sources: list[str] = Field(default_factory=list)
+
+
 class AutosaveSettingsUpdate(BaseModel):
     enabled: bool
 
@@ -204,7 +251,7 @@ class ProcessingExportConfig(BaseModel):
 
 class ProcessingWorkspaceConfig(BaseModel):
     selected_identifier: str = "All"
-    x_axis_option: Literal["By Identifier 2", "By Sequence"] = "By Identifier 2"
+    x_axis_option: Literal["By Identifier 2", "By Sequence"] = "By Sequence"
     color_param: str = "Date"
     z_axis: str = "1  Cycle Int  Samp  44"
     species_name_map: dict[str, str] = Field(default_factory=dict)
@@ -358,6 +405,7 @@ class CycleDiagnosticsPayload(BaseModel):
     inline_summary: str = ""
     figure: dict[str, Any] = Field(default_factory=dict)
     saturation_correction: dict[str, Any] = Field(default_factory=dict)
+    intensity_linearity: dict[str, Any] = Field(default_factory=dict)
     table: list[dict[str, Any]] = Field(default_factory=list)
     cycle_mean: dict[str, Any] = Field(default_factory=dict)
 

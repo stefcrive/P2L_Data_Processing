@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
@@ -54,6 +54,10 @@ from ..domain.contracts import (
     EditAction,
     EditBatchRequest,
     ExportRequest,
+    ImportNamingUpdate,
+    ImportNamingWorkspace,
+    ImportParsingConfig,
+    ImportPreviewResponse,
     ImportResult,
     JobSnapshot,
     LinearityConfig,
@@ -71,19 +75,21 @@ from ..domain.constants import (
     CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
+    CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
     SESSION_RECORD_DIRNAME,
     SESSION_STATE_FILENAME,
     VALID_CYCLES_COL,
 )
-from ..domain.diagnostics.core import create_diagnostic_plots
+from ..domain.diagnostics.core import create_diagnostic_plots, split_diagnostic_plot_grid
 from ..domain.calibration.workspace import build_calibration_workspace, normalize_calibration_config
 from ..domain.import_session import (
     _append_cycles_source,
     _append_rows_preserve_existing_index,
     _build_session_name_from_source_files,
     _load_uploaded_workbooks,
+    preview_uploaded_workbooks,
 )
 from ..domain.processing.core import RangeConfig, _interpolate_outliers_by_identifier2
 from ..domain.processing.cycles import (
@@ -121,8 +127,9 @@ from ..domain.processing.workspace import (
     build_processing_workspace_from_context,
     normalize_processing_config,
 )
-from ..domain.shared.dataframe import _ensure_cycle1_signal_difference_columns
+from ..domain.shared.dataframe import _ensure_cycle1_signal_difference_columns, _get_species_series
 from ..domain.shared.json_compat import to_json_compatible
+from ..domain.shared.naming import apply_identifier1_name_map
 from ..domain.shared.plotting import _build_isotope_3d_scatter
 from ..domain.standards import StandardsRepository
 from ..session_store import FileSessionStore
@@ -197,6 +204,113 @@ def _coerce_row_label(row_label: str, df: pd.DataFrame) -> Any:
 def _load_processing_config(metadata: dict[str, Any]) -> ProcessingConfig:
     raw = metadata.get("processing", {}).get("config", {})
     return ProcessingConfig.model_validate(normalize_processing_config(raw if isinstance(raw, dict) else {}).model_dump())
+
+
+_PROCESSING_FOUR_SIGMA_COLUMNS: dict[str, tuple[str, float]] = {
+    "signal_range": (CYCLE1_SIGNAL_SAMP44_COL, 0.1),
+    "leak_range": ("leak_rate", 1.0),
+    "d13c_range": ("d 13C/12C  Mean", 0.001),
+    "d18o_range": ("d 18O/16O  Mean", 0.001),
+}
+_LEGACY_PROCESSING_RANGES: dict[str, tuple[float, float]] = {
+    "signal_range": (0.0, 50.0),
+    "leak_range": (0.0, 1000.0),
+    "d13c_range": (-10.0, 10.0),
+    "d18o_range": (-10.0, 10.0),
+}
+
+
+def _four_sigma_range(
+    values: pd.Series | None,
+    fallback: tuple[float, float],
+    *,
+    minimum_half_width: float,
+) -> tuple[float, float]:
+    if values is None:
+        return fallback
+    numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if numeric.empty:
+        return fallback
+    mean = float(numeric.mean())
+    standard_deviation = float(numeric.std(ddof=1)) if len(numeric) > 1 else 0.0
+    half_width = 4.0 * standard_deviation
+    if not np.isfinite(half_width) or half_width <= 0.0:
+        half_width = max(float(minimum_half_width), abs(mean) * 0.01)
+    return mean - half_width, mean + half_width
+
+
+def _processing_config_with_four_sigma_ranges(
+    df: pd.DataFrame,
+    raw_config: dict[str, Any] | None = None,
+) -> ProcessingConfig:
+    config = ProcessingConfig.model_validate(normalize_processing_config(raw_config or {}).model_dump())
+    for field_name, (column_name, minimum_half_width) in _PROCESSING_FOUR_SIGMA_COLUMNS.items():
+        fallback = tuple(float(value) for value in getattr(config, field_name))
+        setattr(
+            config,
+            field_name,
+            _four_sigma_range(
+                df.get(column_name),
+                fallback,
+                minimum_half_width=minimum_half_width,
+            ),
+        )
+    return config
+
+
+def _has_legacy_processing_ranges(raw_config: dict[str, Any] | None) -> bool:
+    if not isinstance(raw_config, dict) or not raw_config:
+        return True
+    config = normalize_processing_config(raw_config)
+    return all(
+        np.allclose(
+            np.asarray(getattr(config, field_name), dtype=float),
+            np.asarray(expected, dtype=float),
+            rtol=0.0,
+            atol=1e-12,
+        )
+        for field_name, expected in _LEGACY_PROCESSING_RANGES.items()
+    )
+
+
+def _initialize_processing_ranges_from_data(
+    metadata: dict[str, Any],
+    df: pd.DataFrame,
+) -> ProcessingConfig:
+    processing = metadata.setdefault("processing", {})
+    raw_config = processing.get("config", {})
+    config = _processing_config_with_four_sigma_ranges(
+        df,
+        raw_config if isinstance(raw_config, dict) else {},
+    )
+    processing["config"] = config.model_dump()
+    processing["ranges_source"] = "four_sigma_import"
+    return config
+
+
+def _initialize_legacy_processing_ranges_if_needed(session_id: str) -> tuple[dict[str, Any] | None, pd.DataFrame | None]:
+    metadata = store.load_metadata(session_id)
+    processing = metadata.setdefault("processing", {})
+    if processing.get("ranges_source") or not metadata.get("source_files"):
+        return None, None
+    raw_config = processing.get("config", {})
+    if not _has_legacy_processing_ranges(raw_config if isinstance(raw_config, dict) else {}):
+        return None, None
+    df = store.load_frame(session_id)
+    config = _initialize_processing_ranges_from_data(metadata, df)
+    _persist_session_update(
+        session_id,
+        action="processing_ranges_initialized",
+        payload={
+            "method": "mean_plus_minus_4_sigma",
+            "ranges": {
+                field_name: list(getattr(config, field_name))
+                for field_name in _PROCESSING_FOUR_SIGMA_COLUMNS
+            },
+        },
+        metadata=metadata,
+    )
+    return metadata, df
 
 
 _CALIBRATION_DERIVED_COLUMNS = (
@@ -432,13 +546,12 @@ def _build_interpolation_source_frame(
 def _candidate_diagnostics_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         "Date",
-        "Identifier 1",
-        "Identifier 2",
-        "Species",
-        "Comment",
-        "Label",
-        VALID_CYCLES_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
+        CYCLE1_SIGNAL_REF44_COL,
+        "p_no_acid",
+        "total_co2",
+        "p_gases",
+        VALID_CYCLES_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
         CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
         CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
@@ -982,6 +1095,18 @@ async def _read_uploaded_workbook_bytes(files: list[UploadFile]) -> list[tuple[s
     return raw_uploads
 
 
+def _parse_import_parsing_config(raw: str | None) -> ImportParsingConfig | None:
+    if raw is None or not isinstance(raw, (str, bytes, bytearray)) or str(raw).strip() == "":
+        return None
+    try:
+        return ImportParsingConfig.model_validate_json(raw)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid import parsing configuration: {exc}",
+        ) from exc
+
+
 async def _stage_uploaded_workbooks(files: list[UploadFile]) -> tuple[Path, list[tuple[str, Path]]]:
     """Spool queued job inputs to disk so the bounded queue does not retain upload bytes in RAM."""
 
@@ -1015,6 +1140,7 @@ def _read_staged_workbooks(staged: list[tuple[str, Path]]) -> list[tuple[str, by
 
 def _import_session_from_bytes(
     raw_uploads: list[tuple[str, bytes]],
+    parsing_config: ImportParsingConfig | None = None,
     context: JobContext | None = None,
 ) -> ImportResult:
     uploaded = []
@@ -1022,7 +1148,7 @@ def _import_session_from_bytes(
         uploaded.append(_NamedBytesIO(content, filename))
     if context is not None:
         context.report(15, "parsing_workbooks", f"Parsing {len(uploaded)} workbook(s)")
-    df, cycles_df, specs, errors = _load_uploaded_workbooks(uploaded)
+    df, cycles_df, specs, errors = _load_uploaded_workbooks(uploaded, parsing_config=parsing_config)
     if df is None:
         raise HTTPException(status_code=400, detail={"errors": errors or ["No workbook rows were loaded"]})
     if context is not None:
@@ -1036,6 +1162,12 @@ def _import_session_from_bytes(
     metadata["session_name"] = session_name
     metadata["source_files"] = specs
     metadata["errors"] = errors
+    metadata["import_parsing"] = (
+        parsing_config.model_dump(mode="json")
+        if parsing_config is not None
+        else {"files": [spec.get("identity_parsing", {}) for spec in specs]}
+    )
+    _initialize_processing_ranges_from_data(metadata, df)
     _persist_session_update(
         session_id,
         action="session_loaded",
@@ -1051,6 +1183,7 @@ def _import_session_from_bytes(
 def _append_session_from_bytes(
     session_id: str,
     raw_uploads: list[tuple[str, bytes]],
+    parsing_config: ImportParsingConfig | None = None,
     context: JobContext | None = None,
 ) -> ImportResult:
     _session_exists_or_404(session_id)
@@ -1062,7 +1195,10 @@ def _append_session_from_bytes(
         uploaded.append(_NamedBytesIO(content, filename))
     if context is not None:
         context.report(15, "parsing_workbooks", f"Parsing {len(uploaded)} workbook(s)")
-    append_df, append_cycles, specs, errors = _load_uploaded_workbooks(uploaded)
+    append_df, append_cycles, specs, errors = _load_uploaded_workbooks(
+        uploaded,
+        parsing_config=parsing_config,
+    )
     if append_df is None:
         raise HTTPException(status_code=400, detail={"errors": errors or ["No workbook rows were appended"]})
     merged = _append_rows_preserve_existing_index(current_df, append_df)
@@ -1075,6 +1211,13 @@ def _append_session_from_bytes(
     metadata["source_files"] = list(metadata.get("source_files", [])) + specs
     metadata["session_name"] = _build_session_name_from_source_files(metadata["source_files"])
     metadata["errors"] = list(metadata.get("errors", [])) + errors
+    metadata.setdefault("import_parsing_history", []).append(
+        parsing_config.model_dump(mode="json")
+        if parsing_config is not None
+        else {"files": [spec.get("identity_parsing", {}) for spec in specs]}
+    )
+    if metadata.get("processing", {}).get("ranges_source") == "four_sigma_import":
+        _initialize_processing_ranges_from_data(metadata, merged)
     _persist_session_update(
         session_id,
         action="session_appended",
@@ -1086,18 +1229,45 @@ def _append_session_from_bytes(
     return ImportResult(session=_to_session_snapshot(session_id))
 
 
+@app.post("/sessions/import/preview", response_model=ImportPreviewResponse)
+async def preview_session_import(files: list[UploadFile] = File(...)) -> ImportPreviewResponse:
+    raw_uploads = await _read_uploaded_workbook_bytes(files)
+    uploaded = [_NamedBytesIO(content, filename) for filename, content in raw_uploads]
+    preview = preview_uploaded_workbooks(uploaded)
+    if not preview.files:
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": preview.errors or ["No workbook could be inspected"]},
+        )
+    return preview
+
+
 @app.post("/sessions/import", response_model=ImportResult)
-async def import_session(files: list[UploadFile] = File(...)) -> ImportResult:
-    return _import_session_from_bytes(await _read_uploaded_workbook_bytes(files))
+async def import_session(
+    files: list[UploadFile] = File(...),
+    parsing_config: str | None = Form(default=None),
+) -> ImportResult:
+    return _import_session_from_bytes(
+        await _read_uploaded_workbook_bytes(files),
+        parsing_config=_parse_import_parsing_config(parsing_config),
+    )
 
 
 @app.post("/sessions/import/jobs", response_model=JobSnapshot, status_code=202)
-async def submit_import_session_job(files: list[UploadFile] = File(...)) -> JobSnapshot:
+async def submit_import_session_job(
+    files: list[UploadFile] = File(...),
+    parsing_config: str | None = Form(default=None),
+) -> JobSnapshot:
+    parsed_config = _parse_import_parsing_config(parsing_config)
     stage_root, staged = await _stage_uploaded_workbooks(files)
 
     def _runner(context: JobContext) -> dict[str, Any]:
         try:
-            return _import_session_from_bytes(_read_staged_workbooks(staged), context).model_dump(mode="json")
+            return _import_session_from_bytes(
+                _read_staged_workbooks(staged),
+                parsing_config=parsed_config,
+                context=context,
+            ).model_dump(mode="json")
         finally:
             shutil.rmtree(stage_root, ignore_errors=True)
 
@@ -1109,18 +1279,36 @@ async def submit_import_session_job(files: list[UploadFile] = File(...)) -> JobS
 
 
 @app.post("/sessions/{session_id}/append", response_model=ImportResult)
-async def append_session(session_id: str, files: list[UploadFile] = File(...)) -> ImportResult:
-    return _append_session_from_bytes(session_id, await _read_uploaded_workbook_bytes(files))
+async def append_session(
+    session_id: str,
+    files: list[UploadFile] = File(...),
+    parsing_config: str | None = Form(default=None),
+) -> ImportResult:
+    return _append_session_from_bytes(
+        session_id,
+        await _read_uploaded_workbook_bytes(files),
+        parsing_config=_parse_import_parsing_config(parsing_config),
+    )
 
 
 @app.post("/sessions/{session_id}/append/jobs", response_model=JobSnapshot, status_code=202)
-async def submit_append_session_job(session_id: str, files: list[UploadFile] = File(...)) -> JobSnapshot:
+async def submit_append_session_job(
+    session_id: str,
+    files: list[UploadFile] = File(...),
+    parsing_config: str | None = Form(default=None),
+) -> JobSnapshot:
     _session_exists_or_404(session_id)
+    parsed_config = _parse_import_parsing_config(parsing_config)
     stage_root, staged = await _stage_uploaded_workbooks(files)
 
     def _runner(context: JobContext) -> dict[str, Any]:
         try:
-            return _append_session_from_bytes(session_id, _read_staged_workbooks(staged), context).model_dump(mode="json")
+            return _append_session_from_bytes(
+                session_id,
+                _read_staged_workbooks(staged),
+                parsing_config=parsed_config,
+                context=context,
+            ).model_dump(mode="json")
         finally:
             shutil.rmtree(stage_root, ignore_errors=True)
 
@@ -1129,6 +1317,134 @@ async def submit_append_session_job(session_id: str, files: list[UploadFile] = F
     except Exception:
         shutil.rmtree(stage_root, ignore_errors=True)
         raise
+
+
+@app.post("/sessions/{session_id}/exclude-file", response_model=ImportResult)
+def exclude_session_file(session_id: str, file_index: int = Query(..., ge=0)) -> ImportResult:
+    """Remove one imported workbook and rebuild the session from the remaining uploads."""
+    _session_exists_or_404(session_id)
+    metadata = store.load_metadata(session_id)
+    source_files = list(metadata.get("source_files", []))
+    if file_index >= len(source_files):
+        raise HTTPException(status_code=404, detail="Session file was not found")
+
+    removed = source_files[file_index]
+    remaining = source_files[:file_index] + source_files[file_index + 1:]
+    paths = store._paths(session_id)
+    uploaded = []
+    parsing_specs = []
+    for spec in remaining:
+        name = str(spec.get("raw_name") or spec.get("name") or "").replace("\\", "/")
+        candidates = [paths.uploads_dir / name, paths.uploads_dir / Path(name).name]
+        source_path = next((candidate for candidate in candidates if candidate.exists()), None)
+        if source_path is None:
+            matches = list(paths.uploads_dir.rglob(Path(name).name))
+            source_path = matches[0] if matches else None
+        if source_path is None:
+            raise HTTPException(status_code=409, detail=f"Stored workbook is unavailable: {name}")
+        uploaded.append(_NamedBytesIO(source_path.read_bytes(), str(spec.get("name") or Path(name).name)))
+        parsing_specs.append(spec.get("identity_parsing", {}))
+
+    parsing_config = ImportParsingConfig(files=parsing_specs)
+    df, cycles_df, rebuilt_specs, errors = _load_uploaded_workbooks(uploaded, parsing_config=parsing_config)
+    if df is None:
+        raise HTTPException(status_code=400, detail={"errors": errors or ["No workbook rows remain"]})
+    metadata["source_files"] = rebuilt_specs
+    metadata["errors"] = errors
+    metadata["session_name"] = _build_session_name_from_source_files(rebuilt_specs)
+    _persist_session_update(
+        session_id,
+        action="session_file_excluded",
+        payload={"excluded_file": removed},
+        metadata=metadata,
+        df=df,
+        cycles_df=cycles_df,
+    )
+    return ImportResult(session=_to_session_snapshot(session_id))
+
+
+def _build_import_naming_workspace(
+    session_id: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> ImportNamingWorkspace:
+    meta = metadata if metadata is not None else store.load_metadata(session_id)
+    df = store.load_frame(session_id)
+    config = _load_processing_config(meta)
+    identifier1_sources = sorted(
+        {
+            str(value).strip()
+            for value in df.get("Identifier 1", pd.Series(dtype=object)).dropna().tolist()
+            if str(value).strip()
+        }
+    )
+    species_sources = sorted(
+        {
+            str(value).strip()
+            for value in _get_species_series(df).dropna().tolist()
+            if str(value).strip()
+        }
+    )
+    return ImportNamingWorkspace(
+        species_name_map=dict(config.species_name_map),
+        identifier1_name_map=dict(config.identifier1_name_map),
+        identifier1_sources=identifier1_sources,
+        species_sources=species_sources,
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/import/naming",
+    response_model=ImportNamingWorkspace,
+)
+def get_import_naming_workspace(session_id: str) -> ImportNamingWorkspace:
+    _session_exists_or_404(session_id)
+    return _build_import_naming_workspace(session_id)
+
+
+@app.post(
+    "/sessions/{session_id}/import/naming",
+    response_model=ImportNamingWorkspace,
+)
+def set_import_naming_workspace(
+    session_id: str,
+    update: ImportNamingUpdate,
+) -> ImportNamingWorkspace:
+    _session_exists_or_404(session_id)
+    metadata = store.load_metadata(session_id)
+    previous_config = _load_processing_config(metadata)
+    current = previous_config.model_dump()
+    current["species_name_map"] = update.species_name_map
+    current["identifier1_name_map"] = update.identifier1_name_map
+    normalized_update = normalize_processing_config(current)
+    identifier_translations: dict[str, str] = {}
+    for source in set(previous_config.identifier1_name_map) | set(normalized_update.identifier1_name_map):
+        previous_target = previous_config.identifier1_name_map.get(source, source)
+        next_target = normalized_update.identifier1_name_map.get(source, source)
+        if previous_target != next_target:
+            identifier_translations[previous_target] = next_target
+    current["selected_identifier"] = identifier_translations.get(
+        previous_config.selected_identifier,
+        previous_config.selected_identifier,
+    )
+    current_export = dict(current.get("export", {}))
+    current_export["selected_ids"] = list(
+        dict.fromkeys(
+            identifier_translations.get(value, value)
+            for value in previous_config.export.selected_ids
+        )
+    )
+    current["export"] = current_export
+    config = ProcessingConfig.model_validate(normalize_processing_config(current).model_dump())
+    metadata.setdefault("processing", {})
+    metadata["processing"]["config"] = config.model_dump()
+    _persist_session_update(
+        session_id,
+        action="import_names_updated",
+        payload=update.model_dump(),
+        metadata=metadata,
+    )
+    return _build_import_naming_workspace(session_id, metadata=metadata)
 
 
 @app.get("/sessions", response_model=list[SessionSnapshot])
@@ -1446,7 +1762,19 @@ def diagnostics(
         else:
             z_axis = "1  Cycle Int  Samp  44"
     filtered_df = _apply_diagnostics_filters(diagnostics_df, identifier_filter, d13_min, d13_max, d18_min, d18_max)
-    fig = create_diagnostic_plots(filtered_df, color_param)
+    calibration_meta = metadata.get("calibration", {}) if isinstance(metadata.get("calibration"), dict) else {}
+    calibration_config = calibration_meta.get("config", {}) if isinstance(calibration_meta.get("config"), dict) else {}
+    selected_standards_raw = calibration_config.get(
+        "selected_standards",
+        calibration_meta.get("selected_standards", []),
+    )
+    selected_standards = [
+        str(value).strip()
+        for value in selected_standards_raw
+        if str(value).strip()
+    ] if isinstance(selected_standards_raw, list) else []
+    fig = create_diagnostic_plots(filtered_df, color_param, selected_standards=selected_standards)
+    diagnostic_grid = split_diagnostic_plot_grid(fig)
     fig_3d, _ = _build_isotope_3d_scatter(
         diagnostics_df,
         z_col=z_axis,
@@ -1467,9 +1795,15 @@ def diagnostics(
         if "Identifier 1" in diagnostics_df.columns
         else []
     )
+    figures = {"diagnostics": _figure_json(fig), "diagnostics_3d": _figure_json(fig_3d)}
+    diagnostic_grid_meta: list[dict[str, str]] = []
+    for index, (title, grid_figure) in enumerate(diagnostic_grid):
+        key = f"diagnostic_grid_{index}"
+        figures[key] = _figure_json(grid_figure)
+        diagnostic_grid_meta.append({"key": key, "title": title})
     return ChartBundle(
         session_id=session_id,
-        figures={"diagnostics": _figure_json(fig), "diagnostics_3d": _figure_json(fig_3d)},
+        figures=figures,
         summary={
             "available_color_params": available_color_params,
             "available_z_axis_options": available_z_axes,
@@ -1487,6 +1821,8 @@ def diagnostics(
             },
             "row_count_before": int(len(diagnostics_df)),
             "row_count_after": int(len(filtered_df)),
+            "diagnostic_grid": diagnostic_grid_meta,
+            "selected_standards": selected_standards,
         },
     )
 
@@ -1517,6 +1853,8 @@ def _run_calibration_sync(
         line_2_offset_d13=getattr(config.linearity, "line_2_offset_d13", None),
         line_2_offset_d18=getattr(config.linearity, "line_2_offset_d18", None),
     )
+    identifier1_name_map = _load_processing_config(metadata).identifier1_name_map
+    working_df = apply_identifier1_name_map(working_df, identifier1_name_map)
     standards_repo = StandardsRepository.default()
     if len(config.selected_standards) not in (1, 2):
         raise HTTPException(status_code=400, detail="Please select either one or two standards for calibration.")
@@ -1715,6 +2053,11 @@ def _run_calibration_sync(
         ):
             if cal_col in calibrated_for_storage.columns:
                 calibrated_for_storage.loc[standards_mask, cal_col] = np.nan
+    # Import-page aliases are a reversible view configuration. Keep the source
+    # identifier in the stored snapshot so the naming workspace can still edit
+    # or remove the alias after calibration.
+    if "Identifier 1" in df.columns and "Identifier 1" in calibrated_for_storage.columns:
+        calibrated_for_storage["Identifier 1"] = df["Identifier 1"].reindex(calibrated_for_storage.index)
 
     metadata["calibration"] = {
         "config": config.model_dump(),
@@ -1840,6 +2183,7 @@ def _compute_preview_coefficients_for_calibration_linearity(
     df: pd.DataFrame,
     config: CalibrationConfig,
     cycles_df: pd.DataFrame | None = None,
+    identifier1_name_map: dict[str, str] | None = None,
 ) -> dict[str, dict[str, float]]:
     if len(config.selected_standards) not in (1, 2):
         return {}
@@ -1858,6 +2202,7 @@ def _compute_preview_coefficients_for_calibration_linearity(
         line_2_offset_d13=getattr(config.linearity, "line_2_offset_d13", None),
         line_2_offset_d18=getattr(config.linearity, "line_2_offset_d18", None),
     )
+    working_df = apply_identifier1_name_map(working_df, identifier1_name_map)
 
     standards_repo = StandardsRepository.default()
     override_scope = (
@@ -2050,6 +2395,7 @@ def set_calibration_linearity_config(
         source_df,
         normalized_config,
         cycles_df=cycles_df,
+        identifier1_name_map=_load_processing_config(metadata).identifier1_name_map,
     )
     calibration_meta["selected_standards"] = list(normalized_config.selected_standards)
     _persist_session_update(
@@ -2177,6 +2523,11 @@ def _build_processing_workspace_response(
     cycles_df: pd.DataFrame | None = None,
     species_section_filter: set[str] | None = None,
 ) -> ProcessingWorkspace:
+    if metadata is None and df is None:
+        initialized_metadata, initialized_df = _initialize_legacy_processing_ranges_if_needed(session_id)
+        if initialized_metadata is not None:
+            metadata = initialized_metadata
+            df = initialized_df
     cache_key = _processing_workspace_cache_key(session_id, species_section_filter)
     with _processing_workspace_cache_lock:
         cached = _processing_workspace_cache.get(cache_key)
@@ -2204,6 +2555,7 @@ def _build_processing_workspace_response(
 
 
 def _build_processing_species_section_response(session_id: str, species: str) -> SpeciesSection:
+    _initialize_legacy_processing_ranges_if_needed(session_id)
     normalized_species = str(species).strip()
     cache_key = (
         str(session_id),
@@ -2450,6 +2802,7 @@ def set_processing_config(
     metadata = store.load_metadata(session_id)
     metadata.setdefault("processing", {})
     metadata["processing"]["config"] = config.model_dump()
+    metadata["processing"]["ranges_source"] = "user"
     _persist_session_update(
         session_id,
         action="processing_config_updated",

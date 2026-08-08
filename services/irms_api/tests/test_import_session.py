@@ -12,7 +12,16 @@ from fastapi import UploadFile
 
 from services.irms_api.api import main as api_main
 from services.irms_api.domain.constants import CYCLE1_SIGNAL_SAMP44_COL
-from services.irms_api.domain.import_session import _load_uploaded_workbooks
+from services.irms_api.domain.contracts import (
+    ImportFieldParsingRule,
+    ImportNamingUpdate,
+    ImportParsingConfig,
+    ImportWorkbookParsingConfig,
+)
+from services.irms_api.domain.import_session import (
+    _apply_import_parsing_config,
+    _load_uploaded_workbooks,
+)
 from services.irms_api.session_store import FileSessionStore
 
 
@@ -93,6 +102,123 @@ class ImportSessionTests(unittest.TestCase):
         self.assertEqual(str(df.loc[0, "Identifier 1"]), "SampleA")
         self.assertEqual(str(df.loc[0, "Species"]), "Coral")
 
+    def test_configurable_identity_parsing_preserves_hyphens_inside_identifier(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Metadata": ["MD23-3678 - G. ruber"],
+                "Sequence": ["2129"],
+            }
+        )
+        config = ImportWorkbookParsingConfig(
+            file_index=0,
+            file_name="qtegra.xlsx",
+            software="qtegra",
+            identifier1=ImportFieldParsingRule(
+                source_column="Metadata",
+                mode="split",
+                delimiter=" - ",
+                part_index=0,
+            ),
+            identifier2=ImportFieldParsingRule(
+                source_column="Sequence",
+                mode="direct",
+            ),
+            species=ImportFieldParsingRule(
+                source_column="Metadata",
+                mode="regex",
+                regex_pattern=r"^.+?\s+-\s+(.+)$",
+                regex_group=1,
+            ),
+        )
+
+        parsed = _apply_import_parsing_config(frame, config)
+
+        self.assertEqual(parsed.loc[0, "Identifier 1"], "MD23-3678")
+        self.assertEqual(parsed.loc[0, "Identifier 2"], "2129")
+        self.assertEqual(parsed.loc[0, "Species"], "G. ruber")
+
+    def test_isodat_alternating_rows_are_standardized_to_cycle_pairs(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Row": [4, 4, 4, 4, 4],
+                "Identifier 1": ["DGL-1634"] * 5,
+                "Identifier 2": ["39.33-39.35"] * 5,
+                "Comment": ["up"] * 5,
+                "Date": ["11/18/25"] * 5,
+                "Time": ["13:38:15"] * 5,
+                "d 13C/12C  Mean": [-1.207] * 5,
+                "d 13C/12C  Std Dev": [0.009] * 5,
+                "d 18O/16O  Mean": [4.493] * 5,
+                "d 18O/16O  Std Dev": [0.012] * 5,
+                "1  Cycle Int  Samp  44": [2528.841] * 5,
+                "1  Cycle Int  Ref  44": [2560.193] * 5,
+                "rIntensity 44": [2560.193, 2528.841, 2428.997, 2437.786, 2304.957],
+                "rIntensity 45": [2735.405, 2749.327, 2595.168, 2650.296, 2462.652],
+                "rIntensity 46": [3652.985, 3641.027, 3465.764, 3509.855, 3288.736],
+                "Line": [2] * 5,
+            }
+        )
+        uploaded = _NamedBytesIO(build_workbook_bytes(frame), "isodat-export.xlsx")
+
+        df, cycles_df, specs, errors = _load_uploaded_workbooks([uploaded])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(df), 1)
+        self.assertEqual(len(cycles_df), 3)
+        self.assertEqual(cycles_df["Cycle Number"].tolist(), ["Pre", "Cycle 1", "Cycle 2"])
+        self.assertEqual(df.loc[0, "Identifier 1"], "DGL-1634")
+        self.assertEqual(df.loc[0, "Identifier 2"], "39.33-39.35")
+        self.assertEqual(df.loc[0, "Species"], "up")
+        self.assertAlmostEqual(float(cycles_df.loc[1, "1  Cycle Int  Samp  44"]), 2.528841)
+        self.assertAlmostEqual(float(cycles_df.loc[1, "1  Cycle Int  Ref  44"]), 2.560193)
+        self.assertEqual(specs[0]["software"], "isodat")
+
+    def test_load_uploaded_workbooks_accepts_explicit_per_file_parsing_config(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Composite": ["Core-A|44.1|Species X"],
+                "d 13C/12C  Mean": [1.1],
+                "d 18O/16O  Mean": [2.1],
+            }
+        )
+        uploaded = _NamedBytesIO(build_workbook_bytes(frame), "custom.xlsx")
+        parsing_config = ImportParsingConfig(
+            files=[
+                ImportWorkbookParsingConfig(
+                    file_index=0,
+                    file_name="custom.xlsx",
+                    identifier1=ImportFieldParsingRule(
+                        source_column="Composite",
+                        mode="split",
+                        delimiter="|",
+                        part_index=0,
+                    ),
+                    identifier2=ImportFieldParsingRule(
+                        source_column="Composite",
+                        mode="split",
+                        delimiter="|",
+                        part_index=1,
+                    ),
+                    species=ImportFieldParsingRule(
+                        source_column="Composite",
+                        mode="split",
+                        delimiter="|",
+                        part_index=2,
+                    ),
+                )
+            ]
+        )
+
+        df, _, _, errors = _load_uploaded_workbooks(
+            [uploaded],
+            parsing_config=parsing_config,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(df.loc[0, "Identifier 1"], "Core-A")
+        self.assertEqual(df.loc[0, "Identifier 2"], "44.1")
+        self.assertEqual(df.loc[0, "Species"], "Species X")
+
     def test_import_background_job_returns_new_session(self) -> None:
         frame = pd.DataFrame(
             {
@@ -126,6 +252,17 @@ class ImportSessionTests(unittest.TestCase):
                 self.assertEqual(completed.state, "succeeded", completed.error)
                 session_id = completed.result["session"]["session_id"]
                 self.assertTrue(api_main.store.session_exists(session_id))
+                naming = api_main.set_import_naming_workspace(
+                    session_id,
+                    ImportNamingUpdate(
+                        species_name_map={"Coral": "Coral corrected"},
+                        identifier1_name_map={"SampleA": "Sample Alpha"},
+                    ),
+                )
+                self.assertEqual(naming.species_name_map, {"Coral": "Coral corrected"})
+                self.assertEqual(naming.identifier1_name_map, {"SampleA": "Sample Alpha"})
+                self.assertIn("Coral", naming.species_sources)
+                self.assertIn("SampleA", naming.identifier1_sources)
             finally:
                 api_main.store = original_store
 

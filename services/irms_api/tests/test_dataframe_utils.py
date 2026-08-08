@@ -20,6 +20,7 @@ from services.irms_api.domain.constants import (
 from services.irms_api.domain.shared.dataframe import (
     _apply_cycle_averages,
     _ensure_cycle1_signal_difference_columns,
+    _normalize_signal_intensity,
     _parse_numeric_token,
     _split_label_species,
 )
@@ -29,6 +30,20 @@ class DataframeUtilsTests(unittest.TestCase):
     def test_parse_numeric_token_handles_decimal_comma(self) -> None:
         self.assertEqual(_parse_numeric_token("34,26-34,28"), 34.26)
 
+    def test_parse_numeric_token_preserves_numeric_three_decimal_value(self) -> None:
+        self.assertEqual(_parse_numeric_token(19.987), 19.987)
+
+    def test_normalize_signal_intensity_handles_mixed_volts_and_millivolts(self) -> None:
+        values = pd.Series([14574.861, 19.987, 17.700, None])
+
+        normalized = _normalize_signal_intensity(values)
+        normalized_again = _normalize_signal_intensity(normalized)
+
+        self.assertAlmostEqual(float(normalized.iloc[0]), 14.574861, places=6)
+        self.assertAlmostEqual(float(normalized.iloc[1]), 19.987, places=6)
+        self.assertAlmostEqual(float(normalized.iloc[2]), 17.700, places=6)
+        pd.testing.assert_series_equal(normalized_again, normalized)
+
     def test_parse_numeric_token_handles_unicode_minus(self) -> None:
         self.assertEqual(_parse_numeric_token("−12.5"), -12.5)
 
@@ -36,6 +51,12 @@ class DataframeUtilsTests(unittest.TestCase):
         identifier, species = _split_label_species("Coral- Porites")
         self.assertEqual(identifier, "Coral")
         self.assertEqual(species, "Porites")
+        identifier, species = _split_label_species("MD23-3678")
+        self.assertEqual(identifier, "MD23-3678")
+        self.assertIsNone(species)
+        identifier, species = _split_label_species("MD23-3678 - G. ruber")
+        self.assertEqual(identifier, "MD23-3678")
+        self.assertEqual(species, "G. ruber")
 
     def test_ensure_cycle1_signal_difference_columns_populates_pressure_weighted_mismatch(self) -> None:
         df = pd.DataFrame(

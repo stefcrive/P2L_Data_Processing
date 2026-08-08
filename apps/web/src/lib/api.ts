@@ -7,6 +7,9 @@ import type {
   CycleDiagnosticsPayload,
   EditAction,
   ExportRequest,
+  ImportNamingWorkspace,
+  ImportParsingConfig,
+  ImportPreviewResponse,
   ImportResult,
   LinearityConfig,
   ProcessingConfig,
@@ -133,6 +136,17 @@ function formDataFromFiles(files: File[], includeRelativePaths = false): FormDat
     const relativePath = (file as FileWithRelativePath).webkitRelativePath;
     const filename = includeRelativePaths && relativePath && relativePath.trim().length > 0 ? relativePath : file.name;
     form.append("files", file, filename);
+  }
+  return form;
+}
+
+function formDataFromFilesAndParsingConfig(
+  files: File[],
+  parsingConfig?: ImportParsingConfig | null,
+): FormData {
+  const form = formDataFromFiles(files);
+  if (parsingConfig) {
+    form.append("parsing_config", JSON.stringify(parsingConfig));
   }
   return form;
 }
@@ -338,11 +352,22 @@ export const api = {
     }),
   getJob: (jobId: string) => requestJson<JobSnapshot>(`/jobs/${encodeURIComponent(jobId)}`),
   cancelJob: (jobId: string) => requestJson<JobSnapshot>(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" }),
-  importSession: async (files: File[], onProgress?: (progress: UploadProgress) => void) => {
+  previewImport: (files: File[]) => {
+    rejectEmptyFiles(files);
+    return requestJson<ImportPreviewResponse>("/sessions/import/preview", {
+      method: "POST",
+      body: formDataFromFiles(files),
+    });
+  },
+  importSession: async (
+    files: File[],
+    parsingConfig?: ImportParsingConfig | null,
+    onProgress?: (progress: UploadProgress) => void,
+  ) => {
     rejectEmptyFiles(files);
     const job = await requestFormJsonWithProgress<JobSnapshot<ImportResult>>(
       "/sessions/import/jobs",
-      formDataFromFiles(files),
+      formDataFromFilesAndParsingConfig(files, parsingConfig),
       onProgress,
     );
     return waitForJob(job, (snapshot) =>
@@ -370,11 +395,16 @@ export const api = {
       method: "POST",
       body: formDataFromFiles(files, true),
     }),
-  appendSession: async (sessionId: string, files: File[], onProgress?: (progress: UploadProgress) => void) => {
+  appendSession: async (
+    sessionId: string,
+    files: File[],
+    parsingConfig?: ImportParsingConfig | null,
+    onProgress?: (progress: UploadProgress) => void,
+  ) => {
     rejectEmptyFiles(files);
     const job = await requestFormJsonWithProgress<JobSnapshot<ImportResult>>(
       `/sessions/${encodeURIComponent(sessionId)}/append/jobs`,
-      formDataFromFiles(files),
+      formDataFromFilesAndParsingConfig(files, parsingConfig),
       onProgress,
     );
     return waitForJob(job, (snapshot) =>
@@ -391,6 +421,21 @@ export const api = {
   },
   openSession: (sessionId: string) =>
     requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/open`, { method: "POST" }),
+  excludeSessionFile: (sessionId: string, fileIndex: number) =>
+    requestJson<ImportResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/exclude-file?file_index=${fileIndex}`,
+      { method: "POST" },
+    ),
+  getImportNaming: (sessionId: string) =>
+    requestJson<ImportNamingWorkspace>(`/sessions/${encodeURIComponent(sessionId)}/import/naming`),
+  setImportNaming: (
+    sessionId: string,
+    update: Pick<ImportNamingWorkspace, "species_name_map" | "identifier1_name_map">,
+  ) =>
+    requestJson<ImportNamingWorkspace>(`/sessions/${encodeURIComponent(sessionId)}/import/naming`, {
+      method: "POST",
+      body: body(update),
+    }),
   saveSession: (sessionId: string) =>
     requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/save`, { method: "POST" }),
   closeSession: (sessionId: string) =>

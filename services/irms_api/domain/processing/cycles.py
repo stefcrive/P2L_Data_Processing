@@ -115,6 +115,15 @@ def _get_isotope_target_column(isotope_key: str) -> str | None:
     return None
 
 
+def _get_isotope_std_dev_column(isotope_key: str) -> str | None:
+    key = str(isotope_key).strip()
+    if key == "d13C":
+        return "d 13C/12C  Std Dev"
+    if key == "d18O":
+        return "d 18O/16O  Std Dev"
+    return None
+
+
 def build_target_info(
     df: pd.DataFrame,
     row_label: Any,
@@ -139,6 +148,17 @@ def build_target_info(
     current_value_raw = pd.to_numeric(pd.Series([df.at[row_label, target_col]]), errors="coerce").iloc[0]
     has_value = pd.notna(current_value_raw)
     current_value = float(current_value_raw) if has_value else 0.0
+    std_dev_col = _get_isotope_std_dev_column(isotope_key)
+    internal_std_dev_raw = (
+        pd.to_numeric(pd.Series([df.at[row_label, std_dev_col]]), errors="coerce").iloc[0]
+        if std_dev_col is not None and std_dev_col in df.columns
+        else np.nan
+    )
+    internal_std_dev = (
+        float(internal_std_dev_raw)
+        if pd.notna(internal_std_dev_raw) and np.isfinite(internal_std_dev_raw) and float(internal_std_dev_raw) >= 0.0
+        else None
+    )
     original_map = (edit_state or {}).get("original_delta_values", {})
     original_missing_tokens = {
         str(token)
@@ -165,6 +185,7 @@ def build_target_info(
         "has_value": bool(has_value),
         "current_value": current_value,
         "original_value": original_value,
+        "internal_std_dev": internal_std_dev,
     }
 
 
@@ -400,6 +421,12 @@ def get_cycles_for_selected_point(
         mask = candidates[col].astype(str).str.strip().eq(str(value).strip())
         if mask.any():
             candidates = candidates.loc[mask]
+        elif col == "Excel File" and candidates[col].map(_value_present).any():
+            # Never borrow cycles from another uploaded workbook. Generic
+            # result-only files may have no cycle rows; falling through here
+            # previously selected an unrelated run by the closest isotope
+            # value, and d13C/d18O could therefore show different acquisitions.
+            return None, None
     if candidates.empty:
         return None, None
 
@@ -578,19 +605,15 @@ def compute_cycle_mean_for_target(
 
     isotope_key = str(target.get("isotope_key", "")).strip()
     if isotope_key == "d13C":
-        value_col = _pick_cycle_value_column(cycles, "d 13C/12C  Mean", [r"d13", r"d ?13c", r"d45co2", r"\bd45\b"])
         required_masses = [44, 45]
     elif isotope_key == "d18O":
-        value_col = _pick_cycle_value_column(cycles, "d 18O/16O  Mean", [r"d18", r"d ?18o", r"d46co2", r"\bd46\b"])
         required_masses = [44, 45, 46]
     else:
         result["reason"] = "unsupported_isotope"
         return result
 
-    if value_col is None or value_col not in cycles.columns:
-        result["reason"] = "missing_cycle_delta_column"
-        return result
-    cycle_delta = pd.to_numeric(cycles[value_col], errors="coerce")
+    cycle_delta, value_source = _cycle_isotope_values(cycles, isotope_key)
+    result["value_source"] = value_source
     if cycle_delta.notna().sum() == 0:
         result["reason"] = "no_cycle_delta_values"
         return result
@@ -667,6 +690,174 @@ def _cycle_delta_context(
             46,
         )
     return None, [], None
+
+
+def _cycle_isotope_values(
+    cycles: pd.DataFrame,
+    isotope_key: str,
+) -> tuple[pd.Series, dict[str, Any]]:
+    """Return cycle-varying isotope values, deriving a signal-ratio proxy when needed.
+
+    Some ISODAT exports repeat only the run-level isotope mean on every cycle row.
+    Treating that repeated value as a cycle measurement produces visually flat fits
+    driven only by floating-point noise. In that case, derive the within-run movement
+    from the rare/44 sample-to-reference ion-beam ratio and anchor it to the reported
+    run mean. The proxy is suitable for detecting intensity-dependent cycle drift.
+    """
+    value_col, _, ratio_mass = _cycle_delta_context(cycles, isotope_key)
+    reported = (
+        pd.to_numeric(cycles[value_col], errors="coerce")
+        if value_col is not None and value_col in cycles.columns
+        else pd.Series(np.nan, index=cycles.index, dtype=float)
+    )
+    finite_reported = reported.replace([np.inf, -np.inf], np.nan).dropna()
+    reported_span = float(finite_reported.max() - finite_reported.min()) if not finite_reported.empty else 0.0
+    if len(finite_reported) >= 2 and reported_span > 1e-9:
+        return reported, {
+            "source": "exported_cycle_value",
+            "column": value_col,
+            "is_proxy": False,
+            "ratio_mass": ratio_mass,
+            "axis_label": isotope_key,
+        }
+
+    intensity_cols = [col for col in _find_cycle_intensity_columns(cycles) if col in cycles.columns]
+    sample44_col, reference44_col = _pick_mass_role_columns(cycles, intensity_cols, 44)
+    sample_ratio_col, reference_ratio_col = (
+        _pick_mass_role_columns(cycles, intensity_cols, int(ratio_mass))
+        if ratio_mass is not None
+        else (None, None)
+    )
+    required_columns = [sample44_col, reference44_col, sample_ratio_col, reference_ratio_col]
+    if any(column is None or column not in cycles.columns for column in required_columns):
+        return reported, {
+            "source": "reported_run_mean",
+            "column": value_col,
+            "is_proxy": False,
+            "ratio_mass": ratio_mass,
+            "axis_label": isotope_key,
+        }
+
+    sample44 = _normalize_signal_intensity(cycles[str(sample44_col)])
+    reference44 = _normalize_signal_intensity(cycles[str(reference44_col)])
+    sample_ratio_mass = _normalize_signal_intensity(cycles[str(sample_ratio_col)])
+    reference_ratio_mass = _normalize_signal_intensity(cycles[str(reference_ratio_col)])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio_of_ratios = (sample_ratio_mass / sample44) / (reference_ratio_mass / reference44)
+    ratio_of_ratios = pd.to_numeric(ratio_of_ratios, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    valid_ratio = ratio_of_ratios.where(
+        sample44.gt(0)
+        & reference44.gt(0)
+        & sample_ratio_mass.gt(0)
+        & reference_ratio_mass.gt(0)
+    ).dropna()
+    if len(valid_ratio) < 3:
+        return reported, {
+            "source": "reported_run_mean",
+            "column": value_col,
+            "is_proxy": False,
+            "ratio_mass": ratio_mass,
+            "axis_label": isotope_key,
+        }
+    ratio_reference = float(valid_ratio.median())
+    if not np.isfinite(ratio_reference) or abs(ratio_reference) <= 1e-12:
+        return reported, {
+            "source": "reported_run_mean",
+            "column": value_col,
+            "is_proxy": False,
+            "ratio_mass": ratio_mass,
+            "axis_label": isotope_key,
+        }
+    anchor = float(finite_reported.median()) if not finite_reported.empty else 0.0
+    proxy = anchor + ((ratio_of_ratios / ratio_reference) - 1.0) * 1000.0
+    proxy = pd.to_numeric(proxy, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return proxy, {
+        "source": "internal_signal_ratio_proxy",
+        "column": value_col,
+        "is_proxy": True,
+        "ratio_mass": ratio_mass,
+        "axis_label": f"{isotope_key} internal signal proxy",
+        "description": (
+            f"Within-cycle change derived from the sample/reference m/z {ratio_mass}-to-44 ratio "
+            "and centered on the exported run mean."
+        ),
+    }
+
+
+def _intensity_linearity_diagnostic(
+    cycles: pd.DataFrame,
+    isotope_key: str,
+    cycle_values: pd.Series,
+    valid_mask: pd.Series,
+    internal_std_dev: Any = None,
+) -> dict[str, Any]:
+    intensity_cols = [col for col in _find_cycle_intensity_columns(cycles) if col in cycles.columns]
+    basis_frame = _cycle_44_basis_frame(cycles, intensity_cols)
+    fit_frame = pd.DataFrame(
+        {
+            "intensity": pd.to_numeric(basis_frame["mean_intensity"], errors="coerce"),
+            "value": pd.to_numeric(cycle_values, errors="coerce"),
+        }
+    ).loc[valid_mask]
+    fit_frame = fit_frame.replace([np.inf, -np.inf], np.nan).dropna()
+    result: dict[str, Any] = {
+        "available": False,
+        "n": int(len(fit_frame)),
+        "basis": "mean_sample_reference_44_intensity",
+        "slope_per_10v": None,
+        "r_squared": None,
+        "fitted_span": None,
+        "issue_index": None,
+        "severity": "unavailable",
+    }
+    if len(fit_frame) < 3 or fit_frame["intensity"].nunique(dropna=True) < 2:
+        result["reason"] = "insufficient_cycle_variation"
+        return result
+    try:
+        slope, intercept = np.polyfit(
+            fit_frame["intensity"].to_numpy(dtype=float),
+            fit_frame["value"].to_numpy(dtype=float),
+            1,
+        )
+    except Exception:
+        result["reason"] = "fit_failed"
+        return result
+    predicted = intercept + slope * fit_frame["intensity"]
+    residual_sum = float(((fit_frame["value"] - predicted) ** 2).sum())
+    total_sum = float(((fit_frame["value"] - fit_frame["value"].mean()) ** 2).sum())
+    r_squared = 1.0 - (residual_sum / total_sum) if total_sum > 1e-18 else 0.0
+    intensity_span = float(fit_frame["intensity"].max() - fit_frame["intensity"].min())
+    fitted_span = abs(float(slope)) * intensity_span
+    std_dev = pd.to_numeric(pd.Series([internal_std_dev]), errors="coerce").iloc[0]
+    issue_index = (
+        fitted_span / float(std_dev)
+        if pd.notna(std_dev) and np.isfinite(std_dev) and float(std_dev) > 0.0
+        else None
+    )
+    severity = (
+        "high"
+        if issue_index is not None and issue_index >= 2.0
+        else "watch"
+        if issue_index is not None and issue_index >= 1.0
+        else "low"
+        if issue_index is not None
+        else "unscaled"
+    )
+    result.update(
+        {
+            "available": True,
+            "slope_per_10v": float(slope) * 10.0,
+            "r_squared": float(max(0.0, min(1.0, r_squared))),
+            "fitted_span": float(fitted_span),
+            "issue_index": float(issue_index) if issue_index is not None and np.isfinite(issue_index) else None,
+            "severity": severity,
+            "intensity_min": float(fit_frame["intensity"].min()),
+            "intensity_max": float(fit_frame["intensity"].max()),
+            "internal_std_dev": float(std_dev) if pd.notna(std_dev) and np.isfinite(std_dev) else None,
+            "isotope_key": isotope_key,
+        }
+    )
+    return result
 
 
 def _linear_prediction(
@@ -1458,6 +1649,11 @@ def compute_saturation_correction_for_target(
             "full_slope": None,
             "basis": "delta_rate_asymptote",
         },
+        "intensity_linearity": {
+            "available": False,
+            "severity": "unavailable",
+        },
+        "value_source": {},
         "figures": {},
     }
     if require_partially_saturated and not _is_partially_saturated_collector(target):
@@ -1470,12 +1666,17 @@ def compute_saturation_correction_for_target(
         return payload
 
     isotope_key = str(target.get("isotope_key", "")).strip()
-    value_col, required_masses, reference_mass = _cycle_delta_context(cycles, isotope_key)
-    if value_col is None or value_col not in cycles.columns:
-        payload["reason"] = "missing_cycle_delta_column"
+    _, required_masses, reference_mass = _cycle_delta_context(cycles, isotope_key)
+    if not required_masses:
+        payload["reason"] = "unsupported_isotope"
         return payload
 
-    cycle_delta = pd.to_numeric(cycles[value_col], errors="coerce")
+    cycle_delta, value_source = _cycle_isotope_values(cycles, isotope_key)
+    payload["value_source"] = value_source
+    cycle_value_axis_title = str(value_source.get("axis_label") or isotope_key)
+    if cycle_delta.notna().sum() == 0:
+        payload["reason"] = "missing_cycle_delta_values"
+        return payload
     cycle_numbers = pd.to_numeric(cycles["_cycle_order"], errors="coerce")
     intensity_cols = [col for col in _find_cycle_intensity_columns(cycles) if col in cycles.columns]
     intensity_for_mask = pd.DataFrame(index=cycles.index)
@@ -1503,6 +1704,13 @@ def compute_saturation_correction_for_target(
     payload["last_valid_value"] = last_valid_value
 
     basis_frame = _cycle_44_basis_frame(cycles, intensity_cols)
+    payload["intensity_linearity"] = _intensity_linearity_diagnostic(
+        cycles,
+        isotope_key,
+        cycle_delta,
+        valid_mask,
+        internal_std_dev=target.get("internal_std_dev"),
+    )
     saturated_target_cycle_raw = cycle_numbers.dropna().min()
     saturated_target_cycle = float(saturated_target_cycle_raw) if pd.notna(saturated_target_cycle_raw) else 1.0
     fallback_stabilized_cycle = float(valid_cycles.max()) if not valid_cycles.empty else saturated_target_cycle
@@ -1645,18 +1853,10 @@ def compute_saturation_correction_for_target(
         valid_reference44 = basis_frame["reference"].loc[valid_mask]
         valid_mean44 = basis_frame["mean_intensity"].loc[valid_mask]
         valid_mismatch44 = basis_frame["symmetric_mismatch"].loc[valid_mask]
-        d13_col, _, _ = _cycle_delta_context(cycles, "d13C")
-        d18_col, _, _ = _cycle_delta_context(cycles, "d18O")
-        valid_d13c = (
-            pd.to_numeric(cycles[d13_col], errors="coerce").loc[valid_mask]
-            if d13_col is not None and d13_col in cycles.columns
-            else pd.Series(np.nan, index=valid_cycle_numbers.index)
-        )
-        valid_d18o = (
-            pd.to_numeric(cycles[d18_col], errors="coerce").loc[valid_mask]
-            if d18_col is not None and d18_col in cycles.columns
-            else pd.Series(np.nan, index=valid_cycle_numbers.index)
-        )
+        d13_values, _ = _cycle_isotope_values(cycles, "d13C")
+        d18_values, _ = _cycle_isotope_values(cycles, "d18O")
+        valid_d13c = pd.to_numeric(d13_values, errors="coerce").loc[valid_mask]
+        valid_d18o = pd.to_numeric(d18_values, errors="coerce").loc[valid_mask]
         valid_customdata = _cycle_customdata(
             valid_cycle_numbers,
             valid_sample44,
@@ -1718,7 +1918,7 @@ def compute_saturation_correction_for_target(
                     if reference_mass is not None
                     else "Reference intensity (V)"
                 ),
-                yaxis_title=isotope_key,
+                yaxis_title=cycle_value_axis_title,
                 height=320,
                 margin=dict(l=40, r=20, t=15, b=40),
                 legend=dict(orientation="h", yanchor="top", y=-0.25, x=0.0),
@@ -1781,7 +1981,7 @@ def compute_saturation_correction_for_target(
             )
             fig.update_layout(
                 xaxis_title="Cycle",
-                yaxis_title=isotope_key,
+                yaxis_title=cycle_value_axis_title,
                 height=320,
                 margin=dict(l=40, r=20, t=15, b=40),
                 legend=dict(orientation="h", yanchor="top", y=-0.25, x=0.0),
@@ -1865,7 +2065,7 @@ def compute_saturation_correction_for_target(
             )
             fig.update_layout(
                 xaxis_title=label,
-                yaxis_title=isotope_key,
+                yaxis_title=cycle_value_axis_title,
                 height=320,
                 margin=dict(l=40, r=20, t=15, b=40),
                 legend=dict(orientation="h", yanchor="top", y=-0.25, x=0.0),
@@ -1960,7 +2160,7 @@ def compute_saturation_correction_for_target(
                 )
                 fig.update_layout(
                     xaxis_title="Mean intensity",
-                    yaxis_title=isotope_key,
+                    yaxis_title=cycle_value_axis_title,
                     height=320,
                     margin=dict(l=40, r=20, t=15, b=40),
                     legend=dict(orientation="h", yanchor="top", y=-0.25, x=0.0),
@@ -2083,7 +2283,7 @@ def compute_saturation_correction_for_target(
                 )
                 fig.update_layout(
                     xaxis_title="Delta change per cycle",
-                    yaxis_title=isotope_key,
+                    yaxis_title=cycle_value_axis_title,
                     height=320,
                     margin=dict(l=40, r=20, t=15, b=40),
                     legend=dict(orientation="h", yanchor="top", y=-0.25, x=0.0),
@@ -2344,12 +2544,26 @@ def build_cycle_diagnostics_payload(
     iqr_multiplier: float = 1.5,
 ) -> CycleDiagnosticsPayload:
     cycles, pre_row = get_cycles_for_selected_point(df, cycles_df, target["row_label"], target["target_col"])
+    target = dict(target)
+    target_std = pd.to_numeric(pd.Series([target.get("internal_std_dev")]), errors="coerce").iloc[0]
+    if pd.isna(target_std) or not np.isfinite(target_std) or float(target_std) <= 0.0:
+        std_dev_col = _get_isotope_std_dev_column(str(target.get("isotope_key", "")))
+        std_candidates: list[Any] = []
+        if std_dev_col is not None and isinstance(pre_row, pd.Series) and std_dev_col in pre_row.index:
+            std_candidates.append(pre_row.get(std_dev_col))
+        if std_dev_col is not None and cycles is not None and std_dev_col in cycles.columns:
+            std_candidates.extend(cycles[std_dev_col].tolist())
+        resolved_std = pd.to_numeric(pd.Series(std_candidates), errors="coerce")
+        resolved_std = resolved_std[np.isfinite(resolved_std) & resolved_std.gt(0)]
+        if not resolved_std.empty:
+            target["internal_std_dev"] = float(resolved_std.iloc[0])
     inline_summary = build_selected_point_diagnostics_inline(df, target, pre_row=pre_row)
     if cycles is None or cycles.empty:
         return CycleDiagnosticsPayload(
             session_id=session_id,
             target=target,
             inline_summary=inline_summary,
+            intensity_linearity={"available": False, "reason": "no_cycle_data"},
             cycle_mean={"reason": "no_cycle_data"},
         )
 
@@ -2401,8 +2615,8 @@ def build_cycle_diagnostics_payload(
         )
         figure_json = to_json_compatible(fig.to_plotly_json())
 
-    d13_col = _pick_cycle_value_column(cycles, "d 13C/12C  Mean", [r"d13", r"d ?13c", r"d45co2", r"\bd45\b"])
-    d18_col = _pick_cycle_value_column(cycles, "d 18O/16O  Mean", [r"d18", r"d ?18o", r"d46co2", r"\bd46\b"])
+    d13_values, _ = _cycle_isotope_values(cycles, "d13C")
+    d18_values, _ = _cycle_isotope_values(cycles, "d18O")
     cycle_table = pd.DataFrame({"Cycle": pd.to_numeric(cycles["_cycle_order"], errors="coerce").astype("Int64")}, index=cycles.index)
     for mass in [44, 45, 46]:
         smp_col = mass_roles[mass]["SMP"]
@@ -2411,10 +2625,10 @@ def build_cycle_diagnostics_payload(
         table_ref_col = f"REF Int m/z {mass} (V)"
         cycle_table[table_col] = _normalize_signal_intensity(cycles[smp_col]) if smp_col is not None else np.nan
         cycle_table[table_ref_col] = _normalize_signal_intensity(cycles[std_col]) if std_col is not None else np.nan
-    if d13_col and d13_col in cycles.columns:
-        cycle_table["d13C"] = pd.to_numeric(cycles[d13_col], errors="coerce")
-    if d18_col and d18_col in cycles.columns:
-        cycle_table["d18O"] = pd.to_numeric(cycles[d18_col], errors="coerce")
+    if pd.to_numeric(d13_values, errors="coerce").notna().any():
+        cycle_table["d13C"] = pd.to_numeric(d13_values, errors="coerce")
+    if pd.to_numeric(d18_values, errors="coerce").notna().any():
+        cycle_table["d18O"] = pd.to_numeric(d18_values, errors="coerce")
     intensity_for_mask = pd.DataFrame(index=cycles.index)
     for col in intensity_cols:
         intensity_for_mask[col] = _normalize_signal_intensity(cycles[col])
@@ -2488,6 +2702,7 @@ def build_cycle_diagnostics_payload(
         inline_summary=inline_summary,
         figure=figure_json,
         saturation_correction=saturation_correction,
+        intensity_linearity=to_json_compatible(saturation_correction.get("intensity_linearity", {})),
         table=table_frame.to_dict(orient="records"),
         cycle_mean=to_json_compatible(mean_payload),
     )

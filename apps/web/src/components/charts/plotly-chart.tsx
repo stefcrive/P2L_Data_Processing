@@ -58,6 +58,78 @@ function titleText(value: unknown): string {
   return "";
 }
 
+type PlotlyGraphDiv = HTMLDivElement & {
+  _fullLayout?: {
+    yaxis?: { dtick?: unknown; range?: unknown };
+    yaxis2?: { dtick?: unknown; overlaying?: unknown; range?: unknown; tickmode?: unknown; title?: unknown };
+  };
+};
+
+type PlotlyRelayoutApi = {
+  relayout: (graphDiv: PlotlyGraphDiv, update: Record<string, unknown>) => Promise<unknown>;
+};
+
+function numericAxisRange(value: unknown): [number, number] | null {
+  if (!Array.isArray(value) || value.length !== 2) {
+    return null;
+  }
+  const start = Number(value[0]);
+  const end = Number(value[1]);
+  return Number.isFinite(start) && Number.isFinite(end) && start !== end ? [start, end] : null;
+}
+
+function syncStandardAxisScale(
+  graphDiv: PlotlyGraphDiv | undefined,
+  setProgrammaticRelayout?: (active: boolean) => void,
+) {
+  const primaryAxis = graphDiv?._fullLayout?.yaxis;
+  const standardAxis = graphDiv?._fullLayout?.yaxis2;
+  if (
+    !graphDiv ||
+    !primaryAxis ||
+    !standardAxis ||
+    standardAxis.overlaying !== "y" ||
+    !titleText(standardAxis.title).startsWith("Standard ")
+  ) {
+    return;
+  }
+
+  const primaryTickInterval = Number(primaryAxis.dtick);
+  if (!Number.isFinite(primaryTickInterval) || primaryTickInterval <= 0) {
+    return;
+  }
+  const primaryRange = numericAxisRange(primaryAxis.range);
+  const standardRange = numericAxisRange(standardAxis.range);
+  if (!primaryRange || !standardRange) {
+    return;
+  }
+
+  const primarySpan = Math.abs(primaryRange[1] - primaryRange[0]);
+  const standardCenter = (standardRange[0] + standardRange[1]) / 2;
+  const reversed = primaryRange[1] < primaryRange[0];
+  const targetRange: [number, number] = reversed
+    ? [standardCenter + primarySpan / 2, standardCenter - primarySpan / 2]
+    : [standardCenter - primarySpan / 2, standardCenter + primarySpan / 2];
+  const rangeAlreadyMatched =
+    Math.abs(standardRange[0] - targetRange[0]) < 1e-9 && Math.abs(standardRange[1] - targetRange[1]) < 1e-9;
+  if (standardAxis.tickmode === "linear" && Number(standardAxis.dtick) === primaryTickInterval && rangeAlreadyMatched) {
+    return;
+  }
+
+  void import("@/lib/plotly-core").then(({ default: plotlyModule }) => {
+    const Plotly = plotlyModule as unknown as PlotlyRelayoutApi;
+    setProgrammaticRelayout?.(true);
+    void Plotly
+      .relayout(graphDiv, {
+        "yaxis2.tickmode": "linear",
+        "yaxis2.dtick": primaryTickInterval,
+        // Keep the standards centered, but give both axes the same units-per-pixel.
+        "yaxis2.range": targetRange,
+      })
+      .finally(() => setProgrammaticRelayout?.(false));
+  });
+}
+
 function isD18Label(label: string): boolean {
   const normalized = label.toLowerCase();
   return normalized.includes("d18o") || normalized.includes("18o");
@@ -350,6 +422,7 @@ export function PlotlyChart({
   const didRefreshAfterInitializeRef = useRef(false);
   const pointerInteractionTokenRef = useRef(0);
   const consumedPointerInteractionTokenRef = useRef(0);
+  const isSynchronizingStandardAxisRef = useRef(false);
   const shouldDeferRender = deferRenderMs > 0;
   const preparedFigure = useMemo(() => {
     if (!figure || Object.keys(figure).length === 0) {
@@ -401,7 +474,10 @@ export function PlotlyChart({
     return () => window.clearTimeout(timer);
   }, [deferRenderMs, figure, shouldDeferRender]);
 
-  function refreshAfterInitialize() {
+  function refreshAfterInitialize(_figure?: unknown, graphDiv?: PlotlyGraphDiv) {
+    syncStandardAxisScale(graphDiv, (active) => {
+      isSynchronizingStandardAxisRef.current = active;
+    });
     if (didRefreshAfterInitializeRef.current) {
       return;
     }
@@ -412,7 +488,7 @@ export function PlotlyChart({
   }
 
   function persistViewportUpdate(update: Record<string, unknown> | undefined) {
-    if (!uiRevision || !update) {
+    if (!uiRevision || !update || isSynchronizingStandardAxisRef.current) {
       return;
     }
     const current = persistedViewports.get(uiRevision) ?? {};
@@ -488,6 +564,11 @@ export function PlotlyChart({
         config={{ responsive: true }}
         revision={renderRevision}
         onInitialized={refreshAfterInitialize}
+        onUpdate={(_figure: unknown, graphDiv: PlotlyGraphDiv) =>
+          syncStandardAxisScale(graphDiv, (active) => {
+            isSynchronizingStandardAxisRef.current = active;
+          })
+        }
         onRelayout={persistViewportUpdate}
         useResizeHandler={preparedFigure.useResizeHandler}
         className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}

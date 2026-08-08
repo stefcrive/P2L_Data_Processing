@@ -27,6 +27,50 @@ export type SessionSnapshot = {
   preview: Array<JsonRecord>;
 };
 
+export type ImportFieldParsingRule = {
+  source_column?: string | null;
+  mode: "direct" | "split" | "regex";
+  delimiter: string;
+  part_index: number;
+  regex_pattern: string;
+  regex_group: number | string;
+};
+
+export type ImportWorkbookParsingConfig = {
+  file_index?: number | null;
+  file_name: string;
+  software: "qtegra" | "isodat" | "generic";
+  identifier1: ImportFieldParsingRule;
+  identifier2: ImportFieldParsingRule;
+  species: ImportFieldParsingRule;
+};
+
+export type ImportParsingConfig = {
+  files: ImportWorkbookParsingConfig[];
+};
+
+export type ImportFilePreview = {
+  file_index: number;
+  file_name: string;
+  software: "qtegra" | "isodat" | "generic";
+  columns: string[];
+  row_count: number;
+  sample_rows: JsonRecord[];
+  suggested_config: ImportWorkbookParsingConfig;
+};
+
+export type ImportPreviewResponse = {
+  files: ImportFilePreview[];
+  errors: string[];
+};
+
+export type ImportNamingWorkspace = {
+  species_name_map: Record<string, string>;
+  identifier1_name_map: Record<string, string>;
+  identifier1_sources: string[];
+  species_sources: string[];
+};
+
 export type SessionArtifactKind = "events" | "snapshot" | "cycles" | "metadata" | "state";
 
 export type SessionArtifactPayload = {
@@ -332,6 +376,7 @@ export type CycleDiagnosticsPayload = {
   inline_summary?: string;
   figure: FigurePayload;
   saturation_correction: JsonRecord;
+  intensity_linearity?: JsonRecord;
   table: Array<JsonRecord>;
   cycle_mean?: JsonRecord;
   [key: string]: unknown;

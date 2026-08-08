@@ -11,6 +11,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional for logic-only tests
     go = None
 
 from ..contracts import IdentifierFigureSet, SpeciesSection
+from ..constants import CYCLE1_SIGNAL_REF44_COL, CYCLE1_SIGNAL_SAMP44_COL
 from ..shared.dataframe import _get_species_series, _parse_numeric_token
 from ..shared.json_compat import to_json_compatible
 from ..shared.plotting import (
@@ -157,7 +158,13 @@ def _color_series_for_plot(df: pd.DataFrame, color_col: str) -> tuple[pd.Series,
 
 
 def _color_param_label(color_col: str) -> str:
-    return "Date" if _is_date_color_column(color_col) else str(color_col)
+    if _is_date_color_column(color_col):
+        return "Date"
+    if color_col == CYCLE1_SIGNAL_SAMP44_COL:
+        return "Initial sample intensity"
+    if color_col == CYCLE1_SIGNAL_REF44_COL:
+        return "Initial reference gas intensity"
+    return str(color_col)
 
 
 def _format_hover_color_value(value: Any) -> str:
@@ -253,8 +260,19 @@ def _date_aligned_standard_rows(
     color_col: str,
 ) -> pd.DataFrame:
     """Position standards on a sample x-axis by interpolating acquisition dates."""
-    if standards_df is None or standards_df.empty or reference_df is None or reference_df.empty:
+    if standards_df is None or standards_df.empty:
         return pd.DataFrame()
+
+    standards = _attach_hover_context(standards_df.copy(), color_col)
+    standards["__measurement_datetime"] = _measurement_datetime_series(standards)
+
+    def _native_standard_axis() -> pd.DataFrame:
+        native = standards.copy()
+        native["x_axis"] = _x_axis_series(native, x_axis_option)
+        return native.sort_values(["x_axis", "__measurement_datetime", "Identifier 2"], na_position="last")
+
+    if reference_df is None or reference_df.empty:
+        return _native_standard_axis()
 
     reference = reference_df.copy()
     if "x_axis" not in reference.columns:
@@ -265,7 +283,7 @@ def _date_aligned_standard_rows(
         reference["__measurement_datetime"].notna() & reference["__axis_numeric"].notna()
     ].copy()
     if reference.empty:
-        return pd.DataFrame()
+        return _native_standard_axis()
 
     anchors = (
         reference.groupby("__measurement_datetime", as_index=False)["__axis_numeric"]
@@ -275,11 +293,10 @@ def _date_aligned_standard_rows(
     anchor_dates = anchors["__measurement_datetime"].astype("int64").to_numpy(dtype=float)
     anchor_x = anchors["__axis_numeric"].to_numpy(dtype=float)
 
-    standards = _attach_hover_context(standards_df.copy(), color_col)
-    standards["__measurement_datetime"] = _measurement_datetime_series(standards)
-    standards = standards.loc[standards["__measurement_datetime"].notna()].copy()
-    if standards.empty:
-        return standards
+    standards_with_dates = standards.loc[standards["__measurement_datetime"].notna()].copy()
+    if standards_with_dates.empty:
+        return _native_standard_axis()
+    standards = standards_with_dates
     standard_dates = standards["__measurement_datetime"].astype("int64").to_numpy(dtype=float)
     if len(anchor_dates) == 1:
         standards["x_axis"] = float(anchor_x[0])
@@ -342,6 +359,9 @@ def _add_standard_measurement_traces(
             yaxis2=dict(
                 title=f"Standard {isotope_key}",
                 overlaying="y",
+                # The client copies the resolved primary-axis scale after
+                # Plotly has autoranged both independent axes.
+                tickmode="auto",
                 side="right",
                 showgrid=False,
                 zeroline=False,
@@ -461,8 +481,12 @@ def _build_summary_figure(
     config: Any | None = None,
     edit_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if go is None or df is None or df.empty:
+    has_samples = df is not None and not df.empty
+    has_standards = standards_df is not None and not standards_df.empty
+    if go is None or (not has_samples and not has_standards):
         return {}
+    if df is None:
+        df = pd.DataFrame()
     y_col = "d 13C/12C  Mean" if isotope_key == "d13C" else "d 18O/16O  Mean"
     cal_col = _effective_calibrated_column(df, isotope_key)
     fig = go.Figure()
@@ -1615,15 +1639,28 @@ def _build_identifier_figure(
                     customdata=_build_processing_point_customdata(statistical_outliers, isotope_key),
                 )
             )
-    if getattr(config.overlays, "show_range_outliers", False):
-        range_masks = _exclusive_outlier_masks(
-            [
-                ("signal", summary_masks["Signal Intensity"]),
-                ("leak", summary_masks["Leak Rate"]),
-                ("d13c", summary_masks["d13C Range"]),
-                ("d18o", summary_masks["d18O Range"]),
-            ]
-        )
+    # Do not leave a species chart completely blank solely because every one of
+    # its measurements is outside the active processing ranges.  A blank chart
+    # looks like an identifier/species mapping failure, particularly after a
+    # name is changed on the import page.  Preserve the normal overlay setting
+    # whenever there are accepted rows, but make the range-outlier points
+    # discoverable as a fallback when there are none.
+    range_outlier_masks = _exclusive_outlier_masks(
+        [
+            ("signal", summary_masks["Signal Intensity"]),
+            ("leak", summary_masks["Leak Rate"]),
+            ("d13c", summary_masks["d13C Range"]),
+            ("d18o", summary_masks["d18O Range"]),
+        ]
+    )
+    has_range_outliers = any(bool(mask.any()) for mask in range_outlier_masks.values())
+    show_range_outliers = bool(getattr(config.overlays, "show_range_outliers", False)) or (
+        filtered_identifier.empty and has_range_outliers
+    )
+    forced_range_outlier_visibility = show_range_outliers and not bool(
+        getattr(config.overlays, "show_range_outliers", False)
+    )
+    if show_range_outliers:
         symbol_map = {
             "signal": "diamond",
             "leak": "star",
@@ -1636,7 +1673,7 @@ def _build_identifier_figure(
             "d13c": "d13C Range",
             "d18o": "d18O Range",
         }
-        for key, mask in range_masks.items():
+        for key, mask in range_outlier_masks.items():
             rows = unfiltered_identifier.loc[mask]
             rows = _exclude_restored(rows)
             if rows.empty:
@@ -1651,6 +1688,18 @@ def _build_identifier_figure(
                     customdata=_build_processing_point_customdata(rows, isotope_key),
                 )
             )
+    if forced_range_outlier_visibility:
+        fig.add_annotation(
+            text="All measurements are outside the active processing ranges and are shown as range outliers.",
+            xref="paper",
+            yref="paper",
+            x=0,
+            y=1.14,
+            xanchor="left",
+            yanchor="bottom",
+            showarrow=False,
+            font=dict(size=11, color="#b91c1c"),
+        )
     if getattr(config.overlays, "show_manual_outliers", False):
         manual_mask = summary_masks.get("Manual Override", pd.Series(False, index=unfiltered_identifier.index))
         manual_rows = unfiltered_identifier.loc[manual_mask.reindex(unfiltered_identifier.index, fill_value=False).astype(bool)]
