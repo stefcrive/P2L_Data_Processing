@@ -470,6 +470,9 @@ def _ensure_edit_state(edit_state: dict[str, Any] | None) -> dict[str, Any]:
     payload.setdefault("original_missing_delta_tokens", [])
     payload.setdefault("original_std_values", {})
     payload.setdefault("original_missing_std_tokens", [])
+    payload.setdefault("original_identifier1_values", {})
+    payload.setdefault("original_identifier2_values", {})
+    payload.setdefault("original_species_values", {})
     payload.setdefault("manual_outlier_overrides", {})
     payload.setdefault("restored_delta_tokens", [])
     return payload
@@ -506,6 +509,21 @@ def apply_edit_action(
         for token in state.get("original_missing_std_tokens", [])
         if str(token).strip() != ""
     }
+    original_identifier1_values = {
+        str(key): str(value)
+        for key, value in state.get("original_identifier1_values", {}).items()
+        if str(key).strip() != ""
+    }
+    original_identifier2_values = {
+        str(key): str(value)
+        for key, value in state.get("original_identifier2_values", {}).items()
+        if str(key).strip() != ""
+    }
+    original_species_values = {
+        str(key): str(value)
+        for key, value in state.get("original_species_values", {}).items()
+        if str(key).strip() != ""
+    }
     edited_rows = {str(row) for row in state.get("edited_rows", [])}
     manual_outlier_overrides = {
         str(key): bool(value)
@@ -529,6 +547,19 @@ def apply_edit_action(
         if numeric in work.index:
             return numeric
         raise KeyError(f"Unknown row label {target_row_label}")
+
+    def _row_has_tracked_edit(row_label: str) -> bool:
+        row_token = str(row_label)
+        isotope_suffix = f"|{row_token}"
+        return (
+            row_token in original_identifier1_values
+            or row_token in original_identifier2_values
+            or row_token in original_species_values
+            or any(token.endswith(isotope_suffix) for token in original_map)
+            or any(token.endswith(isotope_suffix) for token in original_missing_tokens)
+            or any(token.endswith(isotope_suffix) for token in original_std_map)
+            or any(token.endswith(isotope_suffix) for token in original_missing_std_tokens)
+        )
 
     if edit.action == "reset_all":
         reset_tokens = sorted(set(original_map.keys()) | original_missing_tokens)
@@ -574,16 +605,93 @@ def apply_edit_action(
                 work.at[row_label, std_col] = float(original_std_map[token])
             else:
                 work.at[row_label, std_col] = np.nan
+        if "Identifier 1" in work.columns:
+            for row_label_raw, original_identifier in original_identifier1_values.items():
+                row_label = _resolve_target_row(row_label_raw)
+                work.at[row_label, "Identifier 1"] = original_identifier
+        if "Identifier 2" in work.columns:
+            for row_label_raw, original_identifier in original_identifier2_values.items():
+                row_label = _resolve_target_row(row_label_raw)
+                work.at[row_label, "Identifier 2"] = original_identifier
+        if "Species" in work.columns:
+            for row_label_raw, original_species in original_species_values.items():
+                row_label = _resolve_target_row(row_label_raw)
+                work.at[row_label, "Species"] = original_species
         edited_rows.clear()
         original_map = {}
         original_missing_tokens = set()
         original_std_map = {}
         original_missing_std_tokens = set()
+        original_identifier1_values = {}
+        original_identifier2_values = {}
+        original_species_values = {}
         restored_tokens = set()
     elif edit.action == "set_outlier_override":
         for target in edit.targets:
-            manual_outlier_overrides[str(target.row_label)] = bool(edit.is_outlier)
+            token = f"{str(target.isotope_key).strip()}|{str(target.row_label)}"
+            manual_outlier_overrides[token] = bool(edit.is_outlier)
+    elif edit.action == "set_identifier1":
+        next_identifier = str(edit.identifier1 or "").strip()
+        if not next_identifier:
+            raise ValueError("Identifier 1 is required")
+        if "Identifier 1" not in work.columns:
+            raise ValueError("Dataset has no Identifier 1 column")
+        work["Identifier 1"] = work["Identifier 1"].astype(object)
+        for target in edit.targets:
+            row_token = str(target.row_label)
+            row_label = _resolve_target_row(target.row_label)
+            current_identifier = str(work.at[row_label, "Identifier 1"] or "").strip()
+            if row_token not in original_identifier1_values:
+                original_identifier1_values[row_token] = current_identifier
+            work.at[row_label, "Identifier 1"] = next_identifier
+            if next_identifier == original_identifier1_values[row_token]:
+                original_identifier1_values.pop(row_token, None)
+                if not _row_has_tracked_edit(row_token):
+                    edited_rows.discard(row_token)
+            else:
+                edited_rows.add(row_token)
+    elif edit.action == "set_identifier2":
+        next_identifier = str(edit.identifier2 or "").strip()
+        if not next_identifier:
+            raise ValueError("Identifier 2 is required")
+        if "Identifier 2" not in work.columns:
+            raise ValueError("Dataset has no Identifier 2 column")
+        work["Identifier 2"] = work["Identifier 2"].astype(object)
+        for target in edit.targets:
+            row_token = str(target.row_label)
+            row_label = _resolve_target_row(target.row_label)
+            current_identifier = str(work.at[row_label, "Identifier 2"] or "").strip()
+            if row_token not in original_identifier2_values:
+                original_identifier2_values[row_token] = current_identifier
+            work.at[row_label, "Identifier 2"] = next_identifier
+            if next_identifier == original_identifier2_values[row_token]:
+                original_identifier2_values.pop(row_token, None)
+                if not _row_has_tracked_edit(row_token):
+                    edited_rows.discard(row_token)
+            else:
+                edited_rows.add(row_token)
+    elif edit.action == "set_species":
+        next_species = str(edit.species or "").strip()
+        if not next_species:
+            raise ValueError("Species is required")
+        if "Species" not in work.columns:
+            raise ValueError("Dataset has no Species column")
+        work["Species"] = work["Species"].astype(object)
+        for target in edit.targets:
+            row_token = str(target.row_label)
+            row_label = _resolve_target_row(target.row_label)
+            current_species = str(work.at[row_label, "Species"] or "").strip()
+            if row_token not in original_species_values:
+                original_species_values[row_token] = current_species
+            work.at[row_label, "Species"] = next_species
+            if next_species == original_species_values[row_token]:
+                original_species_values.pop(row_token, None)
+                if not _row_has_tracked_edit(row_token):
+                    edited_rows.discard(row_token)
+            else:
+                edited_rows.add(row_token)
     elif edit.action == "reset_to_original":
+        reset_metadata_rows: set[str] = set()
         for target in edit.targets:
             row_label = _resolve_target_row(target.row_label)
             raw_col, cal_col, _ = _get_isotope_columns(target.isotope_key)
@@ -614,7 +722,6 @@ def apply_edit_action(
                 original_map.pop(key, None)
                 original_missing_tokens.discard(key)
                 restored_tokens.discard(key)
-                edited_rows.discard(str(target.row_label))
             if std_col and std_col in work.columns and (key in original_std_map or key in original_missing_std_tokens):
                 if key in original_std_map:
                     work.at[row_label, std_col] = float(original_std_map[key])
@@ -622,6 +729,28 @@ def apply_edit_action(
                     work.at[row_label, std_col] = np.nan
                 original_std_map.pop(key, None)
                 original_missing_std_tokens.discard(key)
+            reset_metadata_rows.add(str(target.row_label))
+        if "Identifier 1" in work.columns:
+            for row_token in reset_metadata_rows:
+                original_identifier = original_identifier1_values.pop(row_token, None)
+                if original_identifier is not None:
+                    row_label = _resolve_target_row(row_token)
+                    work.at[row_label, "Identifier 1"] = original_identifier
+        if "Identifier 2" in work.columns:
+            for row_token in reset_metadata_rows:
+                original_identifier = original_identifier2_values.pop(row_token, None)
+                if original_identifier is not None:
+                    row_label = _resolve_target_row(row_token)
+                    work.at[row_label, "Identifier 2"] = original_identifier
+        if "Species" in work.columns:
+            for row_token in reset_metadata_rows:
+                original_species = original_species_values.pop(row_token, None)
+                if original_species is not None:
+                    row_label = _resolve_target_row(row_token)
+                    work.at[row_label, "Species"] = original_species
+        for row_token in reset_metadata_rows:
+            if not _row_has_tracked_edit(row_token):
+                edited_rows.discard(row_token)
     elif edit.action in {"set_value", "offset"}:
         delta = edit.offset if edit.action == "offset" else edit.value
         if delta is None:
@@ -832,6 +961,9 @@ def apply_edit_action(
     state["original_missing_delta_tokens"] = sorted(original_missing_tokens)
     state["original_std_values"] = original_std_map
     state["original_missing_std_tokens"] = sorted(original_missing_std_tokens)
+    state["original_identifier1_values"] = original_identifier1_values
+    state["original_identifier2_values"] = original_identifier2_values
+    state["original_species_values"] = original_species_values
     state["edited_rows"] = sorted(edited_rows)
     state["manual_outlier_overrides"] = manual_outlier_overrides
     state["restored_delta_tokens"] = sorted(restored_tokens)

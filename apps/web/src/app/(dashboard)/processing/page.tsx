@@ -1,11 +1,22 @@
 "use client";
 
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, Download, SearchCheck, X } from "lucide-react";
-import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Check, ChevronRight, Copy, Download, RotateCcw, SearchCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  memo,
+  startTransition,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
+import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
 import {
   SATURATION_COLOR_AXIS_OPTIONS,
   SaturationAxisHelpTooltip,
@@ -26,6 +37,7 @@ import type {
   CalibrationPrecisionSummary,
   CalibrationWorkspace,
   ClientOutputDuplicateCheckResponse,
+  ClientOutputPreviewResponse,
   CycleDiagnosticsPayload,
   EditAction,
   ExportRequest,
@@ -44,6 +56,7 @@ type SelectedTarget = {
   isotopeKey: "d13C" | "d18O" | "cross";
   identifier1: string;
   identifier2: string;
+  species: string;
   currentValue?: number | null;
   currentD13?: number | null;
   currentD18?: number | null;
@@ -52,10 +65,32 @@ type SelectedTarget = {
 
 type IsotopeKey = "d13C" | "d18O";
 const ISOTOPE_KEYS: IsotopeKey[] = ["d13C", "d18O"];
+type ExportEmailLanguage = "pt" | "en" | "es";
+type ExportIdentifierCount = {
+  identifier: string;
+  analyses: number;
+  outliersExcluded: number;
+};
+type ExportStandardPrecision = {
+  standard: string;
+  d13: number | null;
+  d18: number | null;
+  nD13: number;
+  nD18: number;
+  total: number;
+};
+type InsufficientSignalSample = {
+  identifier1: string;
+  identifier2: string;
+  species: string;
+};
 type IsotopeNumericMap = Record<IsotopeKey, number>;
 type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
 type LinearityOffsetDraftState = Record<LinearityOffsetField, string>;
 type SelectionDraftValueMap = Record<string, number>;
+type SelectionDraftIdentifier1Map = Record<string, string>;
+type SelectionDraftIdentifier2Map = Record<string, string>;
+type SelectionDraftSpeciesMap = Record<string, string>;
 type LinearityCycleIntensityAggregation = "run_median" | "first_valid_cycle" | "last_valid_cycle";
 const SATURATION_METHOD_OPTIONS: Array<{ value: SaturationCorrectionMethod; label: string }> = [
   { value: "cycle_mean", label: "Cycle mean" },
@@ -74,6 +109,25 @@ const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const RESTORE_STDEV_DEFAULT_CAP = 0.04;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const SELECTION_EDITOR_CHART_DEFER_MS = 350;
+const CLIENT_NAME_COMMIT_DELAY_MS = 300;
+const EXPORT_EMAIL_LANGUAGE_OPTIONS: Array<{ value: ExportEmailLanguage; label: string }> = [
+  { value: "pt", label: "Português" },
+  { value: "en", label: "English" },
+  { value: "es", label: "Español" },
+];
+const CLIENT_OUTPUT_SOURCE_OPTIONS = [
+  { value: "identifier1", label: "Identifier 1" },
+  { value: "identifier2", label: "Identifier 2" },
+  { value: "comment", label: "Comment" },
+  { value: "species", label: "Species" },
+  { value: "raw_identifier1", label: "Raw Identifier 1" },
+  { value: "raw_label", label: "Raw Label" },
+  { value: "raw_comment", label: "Raw Comment" },
+] as const;
+
+function isRawClientOutputSource(source: string | null | undefined): boolean {
+  return source === "raw_identifier1" || source === "raw_label" || source === "raw_comment";
+}
 const LINEARITY_INTENSITY_SAMP44 = "1  Cycle Int  Samp  44";
 const LINEARITY_INTENSITY_DIFF44 = "1  Cycle Int  Diff Samp-Ref  44";
 const LINEARITY_INTENSITY_MISMATCH44 = "1  Cycle Int  Pressure-Weighted Mismatch Samp-Ref  44";
@@ -162,6 +216,8 @@ type ProcessingPreviewMasks = {
   signal: Set<string>;
   leak: Set<string>;
   manual: Set<string>;
+  manualD13: Set<string>;
+  manualD18: Set<string>;
   partial: Set<string>;
   partialExcluded: Set<string>;
   full: Set<string>;
@@ -190,6 +246,412 @@ const DEFAULT_PLOTLY_COLORWAY = [
 const STANDARD_MEASURED_TRACE_PREFIX = "Standard measured ";
 const selectionSourceHighlightCache = new WeakMap<Record<string, unknown>, Map<string, Record<string, unknown> | undefined>>();
 
+function formatLocalizedList(values: string[], language: ExportEmailLanguage): string {
+  if (!values.length) {
+    return "";
+  }
+  return new Intl.ListFormat(language === "pt" ? "pt-BR" : language, {
+    style: "long",
+    type: "conjunction",
+  }).format(values);
+}
+
+function normalizeExportSummaryLabel(value: string | null | undefined, fallback = "Unassigned"): string {
+  const label = String(value ?? "").trim();
+  return !label || ["NAN", "NONE", "NULL", "UNDEFINED"].includes(label.toLocaleUpperCase()) ? fallback : label;
+}
+
+function formatEmailPrecision(value: number, language: ExportEmailLanguage): string {
+  return new Intl.NumberFormat(language === "pt" ? "pt-BR" : language, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 3,
+  }).format(value);
+}
+
+function buildExportEmailSubject({
+  language,
+  clientName,
+  identifiers,
+}: {
+  language: ExportEmailLanguage;
+  clientName: string;
+  identifiers: string[];
+}): string {
+  const series = identifiers.filter(Boolean).join(", ") || (language === "en" ? "selected" : language === "es" ? "seleccionadas" : "selecionadas");
+  const date = new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" })
+    .format(new Date())
+    .replaceAll("/", "");
+  const base = language === "pt"
+    ? `Resultados das séries ${series} de isótopos estáveis de C e O - P2L`
+    : language === "es"
+      ? `Resultados de las series ${series} de isótopos estables de C y O - P2L`
+      : `Results for ${series} series - stable C & O isotopes - P2L`;
+  const client = clientName.trim();
+  return `${base}${client ? ` - ${client}` : ""} - ${date}`;
+}
+
+function formatAcademicSpeciesName(value: unknown): string {
+  const tokens = String(value ?? "").trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
+  if (!tokens.length) {
+    return "";
+  }
+  return [
+    `${tokens[0].slice(0, 1).toLocaleUpperCase()}${tokens[0].slice(1).toLocaleLowerCase()}`,
+    ...tokens.slice(1).map((token) => (/^[\p{L}]+$/u.test(token) ? token.toLocaleLowerCase() : token)),
+  ].join(" ");
+}
+
+function clientOutputDuplicateIndexes(rows: ClientOutputPreviewResponse["rows"]): Set<number> {
+  const keys = rows.map((row) => {
+    const identifier = String(row.Identifier ?? "").trim();
+    const identifier2 = String(row.__identifier_2_key ?? row["Sample #"] ?? "").trim();
+    const species = String(row.Species ?? "").trim();
+    return identifier2 ? `${identifier}\u0000${identifier2}\u0000${species}` : "";
+  });
+  const counts = new Map<string, number>();
+  for (const key of keys) {
+    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return new Set(keys.flatMap((key, index) => (key && (counts.get(key) ?? 0) > 1 ? [index] : [])));
+}
+
+function formatStandardSampleSize(standard: ExportStandardPrecision, language: ExportEmailLanguage): string {
+  if (standard.nD13 === standard.nD18) {
+    return `n = ${standard.nD13}`;
+  }
+  if (language === "pt") {
+    return `n = ${standard.nD13} para δ¹³C e ${standard.nD18} para δ¹⁸O`;
+  }
+  if (language === "es") {
+    return `n = ${standard.nD13} para δ¹³C y ${standard.nD18} para δ¹⁸O`;
+  }
+  return `n = ${standard.nD13} for δ¹³C and ${standard.nD18} for δ¹⁸O`;
+}
+
+function buildExportEmailBody({
+  language,
+  clientName,
+  identifiers,
+  species,
+  standards,
+  insufficientSignalSamples,
+  includeInsufficientSignalNote,
+  includeConservativeOutlierNote,
+}: {
+  language: ExportEmailLanguage;
+  clientName: string;
+  identifiers: string[];
+  species: string[];
+  standards: ExportStandardPrecision[];
+  insufficientSignalSamples: InsufficientSignalSample[];
+  includeInsufficientSignalNote: boolean;
+  includeConservativeOutlierNote: boolean;
+}): string {
+  const client = clientName.trim();
+  const identifierList = formatLocalizedList(identifiers, language);
+  const speciesList = formatLocalizedList(species, language);
+  const completeStandards = standards.filter((standard) => standard.d13 != null && standard.d18 != null);
+
+  const scope = (() => {
+    if (language === "pt") {
+      const series = identifiers.length === 1 ? `da série ${identifierList}` : identifiers.length > 1 ? `das séries ${identifierList}` : "do conjunto de amostras";
+      return speciesList ? `${series} de ${speciesList}` : series;
+    }
+    if (language === "es") {
+      const series = identifiers.length === 1 ? `de la serie ${identifierList}` : identifiers.length > 1 ? `de las series ${identifierList}` : "del conjunto de muestras";
+      return speciesList ? `${series} de ${speciesList}` : series;
+    }
+    const series = identifiers.length === 1 ? `for the ${identifierList} series` : identifiers.length > 1 ? `for series ${identifierList}` : "for the sample set";
+    return speciesList ? `${series} of ${speciesList}` : series;
+  })();
+
+  const precision = (() => {
+    if (!completeStandards.length) {
+      if (language === "pt") return "Os dados de precisão do material de referência não estão disponíveis neste conjunto.";
+      if (language === "es") return "Los datos de precisión del material de referencia no están disponibles en este conjunto.";
+      return "Reference-material precision data are not available for this dataset.";
+    }
+    const entries = completeStandards.map((standard) => {
+      const values = `${formatEmailPrecision(standard.d13!, language)}‰ para δ¹³C ${language === "en" ? "and" : language === "es" ? "y" : "e"} ${formatEmailPrecision(standard.d18!, language)}‰ para δ¹⁸O`;
+      if (language === "en") {
+        return `${standard.standard}: ${formatEmailPrecision(standard.d13!, language)}‰ for δ¹³C and ${formatEmailPrecision(standard.d18!, language)}‰ for δ¹⁸O (${formatStandardSampleSize(standard, language)})`;
+      }
+      return `${standard.standard}: ${values} (${formatStandardSampleSize(standard, language)})`;
+    });
+    const onlyStandard = completeStandards.length === 1 ? completeStandards[0] : null;
+    if (onlyStandard?.d13 != null && onlyStandard.d18 != null) {
+      const n = formatStandardSampleSize(onlyStandard, language);
+      if (language === "pt") {
+        return `As análises foram de boa qualidade e precisão, com desvio padrão do material de referência ${onlyStandard.standard} de ${formatEmailPrecision(onlyStandard.d13, language)}‰ para δ¹³C e ${formatEmailPrecision(onlyStandard.d18, language)}‰ para δ¹⁸O (${n}) ao longo do período de medição.`;
+      }
+      if (language === "es") {
+        return `Los análisis fueron de buena calidad y precisión, con una desviación estándar del material de referencia ${onlyStandard.standard} de ${formatEmailPrecision(onlyStandard.d13, language)}‰ para δ¹³C y ${formatEmailPrecision(onlyStandard.d18, language)}‰ para δ¹⁸O (${n}) durante el período de medición.`;
+      }
+      return `The analyses are of good quality and precision, with the standard deviation of the ${onlyStandard.standard} reference material being ${formatEmailPrecision(onlyStandard.d13, language)}‰ for δ¹³C and ${formatEmailPrecision(onlyStandard.d18, language)}‰ for δ¹⁸O (${n}) over the measurement period.`;
+    }
+    if (language === "pt") {
+      return `As análises foram de boa qualidade e precisão, com desvio padrão do material de referência de ${entries.join("; ")} ao longo do período de medição.`;
+    }
+    if (language === "es") {
+      return `Los análisis fueron de buena calidad y precisión, con una desviación estándar del material de referencia de ${entries.join("; ")} durante el período de medición.`;
+    }
+    return `The analyses are of good quality and precision, with reference-material standard deviations of ${entries.join("; ")} over the measurement period.`;
+  })();
+
+  const considerations: string[] = [];
+  if (includeInsufficientSignalNote && insufficientSignalSamples.length) {
+    const sampleList = formatLocalizedList(
+      insufficientSignalSamples.map((sample) => {
+        if (language === "pt") {
+          return `${sample.identifier2} (Identificador 1: ${sample.identifier1}; ${sample.species})`;
+        }
+        if (language === "es") {
+          return `${sample.identifier2} (Identificador 1: ${sample.identifier1}; ${sample.species})`;
+        }
+        return `${sample.identifier2} (Identifier 1: ${sample.identifier1}; ${sample.species})`;
+      }),
+      language,
+    );
+    if (language === "pt") {
+      considerations.push(`As seguintes amostras não produziram intensidade de sinal suficiente para gerar resultados confiáveis: ${sampleList}.`);
+    } else if (language === "es") {
+      considerations.push(`Las siguientes muestras no produjeron una intensidad de señal suficiente para generar resultados confiables: ${sampleList}.`);
+    } else {
+      considerations.push(`The following samples did not produce sufficient signal intensity to generate reliable results: ${sampleList}.`);
+    }
+  }
+  if (includeConservativeOutlierNote) {
+    if (language === "pt") {
+      considerations.push("A remoção de outliers foi feita de forma conservadora.");
+    } else if (language === "es") {
+      considerations.push("La eliminación de valores atípicos se realizó de forma conservadora.");
+    } else {
+      considerations.push("Outliers removal was done conservatively.");
+    }
+  }
+  const considerationParagraph = considerations.length ? `\n\n${considerations.join(" ")}` : "";
+
+  if (language === "pt") {
+    return `Bom dia${client ? ` ${client}` : ""},\n\nSeguem em anexo os resultados das análises de isótopos estáveis de C e O ${scope}. ${precision}${considerationParagraph}\n\nQualquer dúvida, estou à disposição.\n\nAbraço,\n\nStefano`;
+  }
+  if (language === "es") {
+    return `Buenos días${client ? ` ${client}` : ""},\n\nAdjunto los resultados de los análisis de isótopos estables de C y O ${scope}. ${precision}${considerationParagraph}\n\nSi tienes alguna duda, quedo a tu disposición.\n\nUn abrazo,\n\nStefano`;
+  }
+  return `Dear${client ? ` ${client}` : ""},\n\nPlease find attached the results of the stable C and O isotope analyses ${scope}. ${precision}${considerationParagraph}\n\nI remain available if you have any questions.\n\nBest regards,\n\nStefano`;
+}
+
+function splitTextByItalicTerms(text: string, italicTerms: string[]): { italic: boolean; text: string }[] {
+  const terms = Array.from(new Set(italicTerms.map((term) => term.trim()).filter(Boolean)))
+    .sort((left, right) => right.length - left.length);
+  if (!terms.length) {
+    return [{ italic: false, text }];
+  }
+  const pattern = new RegExp(`(${terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "g");
+  const termSet = new Set(terms);
+  return text.split(pattern).filter(Boolean).map((part) => ({ italic: termSet.has(part), text: part }));
+}
+
+function renderEmailText(text: string, italicTerms: string[]): ReactNode {
+  return splitTextByItalicTerms(text, italicTerms).map((part, index) =>
+    part.italic ? <em key={`${index}-${part.text}`}>{part.text}</em> : part.text,
+  );
+}
+
+function escapeEmailHtml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function buildEmailClipboardHtml(text: string, italicTerms: string[]): string {
+  return splitTextByItalicTerms(text, italicTerms)
+    .map((part) => part.italic ? `<em>${escapeEmailHtml(part.text)}</em>` : escapeEmailHtml(part.text))
+    .join("")
+    .replaceAll("\n", "<br>");
+}
+
+async function copyTextToClipboard(text: string, html?: string): Promise<void> {
+  if (html && navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/plain": new Blob([text], { type: "text/plain" }),
+          "text/html": new Blob([html], { type: "text/html" }),
+        }),
+      ]);
+      return;
+    } catch {
+      // Fall back to plain text for browsers that reject rich clipboard writes.
+    }
+  }
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+function formatClientOutputPreviewValue(value: unknown, useTwoDecimals: boolean): string {
+  if (value == null || value === "") {
+    return "—";
+  }
+  if (useTwoDecimals && typeof value === "number" && Number.isFinite(value)) {
+    return value.toFixed(2);
+  }
+  return String(value);
+}
+
+function buildClientOutputFilename(emailSubject: string): string {
+  const sanitizedSubject = emailSubject.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
+  return `${sanitizedSubject || "output"}.xlsx`;
+}
+
+function compactIdentifierSeries(identifier: string, speciesValues: string[]): string {
+  const value = identifier.trim();
+  if (!value) {
+    return "";
+  }
+  const replicateMatch = value.match(/^(.+?)\s*#\s*\d+(?:\s*-\s*.*)?$/);
+  if (replicateMatch?.[1]?.trim()) {
+    return replicateMatch[1].trim();
+  }
+  const lowerValue = value.toLocaleLowerCase();
+  for (const species of [...speciesValues].sort((a, b) => b.length - a.length)) {
+    const normalizedSpecies = species.trim();
+    if (!normalizedSpecies || !lowerValue.endsWith(normalizedSpecies.toLocaleLowerCase())) {
+      continue;
+    }
+    const prefix = value.slice(0, value.length - normalizedSpecies.length);
+    const separatorMatch = prefix.match(/^(.*?)\s*-\s*$/);
+    if (separatorMatch?.[1]?.trim()) {
+      return separatorMatch[1].trim();
+    }
+  }
+  return value;
+}
+
+function compactIdentifierSeriesList(identifiers: string[], speciesValues: string[]): string[] {
+  const compactIdentifiers = Array.from(
+    new Set(identifiers.map((identifier) => compactIdentifierSeries(identifier, speciesValues)).filter(Boolean)),
+  );
+  return compactIdentifiers.every((identifier) => /^\d+$/.test(identifier))
+    ? compactIdentifiers.sort((left, right) => Number(right) - Number(left))
+    : compactIdentifiers;
+}
+
+type ClientOutputCellProps = {
+  column: string;
+  numeric: boolean;
+  normalizeSpecies: boolean;
+  rowIndex: number;
+  value: unknown;
+  onCommit: (rowIndex: number, column: string, value: string) => void;
+};
+
+const ClientOutputCell = memo(function ClientOutputCell({
+  column,
+  numeric,
+  normalizeSpecies,
+  rowIndex,
+  value,
+  onCommit,
+}: ClientOutputCellProps) {
+  const committedValue = formatClientOutputPreviewValue(value, numeric);
+  const [draftValue, setDraftValue] = useState(committedValue);
+
+  useEffect(() => {
+    setDraftValue(committedValue);
+  }, [committedValue]);
+
+  return (
+    <input
+      type="text"
+      inputMode={numeric ? "decimal" : "text"}
+      aria-label={`Row ${rowIndex + 1}, ${column}`}
+      value={draftValue}
+      onChange={(event) => setDraftValue(event.target.value)}
+      onBlur={() => {
+        const nextValue = normalizeSpecies ? formatAcademicSpeciesName(draftValue) : draftValue;
+        if (nextValue !== draftValue) {
+          setDraftValue(nextValue);
+        }
+        if (nextValue !== committedValue) {
+          onCommit(rowIndex, column, nextValue);
+        }
+      }}
+      className={cn(
+        "min-w-24 rounded border border-transparent bg-transparent px-1.5 py-1 outline-none transition focus:border-cyan-500 focus:bg-white focus:ring-2 focus:ring-cyan-100",
+        numeric && "text-right font-mono tabular-nums text-slate-800",
+        column === "Species" && "italic",
+      )}
+    />
+  );
+});
+
+type ClientNameInputProps = {
+  value: string;
+  onCommit: (value: string) => void;
+};
+
+const ClientNameInput = memo(function ClientNameInput({ value, onCommit }: ClientNameInputProps) {
+  const [draftValue, setDraftValue] = useState(value);
+  const commitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setDraftValue(value);
+  }, [value]);
+
+  useEffect(
+    () => () => {
+      if (commitTimerRef.current) {
+        clearTimeout(commitTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  const clearCommitTimer = () => {
+    if (commitTimerRef.current) {
+      clearTimeout(commitTimerRef.current);
+      commitTimerRef.current = null;
+    }
+  };
+
+  return (
+    <input
+      type="text"
+      value={draftValue}
+      onChange={(event) => {
+        const nextValue = event.target.value;
+        setDraftValue(nextValue);
+        clearCommitTimer();
+        commitTimerRef.current = setTimeout(() => {
+          startTransition(() => onCommit(nextValue));
+          commitTimerRef.current = null;
+        }, CLIENT_NAME_COMMIT_DELAY_MS);
+      }}
+      onBlur={() => {
+        clearCommitTimer();
+        if (draftValue !== value) {
+          onCommit(draftValue);
+        }
+      }}
+      className="form-control"
+      placeholder="Name shown in the greeting"
+    />
+  );
+});
+
 function selectionDraftValueKey(rowLabel: string, isotopeKey: IsotopeKey): string {
   return `${isotopeKey}|${String(rowLabel).trim()}`;
 }
@@ -204,6 +666,40 @@ function selectionDraftValueFor(
   }
   const value = values[selectionDraftValueKey(rowLabel, isotopeKey)];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function mappedIdentifier1Label(source: string, nameMap: Record<string, string> | null | undefined): string {
+  return normalizeSpeciesLabel(nameMap?.[source] ?? source);
+}
+
+function mappedSpeciesLabel(source: string, nameMap: Record<string, string> | null | undefined): string {
+  return normalizeSpeciesLabel(nameMap?.[source] ?? source);
+}
+
+function resolveIdentifier1Source(
+  identifier1: string | null | undefined,
+  sources: string[],
+  nameMap: Record<string, string> | null | undefined,
+): string {
+  const normalizedIdentifier = normalizeSpeciesLabel(String(identifier1 ?? ""));
+  const exactSource = sources.find((source) => normalizeSpeciesLabel(source) === normalizedIdentifier);
+  if (exactSource) {
+    return exactSource;
+  }
+  return sources.find((source) => mappedIdentifier1Label(source, nameMap) === normalizedIdentifier) ?? normalizedIdentifier;
+}
+
+function resolveSpeciesSource(
+  species: string | null | undefined,
+  sources: string[],
+  nameMap: Record<string, string> | null | undefined,
+): string {
+  const normalizedSpecies = normalizeSpeciesLabel(String(species ?? ""));
+  const exactSource = sources.find((source) => normalizeSpeciesLabel(source) === normalizedSpecies);
+  if (exactSource) {
+    return exactSource;
+  }
+  return sources.find((source) => mappedSpeciesLabel(source, nameMap) === normalizedSpecies) ?? normalizedSpecies;
 }
 
 function getLinearityIntensityOptionLabel(value: string): string {
@@ -604,6 +1100,49 @@ function buildProcessingPreviewRowLookup(previewData: ProcessingLinearityPreview
     }
   }
   return rows;
+}
+
+type DuplicateSampleState = {
+  rowLabels: Set<string>;
+  groupSizeByRow: Map<string, number>;
+};
+
+function buildDuplicateSampleState(
+  previewData: ProcessingLinearityPreviewData | undefined,
+  draftIdentifier1: SelectionDraftIdentifier1Map,
+  draftIdentifier2: SelectionDraftIdentifier2Map,
+  draftSpecies: SelectionDraftSpeciesMap,
+  identifier1NameMap: Record<string, string> | null | undefined,
+  speciesNameMap: Record<string, string> | null | undefined,
+): DuplicateSampleState {
+  const rowsByIdentity = new Map<string, string[]>();
+  for (const row of previewData?.rows ?? []) {
+    const rowLabel = String(row.row_label ?? "").trim();
+    const identifier1Source = String(draftIdentifier1[rowLabel] ?? row.identifier1 ?? "").trim();
+    const identifier1 = String(identifier1NameMap?.[identifier1Source] ?? identifier1Source).trim();
+    const identifier2 = String(draftIdentifier2[rowLabel] ?? row.identifier2 ?? "").trim();
+    const speciesSource = String(draftSpecies[rowLabel] ?? row.species ?? "").trim();
+    const species = String(speciesNameMap?.[speciesSource] ?? speciesSource).trim();
+    if (!rowLabel || !identifier2) {
+      continue;
+    }
+    const identity = `${identifier1}\u0000${identifier2}\u0000${species}`;
+    const group = rowsByIdentity.get(identity) ?? [];
+    group.push(rowLabel);
+    rowsByIdentity.set(identity, group);
+  }
+  const rowLabels = new Set<string>();
+  const groupSizeByRow = new Map<string, number>();
+  for (const group of rowsByIdentity.values()) {
+    if (group.length < 2) {
+      continue;
+    }
+    for (const rowLabel of group) {
+      rowLabels.add(rowLabel);
+      groupSizeByRow.set(rowLabel, group.length);
+    }
+  }
+  return { rowLabels, groupSizeByRow };
 }
 
 function normalizeColumnKey(value: string): string {
@@ -1076,8 +1615,9 @@ function applySelectionDraftPreviewToFigure(
   figure: Record<string, unknown> | undefined,
   draftValues: SelectionDraftValueMap,
   processingConfig: ProcessingConfig | null | undefined,
+  draftRowLabels: string[],
 ): Record<string, unknown> | undefined {
-  if (!figure || !processingConfig || !Object.keys(draftValues).length) {
+  if (!figure || !processingConfig || (!Object.keys(draftValues).length && !draftRowLabels.length)) {
     return figure;
   }
   const cloned = cloneFigure(figure);
@@ -1145,7 +1685,180 @@ function applySelectionDraftPreviewToFigure(
     }
     return nextTrace;
   });
+  const draftRows = new Set(draftRowLabels.map((rowLabel) => String(rowLabel).trim()).filter(Boolean));
+  const alreadyHighlightedRows = new Set<string>();
+  for (const trace of nextData) {
+    if (String(trace.name ?? "").trim() !== "Edited Samples") {
+      continue;
+    }
+    const customdata = coerceVector(trace.customdata) ?? [];
+    for (const item of customdata) {
+      const rowLabel = customDataRowLabel(item);
+      if (rowLabel) {
+        alreadyHighlightedRows.add(rowLabel);
+      }
+    }
+  }
+
+  type DraftHighlightPoint = {
+    rowLabel: string;
+    isotope: "d13C" | "d18O" | "cross";
+    x: unknown;
+    y: unknown;
+    z: unknown;
+    customdata: unknown;
+    traceType: string;
+  };
+  const highlightPoints = new Map<string, DraftHighlightPoint>();
+  for (const trace of nextData) {
+    const customdata = coerceVector(trace.customdata);
+    if (!customdata?.length || String(trace.name ?? "").trim() === "Edited Samples") {
+      continue;
+    }
+    const x = coerceVector(trace.x);
+    const y = coerceVector(trace.y);
+    const z = coerceVector(trace.z);
+    for (let index = 0; index < customdata.length; index += 1) {
+      const rowLabel = customDataRowLabel(customdata[index]);
+      const isotope = customDataIsotope(customdata[index]);
+      if (!rowLabel || !draftRows.has(rowLabel) || alreadyHighlightedRows.has(rowLabel) || !isotope) {
+        continue;
+      }
+      const pointKey = `${rowLabel}|${isotope}`;
+      if (!highlightPoints.has(pointKey)) {
+        highlightPoints.set(pointKey, {
+          rowLabel,
+          isotope,
+          x: x?.[index],
+          y: y?.[index],
+          z: z?.[index],
+          customdata: customdata[index],
+          traceType: String(trace.type ?? "scatter"),
+        });
+      }
+    }
+  }
+
+  const draftPoints = Array.from(highlightPoints.values());
+  const hasExistingEditedTrace = alreadyHighlightedRows.size > 0;
+  const points3d = draftPoints.filter((point) => point.traceType === "scatter3d" && point.z != null);
+  const points2d = draftPoints.filter((point) => point.traceType !== "scatter3d" && point.y != null);
+  if (points2d.length) {
+    nextData.push({
+      type: "scatter",
+      mode: "markers",
+      name: "Edited Samples",
+      showlegend: !hasExistingEditedTrace,
+      x: points2d.map((point) => point.x),
+      y: points2d.map((point) => point.y),
+      customdata: points2d.map((point) => point.customdata),
+      marker: { color: "#ff00ff", symbol: "circle", size: 13, opacity: 1, line: { color: "#ff00ff", width: 1.5 } },
+    });
+    changed = true;
+  }
+  if (points3d.length) {
+    nextData.push({
+      type: "scatter3d",
+      mode: "markers",
+      name: "Edited Samples",
+      showlegend: !hasExistingEditedTrace && !points2d.length,
+      x: points3d.map((point) => point.x),
+      y: points3d.map((point) => point.y),
+      z: points3d.map((point) => point.z),
+      customdata: points3d.map((point) => point.customdata),
+      marker: { color: "#ff00ff", symbol: "circle", size: 9, opacity: 1, line: { color: "#ff00ff", width: 2 } },
+    });
+    changed = true;
+  }
   return changed ? { ...cloned, data: nextData } : figure;
+}
+
+function applyDuplicateHighlightsToFigure(
+  figure: Record<string, unknown> | undefined,
+  duplicateRowLabels: Set<string>,
+): Record<string, unknown> | undefined {
+  if (!figure || !duplicateRowLabels.size) {
+    return figure;
+  }
+  const cloned = cloneFigure(figure);
+  if (!Array.isArray(cloned.data)) {
+    return figure;
+  }
+  type DuplicateHighlightPoint = {
+    rowLabel: string;
+    isotope: "d13C" | "d18O" | "cross";
+    x: unknown;
+    y: unknown;
+    z: unknown;
+    customdata: unknown;
+    traceType: string;
+  };
+  const points = new Map<string, DuplicateHighlightPoint>();
+  for (const trace of cloned.data) {
+    const traceName = String(trace.name ?? "").trim();
+    const customdata = coerceVector(trace.customdata);
+    if (!customdata?.length || traceName === "Duplicate Samples" || traceName === "Edited Samples") {
+      continue;
+    }
+    const x = coerceVector(trace.x);
+    const y = coerceVector(trace.y);
+    const z = coerceVector(trace.z);
+    for (let index = 0; index < customdata.length; index += 1) {
+      const rowLabel = customDataRowLabel(customdata[index]);
+      const isotope = customDataIsotope(customdata[index]);
+      if (!rowLabel || !duplicateRowLabels.has(rowLabel) || !isotope) {
+        continue;
+      }
+      const key = `${rowLabel}|${isotope}`;
+      if (!points.has(key)) {
+        points.set(key, {
+          rowLabel,
+          isotope,
+          x: x?.[index],
+          y: y?.[index],
+          z: z?.[index],
+          customdata: customdata[index],
+          traceType: String(trace.type ?? "scatter"),
+        });
+      }
+    }
+  }
+  const duplicatePoints = Array.from(points.values());
+  const points2d = duplicatePoints.filter((point) => point.traceType !== "scatter3d" && point.y != null);
+  const points3d = duplicatePoints.filter((point) => point.traceType === "scatter3d" && point.z != null);
+  if (!points2d.length && !points3d.length) {
+    return figure;
+  }
+  const nextData = [...cloned.data];
+  const hovertemplate = "<b>Duplicate sample</b><br>Click to edit identifiers or species<extra></extra>";
+  if (points2d.length) {
+    nextData.push({
+      type: "scatter",
+      mode: "markers",
+      name: "Duplicate Samples",
+      showlegend: true,
+      x: points2d.map((point) => point.x),
+      y: points2d.map((point) => point.y),
+      customdata: points2d.map((point) => point.customdata),
+      hovertemplate,
+      marker: { color: "#c2410c", symbol: "diamond-open", size: 15, opacity: 1, line: { color: "#c2410c", width: 3 } },
+    });
+  }
+  if (points3d.length) {
+    nextData.push({
+      type: "scatter3d",
+      mode: "markers",
+      name: "Duplicate Samples",
+      showlegend: !points2d.length,
+      x: points3d.map((point) => point.x),
+      y: points3d.map((point) => point.y),
+      z: points3d.map((point) => point.z),
+      customdata: points3d.map((point) => point.customdata),
+      hovertemplate,
+      marker: { color: "#c2410c", symbol: "diamond-open", size: 10, opacity: 1, line: { color: "#c2410c", width: 3 } },
+    });
+  }
+  return { ...cloned, data: nextData };
 }
 
 function sortedFinite(values: Array<number | null>): number[] {
@@ -1224,15 +1937,38 @@ function rowInRange(value: number | null, range: [number, number]): boolean {
   return value >= low && value <= high;
 }
 
-function applyOverrideFalse(rowLabel: string, value: boolean, overrides: Record<string, boolean>): boolean {
-  return overrides[rowLabel] === false ? false : value;
+function manualOutlierOverride(
+  rowLabel: string,
+  overrides: Record<string, boolean>,
+  isotope?: IsotopeKey,
+): boolean | undefined {
+  const isotopeToken = isotope ? `${isotope}|${rowLabel}` : "";
+  if (isotopeToken && Object.prototype.hasOwnProperty.call(overrides, isotopeToken)) {
+    return overrides[isotopeToken];
+  }
+  return overrides[rowLabel];
 }
 
-function applyOverrideBoth(rowLabel: string, value: boolean, overrides: Record<string, boolean>): boolean {
-  if (overrides[rowLabel] === true) {
+function applyOverrideFalse(
+  rowLabel: string,
+  value: boolean,
+  overrides: Record<string, boolean>,
+  isotope?: IsotopeKey,
+): boolean {
+  return manualOutlierOverride(rowLabel, overrides, isotope) === false ? false : value;
+}
+
+function applyOverrideBoth(
+  rowLabel: string,
+  value: boolean,
+  overrides: Record<string, boolean>,
+  isotope?: IsotopeKey,
+): boolean {
+  const override = manualOutlierOverride(rowLabel, overrides, isotope);
+  if (override === true) {
     return true;
   }
-  if (overrides[rowLabel] === false) {
+  if (override === false) {
     return false;
   }
   return value;
@@ -1282,6 +2018,8 @@ function buildProcessingPreviewMasks(
     signal: new Set(),
     leak: new Set(),
     manual: new Set(),
+    manualD13: new Set(),
+    manualD18: new Set(),
     partial: new Set(),
     partialExcluded: new Set(),
     full: new Set(),
@@ -1295,8 +2033,8 @@ function buildProcessingPreviewMasks(
     }
     const rowLabel = row.rowLabel;
     const isEdited = editedRows.has(rowLabel);
-    const d13Range = !isEdited && applyOverrideFalse(rowLabel, row.d13 != null && !rowInRange(row.d13, config.d13c_range), overrides);
-    const d18Range = !isEdited && applyOverrideFalse(rowLabel, row.d18 != null && !rowInRange(row.d18, config.d18o_range), overrides);
+    const d13Range = !isEdited && applyOverrideFalse(rowLabel, row.d13 != null && !rowInRange(row.d13, config.d13c_range), overrides, "d13C");
+    const d18Range = !isEdited && applyOverrideFalse(rowLabel, row.d18 != null && !rowInRange(row.d18, config.d18o_range), overrides, "d18O");
     const signalRange = !isEdited && applyOverrideFalse(rowLabel, row.signal != null && !rowInRange(row.signal, config.signal_range), overrides);
     const leakRange = !isEdited && applyOverrideFalse(rowLabel, row.leakRate != null && !rowInRange(row.leakRate, config.leak_range), overrides);
     const failed = !isEdited && applyOverrideFalse(rowLabel, row.status === "Failed Sample", overrides);
@@ -1311,7 +2049,9 @@ function buildProcessingPreviewMasks(
     if (full) masks.full.add(rowLabel);
     if (partialStatus) masks.partial.add(rowLabel);
     if (partialExcluded) masks.partialExcluded.add(rowLabel);
-    if (overrides[rowLabel] === true) masks.manual.add(rowLabel);
+    if (manualOutlierOverride(rowLabel, overrides, "d13C") === true) masks.manualD13.add(rowLabel);
+    if (manualOutlierOverride(rowLabel, overrides, "d18O") === true) masks.manualD18.add(rowLabel);
+    if (masks.manualD13.has(rowLabel) || masks.manualD18.has(rowLabel)) masks.manual.add(rowLabel);
 
     const commonRangeOrStatus = d13Range || d18Range || signalRange || leakRange || failed || full || partialExcluded;
     if (!commonRangeOrStatus) {
@@ -1339,8 +2079,8 @@ function buildProcessingPreviewMasks(
       iqrMultiplier,
     );
     for (const row of eligibleRows) {
-      const d13Stat = applyOverrideBoth(row.rowLabel, d13Outliers.has(row.rowLabel), overrides);
-      const d18Stat = applyOverrideBoth(row.rowLabel, d18Outliers.has(row.rowLabel), overrides);
+      const d13Stat = applyOverrideBoth(row.rowLabel, d13Outliers.has(row.rowLabel), overrides, "d13C");
+      const d18Stat = applyOverrideBoth(row.rowLabel, d18Outliers.has(row.rowLabel), overrides, "d18O");
       if (d13Stat) masks.statisticalD13.add(row.rowLabel);
       if (d18Stat) masks.statisticalD18.add(row.rowLabel);
       if (d13Stat || d18Stat) masks.statisticalCombined.add(row.rowLabel);
@@ -1474,7 +2214,10 @@ function traceOverlayRowSet(name: string, masks: ProcessingPreviewMasks, config:
     return config.overlays.show_range_outliers ? masks.d18Range : new Set();
   }
   if (name.includes("Manual Outliers")) {
-    return config.overlays.show_manual_outliers ? masks.manual : new Set();
+    if (!config.overlays.show_manual_outliers) return new Set();
+    if (isotope === "d13C") return masks.manualD13;
+    if (isotope === "d18O") return masks.manualD18;
+    return masks.manual;
   }
   if (name.includes("Partially Failed") || name.includes("Partially Saturated")) {
     return config.overlays.show_saturated_collectors ? masks.partial : new Set();
@@ -1853,66 +2596,73 @@ function TraceModeControl({
 }) {
   const display = normalizeDisplayState(state);
   return (
-    <div
-      className="flex flex-wrap items-center gap-3 rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm shadow-sm"
-      role="group"
-      aria-label="Chart display options"
-    >
-      <label className={cn("inline-flex items-center gap-2 font-medium", hasCalibrated ? "text-stone-700" : "text-stone-400")}>
-        <input
-          type="checkbox"
-          checked={hasCalibrated && display.hideCalibrated}
-          disabled={!hasCalibrated}
-          onChange={(event) => onChange({ hideCalibrated: event.target.checked })}
-          className="h-4 w-4"
-        />
-        Hide calibrated
-      </label>
-      <label className={cn("inline-flex items-center gap-2 font-medium", hasStandards ? "text-stone-700" : "text-stone-400")}>
-        <input
-          type="checkbox"
-          checked={hasStandards && display.overlayStandards}
-          disabled={!hasStandards}
-          onChange={(event) => onChange({ overlayStandards: event.target.checked })}
-          className="h-4 w-4"
-        />
-        Overlay standards
-      </label>
-      <label className="inline-flex items-center gap-2 font-medium text-stone-700">
-        <input
-          type="checkbox"
-          checked={display.hideSymbols}
-          onChange={(event) => onChange({ hideSymbols: event.target.checked })}
-          className="h-4 w-4"
-        />
-        Hide symbols
-      </label>
-      <label className="inline-flex items-center gap-2 font-medium text-stone-700">
-        <input
-          type="checkbox"
-          checked={display.runningAverage}
-          onChange={(event) => onChange({ runningAverage: event.target.checked })}
-          className="h-4 w-4"
-        />
-        Running average
-      </label>
-      <label className="inline-flex items-center gap-2 font-medium text-stone-700">
-        <span>Period</span>
-        <input
-          type="number"
-          min={2}
-          max={999}
-          step={1}
-          value={display.runningAveragePeriod}
-          disabled={!display.runningAverage}
-          onChange={(event) => onChange({ runningAveragePeriod: clampRunningAveragePeriod(event.target.value) })}
-          className={cn(
-            "h-8 w-20 rounded-md border border-stone-300 px-2 text-sm",
-            display.runningAverage ? "bg-white" : "cursor-not-allowed bg-stone-100 text-stone-500",
-          )}
-        />
-      </label>
-    </div>
+    <details className="group relative">
+      <summary className="flex h-8 cursor-pointer list-none items-center gap-1.5 rounded-md border border-stone-300 bg-white px-2.5 text-xs font-medium text-stone-700 shadow-sm transition-colors hover:bg-stone-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 [&::-webkit-details-marker]:hidden">
+        <SlidersHorizontal aria-hidden="true" className="h-3.5 w-3.5" />
+        Display
+        <ChevronRight aria-hidden="true" className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+      </summary>
+      <div
+        className="absolute right-0 top-10 z-30 grid min-w-56 gap-0.5 rounded-lg border border-stone-200 bg-white p-2 text-xs shadow-lg"
+        role="group"
+        aria-label="Chart display options"
+      >
+        <label className={cn("flex min-h-8 items-center gap-2 rounded-md px-2 hover:bg-stone-50", hasCalibrated ? "text-stone-700" : "text-stone-400")}>
+          <input
+            type="checkbox"
+            checked={hasCalibrated && display.hideCalibrated}
+            disabled={!hasCalibrated}
+            onChange={(event) => onChange({ hideCalibrated: event.target.checked })}
+            className="h-3.5 w-3.5 accent-blue-600"
+          />
+          Hide calibrated
+        </label>
+        <label className={cn("flex min-h-8 items-center gap-2 rounded-md px-2 hover:bg-stone-50", hasStandards ? "text-stone-700" : "text-stone-400")}>
+          <input
+            type="checkbox"
+            checked={hasStandards && display.overlayStandards}
+            disabled={!hasStandards}
+            onChange={(event) => onChange({ overlayStandards: event.target.checked })}
+            className="h-3.5 w-3.5 accent-blue-600"
+          />
+          Overlay standards
+        </label>
+        <label className="flex min-h-8 items-center gap-2 rounded-md px-2 text-stone-700 hover:bg-stone-50">
+          <input
+            type="checkbox"
+            checked={display.hideSymbols}
+            onChange={(event) => onChange({ hideSymbols: event.target.checked })}
+            className="h-3.5 w-3.5 accent-blue-600"
+          />
+          Hide symbols
+        </label>
+        <label className="flex min-h-8 items-center gap-2 rounded-md px-2 text-stone-700 hover:bg-stone-50">
+          <input
+            type="checkbox"
+            checked={display.runningAverage}
+            onChange={(event) => onChange({ runningAverage: event.target.checked })}
+            className="h-3.5 w-3.5 accent-blue-600"
+          />
+          Running average
+        </label>
+        <label className="mt-1 flex items-center justify-between gap-3 border-t border-stone-100 px-2 pt-2 font-medium text-stone-700">
+          <span>Period</span>
+          <input
+            type="number"
+            min={2}
+            max={999}
+            step={1}
+            value={display.runningAveragePeriod}
+            disabled={!display.runningAverage}
+            onChange={(event) => onChange({ runningAveragePeriod: clampRunningAveragePeriod(event.target.value) })}
+            className={cn(
+              "h-7 w-16 rounded-md border border-stone-300 px-2 text-xs tabular-nums",
+              display.runningAverage ? "bg-white" : "cursor-not-allowed bg-stone-100 text-stone-500",
+            )}
+          />
+        </label>
+      </div>
+    </details>
   );
 }
 
@@ -2515,6 +3265,7 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
     const isotopeKey = normalizeIsotopeKey(customdata?.[1] ?? customObj?.isotope_key ?? customObj?.isotopeKey) ?? inferredIsotope;
     const identifier1 = String(customdata?.[2] ?? customObj?.identifier_1 ?? customObj?.identifier1 ?? "").trim();
     const identifier2 = String(customdata?.[3] ?? customObj?.identifier_2 ?? customObj?.identifier2 ?? "").trim();
+    const species = String(customdata?.[4] ?? customObj?.species ?? identifier1).trim();
     if (!rowLabel || !isotopeKey) {
       continue;
     }
@@ -2530,6 +3281,7 @@ function parseSelectedTargets(points: PlotlyPoint[], chartKey: string): Selected
       isotopeKey,
       identifier1,
       identifier2,
+      species,
       currentValue: primaryIsotopeTracePoint && typeof point.y === "number" ? point.y : null,
       currentD13: isotopeKey === "cross" && typeof point.y === "number" ? point.y : null,
       currentD18: isotopeKey === "cross" && typeof point.x === "number" ? point.x : null,
@@ -2575,6 +3327,7 @@ function targetSignature(target: SelectedTarget): string {
     target.isotopeKey,
     target.identifier1,
     target.identifier2,
+    target.species,
     targetNumberValue(target.currentValue),
     targetNumberValue(target.currentD13),
     targetNumberValue(target.currentD18),
@@ -2608,6 +3361,7 @@ function coerceStoredSelectedTarget(value: unknown): SelectedTarget | null {
     isotopeKey: isotope,
     identifier1: String(payload.identifier1 ?? "").trim(),
     identifier2: String(payload.identifier2 ?? "").trim(),
+    species: String(payload.species ?? payload.identifier1 ?? "").trim(),
     currentValue: toNumberOrNull(payload.currentValue),
     currentD13: toNumberOrNull(payload.currentD13),
     currentD18: toNumberOrNull(payload.currentD18),
@@ -3605,6 +4359,24 @@ function OutlierTablesPanel({
     setSelectedRowsByTable({});
   }, [tables]);
 
+  const populatedTables = tables.filter((table) => table.rows.length > 0);
+  const totalRowCount = populatedTables.reduce((total, table) => total + table.rows.length, 0);
+
+  if (!populatedTables.length) {
+    return (
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-white px-4 py-3 shadow-sm">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-stone-900">{title}</div>
+          <div className="text-xs text-stone-500">No outliers found for this scope.</div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {isPreview ? <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">Preview</span> : null}
+          <span className="rounded-md bg-stone-100 px-2 py-1 text-xs font-medium text-stone-600">0 rows</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <details open={defaultOpen} className="group rounded-lg border border-stone-200 bg-white shadow-sm">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3">
@@ -3620,20 +4392,19 @@ function OutlierTablesPanel({
         <div className="flex shrink-0 items-center gap-1.5">
           {isPreview ? <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">Preview</span> : null}
           <span className="rounded-md bg-stone-100 px-2 py-1 text-xs font-medium text-stone-600">
-            {tables.reduce((total, table) => total + table.rows.length, 0)} rows
+            {totalRowCount} rows
           </span>
         </div>
       </summary>
-      <div className="space-y-3 border-t border-stone-200 p-4">
-        {tables.length ? (
-          tables.map((table, tableIndex) => {
+      <div className="space-y-2 border-t border-stone-200 p-3">
+        {populatedTables.map((table, tableIndex) => {
             const tableKey = `${table.title ?? table.name}:${tableIndex}`;
             const failedSampleTable = isFailedSampleOutlierTable(table);
             const selectedRowLabels = selectedRowsByTable[tableKey] ?? [];
             return (
-              <details open key={table.title ?? table.name} className="rounded-lg border border-stone-200 bg-white p-3">
+              <details open key={tableKey} className="group/table rounded-lg border border-stone-200 bg-white px-3 py-2.5">
                 <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-medium text-stone-800">
-                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-400" aria-hidden="true" />
+                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-400 transition-transform group-open/table:rotate-90" aria-hidden="true" />
                   <span>{table.title ?? table.name} ({table.rows.length})</span>
                 </summary>
                 <div className="mt-3">
@@ -3659,10 +4430,7 @@ function OutlierTablesPanel({
                 </div>
               </details>
             );
-          })
-        ) : (
-          <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">No outlier tables returned for this scope.</div>
-        )}
+          })}
       </div>
     </details>
   );
@@ -4164,9 +4932,9 @@ function FigureCard({
   onHoverEnd?: () => void;
 }) {
   return (
-    <Card className={cn("min-w-0 overflow-hidden", cardClassName)}>
-      <CardHeader className="gap-3">
-        <div className="flex flex-wrap items-start justify-between gap-3">
+    <Card className={cn("min-w-0", cardClassName)}>
+      <CardHeader className="gap-1.5 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <CardTitle className="text-base">{title}</CardTitle>
           {headerActions ? <div className="ml-auto">{headerActions}</div> : null}
         </div>
@@ -4214,6 +4982,9 @@ export default function ProcessingPage() {
   const [multiOffsetD18, setMultiOffsetD18] = useState(0);
   const [selectionDraftEdits, setSelectionDraftEdits] = useState<EditAction[]>([]);
   const [selectionDraftValues, setSelectionDraftValues] = useState<SelectionDraftValueMap>({});
+  const [selectionDraftIdentifier1, setSelectionDraftIdentifier1] = useState<SelectionDraftIdentifier1Map>({});
+  const [selectionDraftIdentifier2, setSelectionDraftIdentifier2] = useState<SelectionDraftIdentifier2Map>({});
+  const [selectionDraftSpecies, setSelectionDraftSpecies] = useState<SelectionDraftSpeciesMap>({});
   const [linearityPreviewConfig, setLinearityPreviewConfig] = useState<CalibrationConfig["linearity"] | null>(null);
   const [linearityOffsetDrafts, setLinearityOffsetDrafts] = useState<LinearityOffsetDraftState>({
     line_1_offset_d13: "0",
@@ -4228,7 +4999,12 @@ export default function ProcessingPage() {
   const [isExportModalOpen, setExportModalOpen] = useState(false);
   const [openSpeciesSections, setOpenSpeciesSections] = useState<Set<string>>(() => new Set());
   const [exportOutputType, setExportOutputType] = useState<"dataset" | "client_output">("dataset");
+  const [exportEmailLanguage, setExportEmailLanguage] = useState<ExportEmailLanguage>("en");
+  const [includeInsufficientSignalEmailNote, setIncludeInsufficientSignalEmailNote] = useState(false);
+  const [includeConservativeOutlierEmailNote, setIncludeConservativeOutlierEmailNote] = useState(false);
+  const [copiedExportEmail, setCopiedExportEmail] = useState<string | null>(null);
   const [duplicateCheckResult, setDuplicateCheckResult] = useState<ClientOutputDuplicateCheckResponse | null>(null);
+  const [clientOutputDraftRows, setClientOutputDraftRows] = useState<ClientOutputPreviewResponse["rows"]>([]);
   const [restoreStdevEnabled, setRestoreStdevEnabled] = useState(false);
   const [restoreStdevCap, setRestoreStdevCap] = useState(RESTORE_STDEV_DEFAULT_CAP);
   const [failedRestoreRate, setFailedRestoreRate] = useState(100);
@@ -4242,6 +5018,7 @@ export default function ProcessingPage() {
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
   const preserveLinearityPreviewOnWorkspaceUpdateRef = useRef(false);
+  const clientOutputDraftSourceRef = useRef("");
   const speciesDefaultsSessionRef = useRef<string | null>(null);
   const colorScaleFigureCacheRef = useRef<
     WeakMap<Record<string, unknown>, { rangeKey: string; figure: Record<string, unknown> | undefined }>
@@ -4249,6 +5026,12 @@ export default function ProcessingPage() {
   const displayFigureCacheRef = useRef<WeakMap<Record<string, unknown>, Map<string, Record<string, unknown>>>>(
     new WeakMap(),
   );
+  const updateClientOutputCell = useCallback((rowIndex: number, column: string, value: string) => {
+    setClientOutputDraftRows((current) =>
+      current.map((row, index) => (index === rowIndex ? { ...row, [column]: value } : row)),
+    );
+    setDuplicateCheckResult(null);
+  }, []);
   const openSpeciesSectionList = useMemo(() => Array.from(openSpeciesSections).sort(), [openSpeciesSections]);
 
   const workspaceQuery = useQuery({
@@ -4279,6 +5062,48 @@ export default function ProcessingPage() {
     enabled: Boolean(sessionId),
     staleTime: 60_000,
   });
+  const clientOutputPreviewPayload = useMemo<ExportRequest | null>(
+    () =>
+      config
+        ? {
+            ...config.export,
+            output_type: "client_output",
+            client_name: null,
+            restore_stdev: restoreStdevEnabled,
+            restore_stdev_cap: Math.min(RESTORE_STDEV_DEFAULT_CAP, Math.max(0, restoreStdevCap)),
+            client_output_rows: null,
+            email_language: "en",
+          }
+        : null,
+    [config, restoreStdevCap, restoreStdevEnabled],
+  );
+  const clientOutputPreviewQuery = useQuery<ClientOutputPreviewResponse>({
+    queryKey: ["client-output-preview", sessionId, clientOutputPreviewPayload],
+    queryFn: ({ signal }) => api.previewClientOutput(sessionId!, clientOutputPreviewPayload!, signal),
+    enabled: Boolean(
+      sessionId &&
+        clientOutputPreviewPayload &&
+        isExportModalOpen &&
+        exportOutputType === "client_output"
+    ),
+    staleTime: 30_000,
+  });
+  useEffect(() => {
+    if (!clientOutputPreviewQuery.data || !clientOutputPreviewPayload) {
+      return;
+    }
+    const sourceKey = `${sessionId ?? ""}|${JSON.stringify({
+      ...clientOutputPreviewPayload,
+      client_name: null,
+      email_language: "en",
+    })}`;
+    if (clientOutputDraftSourceRef.current === sourceKey) {
+      return;
+    }
+    clientOutputDraftSourceRef.current = sourceKey;
+    setClientOutputDraftRows(clientOutputPreviewQuery.data.rows.map((row) => ({ ...row })));
+    setDuplicateCheckResult(clientOutputPreviewQuery.data);
+  }, [clientOutputPreviewPayload, clientOutputPreviewQuery.data, sessionId]);
   const processingPreviewRowLookup = useMemo(
     () => buildProcessingPreviewRowLookup(linearityPreviewDataQuery.data),
     [linearityPreviewDataQuery.data],
@@ -4426,6 +5251,9 @@ export default function ProcessingPage() {
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       setSelectionDraftEdits([]);
       setSelectionDraftValues({});
+      setSelectionDraftIdentifier1({});
+      setSelectionDraftIdentifier2({});
+      setSelectionDraftSpecies({});
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -4443,6 +5271,9 @@ export default function ProcessingPage() {
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       setSelectionDraftEdits([]);
       setSelectionDraftValues({});
+      setSelectionDraftIdentifier1({});
+      setSelectionDraftIdentifier2({});
+      setSelectionDraftSpecies({});
     },
     onSettled: () => setActiveBackgroundJob(null),
   });
@@ -4462,6 +5293,9 @@ export default function ProcessingPage() {
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       setSelectionDraftEdits([]);
       setSelectionDraftValues({});
+      setSelectionDraftIdentifier1({});
+      setSelectionDraftIdentifier2({});
+      setSelectionDraftSpecies({});
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -4477,6 +5311,9 @@ export default function ProcessingPage() {
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       setSelectionDraftEdits([]);
       setSelectionDraftValues({});
+      setSelectionDraftIdentifier1({});
+      setSelectionDraftIdentifier2({});
+      setSelectionDraftSpecies({});
       setSelectedTargets([]);
       setActiveTargetIndex(0);
       setSelectionEditorOpen(false);
@@ -5308,6 +6145,133 @@ export default function ProcessingPage() {
     }
   }
 
+  function queueIdentifier1Override(target: SelectedTarget, identifier1: string) {
+    const nextIdentifier = identifier1.trim();
+    if (!nextIdentifier) {
+      return;
+    }
+    const targets = buildTargetsForAction([target]);
+    if (!targets.length) {
+      return;
+    }
+    queueSelectionDraftEdit({
+      action: "set_identifier1",
+      targets,
+      identifier1: nextIdentifier,
+    });
+    const originalIdentifier = resolveIdentifier1Source(
+      target.identifier1,
+      workspace?.available_values.identifier1_sources ?? [],
+      activeConfig?.identifier1_name_map,
+    );
+    setSelectionDraftIdentifier1((current) => {
+      const next = { ...current };
+      if (nextIdentifier === originalIdentifier) {
+        delete next[target.rowLabel];
+      } else {
+        next[target.rowLabel] = nextIdentifier;
+      }
+      return next;
+    });
+  }
+
+  function clearSelectionDraftIdentifier1ForTargets(targets: EditAction["targets"]) {
+    const rowLabels = new Set(targets.map((target) => String(target.row_label).trim()));
+    setSelectionDraftIdentifier1((current) => {
+      if (!Object.keys(current).some((rowLabel) => rowLabels.has(rowLabel))) {
+        return current;
+      }
+      const next = { ...current };
+      for (const rowLabel of rowLabels) {
+        delete next[rowLabel];
+      }
+      return next;
+    });
+  }
+
+  function queueIdentifier2Override(target: SelectedTarget, identifier2: string) {
+    const nextIdentifier = identifier2.trim();
+    if (!nextIdentifier) {
+      return;
+    }
+    const targets = buildTargetsForAction([target]);
+    if (!targets.length) {
+      return;
+    }
+    queueSelectionDraftEdit({
+      action: "set_identifier2",
+      targets,
+      identifier2: nextIdentifier,
+    });
+    setSelectionDraftIdentifier2((current) => {
+      const next = { ...current };
+      if (nextIdentifier === target.identifier2.trim()) {
+        delete next[target.rowLabel];
+      } else {
+        next[target.rowLabel] = nextIdentifier;
+      }
+      return next;
+    });
+  }
+
+  function clearSelectionDraftIdentifier2ForTargets(targets: EditAction["targets"]) {
+    const rowLabels = new Set(targets.map((target) => String(target.row_label).trim()));
+    setSelectionDraftIdentifier2((current) => {
+      if (!Object.keys(current).some((rowLabel) => rowLabels.has(rowLabel))) {
+        return current;
+      }
+      const next = { ...current };
+      for (const rowLabel of rowLabels) {
+        delete next[rowLabel];
+      }
+      return next;
+    });
+  }
+
+  function queueSpeciesOverride(target: SelectedTarget, species: string) {
+    const nextSpecies = species.trim();
+    if (!nextSpecies) {
+      return;
+    }
+    const targets = buildTargetsForAction([target]);
+    if (!targets.length) {
+      return;
+    }
+    queueSelectionDraftEdit({
+      action: "set_species",
+      targets,
+      species: nextSpecies,
+    });
+    const originalSpecies = resolveSpeciesSource(
+      target.species,
+      workspace?.available_values.species ?? [],
+      activeConfig?.species_name_map,
+    );
+    setSelectionDraftSpecies((current) => {
+      const next = { ...current };
+      if (nextSpecies === originalSpecies) {
+        delete next[target.rowLabel];
+      } else {
+        next[target.rowLabel] = nextSpecies;
+      }
+      return next;
+    });
+  }
+
+  function clearSelectionDraftSpeciesForTargets(targets: EditAction["targets"]) {
+    const rowLabels = new Set(targets.map((target) => String(target.row_label).trim()));
+    setSelectionDraftSpecies((current) => {
+      if (!Object.keys(current).some((rowLabel) => rowLabels.has(rowLabel))) {
+        return current;
+      }
+      const next = { ...current };
+      for (const rowLabel of rowLabels) {
+        delete next[rowLabel];
+      }
+      return next;
+    });
+  }
+
   function clearSelectionDraftValuesForTargets(targets: EditAction["targets"]) {
     if (!targets.length) {
       return;
@@ -5384,7 +6348,23 @@ export default function ProcessingPage() {
         outputType === "client_output"
           ? Math.min(RESTORE_STDEV_DEFAULT_CAP, Math.max(0, restoreStdevCap))
           : RESTORE_STDEV_DEFAULT_CAP,
+      client_output_rows:
+        outputType === "client_output" && clientOutputPreviewQuery.data ? clientOutputDraftRows : null,
+      email_language: exportEmailLanguage,
     };
+  }
+
+  function removeClientOutputRow(rowIndex: number) {
+    setClientOutputDraftRows((current) => current.filter((_, index) => index !== rowIndex));
+    setDuplicateCheckResult(null);
+  }
+
+  function resetClientOutputRows() {
+    if (!clientOutputPreviewQuery.data) {
+      return;
+    }
+    setClientOutputDraftRows(clientOutputPreviewQuery.data.rows.map((row) => ({ ...row })));
+    setDuplicateCheckResult(clientOutputPreviewQuery.data);
   }
 
   async function handleExport(outputType: "dataset" | "client_output") {
@@ -5611,13 +6591,25 @@ export default function ProcessingPage() {
     if (!sessionId || !workspace) {
       return;
     }
-    const overriddenRows = Object.keys(workspace.edit_state.manual_outlier_overrides ?? {});
-    if (!overriddenRows.length) {
+    const overrideTokens = Object.keys(workspace.edit_state.manual_outlier_overrides ?? {});
+    if (!overrideTokens.length) {
       return;
     }
+    const targets: Array<{ row_label: string; isotope_key: IsotopeKey }> = overrideTokens.flatMap((token) => {
+      const separator = token.indexOf("|");
+      if (separator > 0) {
+        const isotopeKey = token.slice(0, separator);
+        const rowLabel = token.slice(separator + 1);
+        if ((isotopeKey === "d13C" || isotopeKey === "d18O") && rowLabel) {
+          return [{ row_label: rowLabel, isotope_key: isotopeKey }];
+        }
+      }
+      // A legacy row-wide override is cleared for both isotope measurements.
+      return ISOTOPE_KEYS.map((isotopeKey) => ({ row_label: token, isotope_key: isotopeKey }));
+    });
     await editMutation.mutateAsync({
       action: "set_outlier_override",
-      targets: overriddenRows.map((rowLabel) => ({ row_label: rowLabel, isotope_key: "d13C" as const })),
+      targets,
       is_outlier: false,
     });
   }
@@ -5632,6 +6624,9 @@ export default function ProcessingPage() {
       targets,
     });
     clearSelectionDraftValuesForTargets(targets);
+    clearSelectionDraftIdentifier1ForTargets(targets);
+    clearSelectionDraftIdentifier2ForTargets(targets);
+    clearSelectionDraftSpeciesForTargets(targets);
   }
 
   if (!sessionId) {
@@ -5685,6 +6680,14 @@ export default function ProcessingPage() {
   );
   const hasUnsavedLinearityChanges = hasPendingLinearityChanges || hasStickyLinearityChanges;
   const hasPendingSelectionDrafts = selectionDraftEdits.length > 0;
+  const selectionDraftRowLabels = Array.from(
+    new Set([
+      ...Object.keys(selectionDraftValues).map((key) => key.split("|", 2)[1] ?? ""),
+      ...Object.keys(selectionDraftIdentifier1),
+      ...Object.keys(selectionDraftIdentifier2),
+      ...Object.keys(selectionDraftSpecies),
+    ].filter(Boolean)),
+  );
   const hasSaveableChanges = hasPendingProcessingConfigChanges || hasUnsavedLinearityChanges || hasPendingSelectionDrafts;
   const shouldApplyLinearityPreview = Boolean(linearityPreviewConfig) || hasPendingLinearityChanges || linearityPreviewStale;
   const processingPreviewMasks = hasPendingProcessingConfigChanges
@@ -5700,6 +6703,14 @@ export default function ProcessingPage() {
       applyPreviewMasksToOutlierTables(section.outlier_tables, processingPreviewMasks, section.species),
     ]),
   );
+  const duplicateSampleState = buildDuplicateSampleState(
+    linearityPreviewDataQuery.data,
+    selectionDraftIdentifier1,
+    selectionDraftIdentifier2,
+    selectionDraftSpecies,
+    activeConfig.identifier1_name_map,
+    activeConfig.species_name_map,
+  );
   const applyPreviewFigure = (figure: Record<string, unknown> | undefined) => {
     const linearityFigure = shouldApplyLinearityPreview
       ? applyLinearityPreviewToFigure(figure, linearityPreviewDataQuery.data, previewLinearity, activeConfig)
@@ -5707,9 +6718,10 @@ export default function ProcessingPage() {
     const processingFigure = hasPendingProcessingConfigChanges
       ? applyProcessingConfigPreviewToFigure(linearityFigure, processingPreviewMasks, activeConfig, processingPreviewRowLookup)
       : linearityFigure;
-    return hasPendingSelectionDrafts
-      ? applySelectionDraftPreviewToFigure(processingFigure, selectionDraftValues, activeConfig)
+    const draftFigure = hasPendingSelectionDrafts
+      ? applySelectionDraftPreviewToFigure(processingFigure, selectionDraftValues, activeConfig, selectionDraftRowLabels)
       : processingFigure;
+    return applyDuplicateHighlightsToFigure(draftFigure, duplicateSampleState.rowLabels);
   };
   const selectedLinearityIntensityCol = previewLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(previewLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
@@ -5738,6 +6750,167 @@ export default function ProcessingPage() {
   const standardPrecisionRows = (calibrationWorkspaceQuery.data?.precision_summaries ?? [])
     .filter((summary) => selectedStandards.includes(summary.standard))
     .slice(0, 6);
+  const useCorrectedStandardPrecision = Boolean(previewLinearity?.apply);
+  const exportStandardPrecisionRows: ExportStandardPrecision[] = (calibrationWorkspaceQuery.data?.precision_summaries ?? [])
+    .filter((summary) => selectedStandards.includes(summary.standard))
+    .map((summary) => ({
+      standard: summary.standard,
+      d13:
+        (useCorrectedStandardPrecision ? summary.d13_linearity_corrected_precision : summary.d13_precision) ??
+        summary.d13_precision ??
+        summary.d13_linearity_corrected_precision ??
+        null,
+      d18:
+        (useCorrectedStandardPrecision ? summary.d18_linearity_corrected_precision : summary.d18_precision) ??
+        summary.d18_precision ??
+        summary.d18_linearity_corrected_precision ??
+        null,
+      nD13: summary.included_d13,
+      nD18: summary.included_d18,
+      total: summary.total_rows,
+    }));
+  const selectedStandardKeys = new Set(
+    selectedStandards.flatMap((standard) => {
+      const source = String(standard).trim();
+      const mapped = normalizeSpeciesLabel(activeConfig.identifier1_name_map?.[source] ?? source);
+      return [source.toLocaleUpperCase(), mapped.toLocaleUpperCase()];
+    }),
+  );
+  const exportPreviewMasks = buildProcessingPreviewMasks(
+    linearityPreviewDataQuery.data,
+    previewLinearity,
+    { ...activeConfig, selected_identifier: "All" },
+    workspace.edit_state,
+  );
+  const selectedExportIdentifiers = new Set(
+    activeConfig.export.selected_ids.map((identifier) => String(identifier).trim()),
+  );
+  const includesEveryExportIdentifier = selectedExportIdentifiers.has("All");
+  const exportRows = exportPreviewMasks
+    ? Array.from(exportPreviewMasks.rowsByLabel.values())
+    : (linearityPreviewDataQuery.data?.rows ?? []).map((row) => {
+        const sourceIdentifier = String(row.identifier1 ?? "").trim();
+        const sourceSpecies = String(row.species ?? sourceIdentifier).trim();
+        return {
+          rowLabel: String(row.row_label),
+          identifier1: normalizeSpeciesLabel(activeConfig.identifier1_name_map?.[sourceIdentifier] ?? sourceIdentifier),
+          identifier2: String(row.identifier2 ?? "").trim(),
+          species: normalizeSpeciesLabel(activeConfig.species_name_map?.[sourceSpecies] ?? sourceSpecies),
+          d13: null,
+          d18: null,
+          signal: null,
+          leakRate: null,
+          status: String(row.collector_status ?? "").trim(),
+          d13CyclesExcluded: null,
+          d18CyclesExcluded: null,
+        } satisfies ProcessingPreviewRowState;
+      });
+  const exportCandidateRows = exportRows.filter((row) => {
+    if (!row.identifier1 || selectedStandardKeys.has(row.identifier1.toLocaleUpperCase())) {
+      return false;
+    }
+    if (!includesEveryExportIdentifier && !selectedExportIdentifiers.has(row.identifier1)) {
+      return false;
+    }
+    return true;
+  });
+  const exportIdentifierCountMap = new Map<string, { analyses: number; outliersExcluded: number }>();
+  const exportSpecies = new Set<string>();
+  for (const row of exportCandidateRows) {
+    const identifier = normalizeExportSummaryLabel(row.identifier1);
+    const species = normalizeExportSummaryLabel(row.species, "");
+    const excludedAsOutlier = !activeConfig.export.include_outliers && Boolean(exportPreviewMasks && !exportPreviewMasks.baseCross.has(row.rowLabel));
+    const current = exportIdentifierCountMap.get(identifier) ?? { analyses: 0, outliersExcluded: 0 };
+    if (excludedAsOutlier) {
+      current.outliersExcluded += 1;
+    } else {
+      current.analyses += 1;
+    }
+    exportIdentifierCountMap.set(identifier, current);
+    if (!excludedAsOutlier && species && species !== identifier) {
+      exportSpecies.add(species);
+    }
+  }
+  const exportIdentifierCounts: ExportIdentifierCount[] = Array.from(exportIdentifierCountMap, ([identifier, counts]) => ({
+    identifier,
+    ...counts,
+  })).sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true }));
+  const exportAnalysisTotal = exportIdentifierCounts.reduce((total, item) => total + item.analyses, 0);
+  const exportOutliersExcludedTotal = exportIdentifierCounts.reduce((total, item) => total + item.outliersExcluded, 0);
+  const standardMeasurementTotal = exportStandardPrecisionRows.reduce((total, standard) => total + standard.total, 0);
+  const clientOutputIdentifierLabels = Array.from(new Set(
+    clientOutputDraftRows.map((row) => String(row.Identifier ?? "").trim()).filter(Boolean),
+  ));
+  const clientOutputSpecies = Array.from(new Set(
+    clientOutputDraftRows
+      .map((row) =>
+        isRawClientOutputSource(activeConfig.export.client_output_species_source)
+          ? String(row.Species ?? "")
+          : formatAcademicSpeciesName(row.Species),
+      )
+      .filter(Boolean),
+  ));
+  const clientOutputIdentifiers = compactIdentifierSeriesList(clientOutputIdentifierLabels, clientOutputSpecies);
+  const emailIdentifiers = clientOutputIdentifiers.length
+    ? clientOutputIdentifiers
+    : exportIdentifierCounts.map((item) => item.identifier).filter((identifier) => identifier !== "Unassigned");
+  const emailSpecies = clientOutputSpecies.length
+    ? clientOutputSpecies
+    : Array.from(exportSpecies).sort((a, b) => a.localeCompare(b));
+  const insufficientSignalSamples = Array.from(new Map(
+    exportCandidateRows
+      .filter((row) => {
+        if (isFailedSampleCollectorStatus(row.status)) {
+          return true;
+        }
+        const isMarkedOutlier = Boolean(exportPreviewMasks && !exportPreviewMasks.baseCross.has(row.rowLabel));
+        return isMarkedOutlier && row.signal != null && row.signal < 2;
+      })
+      .map((row) => {
+        const sample: InsufficientSignalSample = {
+          identifier1: normalizeExportSummaryLabel(row.identifier1),
+          identifier2: normalizeExportSummaryLabel(row.identifier2),
+          species: normalizeExportSummaryLabel(row.species),
+        };
+        return [`${sample.identifier1}\u0000${sample.identifier2}\u0000${sample.species}`, sample] as const;
+      }),
+  ).values()).sort((left, right) =>
+    left.identifier1.localeCompare(right.identifier1, undefined, { numeric: true })
+      || left.identifier2.localeCompare(right.identifier2, undefined, { numeric: true })
+      || left.species.localeCompare(right.species),
+  );
+  const exportEmailItalicTerms = Array.from(new Set([
+    ...emailSpecies,
+    ...insufficientSignalSamples.map((sample) => sample.species),
+  ])).filter((species) => species && species !== "Unassigned");
+  const exportEmailBody = buildExportEmailBody({
+    language: exportEmailLanguage,
+    clientName: activeConfig.export.client_name ?? "",
+    identifiers: emailIdentifiers,
+    species: emailSpecies,
+    standards: exportStandardPrecisionRows,
+    insufficientSignalSamples,
+    includeInsufficientSignalNote: includeInsufficientSignalEmailNote,
+    includeConservativeOutlierNote: includeConservativeOutlierEmailNote,
+  });
+  const exportEmailSubject = buildExportEmailSubject({
+    language: exportEmailLanguage,
+    clientName: activeConfig.export.client_name ?? "",
+    identifiers: emailIdentifiers,
+  });
+  const duplicateClientOutputRowIndexes = clientOutputDuplicateIndexes(clientOutputDraftRows);
+  const clientOutputRemovedRowCount = Math.max(
+    0,
+    (clientOutputPreviewQuery.data?.total_rows ?? clientOutputDraftRows.length) - clientOutputDraftRows.length,
+  );
+  const exportEmailClipboardText = exportEmailSubject
+    ? `Subject: ${exportEmailSubject}\n\n${exportEmailBody}`
+    : exportEmailBody;
+  const exportEmailClipboardHtml = buildEmailClipboardHtml(exportEmailClipboardText, exportEmailItalicTerms);
+  const clientOutputFilename = exportEmailSubject
+    ? buildClientOutputFilename(exportEmailSubject)
+    : clientOutputPreviewQuery.data?.filename ?? "";
+  const isExportEmailCopied = copiedExportEmail === exportEmailClipboardText;
   const coefficientOffsetEnabled = previewLinearity
     ? [
         Number(previewLinearity.manual_d13_per_10v ?? 0),
@@ -5808,6 +6981,35 @@ export default function ProcessingPage() {
     );
   };
   const manualOverrideCount = Object.keys(workspace.edit_state.manual_outlier_overrides ?? {}).length;
+  const identifier1Sources = workspace.available_values.identifier1_sources;
+  const activeIdentifier1Source = activeTarget
+    ? selectionDraftIdentifier1[activeTarget.rowLabel] ??
+      resolveIdentifier1Source(activeTarget.identifier1, identifier1Sources, activeConfig.identifier1_name_map)
+    : "";
+  const activeIdentifier1Label = activeIdentifier1Source
+    ? mappedIdentifier1Label(activeIdentifier1Source, activeConfig.identifier1_name_map)
+    : activeTarget?.identifier1 ?? "";
+  const identifier2Sources = Array.from(
+    new Set(
+      (linearityPreviewDataQuery.data?.rows ?? [])
+        .map((row) => String(row.identifier2 ?? "").trim())
+        .filter(Boolean),
+    ),
+  ).sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  const activeIdentifier2 = activeTarget
+    ? selectionDraftIdentifier2[activeTarget.rowLabel] ?? activeTarget.identifier2
+    : "";
+  const speciesSources = workspace.available_values.species;
+  const activeSpeciesSource = activeTarget
+    ? selectionDraftSpecies[activeTarget.rowLabel] ??
+      resolveSpeciesSource(activeTarget.species, speciesSources, activeConfig.species_name_map)
+    : "";
+  const activeSpeciesLabel = activeSpeciesSource
+    ? mappedSpeciesLabel(activeSpeciesSource, activeConfig.species_name_map)
+    : activeTarget?.species ?? "";
+  const activeDuplicateGroupSize = activeTarget
+    ? duplicateSampleState.groupSizeByRow.get(activeTarget.rowLabel) ?? 0
+    : 0;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
   const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
@@ -6631,6 +7833,9 @@ export default function ProcessingPage() {
                     setLinearityPreviewStale(false);
                     setSelectionDraftEdits([]);
                     setSelectionDraftValues({});
+                    setSelectionDraftIdentifier1({});
+                    setSelectionDraftIdentifier2({});
+                    setSelectionDraftSpecies({});
                   }}
                   disabled={busy}
                 >
@@ -6648,8 +7853,26 @@ export default function ProcessingPage() {
 
         </aside>
 
+        <ControlColumnToggle />
+
         <div className="space-y-6">
           <ProcessingSummaryHero workspace={workspace} />
+          {duplicateSampleState.rowLabels.size > 0 ? (
+            <div className="flex flex-col gap-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-amber-950 sm:flex-row sm:items-center sm:justify-between" role="status">
+              <div className="flex min-w-0 items-start gap-2.5">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" aria-hidden="true" />
+                <div>
+                  <div className="text-sm font-semibold">
+                    {duplicateSampleState.rowLabels.size} duplicate sample row{duplicateSampleState.rowLabels.size === 1 ? "" : "s"} highlighted
+                  </div>
+                  <div className="mt-0.5 text-xs text-amber-800">
+                    Orange diamonds share Identifier 1, Identifier 2, and Species. Click one to edit those fields in the Selection Editor.
+                  </div>
+                </div>
+              </div>
+              <span className="shrink-0 text-xs font-semibold text-amber-800">Resolve before export</span>
+            </div>
+          ) : null}
 
           <div className="space-y-6">
             <div className="grid gap-6 xl:grid-cols-2">
@@ -6683,76 +7906,169 @@ export default function ProcessingPage() {
           </div>
 
           {isExportModalOpen ? (
-            <div className="fixed inset-0 z-40 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={() => setExportModalOpen(false)}>
+            <div className="fixed inset-0 z-40 flex items-start justify-center bg-stone-950/40 p-3 sm:p-6" onClick={() => setExportModalOpen(false)}>
               <div
-                className="flex max-h-[calc(100vh-2rem)] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="export-dialog-title"
+                className="flex max-h-[calc(100vh-1.5rem)] w-full max-w-6xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl sm:max-h-[calc(100vh-3rem)]"
                 onClick={(event) => event.stopPropagation()}
               >
-                <div className="relative z-20 flex items-center justify-between border-b border-stone-200 bg-white px-4 py-3">
-                  <div>
-                    <div className="text-base font-semibold text-stone-900">Export</div>
-                    <div className="text-sm text-stone-500">Configure export options, then download either the entire dataset or client output.</div>
+                <div className="relative z-20 flex items-start justify-between gap-4 border-b border-slate-200 bg-white px-4 py-4 sm:px-6">
+                  <div className="min-w-0">
+                    <div id="export-dialog-title" className="text-lg font-semibold text-slate-950">Prepare export</div>
+                    <div className="mt-0.5 text-sm text-slate-500">Choose the delivery scope, confirm the analysis summary, and prepare the client message.</div>
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => setExportModalOpen(false)}>
+                  <Button variant="outline" size="sm" onClick={() => setExportModalOpen(false)} aria-label="Close export dialog" className="shrink-0 whitespace-nowrap">
                     <X className="h-4 w-4" />
                     Close
                   </Button>
                 </div>
-                <div className="min-h-0 space-y-4 overflow-y-auto p-4">
-                  <div className="space-y-2">
-                    <div className="text-sm font-medium text-stone-800">Export type</div>
-                    <div className="flex flex-wrap gap-2">
+                <div className="border-b border-slate-200 bg-slate-50 px-4 py-3 sm:px-6">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-sm font-medium text-slate-700">Export type</div>
+                    <div className="inline-flex rounded-lg border border-slate-300 bg-white p-1" role="group" aria-label="Export type">
                       <Button
                         type="button"
-                        variant={exportOutputType === "dataset" ? "default" : "outline"}
+                        variant={exportOutputType === "dataset" ? "default" : "secondary"}
                         size="sm"
+                        aria-pressed={exportOutputType === "dataset"}
                         onClick={() => setExportOutputType("dataset")}
                         disabled={busy}
+                        className={exportOutputType === "dataset" ? "shadow-sm" : "bg-transparent shadow-none"}
                       >
                         Entire dataset
                       </Button>
                       <Button
                         type="button"
-                        variant={exportOutputType === "client_output" ? "default" : "outline"}
+                        variant={exportOutputType === "client_output" ? "default" : "secondary"}
                         size="sm"
+                        aria-pressed={exportOutputType === "client_output"}
                         onClick={() => setExportOutputType("client_output")}
                         disabled={busy}
+                        className={exportOutputType === "client_output" ? "shadow-sm" : "bg-transparent shadow-none"}
                       >
                         Client output
                       </Button>
                     </div>
                   </div>
+                </div>
 
-                  <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
-                    <div className="space-y-4">
-                      <CheckboxField
-                        checked={activeConfig.export.include_outliers}
-                        label="Include outliers in export"
-                        onChange={(checked) => {
-                          updateExport("include_outliers", checked);
-                          if (!checked) {
-                            updateExport("interpolate_outliers", false);
-                          }
-                        }}
-                      />
-                      <CheckboxField
-                        checked={activeConfig.export.interpolate_outliers}
-                        label="Interpolate before export"
-                        description={!activeConfig.export.include_outliers ? "Enable Include outliers first." : undefined}
-                        onChange={(checked) => updateExport("interpolate_outliers", checked)}
-                        disabled={!activeConfig.export.include_outliers}
-                      />
+                <div className="min-h-0 overflow-x-hidden overflow-y-auto">
+                  <div className="grid lg:grid-cols-[minmax(320px,0.78fr)_minmax(0,1.22fr)]">
+                    <div className="min-w-0 space-y-6 p-4 sm:p-6 lg:border-r lg:border-slate-200">
+                      <section className="space-y-3" aria-labelledby="export-delivery-heading">
+                        <div>
+                          <h3 id="export-delivery-heading" className="text-sm font-semibold text-slate-950">Client and series</h3>
+                          <p className="mt-0.5 text-xs text-slate-500">These details define the filename, summary, and email preview.</p>
+                        </div>
+                        <label className="form-field">
+                          <span className="form-label">Client name</span>
+                          <ClientNameInput
+                            value={activeConfig.export.client_name ?? ""}
+                            onCommit={(value) => updateExport("client_name", value || null)}
+                          />
+                        </label>
+                        <fieldset className="space-y-1.5">
+                          <legend className="form-label">Series to export</legend>
+                          <div className="max-h-44 overflow-y-auto rounded-lg border border-slate-300 bg-white p-1 shadow-sm">
+                            {workspace.available_values.export_identifiers.map((option) => {
+                              const checked = activeConfig.export.selected_ids.includes(option);
+                              return (
+                                <label key={option} className="flex min-h-9 cursor-pointer items-center gap-2 rounded-md px-2.5 text-sm text-slate-800 hover:bg-slate-50">
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={(event) => {
+                                      if (option === "All") {
+                                        updateExport("selected_ids", ["All"]);
+                                        return;
+                                      }
+                                      const withoutAll = activeConfig.export.selected_ids.filter((item) => item !== "All");
+                                      const next = event.target.checked
+                                        ? Array.from(new Set([...withoutAll, option]))
+                                        : withoutAll.filter((item) => item !== option);
+                                      updateExport("selected_ids", next.length ? next : ["All"]);
+                                    }}
+                                    className="h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-500"
+                                  />
+                                  <span>{option === "All" ? "All series" : option}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </fieldset>
+                      </section>
+
+                      <section className="space-y-3 border-t border-slate-200 pt-5" aria-labelledby="export-filters-heading">
+                        <h3 id="export-filters-heading" className="text-sm font-semibold text-slate-950">Analysis filters</h3>
+                        <CheckboxField
+                          checked={activeConfig.export.include_outliers}
+                          label="Include outliers"
+                          description="Keep analyses currently marked as outliers in the exported file."
+                          onChange={(checked) => {
+                            updateExport("include_outliers", checked);
+                            if (!checked) {
+                              updateExport("interpolate_outliers", false);
+                            }
+                          }}
+                        />
+                        <CheckboxField
+                          checked={activeConfig.export.interpolate_outliers}
+                          label="Interpolate included outliers"
+                          description={!activeConfig.export.include_outliers ? "Available after outliers are included." : "Replace included outlier values by interpolation before export."}
+                          onChange={(checked) => updateExport("interpolate_outliers", checked)}
+                          disabled={!activeConfig.export.include_outliers}
+                        />
+                      </section>
+
                       {exportOutputType === "client_output" ? (
-                        <div className="space-y-3 rounded-lg border border-stone-200 p-3">
-                          <div className="space-y-2">
+                        <section className="space-y-4 border-t border-slate-200 pt-5" aria-labelledby="client-output-options-heading">
+                          <div>
+                            <h3 id="client-output-options-heading" className="text-sm font-semibold text-slate-950">Client-output checks</h3>
+                            <p className="mt-0.5 text-xs text-slate-500">Shape, review, and verify the final client table before delivery.</p>
+                          </div>
+                          <fieldset className="space-y-2">
+                            <legend className="text-xs font-semibold text-slate-700">Final-column content</legend>
+                            <p className="text-xs text-slate-500">
+                              Choose which field populates each output column. Raw options preserve the original pre-cleanup text exactly.
+                            </p>
+                            <div className="grid gap-2 sm:grid-cols-3">
+                              {([
+                                ["Identifier", "client_output_identifier_source"],
+                                ["Sample #", "client_output_sample_source"],
+                                ["Species", "client_output_species_source"],
+                              ] as const).map(([label, key]) => (
+                                <label key={key} className="form-field min-w-0">
+                                  <span className="form-label">{label}</span>
+                                  <select
+                                    value={activeConfig.export[key]}
+                                    onChange={(event) => updateExport(key, event.target.value as ProcessingConfig["export"][typeof key])}
+                                    className="form-control"
+                                  >
+                                    {CLIENT_OUTPUT_SOURCE_OPTIONS.map((option) => (
+                                      <option key={option.value} value={option.value}>{option.label}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                              ))}
+                            </div>
+                          </fieldset>
+                          <CheckboxField
+                            checked={activeConfig.export.show_sequence}
+                            label="Show Sequence column"
+                            description="Include the sortable sequence value in the preview and final workbook."
+                            onChange={(checked) => updateExport("show_sequence", checked)}
+                          />
+                          <div className="space-y-3">
                             <CheckboxField
                               checked={restoreStdevEnabled}
-                              label="Restore stdev"
-                              description="Cap high stdev values in client output to the maximum below."
+                              label="Cap internal standard deviation"
+                              description="Limit high per-analysis standard deviations to the value below."
                               onChange={setRestoreStdevEnabled}
                             />
-                            <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Max stdev</span>
+                            <label className="form-field max-w-36">
+                              <span className="form-label">Maximum stdev</span>
                               <input
                                 type="number"
                                 min={0}
@@ -6768,21 +8084,26 @@ export default function ProcessingPage() {
                                   )
                                 }
                                 disabled={!restoreStdevEnabled}
-                                className="w-32 rounded-lg border border-stone-300 px-3 py-2 disabled:cursor-not-allowed disabled:bg-stone-100"
+                                className="form-control disabled:cursor-not-allowed disabled:bg-slate-100"
                               />
                             </label>
                           </div>
-                          <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-2.5">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-sm font-medium text-stone-800">Duplicate check</span>
+                          <div className="space-y-2 rounded-lg bg-slate-50 p-3">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span className="text-sm font-medium text-slate-800">Duplicate check</span>
                               <Button type="button" variant="outline" size="sm" onClick={() => void handleDuplicateCheck()} disabled={busy}>
                                 <SearchCheck className="h-4 w-4" />
                                 {duplicateCheckMutation.isPending ? "Checking..." : "Check for duplicates"}
                               </Button>
                             </div>
-                            <div className="text-xs text-stone-600">
-                              Checks for repeated Identifier 1 + Identifier 2 + Species in the current client-output scope.
-                            </div>
+                            <div className="text-xs text-slate-600">Duplicate rows are highlighted in the data preview using Identifier 1 + Identifier 2 + Species.</div>
+                            {duplicateClientOutputRowIndexes.size > 0 ? (
+                              <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-900">
+                                {duplicateClientOutputRowIndexes.size} duplicate row(s) currently highlighted.
+                              </div>
+                            ) : clientOutputDraftRows.length ? (
+                              <div className="rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs text-emerald-900">No duplicates in the reviewed table.</div>
+                            ) : null}
                             {duplicateCheckMutation.isError ? (
                               <div className="text-xs font-medium text-red-700">Duplicate check failed.</div>
                             ) : null}
@@ -6810,69 +8131,343 @@ export default function ProcessingPage() {
                               </div>
                             ) : null}
                           </div>
-                        </div>
+                        </section>
                       ) : null}
-                      <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">Export identifiers</span>
-                        <select
-                          multiple
-                          value={activeConfig.export.selected_ids}
-                          onChange={(event) =>
-                            updateExport(
-                              "selected_ids",
-                              Array.from(event.currentTarget.selectedOptions).map((option) => option.value),
-                            )
-                          }
-                          className="min-h-[150px] w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                        >
-                          {workspace.available_values.export_identifiers.map((option) => (
-                            <option key={option} value={option}>
-                              {option}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">Client name</span>
-                        <input
-                          type="text"
-                          value={activeConfig.export.client_name ?? ""}
-                          onChange={(event) => updateExport("client_name", event.target.value || null)}
-                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                        />
-                      </label>
-                      <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">Comment map</span>
-                        <textarea
-                          value={commentMapText}
-                          onChange={(event) => {
-                            const nextText = event.target.value;
-                            setCommentMapText(nextText);
-                            updateExport("comment_map", parseCommentMap(nextText));
-                          }}
-                          rows={6}
-                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                          placeholder={"old=value\nflag=client label"}
-                        />
-                      </label>
+
+                      <details className="border-t border-slate-200 pt-5">
+                        <summary className="cursor-pointer text-sm font-semibold text-slate-950">Comment replacements</summary>
+                        <label className="mt-3 block text-sm">
+                          <span className="mb-1.5 block text-xs text-slate-500">One replacement per line, formatted as original=replacement.</span>
+                          <textarea
+                            value={commentMapText}
+                            onChange={(event) => {
+                              const nextText = event.target.value;
+                              setCommentMapText(nextText);
+                              updateExport("comment_map", parseCommentMap(nextText));
+                            }}
+                            rows={5}
+                            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100"
+                            placeholder={"old=value\nflag=client label"}
+                          />
+                        </label>
+                      </details>
                     </div>
 
-                    <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50 p-3 text-sm text-stone-700">
-                      <div className="font-medium text-stone-900">Export summary</div>
-                      <div>Filename (dataset): generated from client name and current date.</div>
-                      <div>
-                        Filename (client output): generated from client name, exported series/species, and current date.
-                      </div>
-                      <div>Rows in workspace scope: {workspace.summary.total_measurements}</div>
-                      <div>Final analyses: {workspace.summary.final_analyses}</div>
+                    <div className="min-w-0 space-y-6 bg-slate-50/70 p-4 sm:p-6">
+                      <section className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200" aria-labelledby="export-summary-heading">
+                        <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-4 py-4 sm:px-5">
+                          <div>
+                            <h3 id="export-summary-heading" className="font-semibold text-slate-950">Export summary</h3>
+                            <p className="mt-0.5 text-sm text-slate-500">
+                              {activeConfig.export.client_name?.trim() || "Client name not set"}
+                            </p>
+                          </div>
+                          <span className="rounded-md bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-800">
+                            {exportOutputType === "client_output" ? "Client output" : "Entire dataset"}
+                          </span>
+                        </div>
+
+                        <div className="grid grid-cols-3 border-b border-slate-200">
+                          <div className="px-3 py-3 sm:px-5">
+                            <div className="text-xs text-slate-500">Series</div>
+                            <div className="mt-1 text-lg font-semibold tabular-nums text-slate-950">{exportIdentifierCounts.length}</div>
+                          </div>
+                          <div className="border-x border-slate-200 px-3 py-3 sm:px-5">
+                            <div className="text-xs text-slate-500">Analyses</div>
+                            <div className="mt-1 text-lg font-semibold tabular-nums text-slate-950">{exportAnalysisTotal}</div>
+                          </div>
+                          <div className="px-3 py-3 sm:px-5">
+                            <div className="text-xs text-slate-500">Standard measurements</div>
+                            <div className="mt-1 text-lg font-semibold tabular-nums text-slate-950">{standardMeasurementTotal}</div>
+                          </div>
+                        </div>
+
+                        <div className="space-y-5 px-4 py-4 sm:px-5">
+                          <div>
+                            <div className="mb-2 flex items-center justify-between gap-3">
+                              <h4 className="text-sm font-semibold text-slate-900">Analyses by series</h4>
+                              <span className="text-xs text-slate-500">{activeConfig.export.include_outliers ? "Outliers included" : "Outliers excluded"}</span>
+                            </div>
+                            {exportIdentifierCounts.length ? (
+                              <div className="overflow-hidden rounded-lg border border-slate-200">
+                                <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-4 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
+                                  <span>Series</span>
+                                  <span className="text-right">Analyses</span>
+                                  <span className="text-right">Outliers excluded</span>
+                                </div>
+                                <div className="divide-y divide-slate-100">
+                                {exportIdentifierCounts.map((item) => (
+                                  <div key={item.identifier} className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-4 px-3 py-2 text-sm">
+                                    <span className="truncate font-medium text-slate-800">{item.identifier}</span>
+                                    <span className="min-w-14 text-right tabular-nums text-slate-600">{item.analyses}</span>
+                                    <span className="min-w-24 text-right tabular-nums text-slate-600">{item.outliersExcluded}</span>
+                                  </div>
+                                ))}
+                                </div>
+                                <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-4 border-t border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-950">
+                                  <span>Total</span>
+                                  <span className="min-w-14 text-right tabular-nums">{exportAnalysisTotal}</span>
+                                  <span className="min-w-24 text-right tabular-nums">{exportOutliersExcludedTotal}</span>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-sm text-slate-500">
+                                {linearityPreviewDataQuery.isLoading ? "Calculating analyses in this export…" : "No analyses match the current export scope."}
+                              </div>
+                            )}
+                          </div>
+
+                          <div>
+                            <div className="mb-2 flex items-center justify-between gap-3">
+                              <h4 className="text-sm font-semibold text-slate-900">Reference-material precision</h4>
+                              <span className="text-xs text-slate-500">{useCorrectedStandardPrecision ? "Linearity corrected" : "Measured"}</span>
+                            </div>
+                            {exportStandardPrecisionRows.length ? (
+                              <div className="overflow-x-auto rounded-lg border border-slate-200">
+                                <table className="w-full min-w-[430px] text-left text-sm">
+                                  <thead className="bg-slate-50 text-xs text-slate-500">
+                                    <tr>
+                                      <th className="px-3 py-2 font-medium">Standard</th>
+                                      <th className="px-3 py-2 text-right font-medium">δ¹³C stdev</th>
+                                      <th className="px-3 py-2 text-right font-medium">δ¹⁸O stdev</th>
+                                      <th className="px-3 py-2 text-right font-medium">Measurements</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-slate-100 text-slate-700">
+                                    {exportStandardPrecisionRows.map((standard) => (
+                                      <tr key={standard.standard}>
+                                        <td className="px-3 py-2 font-medium text-slate-900">{standard.standard}</td>
+                                        <td className="px-3 py-2 text-right tabular-nums">{standard.d13 == null ? "—" : `${formatEmailPrecision(standard.d13, "en")}‰`}</td>
+                                        <td className="px-3 py-2 text-right tabular-nums">{standard.d18 == null ? "—" : `${formatEmailPrecision(standard.d18, "en")}‰`}</td>
+                                        <td className="px-3 py-2 text-right tabular-nums">{standard.total}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            ) : (
+                              <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-sm text-slate-500">No selected standard precision is available.</div>
+                            )}
+                          </div>
+                        </div>
+                      </section>
+
+                      {exportOutputType === "client_output" ? (
+                        <section
+                          className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
+                          aria-labelledby="client-output-preview-heading"
+                        >
+                          <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-4 py-4 sm:px-5">
+                            <div>
+                              <h3 id="client-output-preview-heading" className="font-semibold text-slate-950">Data output preview</h3>
+                              <p className="mt-0.5 text-sm text-slate-500">
+                                Review and edit every row in the final workbook. Duplicate rows are highlighted; isotope values are capped at 2 decimals.
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap items-center justify-end gap-2">
+                              {clientOutputPreviewQuery.data ? (
+                                <>
+                                  {clientOutputRemovedRowCount > 0 ? (
+                                    <span className="rounded-md bg-rose-50 px-2.5 py-1 text-xs font-medium tabular-nums text-rose-800">
+                                      {clientOutputRemovedRowCount} removed
+                                    </span>
+                                  ) : null}
+                                  <span className="rounded-md bg-cyan-50 px-2.5 py-1 text-xs font-medium tabular-nums text-cyan-800">
+                                    {clientOutputDraftRows.length} rows
+                                  </span>
+                                  <Button type="button" variant="outline" size="sm" onClick={resetClientOutputRows} disabled={busy}>
+                                    <RotateCcw className="h-4 w-4" />
+                                    Reset table
+                                  </Button>
+                                </>
+                              ) : null}
+                            </div>
+                          </div>
+
+                          {clientOutputPreviewQuery.isLoading && !clientOutputPreviewQuery.data ? (
+                            <div className="px-4 py-6 text-sm text-slate-500 sm:px-5">Preparing the data preview…</div>
+                          ) : clientOutputPreviewQuery.data?.columns.length ? (
+                            <>
+                              <div className="max-h-[32rem] overflow-auto">
+                                <table className="min-w-max border-separate border-spacing-0 text-left text-xs">
+                                  <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600 shadow-[0_1px_0_#cbd5e1]">
+                                    <tr>
+                                      {clientOutputPreviewQuery.data.columns.map((column) => (
+                                        <th key={column} className={cn("max-w-56 whitespace-normal px-3 py-2.5 font-semibold", column === "Species" && "italic")}>
+                                          {column}
+                                        </th>
+                                      ))}
+                                      <th className="sticky right-0 min-w-28 bg-slate-100 px-3 py-2.5 text-right font-semibold">Actions</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-slate-100 text-slate-700">
+                                    {clientOutputDraftRows.map((row, rowIndex) => {
+                                      const isDuplicate = duplicateClientOutputRowIndexes.has(rowIndex);
+                                      return (
+                                      <tr
+                                        key={rowIndex}
+                                        className={cn(
+                                          isDuplicate ? "bg-amber-100" : "odd:bg-white even:bg-slate-50/70",
+                                          "group",
+                                        )}
+                                      >
+                                        {clientOutputPreviewQuery.data.columns.map((column) => {
+                                          const numeric = clientOutputPreviewQuery.data.numeric_columns.includes(column);
+                                          return (
+                                            <td key={column} className="max-w-56 whitespace-nowrap p-1.5">
+                                              <ClientOutputCell
+                                                column={column}
+                                                numeric={numeric}
+                                                normalizeSpecies={
+                                                  column === "Species" &&
+                                                  !isRawClientOutputSource(activeConfig.export.client_output_species_source)
+                                                }
+                                                rowIndex={rowIndex}
+                                                value={row[column]}
+                                                onCommit={updateClientOutputCell}
+                                              />
+                                            </td>
+                                          );
+                                        })}
+                                        <td className={cn("sticky right-0 px-2 py-1.5 text-right", isDuplicate ? "bg-amber-100" : "bg-white group-even:bg-slate-50")}>
+                                          <div className="flex items-center justify-end gap-2">
+                                            {isDuplicate ? <span className="text-[11px] font-semibold text-amber-900">Duplicate</span> : null}
+                                            <Button
+                                              type="button"
+                                              variant="secondary"
+                                              size="icon"
+                                              onClick={() => removeClientOutputRow(rowIndex)}
+                                              aria-label={`Remove row ${rowIndex + 1}`}
+                                              title={`Remove row ${rowIndex + 1}`}
+                                              className="text-rose-700 hover:bg-rose-50 hover:text-rose-800"
+                                            >
+                                              <Trash2 className="h-4 w-4" />
+                                            </Button>
+                                          </div>
+                                        </td>
+                                      </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500 sm:px-5">
+                                <div>
+                                  <span className="font-medium text-slate-700">File:</span>{" "}
+                                  <span className="break-all font-mono">{clientOutputFilename}</span>
+                                </div>
+                                {duplicateClientOutputRowIndexes.size > 0 ? (
+                                  <span className="font-medium text-amber-800">{duplicateClientOutputRowIndexes.size} duplicate row(s)</span>
+                                ) : null}
+                              </div>
+                            </>
+                          ) : clientOutputPreviewQuery.isError ? (
+                            <div className="space-y-3 px-4 py-6 sm:px-5" role="alert">
+                              <div>
+                                <div className="text-sm font-medium text-red-700">The data preview could not be prepared.</div>
+                                <div className="mt-1 text-xs text-red-600">
+                                  {clientOutputPreviewQuery.error instanceof Error
+                                    ? clientOutputPreviewQuery.error.message
+                                    : "Check the export options and try again."}
+                                </div>
+                              </div>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => void clientOutputPreviewQuery.refetch()}
+                                disabled={clientOutputPreviewQuery.isFetching}
+                              >
+                                <RotateCcw className={cn("h-4 w-4", clientOutputPreviewQuery.isFetching && "animate-spin")} />
+                                {clientOutputPreviewQuery.isFetching ? "Retrying…" : "Retry preview"}
+                              </Button>
+                            </div>
+                          ) : (
+                            <div className="px-4 py-6 text-sm text-slate-500 sm:px-5">No rows match the current client-output scope.</div>
+                          )}
+                        </section>
+                      ) : null}
+
+                      {exportOutputType === "client_output" ? (
+                        <section className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200" aria-labelledby="email-preview-heading">
+                          <div className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-200 px-4 py-4 sm:px-5">
+                            <div>
+                              <h3 id="email-preview-heading" className="font-semibold text-slate-950">Email to client</h3>
+                              <p className="mt-0.5 text-sm text-slate-500">Prefilled from the current dataset and precision summary.</p>
+                            </div>
+                            <label className="form-field min-w-36">
+                              <span className="form-label">Language</span>
+                              <select
+                                value={exportEmailLanguage}
+                                onChange={(event) => setExportEmailLanguage(event.target.value as ExportEmailLanguage)}
+                                className="form-control"
+                              >
+                                {EXPORT_EMAIL_LANGUAGE_OPTIONS.map((option) => (
+                                  <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                              </select>
+                            </label>
+                          </div>
+                          <div className="space-y-1 border-b border-slate-200 px-4 py-3 sm:px-5">
+                            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Optional considerations</div>
+                            <CheckboxField
+                              checked={includeInsufficientSignalEmailNote}
+                              label={insufficientSignalSamples.length
+                                ? `Mention insufficient signal samples (${insufficientSignalSamples.length})`
+                                : "Mention insufficient signal samples"}
+                              description={insufficientSignalSamples.length
+                                ? "Add a short note naming failed samples and outliers with signal intensity below 2 V."
+                                : "No failed samples or outliers below 2 V were found in the current export scope."}
+                              onChange={setIncludeInsufficientSignalEmailNote}
+                              disabled={!insufficientSignalSamples.length}
+                            />
+                            <CheckboxField
+                              checked={includeConservativeOutlierEmailNote}
+                              label="Add conservative outlier-removal note"
+                              description='Add "Outliers removal was done conservatively" to the message.'
+                              onChange={setIncludeConservativeOutlierEmailNote}
+                            />
+                          </div>
+                          <div className="border-b border-slate-200 bg-slate-50/70 px-4 py-3 sm:px-5">
+                            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Subject</div>
+                            <div className="mt-1 break-words text-sm font-medium text-slate-900">
+                              {exportEmailSubject || (clientOutputPreviewQuery.isLoading ? "Preparing subject…" : "Subject unavailable")}
+                            </div>
+                          </div>
+                          <div className="max-h-80 overflow-y-auto whitespace-pre-wrap break-words px-4 py-5 font-sans text-sm leading-6 text-slate-700 sm:px-5">
+                            {renderEmailText(exportEmailBody, exportEmailItalicTerms)}
+                          </div>
+                          <div className="flex items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 sm:px-5">
+                            <span className="text-xs text-slate-500" aria-live="polite">{isExportEmailCopied ? "Email copied to clipboard." : "Review the message before sending."}</span>
+                            <Button
+                              type="button"
+                              variant={isExportEmailCopied ? "secondary" : "outline"}
+                              size="sm"
+                              className="shrink-0 whitespace-nowrap"
+                              disabled={!exportEmailSubject}
+                              onClick={() => {
+                                void copyTextToClipboard(exportEmailClipboardText, exportEmailClipboardHtml)
+                                  .then(() => setCopiedExportEmail(exportEmailClipboardText));
+                              }}
+                            >
+                              {isExportEmailCopied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                              {isExportEmailCopied ? "Copied" : "Copy email"}
+                            </Button>
+                          </div>
+                        </section>
+                      ) : (
+                        <div className="rounded-xl border border-dashed border-slate-300 bg-white px-4 py-5 text-sm text-slate-600">
+                          Select <span className="font-medium text-slate-900">Client output</span> to generate the client email preview.
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
-                <div className="flex justify-end gap-2 border-t border-stone-200 px-4 py-3">
+                <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 bg-white px-4 py-3 sm:px-6">
                   <Button variant="outline" onClick={() => setExportModalOpen(false)} disabled={busy}>
                     Cancel
                   </Button>
-                  <Button onClick={() => handleExport(exportOutputType)} disabled={busy}>
+                  <Button onClick={() => handleExport(exportOutputType)} disabled={busy} className="whitespace-nowrap">
                     <Download className="h-4 w-4" />
                     {exportOutputType === "client_output" ? "Download client output" : "Download dataset"}
                   </Button>
@@ -6923,11 +8518,16 @@ export default function ProcessingPage() {
                               {activeTargetIndex + 1}/{selectedTargets.length}
                             </span>
                             <span className="truncate text-sm font-semibold text-stone-900">
-                              {(activeTarget?.identifier1 || "No Identifier 1").trim()} · {(activeTarget?.identifier2 || "No Identifier 2").trim()}
+                              {(activeIdentifier1Label || "No Identifier 1").trim()} · {(activeIdentifier2 || "No Identifier 2").trim()}
                             </span>
                             <span className="rounded-md bg-white px-1.5 py-0.5 text-[11px] text-stone-500 ring-1 ring-stone-200">
                               Row {(activeTarget?.rowLabel || "").trim()}
                             </span>
+                            {activeDuplicateGroupSize > 1 ? (
+                              <span className="rounded-md bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-900 ring-1 ring-amber-300">
+                                Duplicate · {activeDuplicateGroupSize} matching rows
+                              </span>
+                            ) : null}
                           </div>
                           <div className="flex gap-2">
                             <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>
@@ -6942,6 +8542,109 @@ export default function ProcessingPage() {
                               Next
                             </Button>
                           </div>
+                        </div>
+                        {activeDuplicateGroupSize > 1 ? (
+                          <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                            Change Identifier 1, Identifier 2, or Species to make this sample unique. The orange chart marker clears as soon as the draft resolves the duplicate.
+                          </div>
+                        ) : null}
+                        <div className="grid gap-3 lg:grid-cols-3">
+                          <label className="block min-w-0 text-sm">
+                            <span className="mb-1 block text-xs font-semibold text-stone-700">Identifier 1</span>
+                            <input
+                              key={`identifier1:${activeTarget?.rowLabel ?? ""}:${activeIdentifier1Source}`}
+                              type="text"
+                              list="selection-identifier1-options"
+                              defaultValue={activeIdentifier1Source}
+                              disabled={busy || !activeTarget}
+                              aria-describedby="selection-identifier1-help"
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") event.currentTarget.blur();
+                              }}
+                              onBlur={(event) => {
+                                if (!activeTarget) return;
+                                const value = event.currentTarget.value.trim();
+                                if (!value) {
+                                  event.currentTarget.value = activeIdentifier1Source;
+                                } else if (value !== activeIdentifier1Source) {
+                                  queueIdentifier1Override(activeTarget, value);
+                                }
+                              }}
+                              className="h-9 w-full rounded-md border border-stone-300 bg-white px-3 text-sm text-stone-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-stone-100"
+                            />
+                            <datalist id="selection-identifier1-options">
+                              {identifier1Sources.map((source) => <option key={source} value={source} />)}
+                            </datalist>
+                            <span id="selection-identifier1-help" className="mt-1 block text-[11px] leading-4 text-stone-500">
+                              {selectionDraftIdentifier1[activeTarget?.rowLabel ?? ""]
+                                ? "Manual override queued. Apply changes to save it."
+                                : "Type any value or choose an existing suggestion."}
+                            </span>
+                          </label>
+                          <label className="block min-w-0 text-sm">
+                            <span className="mb-1 block text-xs font-semibold text-stone-700">Identifier 2</span>
+                            <input
+                              key={`identifier2:${activeTarget?.rowLabel ?? ""}:${activeIdentifier2}`}
+                              type="text"
+                              list="selection-identifier2-options"
+                              defaultValue={activeIdentifier2}
+                              disabled={busy || !activeTarget}
+                              aria-describedby="selection-identifier2-help"
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") event.currentTarget.blur();
+                              }}
+                              onBlur={(event) => {
+                                if (!activeTarget) return;
+                                const value = event.currentTarget.value.trim();
+                                if (!value) {
+                                  event.currentTarget.value = activeIdentifier2;
+                                } else if (value !== activeIdentifier2) {
+                                  queueIdentifier2Override(activeTarget, value);
+                                }
+                              }}
+                              className="h-9 w-full rounded-md border border-stone-300 bg-white px-3 text-sm text-stone-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-stone-100"
+                            />
+                            <datalist id="selection-identifier2-options">
+                              {identifier2Sources.map((source) => <option key={source} value={source} />)}
+                            </datalist>
+                            <span id="selection-identifier2-help" className="mt-1 block text-[11px] leading-4 text-stone-500">
+                              {selectionDraftIdentifier2[activeTarget?.rowLabel ?? ""]
+                                ? "Manual override queued. Apply changes to save it."
+                                : "Type any value or choose an existing suggestion."}
+                            </span>
+                          </label>
+                          <label className="block min-w-0 text-sm">
+                            <span className="mb-1 block text-xs font-semibold text-stone-700">Species</span>
+                            <input
+                              key={`species:${activeTarget?.rowLabel ?? ""}:${activeSpeciesSource}`}
+                              type="text"
+                              list="selection-species-options"
+                              defaultValue={activeSpeciesSource}
+                              disabled={busy || !activeTarget}
+                              aria-describedby="selection-species-help"
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") event.currentTarget.blur();
+                              }}
+                              onBlur={(event) => {
+                                if (!activeTarget) return;
+                                const value = event.currentTarget.value.trim();
+                                if (!value) {
+                                  event.currentTarget.value = activeSpeciesSource;
+                                } else if (value !== activeSpeciesSource) {
+                                  queueSpeciesOverride(activeTarget, value);
+                                }
+                              }}
+                              className="h-9 w-full rounded-md border border-stone-300 bg-white px-3 text-sm italic text-stone-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-stone-100"
+                            />
+                            <datalist id="selection-species-options">
+                              {speciesSources.map((source) => <option key={source} value={source} />)}
+                            </datalist>
+                            <span id="selection-species-help" className="mt-1 block text-[11px] leading-4 text-stone-500">
+                              {selectionDraftSpecies[activeTarget?.rowLabel ?? ""]
+                                ? "Manual override queued. Apply changes to save it."
+                                : "Type any value or choose an existing suggestion."}
+                            </span>
+                          </label>
                         </div>
                         <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-white sm:grid-cols-[1.2fr_1fr_1fr] sm:divide-x sm:divide-stone-200">
                           <div className="px-3 py-2">
@@ -7212,7 +8915,7 @@ export default function ProcessingPage() {
           ) : null}
 
           <div className="space-y-3">
-            <div className="space-y-6">
+            <div className="space-y-3">
               <FigureCard
                 key={overviewCards.d13Summary.key}
                 chartKey={overviewCards.d13Summary.key}
@@ -7261,7 +8964,7 @@ export default function ProcessingPage() {
             renderTableControls={renderFailedSampleTableControls}
           />
 
-          <div className="space-y-6">
+          <div className="space-y-3">
             {resolvedSpeciesSections.map((section) => {
               const isSectionOpen = openSpeciesSections.has(section.species);
               const identifierCount = section.identifier_count ?? section.identifier_figures.length;
@@ -7280,7 +8983,7 @@ export default function ProcessingPage() {
                     {section.species} ({identifierCount} identifiers)
                   </summary>
                   {isSectionOpen ? (
-                    <div className="space-y-6 p-6 pt-0">
+                    <div className="space-y-3 p-6 pt-0">
                   {isLoadingSectionFigures ? (
                     <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
                       Loading species charts...
@@ -7302,7 +9005,7 @@ export default function ProcessingPage() {
                           <CardTitle>{figureSet.identifier}</CardTitle>
                         </CardHeader>
                         <CardContent className="space-y-4">
-                          <div className="space-y-6">
+                          <div className="space-y-3">
                             <div className="space-y-3">
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
@@ -7319,6 +9022,7 @@ export default function ProcessingPage() {
                                 <PlotlyChart
                                   figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d13c))), d13State)}
                                   className="h-full w-full"
+                                  fitContainer
                                   uiRevision={`processing:${d13Key}`}
                                   {...chartHoverProps(d13Key)}
                                   onPointClick={(points) => handleChartClick(d13Key, points)}
@@ -7343,6 +9047,7 @@ export default function ProcessingPage() {
                                 <PlotlyChart
                                   figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d18o))), d18State)}
                                   className="h-full w-full"
+                                  fitContainer
                                   uiRevision={`processing:${d18Key}`}
                                   {...chartHoverProps(d18Key)}
                                   onPointClick={(points) => handleChartClick(d18Key, points)}

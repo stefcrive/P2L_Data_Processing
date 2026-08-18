@@ -18,6 +18,7 @@ from services.irms_api.domain.constants import (
     CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     ISOTYPE_D13C,
+    SAMPLE_SEQUENCE_COL,
     VALID_CYCLES_COL,
 )
 from services.irms_api.domain.contracts import CalibrationConfig, CalibrationOfficialValueUpsertRequest, LinearityConfig
@@ -140,6 +141,7 @@ class CalibrationApiTests(unittest.TestCase):
         self.assertIn(VALID_CYCLES_COL, preview.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_SAMP44_COL, preview.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_REF44_COL, preview.available_values.color_params)
+        self.assertEqual(preview.available_values.color_params[:2], ["Date", SAMPLE_SEQUENCE_COL])
         shpl2_summary = next(item for item in preview.precision_summaries if item.standard == "SHP2L")
         self.assertIn("1", shpl2_summary.line_precisions)
         line1 = shpl2_summary.line_precisions["1"]
@@ -149,6 +151,21 @@ class CalibrationApiTests(unittest.TestCase):
 
         metadata = api_main.store.load_metadata(self.session_id)
         self.assertEqual(metadata.get("calibration", {}), {})
+
+    def test_sample_sequence_colors_follow_acquisition_order(self) -> None:
+        preview = api_main.calibration_workspace_preview(
+            self.session_id,
+            CalibrationConfig(
+                selected_standards=["SHP2L", "NBS19"],
+                color_param=SAMPLE_SEQUENCE_COL,
+                z_axis="1  Cycle Int  Samp  44",
+            ),
+        )
+
+        color_axis = preview.figures["VPDB(13C)"]["layout"]["coloraxis"]
+        self.assertEqual(preview.config.color_param, SAMPLE_SEQUENCE_COL)
+        self.assertEqual(float(color_axis["cmin"]), 1.0)
+        self.assertEqual(float(color_axis["cmax"]), 6.0)
 
     def test_available_standards_include_dataset_identifiers_and_database_materials(self) -> None:
         preview = api_main.calibration_workspace_preview(
@@ -571,6 +588,81 @@ class CalibrationApiTests(unittest.TestCase):
         self.assertEqual(len(base_section.d13_outliers), 2)
         self.assertEqual(len(apply_section.d13_outliers), 0)
         self.assertNotEqual(base_section.d13_figure.get("data"), apply_section.d13_figure.get("data"))
+
+    def test_preview_workspace_seeds_linearity_fit_without_failed_d18o_rows(self) -> None:
+        good_x = np.linspace(6.0, 18.0, 23)
+        noise = np.array(
+            [
+                0.00,
+                0.03,
+                -0.02,
+                0.02,
+                -0.01,
+                0.01,
+                -0.03,
+                0.02,
+                0.00,
+                -0.02,
+                0.03,
+                -0.01,
+                0.00,
+                0.01,
+                -0.03,
+                0.02,
+                -0.01,
+                0.03,
+                -0.02,
+                0.01,
+                0.00,
+                -0.01,
+                0.02,
+            ]
+        )
+        good_d18 = -27.8 - 0.02 * (good_x - 12.0) + noise
+        bad_x = np.array([19.987, 16.623, 12.289, 9.027])
+        bad_d18 = np.array([-9.346, -2.079, -22.894, -22.675])
+        intensity = np.concatenate([good_x, bad_x])
+        d18 = np.concatenate([good_d18, bad_d18])
+        row_count = len(intensity)
+        failed_d18_df = pd.DataFrame(
+            {
+                "Identifier 1": ["SHP2L"] * row_count,
+                "Identifier 2": [str(index + 1) for index in range(row_count)],
+                "Species": ["Std"] * row_count,
+                "d 13C/12C  Mean": -13.7 - 0.008 * (intensity - 12.0),
+                "d 18O/16O  Mean": d18,
+                "1  Cycle Int  Samp  44": intensity,
+                "1  Cycle Int  Ref  44": [10.0] * row_count,
+                "Date": ["2025-01-01"] * row_count,
+                "Date_ordinal": [739252] * row_count,
+            }
+        )
+        api_main.store.save_frames(self.session_id, failed_d18_df, pd.DataFrame())
+
+        preview = api_main.calibration_workspace_preview(
+            self.session_id,
+            CalibrationConfig(
+                selected_standards=["SHP2L"],
+                calibration_type="IQR",
+                iqr_multiplier=1.5,
+                independent_isotope_outliers=True,
+                color_param="Date_ordinal",
+                z_axis="1  Cycle Int  Samp  44",
+                linearity={
+                    "apply": True,
+                    "intensity_col": "1  Cycle Int  Samp  44",
+                    "cycle_intensity_aggregation": "first_valid_cycle",
+                    "manual_override_enabled": False,
+                },
+            ),
+        )
+
+        d18_fit = preview.linearity_fits["d18O"]
+        self.assertEqual(int(d18_fit["n"]), len(good_x))
+        self.assertAlmostEqual(float(d18_fit["slope"]), -0.02, places=3)
+        self.assertGreater(float(d18_fit["r2"]), 0.9)
+        summary = next(item for item in preview.precision_summaries if item.standard == "SHP2L")
+        self.assertEqual(summary.included_d18, len(good_x))
 
     def test_preview_workspace_linearity_basis_selector_updates_correction_basis(self) -> None:
         config = CalibrationConfig(

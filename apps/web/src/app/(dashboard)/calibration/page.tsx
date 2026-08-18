@@ -14,6 +14,7 @@ import {
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
+import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
 import {
   SATURATION_COLOR_AXIS_OPTIONS,
   SaturationAxisHelpTooltip,
@@ -2147,6 +2148,23 @@ function deriveColorScaleBounds(figures: Array<Record<string, unknown> | undefin
   return { min, max };
 }
 
+function deriveColorScaleBoundsFromState(color: CalibrationPreviewColorState | null | undefined): ColorScaleBounds | null {
+  if (!color) {
+    return null;
+  }
+  const values = Array.from(color.valuesByRow.values()).filter((value) => Number.isFinite(value));
+  if (!values.length) {
+    return null;
+  }
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  if (min === max) {
+    const pad = Math.max(Math.abs(min) * 0.01, 0.001);
+    return { min: min - pad, max: max + pad };
+  }
+  return { min, max };
+}
+
 function formatCalibrationColorScaleValue(value: number, colorParam: string | null): string {
   if (String(colorParam ?? "").trim().toLowerCase() === "date") {
     const date = new Date((value - 719163) * 86400000);
@@ -3313,6 +3331,8 @@ export default function CalibrationPage() {
     queryFn: () => api.previewCalibrationWorkspace(sessionId!, activeDraftConfig!),
     enabled: hasDraftConfigChanges,
     staleTime: 5_000,
+    placeholderData: (previousData, previousQuery) =>
+      hasDraftConfigChanges && previousQuery?.queryKey[1] === sessionId ? previousData : undefined,
   });
   const linearityPreviewDataQuery = useQuery({
     queryKey: ["processing-linearity-preview-data", sessionId],
@@ -3326,9 +3346,17 @@ export default function CalibrationPage() {
   );
   const activeColorParam = activeDraftConfig?.color_param ?? persistedWorkspace?.config.color_param ?? null;
   const colorScaleFigures = useMemo<Array<Record<string, unknown> | undefined>>(() => {
-    return collectCalibrationPreviewFigures(persistedWorkspace, calibrationPreviewMasks, activeDraftConfig);
-  }, [activeDraftConfig, calibrationPreviewMasks, persistedWorkspace]);
-  const colorScaleBounds = useMemo(() => deriveColorScaleBounds(colorScaleFigures), [colorScaleFigures]);
+    const previewWorkspace = calibrationPreviewWorkspaceQuery.data;
+    return collectCalibrationPreviewFigures(
+      previewWorkspace ?? persistedWorkspace,
+      previewWorkspace ? null : calibrationPreviewMasks,
+      activeDraftConfig,
+    );
+  }, [activeDraftConfig, calibrationPreviewMasks, calibrationPreviewWorkspaceQuery.data, persistedWorkspace]);
+  const colorScaleBounds = useMemo(
+    () => deriveColorScaleBounds(colorScaleFigures) ?? deriveColorScaleBoundsFromState(calibrationPreviewMasks?.color),
+    [calibrationPreviewMasks?.color, colorScaleFigures],
+  );
   const colorScaleTwoSigmaRange = useMemo(() => {
     if (!colorScaleBounds) {
       return null;
@@ -4025,10 +4053,10 @@ export default function CalibrationPage() {
   if (!workspace || !activeConfig || !displayedWorkspace) {
     return null;
   }
-  const colorSliderBounds: ColorScaleBounds = colorScaleBounds ?? { min: 0, max: 1 };
+  const colorSliderBounds = colorScaleBounds;
   const effectiveColorScaleRange = normalizeColorScaleRange(
-    colorScaleRange ?? colorScaleTwoSigmaRange ?? [colorSliderBounds.min, colorSliderBounds.max],
-    colorSliderBounds,
+    colorScaleRange ?? colorScaleTwoSigmaRange ?? [colorSliderBounds?.min ?? 0, colorSliderBounds?.max ?? 1],
+    colorSliderBounds ?? { min: 0, max: 1 },
   );
   const colorScaleSignature = `${activeConfig.color_param}:${effectiveColorScaleRange[0]}:${effectiveColorScaleRange[1]}`;
   if (colorScaleSignatureRef.current !== colorScaleSignature) {
@@ -4268,10 +4296,6 @@ export default function CalibrationPage() {
           </>
         }
       />
-
-      {colorScaleBounds ? (
-        <CalibrationColorScaleBar colorParam={activeColorParam} range={effectiveColorScaleRange} />
-      ) : null}
 
       {isOfficialValuesModalOpen ? (
         <div
@@ -4851,7 +4875,7 @@ export default function CalibrationPage() {
               </label>
 
               <div className="grid gap-4">
-                <label className="form-field">
+                <div className="form-field">
                   <span className="form-label">Color parameter</span>
                   <select
                     value={activeConfig.color_param}
@@ -4866,7 +4890,12 @@ export default function CalibrationPage() {
                       </option>
                     ))}
                   </select>
-                </label>
+                  {colorScaleBounds ? (
+                    <div className="mt-2">
+                      <CalibrationColorScaleBar colorParam={activeColorParam} range={effectiveColorScaleRange} />
+                    </div>
+                  ) : null}
+                </div>
                 <label className="form-field">
                   <span className="form-label">3D Z axis</span>
                   <select
@@ -4881,17 +4910,25 @@ export default function CalibrationPage() {
                     ))}
                   </select>
                 </label>
-                <div className="form-field">
-                  <RangeSliderField
-                    label="Color scale interval"
-                    value={effectiveColorScaleRange}
-                    min={colorSliderBounds.min}
-                    max={colorSliderBounds.max}
-                    step={sliderStep(colorSliderBounds)}
-                    precision={sliderPrecision(colorSliderBounds)}
-                    onChange={(nextRange) => setColorScaleRange(nextRange)}
-                  />
-                </div>
+                {colorSliderBounds ? (
+                  <div className="form-field">
+                    <RangeSliderField
+                      label="Color scale interval"
+                      value={effectiveColorScaleRange}
+                      min={colorSliderBounds.min}
+                      max={colorSliderBounds.max}
+                      step={sliderStep(colorSliderBounds)}
+                      precision={sliderPrecision(colorSliderBounds)}
+                      onChange={(nextRange) => setColorScaleRange(nextRange)}
+                    />
+                  </div>
+                ) : (
+                  <p className="text-xs text-stone-500" role="status">
+                    {calibrationPreviewWorkspaceQuery.isFetching || linearityPreviewDataQuery.isLoading
+                      ? "Loading the selected color range..."
+                      : "No numeric values are available for the selected color parameter."}
+                  </p>
+                )}
               </div>
 
               <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
@@ -5281,6 +5318,8 @@ export default function CalibrationPage() {
           </Card>
         </aside>
 
+        <ControlColumnToggle />
+
         <div className="space-y-6">
           {precisionSummaries.length ? (
             <div className="grid gap-3">
@@ -5310,6 +5349,7 @@ export default function CalibrationPage() {
                       figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VPDB(13C)"], "VPDB(13C)")))}
                       className="h-[clamp(380px,42vw,620px)] w-full"
                       fitContainer
+                      uiRevision={`calibration:${sessionId}:VPDB(13C)`}
                       {...chartHoverProps("VPDB(13C)")}
                       onPointClick={(points) => openProcessingSelectionEditor("VPDB(13C)", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("VPDB(13C)", points, true)}
@@ -5325,6 +5365,7 @@ export default function CalibrationPage() {
                       figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VSMOW(18O)"], "VSMOW(18O)")))}
                       className="h-[clamp(380px,42vw,620px)] w-full"
                       fitContainer
+                      uiRevision={`calibration:${sessionId}:VSMOW(18O)`}
                       {...chartHoverProps("VSMOW(18O)")}
                       onPointClick={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("VSMOW(18O)", points, true)}
@@ -5345,6 +5386,7 @@ export default function CalibrationPage() {
                       figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.calibration_3d, "calibration_3d")))}
                       className="h-[clamp(380px,42vw,620px)] w-full"
                       fitContainer
+                      uiRevision={`calibration:${sessionId}:calibration_3d`}
                       {...chartHoverProps("calibration_3d")}
                       onPointClick={(points) => openProcessingSelectionEditor("calibration_3d", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("calibration_3d", points, true)}
@@ -5362,6 +5404,7 @@ export default function CalibrationPage() {
                       figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.crossplot, "crossplot")))}
                       className="h-[clamp(380px,42vw,620px)] w-full"
                       fitContainer
+                      uiRevision={`calibration:${sessionId}:crossplot`}
                       {...chartHoverProps("crossplot")}
                       onPointClick={(points) => openProcessingSelectionEditor("crossplot", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("crossplot", points, true)}
@@ -5391,6 +5434,7 @@ export default function CalibrationPage() {
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_raw, "linearity|d13_raw"))}
                       className="h-[420px] w-full"
                       fitContainer
+                      uiRevision={`calibration:${sessionId}:linearity:d13_raw`}
                       {...chartHoverProps("linearity|d13_raw")}
                       onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("linearity|d13_raw", points, true)}
@@ -5402,6 +5446,7 @@ export default function CalibrationPage() {
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_corrected, "linearity|d13_corrected"))}
                       className="h-[420px] w-full"
                       fitContainer
+                      uiRevision={`calibration:${sessionId}:linearity:d13_corrected`}
                       {...chartHoverProps("linearity|d13_corrected")}
                       onPointClick={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("linearity|d13_corrected", points, true)}
@@ -5413,6 +5458,7 @@ export default function CalibrationPage() {
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_raw, "linearity|d18_raw"))}
                       className="h-[420px] w-full"
                       fitContainer
+                      uiRevision={`calibration:${sessionId}:linearity:d18_raw`}
                       {...chartHoverProps("linearity|d18_raw")}
                       onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("linearity|d18_raw", points, true)}
@@ -5424,6 +5470,7 @@ export default function CalibrationPage() {
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_corrected, "linearity|d18_corrected"))}
                       className="h-[420px] w-full"
                       fitContainer
+                      uiRevision={`calibration:${sessionId}:linearity:d18_corrected`}
                       {...chartHoverProps("linearity|d18_corrected")}
                       onPointClick={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, false)}
                       onSelection={(points) => openProcessingSelectionEditor("linearity|d18_corrected", points, true)}
@@ -5454,6 +5501,7 @@ export default function CalibrationPage() {
                               figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(section.d13_figure, `${section.standard}|d13C`)))}
                               className="h-[460px] w-full"
                               fitContainer
+                              uiRevision={`calibration:${sessionId}:standard:${section.standard}:d13C`}
                               {...chartHoverProps(`${section.standard}|d13C`)}
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, false)}
                               onSelection={(points) => openProcessingSelectionEditor(`${section.standard}|d13C`, points, true)}
@@ -5469,6 +5517,7 @@ export default function CalibrationPage() {
                               figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(section.d18_figure, `${section.standard}|d18O`)))}
                               className="h-[460px] w-full"
                               fitContainer
+                              uiRevision={`calibration:${sessionId}:standard:${section.standard}:d18O`}
                               {...chartHoverProps(`${section.standard}|d18O`)}
                               onPointClick={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, false)}
                               onSelection={(points) => openProcessingSelectionEditor(`${section.standard}|d18O`, points, true)}

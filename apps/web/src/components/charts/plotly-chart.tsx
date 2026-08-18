@@ -69,6 +69,12 @@ type PlotlyRelayoutApi = {
   relayout: (graphDiv: PlotlyGraphDiv, update: Record<string, unknown>) => Promise<unknown>;
 };
 
+type PlotlyResizeApi = {
+  Plots: {
+    resize: (graphDiv: PlotlyGraphDiv) => Promise<unknown> | void;
+  };
+};
+
 function numericAxisRange(value: unknown): [number, number] | null {
   if (!Array.isArray(value) || value.length !== 2) {
     return null;
@@ -419,6 +425,8 @@ export function PlotlyChart({
 }: PlotlyChartProps) {
   const [renderRevision, setRenderRevision] = useState(0);
   const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const graphDivRef = useRef<PlotlyGraphDiv | null>(null);
   const didRefreshAfterInitializeRef = useRef(false);
   const pointerInteractionTokenRef = useRef(0);
   const consumedPointerInteractionTokenRef = useRef(0);
@@ -474,7 +482,57 @@ export function PlotlyChart({
     return () => window.clearTimeout(timer);
   }, [deferRenderMs, figure, shouldDeferRender]);
 
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !preparedFigure || !isDeferredReady || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    let resizeFrame: number | null = null;
+    let lastWidth = container.getBoundingClientRect().width;
+    let lastHeight = container.getBoundingClientRect().height;
+
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry) {
+        return;
+      }
+      const { width, height } = entry.contentRect;
+      if (Math.abs(width - lastWidth) < 0.5 && Math.abs(height - lastHeight) < 0.5) {
+        return;
+      }
+      lastWidth = width;
+      lastHeight = height;
+
+      if (resizeFrame !== null) {
+        window.cancelAnimationFrame(resizeFrame);
+      }
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = null;
+        const graphDiv = graphDivRef.current;
+        if (!graphDiv?.isConnected) {
+          return;
+        }
+        void import("@/lib/plotly-core").then(({ default: plotlyModule }) => {
+          if (!graphDiv.isConnected) {
+            return;
+          }
+          const Plotly = plotlyModule as unknown as PlotlyResizeApi;
+          void Plotly.Plots.resize(graphDiv);
+        });
+      });
+    });
+
+    observer.observe(container);
+    return () => {
+      observer.disconnect();
+      if (resizeFrame !== null) {
+        window.cancelAnimationFrame(resizeFrame);
+      }
+    };
+  }, [isDeferredReady, preparedFigure]);
+
   function refreshAfterInitialize(_figure?: unknown, graphDiv?: PlotlyGraphDiv) {
+    graphDivRef.current = graphDiv ?? null;
     syncStandardAxisScale(graphDiv, (active) => {
       isSynchronizingStandardAxisRef.current = active;
     });
@@ -557,18 +615,23 @@ export function PlotlyChart({
         }
       : {};
   return (
-    <div className={cn("min-w-0 w-full overflow-hidden", className)} onPointerDownCapture={registerPointerInteraction}>
+    <div
+      ref={containerRef}
+      className={cn("min-w-0 w-full overflow-hidden", className)}
+      onPointerDownCapture={registerPointerInteraction}
+    >
       <Plot
         data={preparedFigure.data}
         layout={preparedFigure.layout}
         config={{ responsive: true }}
         revision={renderRevision}
         onInitialized={refreshAfterInitialize}
-        onUpdate={(_figure: unknown, graphDiv: PlotlyGraphDiv) =>
+        onUpdate={(_figure: unknown, graphDiv: PlotlyGraphDiv) => {
+          graphDivRef.current = graphDiv;
           syncStandardAxisScale(graphDiv, (active) => {
             isSynchronizingStandardAxisRef.current = active;
           })
-        }
+        }}
         onRelayout={persistViewportUpdate}
         useResizeHandler={preparedFigure.useResizeHandler}
         className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}

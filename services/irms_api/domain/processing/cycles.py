@@ -2488,7 +2488,7 @@ def find_interpolation_neighbors(
     range_excluded = range_excluded | pd.to_numeric(base.get("leak_rate"), errors="coerce").gt(float(config.leak_range[1]))
 
     groups = _get_species_series(base)
-    _, _, sigma_excluded = compute_statistical_outlier_masks(
+    sigma_d13, sigma_d18, _ = compute_statistical_outlier_masks(
         base,
         sigma_level=sigma_level,
         edit_state=edit_state,
@@ -2496,9 +2496,15 @@ def find_interpolation_neighbors(
         method=statistical_outlier_method,
         iqr_multiplier=iqr_multiplier,
     )
+    sigma_excluded = sigma_d13 if partial_iso_key == "d13C" else sigma_d18
 
     excluded_mask = status_excluded | range_excluded | sigma_excluded.reindex(base.index, fill_value=False).astype(bool)
-    excluded_mask = _apply_manual_outlier_overrides(excluded_mask, edit_state, row_index=base.index)
+    excluded_mask = _apply_manual_outlier_overrides(
+        excluded_mask,
+        edit_state,
+        row_index=base.index,
+        isotope_key=partial_iso_key,
+    )
     candidate_mask = ~excluded_mask
 
     prev_neighbor = None
@@ -2694,6 +2700,7 @@ def build_cycle_diagnostics_payload(
         sigma_level=sigma_level,
         statistical_outlier_method=statistical_outlier_method,
         iqr_multiplier=iqr_multiplier,
+        isotope_key=target.get("isotope_key"),
     )
     table_frame = cycle_table.reset_index(drop=True).replace({pd.NA: None}).where(pd.notnull(cycle_table.reset_index(drop=True)), None)
     return CycleDiagnosticsPayload(

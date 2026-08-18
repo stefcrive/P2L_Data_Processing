@@ -4,6 +4,7 @@ import type {
   CalibrationWorkspace,
   ChartBundle,
   ClientOutputDuplicateCheckResponse,
+  ClientOutputPreviewResponse,
   CycleDiagnosticsPayload,
   EditAction,
   ExportRequest,
@@ -588,6 +589,15 @@ export const api = {
       {
         method: "POST",
         body: body(payload),
+      },
+    ),
+  previewClientOutput: (sessionId: string, payload: ExportRequest, signal?: AbortSignal) =>
+    requestJson<ClientOutputPreviewResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/exports/client-output/preview`,
+      {
+        method: "POST",
+        body: body(payload),
+        signal,
       },
     ),
   exportDataset,

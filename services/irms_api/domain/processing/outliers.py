@@ -123,12 +123,37 @@ def _get_manual_outlier_override_map(edit_state: dict[str, Any] | None) -> dict[
     return cleaned
 
 
+def _get_manual_outlier_override(
+    edit_state: dict[str, Any] | None,
+    row_label: Any,
+    isotope_key: str | None = None,
+) -> bool | None:
+    """Return an isotope override, falling back to legacy row-wide overrides."""
+    overrides = _get_manual_outlier_override_map(edit_state)
+    return _manual_outlier_override_from_map(overrides, row_label, isotope_key)
+
+
+def _manual_outlier_override_from_map(
+    overrides: dict[str, bool],
+    row_label: Any,
+    isotope_key: str | None = None,
+) -> bool | None:
+    row_key = str(row_label)
+    isotope = str(isotope_key or "").strip()
+    if isotope in {"d13C", "d18O"}:
+        isotope_token = f"{isotope}|{row_key}"
+        if isotope_token in overrides:
+            return overrides[isotope_token]
+    return overrides.get(row_key)
+
+
 def _apply_manual_outlier_overrides(
     mask: pd.Series | list[bool] | np.ndarray,
     edit_state: dict[str, Any] | None,
     row_index: pd.Index | None = None,
     apply_true: bool = True,
     apply_false: bool = True,
+    isotope_key: str | None = None,
 ) -> pd.Series:
     if row_index is None:
         if isinstance(mask, pd.Series):
@@ -144,7 +169,7 @@ def _apply_manual_outlier_overrides(
         return mask_series
 
     override_for_rows = pd.Series(
-        [overrides.get(str(idx), None) for idx in mask_series.index],
+        [_manual_outlier_override_from_map(overrides, idx, isotope_key) for idx in mask_series.index],
         index=mask_series.index,
         dtype=object,
     )
@@ -202,6 +227,7 @@ def _partial_status_outlier_mask(
         row_index=idx,
         apply_true=True,
         apply_false=True,
+        isotope_key=isotope_key,
     )
     return (effective_mask & partial_mask).astype(bool)
 
@@ -248,8 +274,12 @@ def compute_statistical_outlier_masks(
             statistical_mask_d18.loc[group_data.index] = group_stat_outliers_d18.astype(bool).to_numpy()
     statistical_mask_d13 = statistical_mask_d13 & ~edited_mask
     statistical_mask_d18 = statistical_mask_d18 & ~edited_mask
-    statistical_mask_d13 = _apply_manual_outlier_overrides(statistical_mask_d13, edit_state, row_index=df.index)
-    statistical_mask_d18 = _apply_manual_outlier_overrides(statistical_mask_d18, edit_state, row_index=df.index)
+    statistical_mask_d13 = _apply_manual_outlier_overrides(
+        statistical_mask_d13, edit_state, row_index=df.index, isotope_key="d13C"
+    )
+    statistical_mask_d18 = _apply_manual_outlier_overrides(
+        statistical_mask_d18, edit_state, row_index=df.index, isotope_key="d18O"
+    )
     statistical_mask_combined = (statistical_mask_d13 | statistical_mask_d18).fillna(False).astype(bool)
     return (
         statistical_mask_d13.fillna(False).astype(bool),
@@ -320,16 +350,29 @@ def build_category_masks(
     status_series = df.get("Collector Status", pd.Series("", index=idx)).astype(str).str.strip()
     species_groups = species_series if species_series is not None else _get_species_series(df)
     manual_map = _get_manual_outlier_override_map(edit_state)
+    statistical_d13, statistical_d18, statistical_combined = compute_statistical_outlier_masks(
+        df,
+        sigma_level,
+        edit_state,
+        species_groups,
+        method=statistical_outlier_method,
+        iqr_multiplier=iqr_multiplier,
+    )
+    manual_d13 = pd.Series(
+        [_manual_outlier_override_from_map(manual_map, row, "d13C") is True for row in idx],
+        index=idx,
+        dtype=bool,
+    )
+    manual_d18 = pd.Series(
+        [_manual_outlier_override_from_map(manual_map, row, "d18O") is True for row in idx],
+        index=idx,
+        dtype=bool,
+    )
 
     masks = {
-        "Statistical": _compute_statistical_outlier_mask(
-            df,
-            sigma_level,
-            edit_state,
-            species_groups,
-            method=statistical_outlier_method,
-            iqr_multiplier=iqr_multiplier,
-        ),
+        "Statistical": statistical_combined,
+        "Statistical d13C": statistical_d13,
+        "Statistical d18O": statistical_d18,
         "d13C Range": _apply_manual_outlier_overrides(
             pd.to_numeric(df.get("d 13C/12C  Mean"), errors="coerce").lt(float(config.d13c_range[0]))
             | pd.to_numeric(df.get("d 13C/12C  Mean"), errors="coerce").gt(float(config.d13c_range[1])),
@@ -337,6 +380,7 @@ def build_category_masks(
             row_index=idx,
             apply_true=False,
             apply_false=True,
+            isotope_key="d13C",
         )
         & ~edited_mask,
         "d18O Range": _apply_manual_outlier_overrides(
@@ -346,6 +390,7 @@ def build_category_masks(
             row_index=idx,
             apply_true=False,
             apply_false=True,
+            isotope_key="d18O",
         )
         & ~edited_mask,
         "Signal Intensity": _apply_manual_outlier_overrides(
@@ -388,11 +433,9 @@ def build_category_masks(
             apply_false=True,
         )
         & ~edited_mask,
-        "Manual Override": pd.Series(
-            [manual_map.get(str(row), False) for row in idx],
-            index=idx,
-            dtype=bool,
-        ),
+        "Manual Override d13C": manual_d13,
+        "Manual Override d18O": manual_d18,
+        "Manual Override": manual_d13 | manual_d18,
     }
     return {key: value.fillna(False).astype(bool) for key, value in masks.items()}
 
@@ -403,9 +446,19 @@ def build_outlier_type_labels(
 ) -> pd.Series:
     if df is None or df.empty:
         return pd.Series(dtype=object)
+    internal_mask_names = {
+        "Statistical d13C",
+        "Statistical d18O",
+        "Manual Override d13C",
+        "Manual Override d18O",
+    }
     rows: list[str] = []
     for row_label in df.index:
-        active_categories = [name for name, mask in category_masks.items() if bool(mask.get(row_label, False))]
+        active_categories = [
+            name
+            for name, mask in category_masks.items()
+            if name not in internal_mask_names and bool(mask.get(row_label, False))
+        ]
         rows.append("; ".join(active_categories))
     return pd.Series(rows, index=df.index, dtype=object)
 
@@ -598,9 +651,10 @@ def is_row_outlier_effective(
     sigma_level: float = 4.0,
     statistical_outlier_method: str = "Z-Score",
     iqr_multiplier: float = 1.5,
+    isotope_key: str | None = None,
 ) -> bool:
     if df is None or row_label not in df.index:
-        override = _get_manual_outlier_override_map(edit_state).get(str(row_label))
+        override = _get_manual_outlier_override(edit_state, row_label, isotope_key)
         return bool(override) if override is not None else False
     masks = build_category_masks(
         df,
@@ -610,6 +664,31 @@ def is_row_outlier_effective(
         statistical_outlier_method=statistical_outlier_method,
         iqr_multiplier=iqr_multiplier,
     )
-    computed = any(bool(mask.get(row_label, False)) for mask in masks.values())
-    override = _get_manual_outlier_override_map(edit_state).get(str(row_label))
+    isotope = str(isotope_key or "").strip()
+    if isotope == "d13C":
+        relevant_keys = [
+            "Statistical d13C",
+            "d13C Range",
+            "Signal Intensity",
+            "Leak Rate",
+            "Partially Saturated Collectors",
+            "Fully Saturated Collectors",
+            "Failed Sample",
+            "Manual Override d13C",
+        ]
+    elif isotope == "d18O":
+        relevant_keys = [
+            "Statistical d18O",
+            "d18O Range",
+            "Signal Intensity",
+            "Leak Rate",
+            "Partially Saturated Collectors",
+            "Fully Saturated Collectors",
+            "Failed Sample",
+            "Manual Override d18O",
+        ]
+    else:
+        relevant_keys = list(masks)
+    computed = any(bool(masks[key].get(row_label, False)) for key in relevant_keys if key in masks)
+    override = _get_manual_outlier_override(edit_state, row_label, isotope_key)
     return bool(override) if override is not None else computed

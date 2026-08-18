@@ -25,6 +25,15 @@ MATERIALS_METHODS_TEXT = (
     "Spectrometry 36, 1125-1134. DOI: 10.1039/D1JA00030F."
 )
 
+CLIENT_OUTPUT_NUMERIC_COLUMNS = [
+    "d13C (\u2030, VPDB)  Mean",
+    "d13C (\u2030, VPDB)  Std Dev",
+    "d18O (\u2030, VPDB)  Mean",
+    "d18O (\u2030, VPDB)  Std Dev",
+    "Corrected d13C (\u2030, VPDB)",
+    "Corrected d18O (\u2030, VPDB)",
+]
+
 
 def _sanitize_filename(name: str) -> str:
     value = re.sub(r'[\\/:*?"<>|]', "_", str(name))
@@ -32,28 +41,71 @@ def _sanitize_filename(name: str) -> str:
     return value or "output"
 
 
-def _build_client_filename(client_name: str, client_df: pd.DataFrame) -> str:
+def _compact_client_identifier(identifier: str, species_values: list[str]) -> str:
+    value = str(identifier).strip()
+    if not value:
+        return ""
+    replicate_match = re.match(r"^(.+?)\s*#\s*\d+(?:\s*-\s*.*)?$", value)
+    if replicate_match and replicate_match.group(1).strip():
+        return replicate_match.group(1).strip()
+    for species in sorted(species_values, key=len, reverse=True):
+        normalized_species = str(species).strip()
+        if not normalized_species:
+            continue
+        species_match = re.match(
+            rf"^(.*?)\s*-\s*{re.escape(normalized_species)}\s*$",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if species_match and species_match.group(1).strip():
+            return species_match.group(1).strip()
+    return value
+
+
+def _client_identifier_tokens(client_df: pd.DataFrame) -> list[str]:
     identifier_values = (
         client_df.get("Identifier", pd.Series(dtype=object))
         .dropna()
         .astype(str)
         .map(str.strip)
     )
-    identifier_tokens = [_sanitize_filename(value) for value in pd.unique(identifier_values) if value]
+    species_values = [
+        value
+        for value in pd.unique(
+            client_df.get("Species", pd.Series(dtype=object)).dropna().astype(str).map(str.strip)
+        )
+        if value
+    ]
+    compact_values = identifier_values.map(lambda value: _compact_client_identifier(value, species_values))
+    tokens = [value for value in pd.unique(compact_values) if value]
+    return sorted(tokens, key=int, reverse=True) if tokens and all(value.isdigit() for value in tokens) else tokens
 
-    client_part = _sanitize_filename(client_name) if client_name else "Client"
-    series_part = " ".join(identifier_tokens)
+
+def build_client_email_subject(client_name: str, client_df: pd.DataFrame, language: str = "en") -> str:
+    identifier_tokens = _client_identifier_tokens(client_df)
+    series_part = ", ".join(identifier_tokens) or "selected"
+    client_part = str(client_name).strip()
     date_str = pd.Timestamp.today().strftime("%d%m%Y")
-    title = "stable C&O isotopes P2L"
-    parts = [part for part in [client_part, series_part, "series", title, date_str] if part]
-    return f"{' '.join(parts)}.xlsx"
+    if language == "pt":
+        subject = f"Resultados das séries {series_part} de isótopos estáveis de C e O - P2L"
+    elif language == "es":
+        subject = f"Resultados de las series {series_part} de isótopos estables de C y O - P2L"
+    else:
+        subject = f"Results for {series_part} series - stable C & O isotopes - P2L"
+    if client_part:
+        subject = f"{subject} - {client_part}"
+    return f"{subject} - {date_str}"
+
+
+def _build_client_filename(client_name: str, client_df: pd.DataFrame) -> str:
+    subject = build_client_email_subject(client_name, client_df, language="en")
+    return f"{_sanitize_filename(subject)}.xlsx"
 
 
 def _build_dataset_filename(client_name: str | None) -> str:
     client_part = _sanitize_filename(client_name) if client_name else "Client"
     date_str = pd.Timestamp.today().strftime("%d%m%Y")
-    title = "all data BTS stable C&O isosopes results P2L"
-    return f"{client_part} {title} {date_str}.xlsx"
+    return f"Results all data stable C&O isotopes P2L client {client_part} {date_str}.xlsx"
 
 
 def _build_data_sheet(df: pd.DataFrame, selected_standards: list[str]) -> pd.DataFrame:
@@ -65,25 +117,61 @@ def _build_data_sheet(df: pd.DataFrame, selected_standards: list[str]) -> pd.Dat
     return df.loc[~standards_mask].copy()
 
 
-def _build_client_output_frame(data_sheet: pd.DataFrame, comment_map: dict[str, str] | None = None) -> pd.DataFrame:
-    sample_series = (
-        data_sheet.get("Comment", data_sheet.get("Identifier 2", pd.Series(index=data_sheet.index, dtype=object)))
-        .fillna("")
-        .astype(str)
-    )
+def _client_output_source_series(data_sheet: pd.DataFrame, source: str) -> pd.Series:
+    source_columns = {
+        "identifier1": "Identifier 1",
+        "identifier2": "Identifier 2",
+        "comment": "Comment",
+        "species": "Species",
+        "raw_identifier1": "Raw Identifier 1",
+        "raw_label": "Raw Label",
+        "raw_comment": "Raw Comment",
+    }
+    fallback_columns = {
+        "raw_identifier1": "Identifier 1",
+        "raw_label": "Label",
+        "raw_comment": "Comment",
+    }
+    source_key = str(source)
+    column = source_columns.get(source_key, "")
+    if column not in data_sheet.columns:
+        column = fallback_columns.get(source_key, column)
+    return data_sheet.get(column, pd.Series("", index=data_sheet.index, dtype=object)).fillna("").astype(str)
+
+
+def is_raw_client_output_source(source: str) -> bool:
+    return str(source) in {"raw_identifier1", "raw_label", "raw_comment"}
+
+
+def format_academic_species_name(value: Any) -> str:
+    tokens = re.sub(r"\s+", " ", str(value or "")).strip().split(" ")
+    if not tokens or not tokens[0]:
+        return ""
+    first = tokens[0][:1].upper() + tokens[0][1:].lower()
+    qualifiers = {"sp.", "spp.", "cf.", "aff.", "subsp.", "var."}
+    remainder = [token.lower() if token.lower() in qualifiers or token.isalpha() else token for token in tokens[1:]]
+    return " ".join([first, *remainder])
+
+
+def _build_client_output_frame(
+    data_sheet: pd.DataFrame,
+    comment_map: dict[str, str] | None = None,
+    *,
+    identifier_source: str = "identifier1",
+    sample_source: str = "comment",
+    species_source: str = "species",
+    show_sequence: bool = True,
+) -> pd.DataFrame:
+    sample_series = _client_output_source_series(data_sheet, sample_source)
     sequence_series = sample_series.map(_parse_numeric_token)
-    species_series = (
-        data_sheet.get("Species", pd.Series(index=data_sheet.index, dtype=object))
-        .fillna("")
-        .astype(str)
-    )
-    if comment_map:
-        species_series = species_series.map(lambda value: comment_map.get(value, value))
-    return pd.DataFrame(
-        {
-            "Identifier": data_sheet.get("Identifier 1", pd.Series(index=data_sheet.index, dtype=object)),
+    species_series = _client_output_source_series(data_sheet, species_source)
+    if not is_raw_client_output_source(species_source):
+        if comment_map:
+            species_series = species_series.map(lambda value: comment_map.get(value, value))
+        species_series = species_series.map(format_academic_species_name)
+    columns: dict[str, pd.Series] = {
+            "Identifier": _client_output_source_series(data_sheet, identifier_source),
             "Sample #": sample_series,
-            "Sequence": sequence_series,
             "Species": species_series,
             "d13C (\u2030, VPDB)  Mean": pd.to_numeric(data_sheet.get("d 13C/12C  Mean"), errors="coerce"),
             "d13C (\u2030, VPDB)  Std Dev": pd.to_numeric(data_sheet.get("d 13C/12C  Std Dev"), errors="coerce"),
@@ -98,20 +186,14 @@ def _build_client_output_frame(data_sheet: pd.DataFrame, comment_map: dict[str, 
                 errors="coerce",
             ),
         }
-    )
+    if show_sequence:
+        columns = {"Identifier": columns.pop("Identifier"), "Sample #": columns.pop("Sample #"), "Sequence": sequence_series, **columns}
+    return pd.DataFrame(columns)
 
 
 def _round_client_output_columns(client_df: pd.DataFrame) -> pd.DataFrame:
     rounded = client_df.copy()
-    numeric_cols = [
-        "d13C (\u2030, VPDB)  Mean",
-        "d13C (\u2030, VPDB)  Std Dev",
-        "d18O (\u2030, VPDB)  Mean",
-        "d18O (\u2030, VPDB)  Std Dev",
-        "Corrected d13C (\u2030, VPDB)",
-        "Corrected d18O (\u2030, VPDB)",
-    ]
-    for col in numeric_cols:
+    for col in CLIENT_OUTPUT_NUMERIC_COLUMNS:
         if col in rounded.columns:
             rounded[col] = pd.to_numeric(rounded[col], errors="coerce").round(2)
     return rounded
@@ -156,7 +238,8 @@ def summarize_client_output_duplicates(client_df: pd.DataFrame) -> dict[str, Any
     duplicate_identity_mask = identifier2_series.ne("") & duplicate_identity_series.duplicated(keep=False)
     duplicate_row_mask = duplicate_identity_mask.astype(bool)
 
-    duplicate_rows_df = client_df.loc[duplicate_row_mask, ["Identifier", "Sample #", "Species", "Sequence"]].copy()
+    duplicate_columns = [column for column in ["Identifier", "Sample #", "Species", "Sequence"] if column in client_df.columns]
+    duplicate_rows_df = client_df.loc[duplicate_row_mask, duplicate_columns].copy()
     duplicate_rows_df["Duplicate Identifier 1 + Identifier 2 + Species"] = (
         duplicate_identity_mask.loc[duplicate_rows_df.index].astype(bool)
     )
@@ -203,14 +286,8 @@ def _format_client_output_worksheet(
     header_fmt = workbook.add_format({"bold": True})
     corrected_hdr_fmt = workbook.add_format({"bold": True, "font_color": "#6A1B9A"})
     num_fmt = workbook.add_format({"num_format": "0.00"})
-    numeric_cols = {
-        "d13C (\u2030, VPDB)  Mean",
-        "d13C (\u2030, VPDB)  Std Dev",
-        "d18O (\u2030, VPDB)  Mean",
-        "d18O (\u2030, VPDB)  Std Dev",
-        "Corrected d13C (\u2030, VPDB)",
-        "Corrected d18O (\u2030, VPDB)",
-    }
+    species_fmt = workbook.add_format({"italic": True})
+    numeric_cols = set(CLIENT_OUTPUT_NUMERIC_COLUMNS)
     for col_idx, col_name in enumerate(client_df.columns):
         worksheet.write(0, col_idx, col_name, corrected_hdr_fmt if "Corrected" in col_name else header_fmt)
         width = 15
@@ -218,7 +295,8 @@ def _format_client_output_worksheet(
             width = 18
         elif "Corrected" in col_name:
             width = 22
-        worksheet.set_column(col_idx, col_idx, width, num_fmt if col_name in numeric_cols else None)
+        cell_format = num_fmt if col_name in numeric_cols else species_fmt if col_name == "Species" else None
+        worksheet.set_column(col_idx, col_idx, width, cell_format)
     if duplicate_row_mask is not None and not client_df.empty:
         duplicate_row_fmt = workbook.add_format({"bg_color": "#FDE68A"})
         last_col = len(client_df.columns) - 1
@@ -307,16 +385,36 @@ def build_client_output_workbook_bytes(
     comment_map: dict[str, str] | None = None,
     precision_source_df: pd.DataFrame | None = None,
     precision_override: tuple[float, float, int, int] | None = None,
+    identifier_source: str = "identifier1",
+    sample_source: str = "comment",
+    species_source: str = "species",
+    show_sequence: bool = True,
+    client_output_df: pd.DataFrame | None = None,
 ) -> tuple[bytes, str]:
     towrite = io.BytesIO()
     selected_standards = selected_standards or []
     data_sheet = _build_data_sheet(df, selected_standards)
-    client_df = _round_client_output_columns(_build_client_output_frame(data_sheet, comment_map=comment_map))
-    client_df["__identifier_2_key"] = data_sheet.get(
-        "Identifier 2",
-        pd.Series(index=data_sheet.index, dtype=object),
-    )
-    if "Sequence" in client_df.columns:
+    if client_output_df is None:
+        client_df = _round_client_output_columns(
+            _build_client_output_frame(
+                data_sheet,
+                comment_map=comment_map,
+                identifier_source=identifier_source,
+                sample_source=sample_source,
+                species_source=species_source,
+                show_sequence=show_sequence,
+            )
+        )
+        client_df["__identifier_2_key"] = data_sheet.get(
+            "Identifier 2",
+            pd.Series(index=data_sheet.index, dtype=object),
+        )
+    else:
+        client_df = client_output_df.copy()
+        if "Species" in client_df.columns and not is_raw_client_output_source(species_source):
+            client_df["Species"] = client_df["Species"].map(format_academic_species_name)
+        client_df = _round_client_output_columns(client_df)
+    if client_output_df is None and "Sequence" in client_df.columns:
         client_df = client_df.sort_values(
             by=["Sequence", "Identifier", "Sample #"],
             ascending=[True, True, True],

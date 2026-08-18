@@ -247,6 +247,16 @@ class ProcessingExportConfig(BaseModel):
     interpolate_outliers: bool = False
     client_name: str | None = None
     comment_map: dict[str, str] = Field(default_factory=dict)
+    client_output_identifier_source: Literal[
+        "identifier1", "identifier2", "comment", "species", "raw_identifier1", "raw_label", "raw_comment"
+    ] = "identifier1"
+    client_output_sample_source: Literal[
+        "identifier1", "identifier2", "comment", "species", "raw_identifier1", "raw_label", "raw_comment"
+    ] = "comment"
+    client_output_species_source: Literal[
+        "identifier1", "identifier2", "comment", "species", "raw_identifier1", "raw_label", "raw_comment"
+    ] = "species"
+    show_sequence: bool = True
 
 
 class ProcessingWorkspaceConfig(BaseModel):
@@ -287,6 +297,9 @@ class EditTarget(BaseModel):
 class EditAction(BaseModel):
     action: Literal[
         "set_value",
+        "set_identifier1",
+        "set_identifier2",
+        "set_species",
         "offset",
         "interpolate",
         "reset_to_original",
@@ -298,6 +311,9 @@ class EditAction(BaseModel):
     offset: float | None = None
     stdev: float | None = None
     is_outlier: bool | None = None
+    identifier1: str | None = Field(default=None, max_length=500)
+    identifier2: str | None = Field(default=None, max_length=500)
+    species: str | None = Field(default=None, max_length=500)
 
 
 class EditBatchRequest(BaseModel):
@@ -328,12 +344,34 @@ class ExportRequest(BaseModel):
     restore_stdev: bool = False
     restore_stdev_cap: float = Field(default=0.2, ge=0.0)
     output_type: Literal["dataset", "client_output"] = "dataset"
+    client_output_identifier_source: Literal[
+        "identifier1", "identifier2", "comment", "species", "raw_identifier1", "raw_label", "raw_comment"
+    ] = "identifier1"
+    client_output_sample_source: Literal[
+        "identifier1", "identifier2", "comment", "species", "raw_identifier1", "raw_label", "raw_comment"
+    ] = "comment"
+    client_output_species_source: Literal[
+        "identifier1", "identifier2", "comment", "species", "raw_identifier1", "raw_label", "raw_comment"
+    ] = "species"
+    show_sequence: bool = True
+    client_output_rows: list[dict[str, Any]] | None = None
+    email_language: Literal["pt", "en", "es"] = "en"
 
 
 class ClientOutputDuplicateCheckResponse(BaseModel):
     duplicate_row_count: int = 0
     duplicate_identifier1_identifier2_species_values: list[str] = Field(default_factory=list)
     duplicate_rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ClientOutputPreviewResponse(ClientOutputDuplicateCheckResponse):
+    columns: list[str] = Field(default_factory=list)
+    numeric_columns: list[str] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    total_rows: int = 0
+    email_subject: str = ""
+    filename: str = ""
+    duplicate_row_indexes: list[int] = Field(default_factory=list)
 
 
 class ProcessingSummaryMetric(BaseModel):
@@ -395,6 +433,9 @@ class ProcessingEditState(BaseModel):
     original_missing_delta_tokens: list[str] = Field(default_factory=list)
     original_std_values: dict[str, float] = Field(default_factory=dict)
     original_missing_std_tokens: list[str] = Field(default_factory=list)
+    original_identifier1_values: dict[str, str] = Field(default_factory=dict)
+    original_identifier2_values: dict[str, str] = Field(default_factory=dict)
+    original_species_values: dict[str, str] = Field(default_factory=dict)
     manual_outlier_overrides: dict[str, bool] = Field(default_factory=dict)
     restored_delta_tokens: list[str] = Field(default_factory=list)
 

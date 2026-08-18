@@ -15,11 +15,13 @@ from services.irms_api.domain.constants import (
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SAMP45_COL,
     CYCLE1_SIGNAL_SAMP46_COL,
+    SAMPLE_SEQUENCE_COL,
     VALID_CYCLES_COL,
 )
 from services.irms_api.domain.shared.dataframe import (
     _apply_cycle_averages,
     _ensure_cycle1_signal_difference_columns,
+    _ensure_sample_sequence_column,
     _normalize_signal_intensity,
     _parse_numeric_token,
     _split_label_species,
@@ -27,6 +29,14 @@ from services.irms_api.domain.shared.dataframe import (
 
 
 class DataframeUtilsTests(unittest.TestCase):
+    def test_ensure_sample_sequence_column_uses_source_row_order(self) -> None:
+        df = pd.DataFrame({"Identifier 1": ["B", "A", "C"]}, index=[20, 5, 90])
+
+        result = _ensure_sample_sequence_column(df)
+
+        self.assertEqual(result.index.tolist(), [20, 5, 90])
+        self.assertEqual(result[SAMPLE_SEQUENCE_COL].tolist(), [1.0, 2.0, 3.0])
+
     def test_parse_numeric_token_handles_decimal_comma(self) -> None:
         self.assertEqual(_parse_numeric_token("34,26-34,28"), 34.26)
 

@@ -75,7 +75,11 @@ textarea {
   }
 
   .workspace-grid {
-    @apply grid gap-5 xl:grid-cols-[minmax(360px,24vw)_minmax(0,1fr)];
+    @apply grid gap-3 xl:grid-cols-[minmax(360px,24vw)_2rem_minmax(0,1fr)];
+  }
+
+  .control-column-is-collapsed .workspace-grid {
+    @apply xl:grid-cols-[2rem_minmax(0,1fr)];
   }
 
   .control-column {
@@ -83,6 +87,32 @@ textarea {
     top: calc(var(--app-header-height) + 1rem);
     max-height: calc(100vh - var(--app-header-height) - 2rem);
     scrollbar-gutter: stable;
+  }
+
+  .control-column-is-collapsed .control-column {
+    @apply hidden;
+  }
+
+  .control-column-toggle {
+    @apply order-first flex h-9 items-center justify-start xl:order-none xl:sticky xl:top-[calc(var(--app-header-height)+1rem)] xl:h-[calc(100vh-var(--app-header-height)-2rem)] xl:justify-center;
+  }
+
+  .control-column-toggle::before {
+    @apply hidden xl:block;
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    left: 50%;
+    width: 1px;
+    background: #dce3ec;
+  }
+
+  .control-column-toggle__button {
+    @apply relative z-10 grid h-8 w-8 place-items-center rounded-md border border-slate-300 bg-white text-slate-600 shadow-sm transition-colors hover:border-blue-300 hover:bg-blue-50 hover:text-blue-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2;
+  }
+
+  .control-column-toggle__button svg {
+    @apply h-4 w-4;
   }
 
   .range-field {

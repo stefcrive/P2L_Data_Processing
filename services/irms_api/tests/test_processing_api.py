@@ -13,7 +13,12 @@ from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 
 from services.irms_api.api import main as api_main
-from services.irms_api.domain.constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, VALID_CYCLES_COL
+from services.irms_api.domain.constants import (
+    CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+    CYCLE1_SIGNAL_REF44_COL,
+    SAMPLE_SEQUENCE_COL,
+    VALID_CYCLES_COL,
+)
 from services.irms_api.domain.contracts import CycleDiagnosticsRequest, EditAction, EditBatchRequest, ExportRequest, ProcessingConfig
 from services.irms_api.domain.shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column
 from services.irms_api.session_store import FileSessionStore
@@ -365,6 +370,11 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertEqual(len(identifier_customdata), len(identifier_calibrated.get("y", [])))
 
     def test_linearity_preview_data_returns_vectors_without_persisting(self) -> None:
+        frame = sample_processing_df().copy()
+        frame["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
+        frame["total_co2"] = [1.0, 1.1, 1.2, 1.3]
+        frame["p_gases"] = [201.0, 202.0, 203.0, 204.0]
+        api_main.store.save_frames(self.session_id, frame, sample_cycles_df())
         metadata = api_main.store.load_metadata(self.session_id)
         metadata_before = dict(metadata)
         metadata["calibration"] = {
@@ -401,10 +411,35 @@ class ProcessingApiTests(unittest.TestCase):
         row0 = next(row for row in preview.rows if row.row_label == "0")
         self.assertAlmostEqual(float(row0.d13_raw), 1.0, places=6)
         self.assertAlmostEqual(float(row0.intensities["1  Cycle Int  Samp  44"]), 15.0, places=6)
+        self.assertIn(CYCLE1_SIGNAL_REF44_COL, row0.intensities)
+        self.assertEqual(float(row0.attributes[SAMPLE_SEQUENCE_COL]), 1.0)
+        self.assertAlmostEqual(float(row0.attributes["p_no_acid"]), 101.0, places=6)
+        self.assertAlmostEqual(float(row0.attributes["total_co2"]), 1.0, places=6)
+        self.assertAlmostEqual(float(row0.attributes["p_gases"]), 201.0, places=6)
         # Preview rows are intentionally pre-linearity and pre-line-offset so the client can draft edits locally.
         self.assertNotEqual(float(row0.d13_raw), 4.0)
         self.assertEqual(api_main.store.load_metadata(self.session_id)["calibration"], metadata["calibration"])
         self.assertEqual(metadata_before.get("processing"), api_main.store.load_metadata(self.session_id).get("processing"))
+
+    def test_linearity_preview_data_does_not_serialize_missing_identity_values_as_nan(self) -> None:
+        frame = sample_processing_df().copy()
+        frame.loc[0, ["Identifier 2", "Species", "Collector Status"]] = np.nan
+        frame.loc[1, ["Identifier 1", "Identifier 2", "Species", "Collector Status"]] = pd.NA
+        api_main.store.save_frames(self.session_id, frame, sample_cycles_df())
+
+        preview = api_main.processing_linearity_preview_data(self.session_id)
+
+        row0 = next(row for row in preview.rows if row.row_label == "0")
+        self.assertEqual(row0.identifier1, "SampleA")
+        self.assertEqual(row0.identifier2, "")
+        self.assertEqual(row0.species, "SampleA")
+        self.assertEqual(row0.collector_status, "")
+
+        row1 = next(row for row in preview.rows if row.row_label == "1")
+        self.assertEqual(row1.identifier1, "")
+        self.assertEqual(row1.identifier2, "")
+        self.assertEqual(row1.species, "")
+        self.assertEqual(row1.collector_status, "")
 
     def test_remove_processing_calibration_drops_applied_columns_only(self) -> None:
         workspace = api_main.remove_processing_calibration(self.session_id)
@@ -498,6 +533,9 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertAlmostEqual(float(updated_df.loc[1, "d 13C/12C  Mean"]), 4.0, places=6)
 
     def test_cycle_diagnostics_and_export_endpoints(self) -> None:
+        source_df = api_main.store.load_frame(self.session_id)
+        source_df.loc[0, "d 13C/12C  Mean"] = 1.2345
+        api_main.store.save_frames(self.session_id, source_df, api_main.store.load_cycles_frame(self.session_id))
         diagnostics = api_main.processing_cycle_diagnostics(
             self.session_id,
             CycleDiagnosticsRequest(target={"row_label": "0", "isotope_key": "d13C"}),
@@ -550,7 +588,35 @@ class ProcessingApiTests(unittest.TestCase):
         disposition_headers = {key.lower(): value for key, value in export_client_output.headers.items()}
         self.assertIn("content-disposition", disposition_headers)
         self.assertIn("Client A", disposition_headers["content-disposition"])
-        self.assertIn("stable C&O isotopes P2L", disposition_headers["content-disposition"])
+        self.assertIn("stable C & O isotopes - P2L", disposition_headers["content-disposition"])
+        date_code = pd.Timestamp.today().strftime("%d%m%Y")
+        self.assertIn(
+            f"Results for SampleA, SampleB series - stable C & O isotopes - P2L - Client A - {date_code}.xlsx",
+            disposition_headers["content-disposition"],
+        )
+        preview = api_main.preview_client_output(
+            self.session_id,
+            ExportRequest(
+                include_outliers=False,
+                selected_ids=["All"],
+                interpolate_outliers=False,
+                client_name="Client A",
+                comment_map={"Coral": "Porites"},
+                output_type="client_output",
+            ),
+        )
+        self.assertEqual(preview.columns, [column for column in client_sheet.columns if not str(column).startswith("Unnamed:")])
+        self.assertEqual(preview.total_rows, int(client_sheet["Identifier"].notna().sum()))
+        self.assertEqual(preview.email_subject, f"Results for SampleA, SampleB series - stable C & O isotopes - P2L - Client A - {date_code}")
+        self.assertEqual(preview.filename, f"Results for SampleA, SampleB series - stable C & O isotopes - P2L - Client A - {date_code}.xlsx")
+        self.assertEqual(len(preview.rows), 3)
+        first_sample = next(row for row in preview.rows if row.get("Sample #") == "ok")
+        self.assertEqual(first_sample["d13C (‰, VPDB)  Mean"], 1.23)
+        for row in preview.rows:
+            for column in preview.numeric_columns:
+                value = row.get(column)
+                if value is not None:
+                    self.assertEqual(float(value), round(float(value), 2))
         duplicate_check = api_main.check_client_output_duplicates(
             self.session_id,
             ExportRequest(
@@ -572,6 +638,8 @@ class ProcessingApiTests(unittest.TestCase):
         workbook_with_styles = load_workbook(io.BytesIO(export_client_output.body))
         worksheet = workbook_with_styles["Client Output"]
         self.assertEqual(len(list(worksheet.conditional_formatting)), 0)
+        species_column = next(cell.column for cell in worksheet[1] if cell.value == "Species")
+        self.assertTrue(bool(worksheet.cell(row=2, column=species_column).font.italic))
 
         export_client_output_capped = api_main.export_dataset(
             self.session_id,
@@ -696,6 +764,26 @@ class ProcessingApiTests(unittest.TestCase):
         corrected_y = corrected_bundle.figures.get("diagnostics", {}).get("data", [{}])[0].get("y", [])
         self.assertNotEqual(raw_y, corrected_y)
 
+    def test_diagnostics_exposes_sample_sequence_after_date(self) -> None:
+        df = sample_processing_df().copy()
+        df["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
+        df["total_co2"] = [1.0, 1.1, 1.2, 1.3]
+        df["p_gases"] = [201.0, 202.0, 203.0, 204.0]
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        bundle = api_main.diagnostics(
+            self.session_id,
+            color_param=SAMPLE_SEQUENCE_COL,
+            identifier_filter=[],
+            d13_min=None,
+            d13_max=None,
+            d18_min=None,
+            d18_max=None,
+        )
+
+        self.assertEqual(bundle.summary["available_color_params"][:2], ["Date", SAMPLE_SEQUENCE_COL])
+        self.assertEqual(bundle.summary["active_filters"]["color_param"], SAMPLE_SEQUENCE_COL)
+
     def test_diagnostics_endpoint_includes_diff_signal_vs_isotope_scatter_plots(self) -> None:
         df = sample_processing_df().copy()
         df["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
@@ -763,55 +851,44 @@ class ProcessingApiTests(unittest.TestCase):
             for annotation in annotations
             if isinstance(annotation, dict)
         }
-        ordered_annotation_text = [
-            str(annotation.get("text", "")).strip()
-            for annotation in annotations
-            if isinstance(annotation, dict) and str(annotation.get("text", "")).strip()
-        ]
-
-        def _idx(title: str) -> int:
-            return ordered_annotation_text.index(title)
-
         self.assertIn("d18O vs Diff Signal Intensity", subplot_titles)
         self.assertIn("d13C vs Diff Signal Intensity", subplot_titles)
         self.assertIn("d18O vs Pressure-Adjusted Signal Intensity Diff", subplot_titles)
         self.assertIn("d13C vs Pressure-Adjusted Signal Intensity Diff", subplot_titles)
-        self.assertLess(_idx("Signal Intensity vs d13C"), _idx("Signal Intensity vs d18O"))
-        self.assertLess(_idx("Signal Intensity vs d18O"), _idx("d13C vs Diff Signal Intensity"))
-        self.assertLess(_idx("d13C vs Diff Signal Intensity"), _idx("d18O vs Diff Signal Intensity"))
-        self.assertLess(_idx("d18O vs Diff Signal Intensity"), _idx("d13C vs Pressure-Adjusted Signal Intensity Diff"))
-        self.assertLess(_idx("d13C vs Pressure-Adjusted Signal Intensity Diff"), _idx("d18O vs Pressure-Adjusted Signal Intensity Diff"))
+        self.assertIn("P no Acid vs Line", subplot_titles)
+        self.assertIn("P Gasses vs Line", subplot_titles)
+        self.assertIn("Initial Sample Intensity vs Line", subplot_titles)
 
-        isotope_group_headers = {
-            title
-            for title in subplot_titles
-            if title in {"<b>CARBON ISOTOPE (d13C)</b>", "<b>OXYGEN ISOTOPE (d18O)</b>"}
-        }
+        grid_meta = bundle.summary.get("diagnostic_grid", [])
+        ordered_groups = list(dict.fromkeys(item["group"] for item in grid_meta))
         self.assertEqual(
-            isotope_group_headers,
-            {"<b>CARBON ISOTOPE (d13C)</b>", "<b>OXYGEN ISOTOPE (d18O)</b>"},
+            ordered_groups,
+            [
+                "d13C",
+                "d18O",
+                "Leak Rate",
+                "Total CO2",
+                "P no Acid",
+                "P Gasses",
+                "Initial Sample Intensity",
+                "Isotope Comparison",
+                "Multivariate Overview",
+            ],
         )
-        section_headers = {
-            title
-            for title in subplot_titles
-            if title in {
-                "SAMPLE CONDITIONS",
-                "SIGNAL RESPONSE",
-                "LINE EFFECTS",
-                "INSTRUMENT RELATIONSHIPS",
-                "MULTIVARIATE OVERVIEW",
-            }
-        }
-        self.assertEqual(
-            section_headers,
-            {
-                "SAMPLE CONDITIONS",
-                "SIGNAL RESPONSE",
-                "LINE EFFECTS",
-                "INSTRUMENT RELATIONSHIPS",
-                "MULTIVARIATE OVERVIEW",
-            },
-        )
+
+        expected_line = pd.to_numeric(df["Line"], errors="coerce").tolist()
+        for title, value_column in (
+            ("P no Acid vs Line", "p_no_acid"),
+            ("P Gasses vs Line", "p_gases"),
+            ("Initial Sample Intensity vs Line", "1  Cycle Int  Samp  44"),
+        ):
+            item = next(item for item in grid_meta if item["title"] == title)
+            trace = bundle.figures[item["key"]]["data"][0]
+            self.assertEqual(_parse_numeric_vector(trace.get("x", [])), expected_line)
+            self.assertEqual(
+                _parse_numeric_vector(trace.get("y", [])),
+                pd.to_numeric(df[value_column], errors="coerce").tolist(),
+            )
 
     def test_diagnostics_grid_uses_calibration_selected_standards_and_visible_gridlines(self) -> None:
         df = sample_processing_df().copy()
@@ -840,7 +917,8 @@ class ProcessingApiTests(unittest.TestCase):
         )
 
         grid_meta = bundle.summary.get("diagnostic_grid", [])
-        self.assertEqual(len(grid_meta), 23)
+        self.assertEqual(len(grid_meta), 26)
+        self.assertEqual(grid_meta[0]["group"], "d13C")
         self.assertEqual(bundle.summary.get("selected_standards"), ["SampleA"])
 
         first_key = grid_meta[0]["key"]
@@ -854,6 +932,10 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertTrue(first_figure["layout"]["yaxis"]["showgrid"])
         self.assertEqual(first_figure["layout"]["xaxis"]["gridcolor"], "#cbd5e1")
         self.assertEqual(first_figure["layout"]["yaxis"]["gridcolor"], "#cbd5e1")
+        self.assertEqual(first_figure["layout"]["title"]["text"], "<b>d13C vs Leak Rate</b>")
+        self.assertEqual(first_figure["layout"]["title"]["font"], {"color": "#172554", "size": 16})
+        self.assertEqual(first_figure["layout"]["xaxis"]["title"]["font"], {"color": "#475569", "size": 11})
+        self.assertEqual(first_figure["layout"]["xaxis"]["tickfont"], {"color": "#64748b", "size": 10})
         self.assertIsNone(bundle.figures["diagnostics"]["layout"].get("title", {}).get("text"))
 
     def test_diagnostics_endpoint_marks_partially_saturated_collectors_with_orange_diamond_outline(self) -> None:
@@ -1037,6 +1119,189 @@ class ProcessingApiTests(unittest.TestCase):
             {"SampleA | 1 | Porites"},
         )
         self.assertEqual(len(duplicate_check.duplicate_rows), 2)
+
+        duplicate_preview = api_main.preview_client_output(
+            self.session_id,
+            ExportRequest(
+                include_outliers=False,
+                selected_ids=["All"],
+                interpolate_outliers=False,
+                client_name="Client A",
+                comment_map={"Coral": "Porites"},
+                output_type="client_output",
+            ),
+        )
+        self.assertEqual(len(duplicate_preview.duplicate_row_indexes), 2)
+        for row_index in duplicate_preview.duplicate_row_indexes:
+            self.assertEqual(duplicate_preview.rows[row_index]["Identifier"], "SampleA")
+            self.assertEqual(duplicate_preview.rows[row_index]["__identifier_2_key"], "1")
+
+        api_main.edit_processing(
+            self.session_id,
+            EditAction(
+                action="set_identifier2",
+                targets=[{"row_label": "3", "isotope_key": "d13C"}],
+                identifier2="1-resolved",
+            ),
+        )
+        resolved_preview = api_main.preview_client_output(
+            self.session_id,
+            ExportRequest(
+                include_outliers=False,
+                selected_ids=["All"],
+                output_type="client_output",
+                comment_map={"Coral": "Porites"},
+            ),
+        )
+        self.assertEqual(resolved_preview.duplicate_row_count, 0)
+        self.assertEqual(resolved_preview.duplicate_row_indexes, [])
+
+    def test_client_output_preview_returns_all_rows_and_supports_raw_field_mapping(self) -> None:
+        base = sample_processing_df().iloc[[0]].copy()
+        df = pd.concat([base] * 12, ignore_index=True)
+        df["Identifier 1"] = ["Series A"] * 12
+        df["Identifier 2"] = [str(index) for index in range(1, 13)]
+        df["Comment"] = ["PORITES LOBATA"] * 12
+        df["Species"] = ["ignored species"] * 12
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        preview = api_main.preview_client_output(
+            self.session_id,
+            ExportRequest(
+                include_outliers=True,
+                selected_ids=["All"],
+                output_type="client_output",
+                client_output_identifier_source="identifier2",
+                client_output_sample_source="identifier1",
+                client_output_species_source="comment",
+                show_sequence=False,
+            ),
+        )
+
+        self.assertEqual(preview.total_rows, 12)
+        self.assertEqual(len(preview.rows), 12)
+        self.assertNotIn("Sequence", preview.columns)
+        self.assertEqual({row["Sample #"] for row in preview.rows}, {"Series A"})
+        self.assertEqual({row["Species"] for row in preview.rows}, {"Porites lobata"})
+        self.assertEqual({str(row["Identifier"]) for row in preview.rows}, {str(index) for index in range(1, 13)})
+
+    def test_client_output_raw_identity_sources_preserve_exact_text_in_preview_and_export(self) -> None:
+        df = sample_processing_df().copy()
+        df["Raw Identifier 1"] = ["  RAW SERIES A  ", "raw-b", "raw-c", "raw-d"]
+        df["Raw Label"] = ["  Label A - PORITES LOBATA  ", "label-b", "label-c", "label-d"]
+        df["Raw Comment"] = ["  PORITES LOBATA  ", "comment-b", "comment-c", "comment-d"]
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+        request = ExportRequest(
+            include_outliers=False,
+            selected_ids=["All"],
+            output_type="client_output",
+            client_output_identifier_source="raw_identifier1",
+            client_output_sample_source="raw_label",
+            client_output_species_source="raw_comment",
+        )
+
+        preview = api_main.preview_client_output(self.session_id, request)
+        raw_row = next(row for row in preview.rows if row["Identifier"] == "  RAW SERIES A  ")
+        self.assertEqual(raw_row["Sample #"], "  Label A - PORITES LOBATA  ")
+        self.assertEqual(raw_row["Species"], "  PORITES LOBATA  ")
+
+        exported = api_main.export_dataset(self.session_id, request)
+        sheet = pd.read_excel(io.BytesIO(exported.body), sheet_name="Client Output", dtype=object)
+        exported_row = sheet.loc[sheet["Identifier"] == "  RAW SERIES A  "].iloc[0]
+        self.assertEqual(exported_row["Sample #"], "  Label A - PORITES LOBATA  ")
+        self.assertEqual(exported_row["Species"], "  PORITES LOBATA  ")
+
+    def test_reviewed_client_output_rows_are_authoritative_for_export(self) -> None:
+        request = ExportRequest(
+            include_outliers=False,
+            selected_ids=["All"],
+            output_type="client_output",
+        )
+        preview = api_main.preview_client_output(self.session_id, request)
+        reviewed_rows = [dict(row) for row in preview.rows[:-1]]
+        reviewed_rows[0]["Identifier"] = "Reviewed series"
+        reviewed_rows[0]["Species"] = "PORITES LOBATA"
+
+        exported = api_main.export_dataset(
+            self.session_id,
+            request.model_copy(update={"client_output_rows": reviewed_rows}),
+        )
+        sheet = pd.read_excel(io.BytesIO(exported.body), sheet_name="Client Output")
+
+        self.assertEqual(int(sheet["Identifier"].notna().sum()), len(reviewed_rows))
+        self.assertEqual(sheet.iloc[0]["Identifier"], "Reviewed series")
+        self.assertEqual(sheet.iloc[0]["Species"], "Porites lobata")
+
+    def test_client_output_subject_is_localized_without_empty_client_placeholder(self) -> None:
+        preview = api_main.preview_client_output(
+            self.session_id,
+            ExportRequest(
+                include_outliers=False,
+                selected_ids=["All"],
+                output_type="client_output",
+                client_name=None,
+                email_language="pt",
+            ),
+        )
+
+        self.assertTrue(preview.email_subject.startswith("Resultados das séries"))
+        self.assertNotIn("client:", preview.email_subject.lower())
+        self.assertNotIn("cliente", preview.email_subject.lower())
+
+    def test_client_output_subject_compacts_replicate_and_species_identifiers(self) -> None:
+        identifiers = [
+            "3633#1 - Uvigerina",
+            "3633#2 - Uvigerina",
+            "3633#1 - G. ruber",
+            "3633#2 - G. ruber",
+            "3625#2 - Uvigerina",
+            "3625#1 - Uvigerina",
+            "3625#3 - Uvigerina",
+            "3625#2- Uvigerina",
+            "3618#1 - Bolivina",
+            "3618#2 - Bolivina",
+            "3618#3 - Bolivina",
+            "3618#4 - Bolivina",
+            "3618#5 - Bolivina",
+        ]
+        species = [
+            "Uvigerina",
+            "Uvigerina",
+            "G. ruber",
+            "G. ruber",
+            "Uvigerina",
+            "Uvigerina",
+            "Uvigerina",
+            "Uvigerina",
+            "Bolivina",
+            "Bolivina",
+            "Bolivina",
+            "Bolivina",
+            "Bolivina",
+        ]
+        base = sample_processing_df().iloc[[0]].copy()
+        df = pd.concat([base] * len(identifiers), ignore_index=True)
+        df["Identifier 1"] = identifiers
+        df["Identifier 2"] = [str(index) for index in range(1, len(identifiers) + 1)]
+        df["Species"] = species
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        preview = api_main.preview_client_output(
+            self.session_id,
+            ExportRequest(
+                include_outliers=True,
+                selected_ids=["All"],
+                output_type="client_output",
+                client_name="Maria Pivel",
+            ),
+        )
+
+        date_code = pd.Timestamp.today().strftime("%d%m%Y")
+        self.assertEqual(
+            preview.email_subject,
+            f"Results for 3633, 3625, 3618 series - stable C & O isotopes - P2L - Maria Pivel - {date_code}",
+        )
+        self.assertNotIn("#", preview.email_subject)
 
     def test_client_output_matches_chart_scoped_statistical_filtering(self) -> None:
         df = sample_processing_df().copy()

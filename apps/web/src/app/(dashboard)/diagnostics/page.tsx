@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
+import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
 import {
   SATURATION_COLOR_AXIS_OPTIONS,
   SaturationAxisHelpTooltip,
@@ -1489,6 +1490,28 @@ function diagnosticsColorScaleTicks(range: [number, number], count = 6): number[
   return Array.from({ length: count }, (_, index) => start + ((end - start) * index) / (count - 1));
 }
 
+function DiagnosticsColorScaleBar({ colorParam, range }: { colorParam: string; range: [number, number] }) {
+  const label = diagnosticsColorParameterLabel(colorParam);
+  const ticks = diagnosticsColorScaleTicks(range);
+  return (
+    <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
+      <div className="mb-1 font-semibold text-stone-900">{label}</div>
+      <div
+        className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
+        role="img"
+        aria-label={`${label} color scale from ${range[0]} to ${range[1]}`}
+      />
+      <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
+        {ticks.map((tick, index) => (
+          <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
+            {formatDiagnosticsColorbarValue(tick, colorParam)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function normalizeColorScaleRange(range: [number, number], bounds: ColorScaleBounds): [number, number] {
   const low = clampNumber(Math.min(range[0], range[1]), bounds.min, bounds.max);
   const high = clampNumber(Math.max(range[0], range[1]), bounds.min, bounds.max);
@@ -1706,6 +1729,8 @@ export default function DiagnosticsPage() {
         d18_range: appliedD18Range,
       }),
     enabled: Boolean(sessionId),
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[1] === sessionId ? previousData : undefined,
   });
   const calibrationWorkspaceQuery = useQuery({
     queryKey: ["calibration-workspace", sessionId],
@@ -1796,7 +1821,8 @@ export default function DiagnosticsPage() {
       if (!key || !figure) {
         return [];
       }
-      return [{ key, title: asString((item as Record<string, unknown>).title), figure }];
+      const group = asString((item as Record<string, unknown>).group).trim() || "Other diagnostics";
+      return [{ key, group, title: asString((item as Record<string, unknown>).title), figure }];
     });
   }, [data?.figures, summary.diagnostic_grid]);
   const colorScaleBounds = useMemo(() => deriveColorScaleBounds(diagnosticsFigure), [diagnosticsFigure]);
@@ -1817,6 +1843,18 @@ export default function DiagnosticsPage() {
       })),
     [diagnosticGridItems, effectiveColorScaleRange, symbolSize],
   );
+  const diagnosticGridGroups = useMemo(() => {
+    const groups: Array<{ name: string; items: typeof displayedDiagnosticGridItems }> = [];
+    for (const item of displayedDiagnosticGridItems) {
+      const currentGroup = groups[groups.length - 1];
+      if (!currentGroup || currentGroup.name !== item.group) {
+        groups.push({ name: item.group, items: [item] });
+      } else {
+        currentGroup.items.push(item);
+      }
+    }
+    return groups;
+  }, [displayedDiagnosticGridItems]);
   const activeLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config?.linearity ?? null;
   const selectedLinearityIntensityCol = activeLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(activeLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
@@ -2334,23 +2372,6 @@ export default function DiagnosticsPage() {
         description="Filter measurements, inspect cycle behavior, and investigate anomalies."
         actions={<span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-[10px] text-slate-600">Rows {Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}</span>}
       />
-      {colorScaleBounds ? (
-        <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
-          <div className="mb-1 font-semibold text-stone-900">{diagnosticsColorParameterLabel(colorParam)}</div>
-          <div
-            className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
-            role="img"
-            aria-label={`${diagnosticsColorParameterLabel(colorParam)} color scale from ${effectiveColorScaleRange[0]} to ${effectiveColorScaleRange[1]}`}
-          />
-          <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
-            {diagnosticsColorScaleTicks(effectiveColorScaleRange).map((tick, index, ticks) => (
-              <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
-                {formatDiagnosticsColorbarValue(tick, colorParam)}
-              </span>
-            ))}
-          </div>
-        </div>
-      ) : null}
       <div className="workspace-grid">
         <aside className="control-column">
           <Card>
@@ -2361,9 +2382,9 @@ export default function DiagnosticsPage() {
             <CardContent className="space-y-4">
               <div className="space-y-3">
                 <div className="form-section-title">Parameter Selection</div>
-                <div className="grid grid-cols-[minmax(0,1fr)_7rem] gap-3">
-                  <label className="form-field min-w-0">
-                    <span className="form-label">Choose a parameter to color the dots</span>
+                <div className="grid gap-3">
+                  <div className="form-field min-w-0">
+                    <span className="form-label">Color parameter</span>
                     <select value={colorParam} onChange={(event) => setColorParam(event.target.value)} className="form-control">
                       {(availableColorParams.length ? availableColorParams : [colorParam]).map((option) => (
                         <option key={option} value={option}>
@@ -2371,8 +2392,13 @@ export default function DiagnosticsPage() {
                         </option>
                       ))}
                     </select>
-                  </label>
-                  <label className="form-field">
+                    {colorScaleBounds ? (
+                      <div className="mt-2">
+                        <DiagnosticsColorScaleBar colorParam={colorParam} range={effectiveColorScaleRange} />
+                      </div>
+                    ) : null}
+                  </div>
+                  <label className="form-field max-w-28">
                     <span className="form-label">Symbol size</span>
                     <input
                       type="number"
@@ -2666,30 +2692,47 @@ export default function DiagnosticsPage() {
           </Card>
         </aside>
 
+        <ControlColumnToggle />
+
         <div className="space-y-6">
           {error && <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">{String(error)}</div>}
           <Card>
             <CardContent className="space-y-3 p-3">
-              {displayedDiagnosticGridItems.length ? (
-                <div className="overflow-x-auto">
-                  <div className="grid min-w-[960px] grid-cols-3 gap-3">
-                    {displayedDiagnosticGridItems.map((item) => (
-                      <div
-                        key={item.key}
-                        className="aspect-square min-w-0 overflow-hidden rounded-lg border border-stone-200 bg-white"
-                      >
-                        <PlotlyChart
-                          figure={item.figure}
-                          className="h-full w-full"
-                          fitContainer
-                          uiRevision={`diagnostics-grid:${item.key}`}
-                          onPointClick={(points) => handleDiagnosticsPointClick(points, item.figure)}
-                          onPointHover={(payload) => handleDiagnosticsPointHover(payload, item.figure)}
-                          onHoverEnd={scheduleHoverPreviewHide}
-                        />
-                      </div>
-                    ))}
-                  </div>
+              {diagnosticGridGroups.length ? (
+                <div className="space-y-8">
+                  {diagnosticGridGroups.map((group, groupIndex) => {
+                    const headingId = `diagnostic-group-${groupIndex}`;
+                    return (
+                      <section key={group.name} aria-labelledby={headingId} className="space-y-3">
+                        <div className="flex items-baseline justify-between gap-3 border-b border-stone-200 pb-2">
+                          <h2 id={headingId} className="text-base font-semibold text-stone-900">
+                            {group.name}
+                          </h2>
+                          <span className="text-xs tabular-nums text-stone-500">
+                            {group.items.length} {group.items.length === 1 ? "plot" : "plots"}
+                          </span>
+                        </div>
+                        <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
+                          {group.items.map((item) => (
+                            <div
+                              key={item.key}
+                              className="aspect-square min-w-0 overflow-hidden rounded-lg border border-stone-200 bg-white"
+                            >
+                              <PlotlyChart
+                                figure={item.figure}
+                                className="h-full w-full"
+                                fitContainer
+                                uiRevision={`diagnostics:${sessionId}:grid:${item.key}`}
+                                onPointClick={(points) => handleDiagnosticsPointClick(points, item.figure)}
+                                onPointHover={(payload) => handleDiagnosticsPointHover(payload, item.figure)}
+                                onHoverEnd={scheduleHoverPreviewHide}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+                    );
+                  })}
                 </div>
               ) : (
                 <div className="p-3 text-sm text-stone-500">No diagnostic charts.</div>

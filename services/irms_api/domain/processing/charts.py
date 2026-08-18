@@ -74,7 +74,9 @@ def _attach_point_ids_from_customdata(fig: go.Figure) -> None:
             if getattr(trace, "ids", None) is not None:
                 continue
             labels = _extract_point_ids_from_customdata(getattr(trace, "customdata", None))
-            if not labels:
+            # Plotly IDs must be non-empty and unique. Repeated empty IDs make
+            # standard-curve markers collapse into a single rendered point.
+            if not labels or any(not label for label in labels) or len(set(labels)) != len(labels):
                 continue
             trace.ids = labels
         except Exception:
@@ -259,7 +261,14 @@ def _date_aligned_standard_rows(
     x_axis_option: str,
     color_col: str,
 ) -> pd.DataFrame:
-    """Position standards on a sample x-axis by interpolating acquisition dates."""
+    """Position standards on a sample x-axis using dates plus adaptive spacing.
+
+    Dates within the plotted sample period use ordinary interpolation. When
+    several standards fall before the first sample or after the last sample,
+    interpolation would clamp them all to one endpoint. In that case, blend
+    the date-aligned positions with evenly spaced chronological ranks so the
+    points remain date-aware without becoming an unreadable stack.
+    """
     if standards_df is None or standards_df.empty:
         return pd.DataFrame()
 
@@ -302,6 +311,31 @@ def _date_aligned_standard_rows(
         standards["x_axis"] = float(anchor_x[0])
     else:
         standards["x_axis"] = np.interp(standard_dates, anchor_dates, anchor_x)
+        axis_min = float(np.nanmin(anchor_x))
+        axis_max = float(np.nanmax(anchor_x))
+        axis_span = axis_max - axis_min
+        if axis_span > 0:
+            standard_labels = standards.get(
+                "Identifier 1",
+                pd.Series("", index=standards.index, dtype=object),
+            ).fillna("").astype(str)
+            for standard_label in standard_labels.unique():
+                group_index = standards.index[standard_labels == standard_label]
+                if len(group_index) < 3:
+                    continue
+                group_dates = standards.loc[group_index, "__measurement_datetime"].astype("int64")
+                early_count = int((group_dates.to_numpy(dtype=float) < anchor_dates[0]).sum())
+                late_count = int((group_dates.to_numpy(dtype=float) > anchor_dates[-1]).sum())
+                if max(early_count, late_count) < 3:
+                    continue
+
+                ordered_index = standards.loc[group_index].sort_values(
+                    ["__measurement_datetime", "Identifier 2"],
+                    na_position="last",
+                ).index
+                date_aligned = pd.to_numeric(standards.loc[ordered_index, "x_axis"], errors="coerce").to_numpy()
+                rank_spaced = np.linspace(axis_min, axis_max, len(ordered_index))
+                standards.loc[ordered_index, "x_axis"] = 0.5 * date_aligned + 0.5 * rank_spaced
     return standards.sort_values(["__measurement_datetime", "Identifier 2"], na_position="last")
 
 
@@ -347,8 +381,13 @@ def _add_standard_measurement_traces(
                 mode="lines+markers",
                 name=f"Standard measured {isotope_key} - {standard}",
                 legendgroup=f"standard-measured-{isotope_key}-{standard}",
-                line=dict(color=color, width=2, dash="dot"),
-                marker=dict(color=color, size=9, symbol="diamond", line=dict(color="white", width=1)),
+                line=dict(color=color, width=1, dash="solid"),
+                marker=dict(
+                    color="white",
+                    size=6,
+                    symbol="diamond",
+                    line=dict(color=color, width=1.25),
+                ),
                 customdata=_build_standard_point_customdata(rows, isotope_key),
             )
         )
@@ -678,7 +717,7 @@ def _add_processing_summary_overlays(
             )
 
     if getattr(config.overlays, "show_manual_outliers", False):
-        manual_rows = _finite_value_rows(_rows(summary_masks.get("Manual Override")))
+        manual_rows = _finite_value_rows(_rows(summary_masks.get(f"Manual Override {isotope_key}")))
         if not manual_rows.empty:
             fig.add_trace(
                 go.Scatter(
@@ -1611,11 +1650,11 @@ def _build_identifier_figure(
     color_series, _, has_numeric_colors, color_min, color_max = _color_series_for_plot(filtered_identifier, config.color_param)
     filtered_identifier["_color_value"] = color_series
     edited_row_tokens = {str(row) for row in (edit_state or {}).get("edited_rows", [])}
-    edited_mask = pd.Series(
-        [str(idx) in edited_row_tokens and str(idx) not in restored_rows_for_isotope for idx in filtered_identifier.index],
-        index=filtered_identifier.index,
-        dtype=bool,
-    )
+    edited_rows = unfiltered_identifier.loc[
+        [str(idx) in edited_row_tokens and str(idx) not in restored_rows_for_isotope for idx in unfiltered_identifier.index]
+    ].copy()
+    if not edited_rows.empty:
+        edited_rows = edited_rows.loc[pd.to_numeric(edited_rows.get(y_col), errors="coerce").notna()]
     sat_masks = _partial_saturation_isotope_masks(unfiltered_identifier)
     d13_std_lookup, d18_std_lookup = _build_cycle_std_lookups(unfiltered_identifier)
 
@@ -1701,7 +1740,10 @@ def _build_identifier_figure(
             font=dict(size=11, color="#b91c1c"),
         )
     if getattr(config.overlays, "show_manual_outliers", False):
-        manual_mask = summary_masks.get("Manual Override", pd.Series(False, index=unfiltered_identifier.index))
+        manual_mask = summary_masks.get(
+            f"Manual Override {isotope_key}",
+            pd.Series(False, index=unfiltered_identifier.index),
+        )
         manual_rows = unfiltered_identifier.loc[manual_mask.reindex(unfiltered_identifier.index, fill_value=False).astype(bool)]
         manual_rows = _exclude_restored(manual_rows)
         if not manual_rows.empty:
@@ -1807,6 +1849,19 @@ def _build_identifier_figure(
             )
     _apply_processing_isotope_hover_templates(fig, isotope_key, config.color_param)
 
+    if filtered_identifier.empty and not edited_rows.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=edited_rows["x_axis"],
+                y=pd.to_numeric(edited_rows.get(y_col), errors="coerce"),
+                mode="markers",
+                marker=dict(color="#ff00ff", symbol="circle", size=12, line=dict(width=1, color="#ff00ff")),
+                name="Edited Samples",
+                customdata=_build_processing_point_customdata(edited_rows, isotope_key),
+            )
+        )
+        _apply_processing_isotope_hover_templates(fig, isotope_key, config.color_param)
+
     if not filtered_identifier.empty:
         error_y = _build_plotly_error_bar_for_df(filtered_identifier, isotope_key, d13_std_lookup, d18_std_lookup)
         raw_marker_sizes = [0 if str(idx) in restored_rows_for_isotope else 8 for idx in filtered_identifier.index]
@@ -1835,8 +1890,7 @@ def _build_identifier_figure(
                 customdata=_build_processing_point_customdata(filtered_identifier, isotope_key),
             )
         )
-        if edited_mask.any():
-            edited_rows = filtered_identifier.loc[edited_mask]
+        if not edited_rows.empty:
             fig.add_trace(
                 go.Scatter(
                     x=edited_rows["x_axis"],

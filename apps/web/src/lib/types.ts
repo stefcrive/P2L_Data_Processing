@@ -221,6 +221,10 @@ export type ProcessingConfig = {
     interpolate_outliers: boolean;
     client_name?: string | null;
     comment_map: Record<string, string>;
+    client_output_identifier_source: "identifier1" | "identifier2" | "comment" | "species" | "raw_identifier1" | "raw_label" | "raw_comment";
+    client_output_sample_source: "identifier1" | "identifier2" | "comment" | "species" | "raw_identifier1" | "raw_label" | "raw_comment";
+    client_output_species_source: "identifier1" | "identifier2" | "comment" | "species" | "raw_identifier1" | "raw_label" | "raw_comment";
+    show_sequence: boolean;
     [key: string]: unknown;
   };
   [key: string]: unknown;
@@ -292,6 +296,9 @@ export type ProcessingWorkspace = {
     original_missing_delta_tokens: string[];
     original_std_values: Record<string, number>;
     original_missing_std_tokens: string[];
+    original_identifier1_values: Record<string, string>;
+    original_identifier2_values: Record<string, string>;
+    original_species_values: Record<string, string>;
     manual_outlier_overrides: Record<string, boolean>;
     restored_delta_tokens: string[];
     [key: string]: unknown;
@@ -356,6 +363,9 @@ export type EditTarget = {
 export type EditAction = {
   action:
     | "set_value"
+    | "set_identifier1"
+    | "set_identifier2"
+    | "set_species"
     | "offset"
     | "interpolate"
     | "reset_to_original"
@@ -367,6 +377,9 @@ export type EditAction = {
   value?: number | null;
   offset?: number | null;
   stdev?: number | null;
+  identifier1?: string | null;
+  identifier2?: string | null;
+  species?: string | null;
   [key: string]: unknown;
 };
 
@@ -389,6 +402,12 @@ export type ExportRequest = {
   interpolate_outliers: boolean;
   client_name?: string | null;
   comment_map: Record<string, string>;
+  client_output_identifier_source?: "identifier1" | "identifier2" | "comment" | "species" | "raw_identifier1" | "raw_label" | "raw_comment";
+  client_output_sample_source?: "identifier1" | "identifier2" | "comment" | "species" | "raw_identifier1" | "raw_label" | "raw_comment";
+  client_output_species_source?: "identifier1" | "identifier2" | "comment" | "species" | "raw_identifier1" | "raw_label" | "raw_comment";
+  show_sequence?: boolean;
+  client_output_rows?: Array<JsonRecord> | null;
+  email_language?: "pt" | "en" | "es";
   restore_stdev?: boolean;
   restore_stdev_cap?: number;
   [key: string]: unknown;
@@ -398,4 +417,14 @@ export type ClientOutputDuplicateCheckResponse = {
   duplicate_row_count: number;
   duplicate_identifier1_identifier2_species_values: string[];
   duplicate_rows: Array<JsonRecord>;
+};
+
+export type ClientOutputPreviewResponse = ClientOutputDuplicateCheckResponse & {
+  columns: string[];
+  numeric_columns: string[];
+  rows: Array<JsonRecord>;
+  total_rows: number;
+  email_subject: string;
+  filename: string;
+  duplicate_row_indexes: number[];
 };

@@ -11,6 +11,7 @@ from services.irms_api.domain.constants import (
     CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL,
     CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
     CYCLE1_SIGNAL_REF44_COL,
+    SAMPLE_SEQUENCE_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     VALID_CYCLES_COL,
 )
@@ -27,6 +28,7 @@ from services.irms_api.domain.processing.cycles import (
     build_target_info,
     get_cycles_for_selected_point,
 )
+from services.irms_api.domain.processing.charts import _date_aligned_standard_rows
 from services.irms_api.domain.processing.edits import (
     _interpolate_single_target_within_identifier_group,
     apply_edit_action,
@@ -95,6 +97,49 @@ def sample_cycles_df() -> pd.DataFrame:
 
 
 class ProcessingCoreTests(unittest.TestCase):
+    def test_date_aligned_standards_spread_endpoint_clusters_while_preserving_order(self) -> None:
+        reference = pd.DataFrame(
+            {
+                "Identifier 1": ["SampleA"] * 4,
+                "Identifier 2": ["2", "10", "20", "24"],
+                "Date": ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04"],
+                "x_axis": [2.0, 10.0, 20.0, 24.0],
+            }
+        )
+        standards = pd.DataFrame(
+            {
+                "Identifier 1": ["SHP2L"] * 10,
+                "Identifier 2": [str(index) for index in range(10)],
+                "Date": [
+                    "2026-07-25",
+                    "2026-07-26",
+                    "2026-07-27",
+                    "2026-07-28",
+                    "2026-07-29",
+                    "2026-07-30",
+                    "2026-07-31",
+                    "2026-08-02",
+                    "2026-08-05",
+                    "2026-08-06",
+                ],
+            }
+        )
+
+        aligned = _date_aligned_standard_rows(
+            standards,
+            reference,
+            x_axis_option="By Identifier 2",
+            color_col="Date",
+        )
+        aligned_x = pd.to_numeric(aligned["x_axis"], errors="coerce").to_numpy()
+
+        self.assertTrue(np.all(np.diff(aligned_x) >= 0))
+        self.assertEqual(len(np.unique(np.round(aligned_x[:7], 8))), 7)
+        self.assertGreater(aligned_x[6], 2.0)
+        self.assertLess(aligned_x[8], 24.0)
+        self.assertAlmostEqual(aligned_x[0], 2.0)
+        self.assertAlmostEqual(aligned_x[-1], 24.0)
+
     def test_cycle_lookup_does_not_borrow_cycles_from_another_workbook(self) -> None:
         df = pd.DataFrame(
             {
@@ -149,6 +194,34 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertFalse(bool(masks["d13C Range"].loc[1]))
         self.assertFalse(bool(masks["Statistical"].loc[0]))
         self.assertTrue(bool(masks["Manual Override"].loc[3]))
+
+    def test_manual_outlier_override_only_marks_target_isotope(self) -> None:
+        df = sample_processing_df()
+        edit_state = {
+            "edited_rows": [],
+            "original_delta_values": {},
+            "manual_outlier_overrides": {"d13C|0": True},
+        }
+
+        masks = build_category_masks(df, RangeConfig(), edit_state=edit_state, sigma_level=10.0)
+
+        self.assertTrue(bool(masks["Manual Override d13C"].loc[0]))
+        self.assertFalse(bool(masks["Manual Override d18O"].loc[0]))
+        self.assertTrue(bool(masks["Statistical d13C"].loc[0]))
+        self.assertFalse(bool(masks["Statistical d18O"].loc[0]))
+
+    def test_set_outlier_override_is_stored_per_isotope(self) -> None:
+        _, updated_state = apply_edit_action(
+            sample_processing_df(),
+            {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            EditAction(
+                action="set_outlier_override",
+                targets=[{"row_label": "0", "isotope_key": "d13C"}],
+                is_outlier=True,
+            ),
+        )
+
+        self.assertEqual(updated_state["manual_outlier_overrides"], {"d13C|0": True})
 
     def test_interpolate_outliers_by_identifier2(self) -> None:
         df = pd.DataFrame(
@@ -697,6 +770,165 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertNotIn("0", reset_state["edited_rows"])
         self.assertNotIn("d13C|0", reset_state["original_delta_values"])
 
+    def test_apply_edit_action_overrides_identifier1_with_dataset_value_and_resets(self) -> None:
+        df = sample_processing_df()
+        edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        updated_df, updated_state = apply_edit_action(
+            df,
+            edit_state,
+            EditAction(
+                action="set_identifier1",
+                targets=[{"row_label": "0", "isotope_key": "d13C"}],
+                identifier1="SampleB",
+            ),
+        )
+
+        self.assertEqual(str(updated_df.loc[0, "Identifier 1"]), "SampleB")
+        self.assertEqual(updated_state["original_identifier1_values"], {"0": "SampleA"})
+        self.assertIn("0", updated_state["edited_rows"])
+
+        workspace = build_processing_workspace(
+            "session-1",
+            updated_df,
+            sample_cycles_df(),
+            {
+                "processing": {"config": normalize_processing_config({}).model_dump()},
+                "edit_state": updated_state,
+                "calibration": {"selected_standards": []},
+            },
+        )
+        coral_section = next(section for section in workspace.species_sections if section.species == "Coral")
+        reassigned_figure = next(item for item in coral_section.identifier_figures if item.identifier == "SampleB")
+        self.assertIn("Edited Samples", [str(trace.get("name", "")) for trace in reassigned_figure.d13c.get("data", [])])
+
+        reset_df, reset_state = apply_edit_action(
+            updated_df,
+            updated_state,
+            EditAction(action="reset_to_original", targets=[{"row_label": "0", "isotope_key": "d13C"}]),
+        )
+
+        self.assertEqual(str(reset_df.loc[0, "Identifier 1"]), "SampleA")
+        self.assertEqual(reset_state["original_identifier1_values"], {})
+        self.assertNotIn("0", reset_state["edited_rows"])
+
+    def test_apply_edit_action_accepts_manual_identifier1_value(self) -> None:
+        updated_df, updated_state = apply_edit_action(
+            sample_processing_df(),
+            {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            EditAction(
+                action="set_identifier1",
+                targets=[{"row_label": "0", "isotope_key": "d13C"}],
+                identifier1="New identifier",
+            ),
+        )
+
+        self.assertEqual(updated_df.loc[0, "Identifier 1"], "New identifier")
+        self.assertEqual(updated_state["original_identifier1_values"], {"0": "SampleA"})
+
+    def test_apply_edit_action_accepts_manual_identifier2_value_and_resets(self) -> None:
+        updated_df, updated_state = apply_edit_action(
+            sample_processing_df(),
+            {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            EditAction(
+                action="set_identifier2",
+                targets=[{"row_label": "0", "isotope_key": "d13C"}],
+                identifier2="1-resolved",
+            ),
+        )
+
+        self.assertEqual(updated_df.loc[0, "Identifier 2"], "1-resolved")
+        self.assertEqual(updated_state["original_identifier2_values"], {"0": "1"})
+        self.assertIn("0", updated_state["edited_rows"])
+
+        reset_df, reset_state = apply_edit_action(
+            updated_df,
+            updated_state,
+            EditAction(action="reset_to_original", targets=[{"row_label": "0", "isotope_key": "d13C"}]),
+        )
+        self.assertEqual(reset_df.loc[0, "Identifier 2"], "1")
+        self.assertEqual(reset_state["original_identifier2_values"], {})
+        self.assertNotIn("0", reset_state["edited_rows"])
+
+    def test_apply_edit_action_overrides_species_with_dataset_value_and_resets(self) -> None:
+        df = sample_processing_df()
+        edit_state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+
+        updated_df, updated_state = apply_edit_action(
+            df,
+            edit_state,
+            EditAction(
+                action="set_species",
+                targets=[{"row_label": "0", "isotope_key": "d13C"}],
+                species="Shell",
+            ),
+        )
+
+        self.assertEqual(str(updated_df.loc[0, "Species"]), "Shell")
+        self.assertEqual(updated_state["original_species_values"], {"0": "Coral"})
+        self.assertIn("0", updated_state["edited_rows"])
+
+        workspace = build_processing_workspace(
+            "session-1",
+            updated_df,
+            sample_cycles_df(),
+            {
+                "processing": {"config": normalize_processing_config({}).model_dump()},
+                "edit_state": updated_state,
+                "calibration": {"selected_standards": []},
+            },
+        )
+        shell_section = next(section for section in workspace.species_sections if section.species == "Shell")
+        reassigned_figure = next(item for item in shell_section.identifier_figures if item.identifier == "SampleA")
+        self.assertIn("Edited Samples", [str(trace.get("name", "")) for trace in reassigned_figure.d13c.get("data", [])])
+
+        reset_df, reset_state = apply_edit_action(
+            updated_df,
+            updated_state,
+            EditAction(action="reset_to_original", targets=[{"row_label": "0", "isotope_key": "d13C"}]),
+        )
+
+        self.assertEqual(str(reset_df.loc[0, "Species"]), "Coral")
+        self.assertEqual(reset_state["original_species_values"], {})
+        self.assertNotIn("0", reset_state["edited_rows"])
+
+    def test_apply_edit_action_accepts_manual_species_value(self) -> None:
+        updated_df, updated_state = apply_edit_action(
+            sample_processing_df(),
+            {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}},
+            EditAction(
+                action="set_species",
+                targets=[{"row_label": "0", "isotope_key": "d13C"}],
+                species="New species",
+            ),
+        )
+
+        self.assertEqual(updated_df.loc[0, "Species"], "New species")
+        self.assertEqual(updated_state["original_species_values"], {"0": "Coral"})
+
+    def test_resetting_one_isotope_keeps_sample_edited_when_other_isotope_remains_changed(self) -> None:
+        df = sample_processing_df()
+        state = {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {}}
+        d13_df, d13_state = apply_edit_action(
+            df,
+            state,
+            EditAction(action="set_value", targets=[{"row_label": "0", "isotope_key": "d13C"}], value=7.5),
+        )
+        both_df, both_state = apply_edit_action(
+            d13_df,
+            d13_state,
+            EditAction(action="set_value", targets=[{"row_label": "0", "isotope_key": "d18O"}], value=8.5),
+        )
+
+        _, reset_state = apply_edit_action(
+            both_df,
+            both_state,
+            EditAction(action="reset_to_original", targets=[{"row_label": "0", "isotope_key": "d13C"}]),
+        )
+
+        self.assertIn("0", reset_state["edited_rows"])
+        self.assertIn("d18O|0", reset_state["original_delta_values"])
+
     def test_apply_edit_action_set_value_keeps_calibrated_synced_without_coefficients(self) -> None:
         df = pd.DataFrame(
             {
@@ -836,7 +1068,7 @@ class ProcessingCoreTests(unittest.TestCase):
                 "config": {
                     "selected_identifier": "All",
                     "x_axis_option": "By Identifier 2",
-                    "color_param": "Date_ordinal",
+                    "color_param": SAMPLE_SEQUENCE_COL,
                     "z_axis": "1  Cycle Int  Samp  44",
                     "signal_range": [0.0, 50.0],
                     "leak_range": [0.0, 1000.0],
@@ -871,6 +1103,7 @@ class ProcessingCoreTests(unittest.TestCase):
         workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
 
         self.assertEqual(workspace.session_id, "session-1")
+        self.assertEqual(workspace.config.color_param, SAMPLE_SEQUENCE_COL)
         self.assertIn("processing_3d", workspace.overview_figures)
         self.assertIn("crossplot", workspace.overview_figures)
         self.assertGreaterEqual(len(workspace.species_sections), 2)
@@ -879,6 +1112,7 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertIn(VALID_CYCLES_COL, workspace.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_SAMP44_COL, workspace.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_REF44_COL, workspace.available_values.color_params)
+        self.assertEqual(workspace.available_values.color_params[:2], ["Date", SAMPLE_SEQUENCE_COL])
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, workspace.available_values.color_params)
         self.assertIn(CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL, workspace.available_values.z_axis_options)
 
@@ -1026,6 +1260,24 @@ class ProcessingCoreTests(unittest.TestCase):
         }
         self.assertIn("Standard measured d13C - SHP2L", d13_trace_names)
         self.assertIn("Standard measured d18O - SHP2L", d18_trace_names)
+        d13_standard_trace = next(
+            trace
+            for trace in workspace.overview_figures.get("d13_summary", {}).get("data", [])
+            if str(trace.get("name", "")) == "Standard measured d13C - SHP2L"
+        )
+        self.assertEqual(d13_standard_trace.get("mode"), "lines+markers")
+        self.assertEqual(
+            d13_standard_trace.get("line"),
+            {"color": "#0f766e", "dash": "solid", "width": 1},
+        )
+        self.assertEqual(d13_standard_trace.get("marker", {}).get("color"), "white")
+        self.assertEqual(d13_standard_trace.get("marker", {}).get("size"), 6)
+        self.assertEqual(d13_standard_trace.get("marker", {}).get("symbol"), "diamond")
+        self.assertNotIn("ids", d13_standard_trace)
+        self.assertEqual(
+            d13_standard_trace.get("marker", {}).get("line"),
+            {"color": "#0f766e", "width": 1.25},
+        )
 
     def test_run_level_linearity_basis_can_use_cycle_endpoint_intensities(self) -> None:
         df = sample_processing_df().iloc[[0]].copy()
@@ -1953,6 +2205,35 @@ class ProcessingCoreTests(unittest.TestCase):
             ]
             self.assertIn("Edited Samples", trace_names, figure_key)
 
+    def test_identifier_charts_highlight_edited_rows_even_when_filtered_out(self) -> None:
+        df = sample_processing_df().copy()
+        config = normalize_processing_config({}).model_dump()
+        config["selected_identifier"] = "All"
+        config["sigma_level_data"] = 99.0
+        config["signal_range"] = [0.0, 100.0]
+        config["leak_range"] = [0.0, 1000.0]
+        config["d13c_range"] = [-10.0, 10.0]
+        config["d18o_range"] = [-100.0, 100.0]
+        metadata = {
+            "processing": {"config": config},
+            "edit_state": {"edited_rows": ["1"], "original_delta_values": {"d13C|1": 2.0}},
+            "calibration": {"selected_standards": []},
+        }
+
+        workspace = build_processing_workspace("session-1", df, sample_cycles_df(), metadata)
+        coral_section = next(section for section in workspace.species_sections if section.species == "Coral")
+        figure_set = next(item for item in coral_section.identifier_figures if item.identifier == "SampleA")
+        edited_trace = next(
+            trace for trace in figure_set.d13c.get("data", []) if str(trace.get("name", "")) == "Edited Samples"
+        )
+        edited_row_labels = {
+            str(item[0])
+            for item in edited_trace.get("customdata", [])
+            if isinstance(item, (list, tuple)) and item
+        }
+
+        self.assertIn("1", edited_row_labels)
+
     def test_unselected_outlier_overlays_are_hidden_from_base_charts(self) -> None:
         df = sample_processing_df()
         metadata = {
@@ -2128,7 +2409,11 @@ class ProcessingCoreTests(unittest.TestCase):
                         },
                     }
                 },
-                "edit_state": {"edited_rows": [], "original_delta_values": {}, "manual_outlier_overrides": {"1": True}},
+                "edit_state": {
+                    "edited_rows": [],
+                    "original_delta_values": {},
+                    "manual_outlier_overrides": {"d13C|1": True},
+                },
                 "calibration": {"selected_standards": []},
             }
 
@@ -2148,7 +2433,9 @@ class ProcessingCoreTests(unittest.TestCase):
         )
         self.assertIsNotNone(figure_set)
         d13_names = [str(trace.get("name", "")) for trace in (figure_set.d13c.get("data", []) if figure_set else [])]
+        d18_names = [str(trace.get("name", "")) for trace in (figure_set.d18o.get("data", []) if figure_set else [])]
         self.assertIn("Manual Outliers", d13_names)
+        self.assertNotIn("Manual Outliers", d18_names)
 
     def test_partial_saturated_rows_follow_processing_controls_outlier_toggle(self) -> None:
         df = sample_processing_df()

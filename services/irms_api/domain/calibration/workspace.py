@@ -24,6 +24,7 @@ from ..constants import (
     ISOTYPE_D13C,
     ISOTYPE_D18O,
     LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44,
+    SAMPLE_SEQUENCE_COL,
 )
 from ..contracts import (
     CalibrationAvailableValues,
@@ -33,7 +34,12 @@ from ..contracts import (
     CalibrationStandardSection,
     CalibrationWorkspace,
 )
-from ..shared.dataframe import _ensure_cycle1_signal_difference_columns, _find_column, _parse_numeric_token
+from ..shared.dataframe import (
+    _ensure_cycle1_signal_difference_columns,
+    _ensure_sample_sequence_column,
+    _find_column,
+    _parse_numeric_token,
+)
 from ..shared.json_compat import to_json_compatible
 from ..shared.naming import apply_identifier1_name_map
 from ..shared.plotting import (
@@ -86,6 +92,7 @@ def _figure_json(fig: go.Figure | None) -> dict[str, Any]:
 def _candidate_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         "Date",
+        SAMPLE_SEQUENCE_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
         CYCLE1_SIGNAL_REF44_COL,
         "p_no_acid",
@@ -875,7 +882,7 @@ def build_calibration_workspace(
     include_figures: bool = True,
     include_standard_sections: bool = True,
 ) -> CalibrationWorkspace:
-    work_df = _ensure_cycle1_signal_difference_columns(df.copy())
+    work_df = _ensure_cycle1_signal_difference_columns(_ensure_sample_sequence_column(df.copy()))
     calibration_meta = metadata.get("calibration", {})
     config_payload: dict[str, Any] | CalibrationConfig
     if config_override is None:
@@ -975,6 +982,27 @@ def build_calibration_workspace(
             carbonate_material=config.carbonate_material,
         )
         if not fit_input.empty:
+            # Seed the correction from raw inliers.  Fitting the bootstrap
+            # correction to every row lets a failed analysis tilt the model
+            # enough to move a second bad result inside the corrected IQR.
+            # These masks are only used for the seed fit; final outlier
+            # detection still runs after applying the correction, so genuine
+            # intensity trends are retained.
+            bootstrap_fit_input = _filter_standards_remove_outliers(
+                fit_input,
+                selected_standards,
+                config.calibration_type,
+                config.sigma_level,
+                config.iqr_multiplier,
+                config.independent_isotope_outliers,
+                outlier_reference_df=fit_input,
+            )
+            bootstrap_fit_input = _with_standard_linearity_residual_columns(
+                bootstrap_fit_input,
+                selected_standards,
+                standards_repo,
+                carbonate_material=config.carbonate_material,
+            )
             intensity_col = _resolve_selected_linearity_intensity_column(
                 df=fit_input,
                 use_diff_intensity=config.linearity.use_diff_intensity,
@@ -984,7 +1012,7 @@ def build_calibration_workspace(
             pre_outlier_d18_col = d18_offset_intensity_col if d18_offset_intensity_col in fit_input.columns else intensity_col
             pre_outlier_fit13 = _compute_standard_linearity_fit(
                 _filter_linearity_fit_input_by_max_intensity(
-                    fit_input,
+                    bootstrap_fit_input,
                     pre_outlier_d13_col,
                     max_sample_intensity,
                 ),
@@ -995,7 +1023,7 @@ def build_calibration_workspace(
             )
             pre_outlier_fit18 = _compute_standard_linearity_fit(
                 _filter_linearity_fit_input_by_max_intensity(
-                    fit_input,
+                    bootstrap_fit_input,
                     pre_outlier_d18_col,
                     max_sample_intensity,
                 ),

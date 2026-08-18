@@ -20,6 +20,7 @@ from ..constants import (
     CYCLE1_SIGNAL_SAMP45_COL,
     CYCLE1_SIGNAL_SAMP46_COL,
     CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+    SAMPLE_SEQUENCE_COL,
     VALID_CYCLES_COL,
 )
 
@@ -130,6 +131,13 @@ def _ensure_valid_cycles_column(df):
         df[VALID_CYCLES_COL] = values.where(values.notna(), existing)
     else:
         df[VALID_CYCLES_COL] = values
+    return df
+
+def _ensure_sample_sequence_column(df):
+    """Add a stable one-based acquisition-order value for color mapping."""
+    if df is None:
+        return df
+    df[SAMPLE_SEQUENCE_COL] = np.arange(1, len(df) + 1, dtype=float)
     return df
 
 def _coalesce_duplicate_columns(df):

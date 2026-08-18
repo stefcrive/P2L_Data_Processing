@@ -137,6 +137,31 @@ class ImportSessionTests(unittest.TestCase):
         self.assertEqual(parsed.loc[0, "Identifier 2"], "2129")
         self.assertEqual(parsed.loc[0, "Species"], "G. ruber")
 
+    def test_configurable_identity_parsing_preserves_original_identity_text(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Identifier 1": ["  Original identifier  "],
+                "Label": ["  Parsed identifier - PORITES LOBATA  "],
+                "Comment": ["  Original comment  "],
+            }
+        )
+        config = ImportWorkbookParsingConfig(
+            file_index=0,
+            file_name="raw-identities.xlsx",
+            software="generic",
+            identifier1=ImportFieldParsingRule(source_column="Label", mode="split", delimiter=" - ", part_index=0),
+            identifier2=ImportFieldParsingRule(source_column="Comment", mode="direct"),
+            species=ImportFieldParsingRule(source_column="Label", mode="split", delimiter=" - ", part_index=1),
+        )
+
+        parsed = _apply_import_parsing_config(frame, config)
+
+        self.assertEqual(parsed.loc[0, "Identifier 1"], "Parsed identifier")
+        self.assertEqual(parsed.loc[0, "Species"], "PORITES LOBATA")
+        self.assertEqual(parsed.loc[0, "Raw Identifier 1"], "  Original identifier  ")
+        self.assertEqual(parsed.loc[0, "Raw Label"], "  Parsed identifier - PORITES LOBATA  ")
+        self.assertEqual(parsed.loc[0, "Raw Comment"], "  Original comment  ")
+
     def test_isodat_alternating_rows_are_standardized_to_cycle_pairs(self) -> None:
         frame = pd.DataFrame(
             {

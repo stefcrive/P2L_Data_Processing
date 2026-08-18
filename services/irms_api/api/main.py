@@ -48,6 +48,7 @@ from ..domain.contracts import (
     CalibrationOfficialValueUpsertRequest,
     CalibrationWorkspace,
     ClientOutputDuplicateCheckResponse,
+    ClientOutputPreviewResponse,
     ChartBundle,
     CycleDiagnosticsPayload,
     CycleDiagnosticsRequest,
@@ -78,6 +79,7 @@ from ..domain.constants import (
     CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+    SAMPLE_SEQUENCE_COL,
     SESSION_RECORD_DIRNAME,
     SESSION_STATE_FILENAME,
     VALID_CYCLES_COL,
@@ -101,10 +103,15 @@ from ..domain.processing.cycles import (
 )
 from ..domain.processing.edits import apply_edit_action
 from ..domain.processing.export import (
+    CLIENT_OUTPUT_NUMERIC_COLUMNS,
     _build_client_output_frame,
+    _build_client_filename,
     _round_client_output_columns,
+    build_client_email_subject,
     build_client_output_workbook_bytes,
     build_dataset_workbook_bytes,
+    format_academic_species_name,
+    is_raw_client_output_source,
     summarize_client_output_duplicates,
 )
 from ..domain.processing.outliers import (
@@ -127,7 +134,11 @@ from ..domain.processing.workspace import (
     build_processing_workspace_from_context,
     normalize_processing_config,
 )
-from ..domain.shared.dataframe import _ensure_cycle1_signal_difference_columns, _get_species_series
+from ..domain.shared.dataframe import (
+    _ensure_cycle1_signal_difference_columns,
+    _ensure_sample_sequence_column,
+    _get_species_series,
+)
 from ..domain.shared.json_compat import to_json_compatible
 from ..domain.shared.naming import apply_identifier1_name_map
 from ..domain.shared.plotting import _build_isotope_3d_scatter
@@ -546,6 +557,7 @@ def _build_interpolation_source_frame(
 def _candidate_diagnostics_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         "Date",
+        SAMPLE_SEQUENCE_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
         CYCLE1_SIGNAL_REF44_COL,
         "p_no_acid",
@@ -1797,10 +1809,10 @@ def diagnostics(
     )
     figures = {"diagnostics": _figure_json(fig), "diagnostics_3d": _figure_json(fig_3d)}
     diagnostic_grid_meta: list[dict[str, str]] = []
-    for index, (title, grid_figure) in enumerate(diagnostic_grid):
+    for index, (group, title, grid_figure) in enumerate(diagnostic_grid):
         key = f"diagnostic_grid_{index}"
         figures[key] = _figure_json(grid_figure)
-        diagnostic_grid_meta.append({"key": key, "title": title})
+        diagnostic_grid_meta.append({"key": key, "group": group, "title": title})
     return ChartBundle(
         session_id=session_id,
         figures=figures,
@@ -2626,6 +2638,7 @@ def _processing_linearity_preview_rows(
         return []
     intensity_cols = {
         CYCLE1_SIGNAL_SAMP44_COL,
+        CYCLE1_SIGNAL_REF44_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
         CYCLE1_SIGNAL_DIFF45_COL,
         CYCLE1_SIGNAL_DIFF46_COL,
@@ -2654,8 +2667,10 @@ def _processing_linearity_preview_rows(
         "Species",
         "Comment",
         "Label",
+        SAMPLE_SEQUENCE_COL,
         VALID_CYCLES_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
+        CYCLE1_SIGNAL_REF44_COL,
         CYCLE1_SIGNAL_DIFF44_COL,
         CYCLE1_SIGNAL_DIFF45_COL,
         CYCLE1_SIGNAL_DIFF46_COL,
@@ -2663,6 +2678,9 @@ def _processing_linearity_preview_rows(
         CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL,
         CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
         CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL,
+        "p_no_acid",
+        "total_co2",
+        "p_gases",
         "leak_rate",
         "Line",
         "d 13C/12C  Mean",
@@ -2699,6 +2717,19 @@ def _processing_linearity_preview_rows(
             return numeric
         return str(value)
 
+    def _preview_text(value: Any, fallback: Any = "") -> str:
+        """Return clean identity text without leaking pandas null sentinels."""
+        for candidate in (value, fallback):
+            if candidate is None:
+                continue
+            try:
+                if pd.isna(candidate):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return str(candidate).strip()
+        return ""
+
     line_col = next((col for col in df.columns if str(col).strip().lower() == "line"), None)
     rows: list[dict[str, Any]] = []
     for row_label, row in df.iterrows():
@@ -2715,10 +2746,10 @@ def _processing_linearity_preview_rows(
         rows.append(
             {
                 "row_label": str(row_label),
-                "identifier1": str(row.get("Identifier 1") or "").strip(),
-                "identifier2": str(row.get("Identifier 2") or "").strip(),
-                "species": str(row.get("Species") or row.get("Identifier 1") or "").strip(),
-                "collector_status": str(row.get("Collector Status") or "").strip(),
+                "identifier1": _preview_text(row.get("Identifier 1")),
+                "identifier2": _preview_text(row.get("Identifier 2")),
+                "species": _preview_text(row.get("Species"), row.get("Identifier 1")),
+                "collector_status": _preview_text(row.get("Collector Status")),
                 "line": _numeric_or_none(row.get(line_col)) if line_col else None,
                 "d13_raw": _numeric_or_none(row.get("d 13C/12C  Mean")),
                 "d18_raw": _numeric_or_none(row.get("d 18O/16O  Mean")),
@@ -2775,7 +2806,7 @@ def processing_linearity_preview_data(session_id: str) -> ProcessingLinearityPre
         use_diff_intensity=bool(linearity_cfg.get("use_diff_intensity", False)),
         selected_intensity_col=linearity_cfg.get("intensity_col"),
     )
-    base_df = _ensure_cycle1_signal_difference_columns(df.copy())
+    base_df = _ensure_cycle1_signal_difference_columns(_ensure_sample_sequence_column(df.copy()))
     if cycles_df is not None and not cycles_df.empty:
         base_df = apply_run_level_linearity_basis_from_cycles(
             base_df,
@@ -2859,6 +2890,9 @@ def _apply_processing_edit_batch(
             "original_missing_delta_tokens": [],
             "original_std_values": {},
             "original_missing_std_tokens": [],
+            "original_identifier1_values": {},
+            "original_identifier2_values": {},
+            "original_species_values": {},
             "manual_outlier_overrides": {},
             "restored_delta_tokens": [],
         },
@@ -3026,15 +3060,62 @@ def processing_charts(session_id: str) -> ChartBundle:
     return _workspace_to_chart_bundle(_build_processing_workspace_response(session_id))
 
 
-@app.post("/sessions/{session_id}/exports/client-output/duplicates", response_model=ClientOutputDuplicateCheckResponse)
-def check_client_output_duplicates(session_id: str, request: ExportRequest) -> ClientOutputDuplicateCheckResponse:
+def _build_final_client_output_frame(
+    client_source: pd.DataFrame,
+    request: ExportRequest,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    client_df = _round_client_output_columns(
+        _build_client_output_frame(
+            client_source,
+            comment_map=request.comment_map,
+            identifier_source=request.client_output_identifier_source,
+            sample_source=request.client_output_sample_source,
+            species_source=request.client_output_species_source,
+            show_sequence=bool(request.show_sequence),
+        )
+    )
+    client_df["__identifier_2_key"] = client_source.get(
+        "Identifier 2",
+        pd.Series(index=client_source.index, dtype=object),
+    ).fillna("").astype(str).to_numpy()
+    if "Sequence" in client_df.columns:
+        client_df = client_df.sort_values(
+            by=["Sequence", "Identifier", "Sample #"],
+            ascending=[True, True, True],
+            na_position="last",
+            kind="mergesort",
+        ).reset_index(drop=True)
+
+    if request.client_output_rows is not None:
+        visible_columns = [column for column in client_df.columns if not str(column).startswith("__")]
+        reviewed_rows: list[dict[str, Any]] = []
+        for row in request.client_output_rows:
+            reviewed = {column: row.get(column) for column in visible_columns}
+            reviewed["__identifier_2_key"] = row.get("__identifier_2_key", row.get("Sample #", ""))
+            reviewed_rows.append(reviewed)
+        client_df = pd.DataFrame(reviewed_rows, columns=[*visible_columns, "__identifier_2_key"])
+        for column in CLIENT_OUTPUT_NUMERIC_COLUMNS:
+            if column in client_df.columns:
+                client_df[column] = pd.to_numeric(client_df[column], errors="coerce").round(2)
+        if "Species" in client_df.columns and not is_raw_client_output_source(request.client_output_species_source):
+            client_df["Species"] = client_df["Species"].map(format_academic_species_name)
+
+    client_df = client_df.reset_index(drop=True)
+    duplicate_summary = summarize_client_output_duplicates(client_df)
+    return client_df, duplicate_summary
+
+
+def _prepare_client_output_preview(
+    session_id: str,
+    request: ExportRequest,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     _session_exists_or_404(session_id)
     metadata = store.load_metadata(session_id)
     df = store.load_frame(session_id)
     cycles_df = store.load_cycles_frame(session_id)
     config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
     config.export = ProcessingExportConfig.model_validate(
-        request.model_dump(exclude={"output_type", "restore_stdev", "restore_stdev_cap"})
+        request.model_dump(exclude={"output_type", "restore_stdev", "restore_stdev_cap", "client_output_rows", "email_language"})
     )
 
     calibration = _processing_calibration_meta(metadata)
@@ -3095,19 +3176,45 @@ def check_client_output_duplicates(session_id: str, request: ExportRequest) -> C
     else:
         client_source = client_source.copy()
 
-    client_df = _round_client_output_columns(_build_client_output_frame(client_source, comment_map=config.export.comment_map))
-    client_df["__identifier_2_key"] = client_source.get(
-        "Identifier 2",
-        pd.Series(index=client_source.index, dtype=object),
+    if request.restore_stdev:
+        restore_stdev_cap = float(request.restore_stdev_cap)
+        if not np.isfinite(restore_stdev_cap):
+            raise HTTPException(status_code=400, detail="restore_stdev_cap must be a finite number")
+        client_source = _cap_stdev_columns_for_client_output(client_source, restore_stdev_cap)
+
+    return _build_final_client_output_frame(client_source, request)
+
+
+@app.post("/sessions/{session_id}/exports/client-output/preview", response_model=ClientOutputPreviewResponse)
+def preview_client_output(session_id: str, request: ExportRequest) -> ClientOutputPreviewResponse:
+    client_df, duplicate_summary = _prepare_client_output_preview(session_id, request)
+    export_df = client_df.drop(columns=["__identifier_2_key"], errors="ignore")
+    preview_df = client_df.astype(object).where(pd.notna(client_df), None)
+    client_name = str(request.client_name or "")
+    return ClientOutputPreviewResponse(
+        columns=[str(column) for column in export_df.columns],
+        numeric_columns=[column for column in CLIENT_OUTPUT_NUMERIC_COLUMNS if column in export_df.columns],
+        rows=[dict(row) for row in preview_df.to_dict(orient="records")],
+        total_rows=int(len(export_df)),
+        email_subject=build_client_email_subject(client_name, export_df, language=request.email_language),
+        filename=_build_client_filename(client_name, export_df),
+        duplicate_row_count=int(duplicate_summary["duplicate_row_count"]),
+        duplicate_identifier1_identifier2_species_values=[
+            str(value)
+            for value in duplicate_summary["duplicate_identifier1_identifier2_species_values"]
+        ],
+        duplicate_rows=[dict(row) for row in duplicate_summary["duplicate_rows"]],
+        duplicate_row_indexes=[
+            int(index)
+            for index, is_duplicate in duplicate_summary["duplicate_row_mask"].items()
+            if bool(is_duplicate)
+        ],
     )
-    if "Sequence" in client_df.columns:
-        client_df = client_df.sort_values(
-            by=["Sequence", "Identifier", "Sample #"],
-            ascending=[True, True, True],
-            na_position="last",
-            kind="mergesort",
-        ).reset_index(drop=True)
-    duplicate_summary = summarize_client_output_duplicates(client_df)
+
+
+@app.post("/sessions/{session_id}/exports/client-output/duplicates", response_model=ClientOutputDuplicateCheckResponse)
+def check_client_output_duplicates(session_id: str, request: ExportRequest) -> ClientOutputDuplicateCheckResponse:
+    _, duplicate_summary = _prepare_client_output_preview(session_id, request)
     return ClientOutputDuplicateCheckResponse(
         duplicate_row_count=int(duplicate_summary["duplicate_row_count"]),
         duplicate_identifier1_identifier2_species_values=[
@@ -3133,7 +3240,9 @@ def _export_dataset_sync(
     df = store.load_frame(session_id)
     cycles_df = store.load_cycles_frame(session_id)
     config = normalize_processing_config(metadata.get("processing", {}).get("config", {}))
-    config.export = ProcessingExportConfig.model_validate(request.model_dump(exclude={"output_type"}))
+    config.export = ProcessingExportConfig.model_validate(
+        request.model_dump(exclude={"output_type", "restore_stdev", "restore_stdev_cap", "client_output_rows", "email_language"})
+    )
     metadata.setdefault("processing", {})
     metadata["processing"]["config"] = config.model_dump()
 
@@ -3237,6 +3346,9 @@ def _export_dataset_sync(
             )
         if request.restore_stdev:
             client_source = _cap_stdev_columns_for_client_output(client_source, restore_stdev_cap)
+        if selected_standards and "Identifier 1" in client_source.columns:
+            client_source = client_source.loc[~client_source["Identifier 1"].isin(selected_standards)].copy()
+        final_client_df, _ = _build_final_client_output_frame(client_source, request)
         precision_override = _compute_export_shp2l_precision(
             df,
             metadata=metadata,
@@ -3250,6 +3362,8 @@ def _export_dataset_sync(
             comment_map=config.export.comment_map,
             precision_source_df=working_df,
             precision_override=precision_override,
+            species_source=request.client_output_species_source,
+            client_output_df=final_client_df,
         )
     else:
         workbook, filename = build_dataset_workbook_bytes(

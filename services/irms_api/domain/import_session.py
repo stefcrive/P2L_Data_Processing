@@ -370,6 +370,13 @@ def _apply_import_parsing_config(
 ) -> pd.DataFrame:
     """Populate canonical identity columns without mutating source columns."""
     work = df.copy()
+    for raw_column, source_column in (
+        ("Raw Identifier 1", "Identifier 1"),
+        ("Raw Label", "Label"),
+        ("Raw Comment", "Comment"),
+    ):
+        source = _find_column(work, source_column)
+        work[raw_column] = work[source].copy() if source is not None else None
     parsed = {
         "Identifier 1": _extract_import_field(work, config.identifier1, target_name="Identifier 1"),
         "Identifier 2": _extract_import_field(work, config.identifier2, target_name="Identifier 2"),

@@ -27,6 +27,7 @@ from ..constants import (
     CYCLE1_SIGNAL_REF44_COL,
     CYCLE1_SIGNAL_SAMP44_COL,
     CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL,
+    SAMPLE_SEQUENCE_COL,
     VALID_CYCLES_COL,
 )
 from ..contracts import (
@@ -40,7 +41,12 @@ from ..contracts import (
     ProcessingWorkspace,
     ProcessingWorkspaceConfig,
 )
-from ..shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column, _get_species_series, _parse_numeric_token
+from ..shared.dataframe import (
+    _ensure_cycle1_pressure_weighted_mismatch_column,
+    _ensure_sample_sequence_column,
+    _get_species_series,
+    _parse_numeric_token,
+)
 from ..shared.naming import (
     apply_identifier1_name_map as _apply_identifier1_name_map,
     mapped_identifier1 as _mapped_identifier1,
@@ -172,6 +178,7 @@ def _build_export_filename(config: ProcessingWorkspaceConfig) -> str:
 def _candidate_color_columns(df: pd.DataFrame) -> list[str]:
     preferred = [
         "Date",
+        SAMPLE_SEQUENCE_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
         CYCLE1_SIGNAL_REF44_COL,
         "p_no_acid",
@@ -462,7 +469,7 @@ def _derive_working_frame(
     cycles_df: pd.DataFrame | None = None,
     saturation_row_labels: set[Any] | None = None,
 ) -> pd.DataFrame:
-    work = _ensure_cycle1_pressure_weighted_mismatch_column(df.copy())
+    work = _ensure_cycle1_pressure_weighted_mismatch_column(_ensure_sample_sequence_column(df.copy()))
     if "Identifier 2" in work.columns:
         work["Sequence"] = work["Identifier 2"].apply(_parse_numeric_token)
     calibration = calibration_meta or {}
@@ -699,6 +706,9 @@ def build_processing_context(
                 "original_missing_delta_tokens": [],
                 "original_std_values": {},
                 "original_missing_std_tokens": [],
+                "original_identifier1_values": {},
+                "original_identifier2_values": {},
+                "original_species_values": {},
                 "manual_outlier_overrides": {},
                 "restored_delta_tokens": [],
             },

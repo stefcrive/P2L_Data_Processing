@@ -16,6 +16,7 @@ CYCLE1_SIGNAL_RELATIVE_MISMATCH44_COL = "1  Cycle Int  Relative Mismatch Samp-Re
 CYCLE1_SIGNAL_SYMMETRIC_MISMATCH44_COL = "1  Cycle Int  Symmetric Relative Mismatch Samp-Ref  44"
 CYCLE1_SIGNAL_MEAN_SAMP_REF44_COL = "1  Cycle Int  Mean Samp-Ref  44"
 VALID_CYCLES_COL = "Valid Cycles"
+SAMPLE_SEQUENCE_COL = "Sample sequence"
 LINEARITY_BASIS_TWO_TERM_MEAN_SYMMETRIC44 = "Linearity Two-Term Mean Intensity + Symmetric Mismatch 44"
 
 AUTOSAVE_LOG_PATH_KEY = "autosave_log_path"
