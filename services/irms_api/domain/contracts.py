@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from .constants import CYCLE1_SIGNAL_SAMP44_COL
 
@@ -57,6 +57,62 @@ class SessionSnapshot(BaseModel):
     preview: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class ScientificChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4_000)
+
+
+class ScientificChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4_000)
+    history: list[ScientificChatHistoryMessage] = Field(default_factory=list, max_length=12)
+    current_session_id: str | None = Field(default=None, max_length=200)
+
+
+class ScientificToolActivity(BaseModel):
+    tool: str
+    status: Literal["completed", "error"]
+    summary: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+    at: datetime
+
+
+class ScientificChatResponse(BaseModel):
+    message: str
+    model: str
+    tools_used: list[str] = Field(default_factory=list)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    generated_at: datetime
+    read_only: bool = True
+    processing_environment: dict[str, Any] = Field(default_factory=dict)
+    tool_activity: list[ScientificToolActivity] = Field(default_factory=list)
+    reasoning_summary: str | None = None
+
+
+class OpenAIApiKeyUpdate(BaseModel):
+    api_key: SecretStr
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value().strip()
+        if len(raw) < 20:
+            raise ValueError("OpenAI API key is too short")
+        if not raw.startswith("sk-"):
+            raise ValueError("OpenAI API key must start with sk-")
+        return SecretStr(raw)
+
+
+class OpenAIApiKeyStatus(BaseModel):
+    configured: bool
+    source: Literal[
+        "application_memory",
+        "user_environment",
+        "environment",
+        "not_configured",
+    ]
+
+
 class ImportResult(BaseModel):
     session: SessionSnapshot
 
@@ -106,6 +162,7 @@ class ImportNamingUpdate(BaseModel):
 class ImportNamingWorkspace(ImportNamingUpdate):
     identifier1_sources: list[str] = Field(default_factory=list)
     species_sources: list[str] = Field(default_factory=list)
+    species_source_details: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
 
 
 class AutosaveSettingsUpdate(BaseModel):
@@ -444,6 +501,7 @@ class CycleDiagnosticsPayload(BaseModel):
     session_id: str
     target: dict[str, Any] = Field(default_factory=dict)
     inline_summary: str = ""
+    analysis_info: dict[str, Any] = Field(default_factory=dict)
     figure: dict[str, Any] = Field(default_factory=dict)
     saturation_correction: dict[str, Any] = Field(default_factory=dict)
     intensity_linearity: dict[str, Any] = Field(default_factory=dict)

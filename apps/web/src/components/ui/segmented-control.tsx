@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
+import { formatScientificText } from "@/lib/scientific-notation";
 
 type SegmentItem = {
   value: string;
@@ -37,7 +38,7 @@ export function SegmentedControl({
               active ? "bg-stone-900 text-white" : "text-stone-700 hover:bg-stone-100",
             )}
           >
-            {item.label}
+            {typeof item.label === "string" ? formatScientificText(item.label) : item.label}
           </button>
         );
       })}

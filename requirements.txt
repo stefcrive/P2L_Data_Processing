@@ -14,3 +14,4 @@ fastapi
 uvicorn
 python-multipart
 pydantic
+openai>=2.36.0

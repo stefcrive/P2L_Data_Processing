@@ -5,6 +5,7 @@ import { AlertTriangle, Check, ChevronRight, Copy, Download, RotateCcw, SearchCh
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
+  Fragment,
   memo,
   startTransition,
   useCallback,
@@ -16,6 +17,7 @@ import {
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
+import { RawAnalysisInfoTable } from "@/components/diagnostics/raw-analysis-info-table";
 import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
 import {
   SATURATION_COLOR_AXIS_OPTIONS,
@@ -48,6 +50,7 @@ import type {
   SaturationCorrectionMethod,
   SpeciesSection,
 } from "@/lib/types";
+import { formatScientificText } from "@/lib/scientific-notation";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
 
@@ -107,6 +110,7 @@ const SATURATION_METHOD_OPTIONS: Array<{ value: SaturationCorrectionMethod; labe
 ];
 const SELECTION_EDITOR_DEFAULT_OFFSET = 0.1;
 const RESTORE_STDEV_DEFAULT_CAP = 0.04;
+const LOW_SIGNAL_THRESHOLD_V = 2;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const SELECTION_EDITOR_CHART_DEFER_MS = 350;
 const CLIENT_NAME_COMMIT_DELAY_MS = 300;
@@ -306,7 +310,8 @@ function clientOutputDuplicateIndexes(rows: ClientOutputPreviewResponse["rows"])
     const identifier = String(row.Identifier ?? "").trim();
     const identifier2 = String(row.__identifier_2_key ?? row["Sample #"] ?? "").trim();
     const species = String(row.Species ?? "").trim();
-    return identifier2 ? `${identifier}\u0000${identifier2}\u0000${species}` : "";
+    const failedOrLowSignal = Boolean(row.__duplicate_failed_or_low_signal);
+    return identifier2 ? `${identifier}\u0000${identifier2}\u0000${species}\u0000${failedOrLowSignal}` : "";
   });
   const counts = new Map<string, number>();
   for (const key of keys) {
@@ -802,7 +807,7 @@ function getLinearityCoefficientLabel(
   term: LinearityCoefficientTerm,
   aggregation: LinearityCycleIntensityAggregation = "run_median",
 ): string {
-  const prefix = isotope === "d13C" ? "d13C" : "d18O";
+  const prefix = isotope === "d13C" ? "δ¹³C" : "δ¹⁸O";
   const coefficient = getLinearityCoefficientTermLabel(term, intensityCol).replace(" coefficient", "");
   return `${prefix} ${coefficient} offset, ${getLinearityBasisTerm(intensityCol, aggregation)} ${getLinearityCoefficientUnit(term, intensityCol)}`;
 }
@@ -1105,6 +1110,7 @@ function buildProcessingPreviewRowLookup(previewData: ProcessingLinearityPreview
 type DuplicateSampleState = {
   rowLabels: Set<string>;
   groupSizeByRow: Map<string, number>;
+  groupRowLabelsByRow: Map<string, string[]>;
 };
 
 function buildDuplicateSampleState(
@@ -1126,13 +1132,17 @@ function buildDuplicateSampleState(
     if (!rowLabel || !identifier2) {
       continue;
     }
-    const identity = `${identifier1}\u0000${identifier2}\u0000${species}`;
+    const failedOrLowSignal =
+      isFailedSampleCollectorStatus(row.collector_status) ||
+      (row.signal != null && row.signal < LOW_SIGNAL_THRESHOLD_V);
+    const identity = `${identifier1}\u0000${identifier2}\u0000${species}\u0000${failedOrLowSignal}`;
     const group = rowsByIdentity.get(identity) ?? [];
     group.push(rowLabel);
     rowsByIdentity.set(identity, group);
   }
   const rowLabels = new Set<string>();
   const groupSizeByRow = new Map<string, number>();
+  const groupRowLabelsByRow = new Map<string, string[]>();
   for (const group of rowsByIdentity.values()) {
     if (group.length < 2) {
       continue;
@@ -1140,9 +1150,10 @@ function buildDuplicateSampleState(
     for (const rowLabel of group) {
       rowLabels.add(rowLabel);
       groupSizeByRow.set(rowLabel, group.length);
+      groupRowLabelsByRow.set(rowLabel, group);
     }
   }
-  return { rowLabels, groupSizeByRow };
+  return { rowLabels, groupSizeByRow, groupRowLabelsByRow };
 }
 
 function normalizeColumnKey(value: string): string {
@@ -1176,6 +1187,67 @@ function previewRowValueForColumn(row: ProcessingPreviewRow, column: string): un
     return row.intensities[normalizedIntensityKey];
   }
   return null;
+}
+
+function buildHoverAnalysisInfo(
+  diagnostics: CycleDiagnosticsPayload | undefined,
+  row: ProcessingPreviewRow | undefined,
+  target: SelectedTarget | null,
+): Record<string, unknown> {
+  const diagnosticsInfo = diagnostics?.analysis_info;
+  if (diagnosticsInfo && Object.keys(diagnosticsInfo).length) {
+    return diagnosticsInfo;
+  }
+  if (!row || !target) {
+    return {};
+  }
+
+  const attributes = row.attributes ?? {};
+  const normalizedAttributes = new Map(
+    Object.entries(attributes).map(([column, value]) => [normalizeColumnKey(column), { column, value }]),
+  );
+  const attribute = (...candidates: string[]): { column: string; value: unknown } | null => {
+    for (const candidate of candidates) {
+      const match = normalizedAttributes.get(normalizeColumnKey(candidate));
+      if (match) {
+        return match;
+      }
+    }
+    return null;
+  };
+
+  const isotopeValue = target.isotopeKey === "d18O" ? row.d18_raw : row.d13_raw;
+  const stdDev = attribute(
+    target.isotopeKey === "d18O" ? "d 18O/16O  Std Dev" : "d 13C/12C  Std Dev",
+  );
+  const line = attribute("Line");
+  const date = attribute("Date");
+  const time = attribute("Start Time", "Analysis Time", "Time");
+  const origin = attribute("Excel File", "Origin File", "Source File", "File");
+  const consumedColumns = new Set(
+    [stdDev, line, date, time, origin]
+      .filter((entry): entry is { column: string; value: unknown } => entry != null)
+      .map((entry) => entry.column),
+  );
+  const info: Record<string, unknown> = {
+    "Isotopic value": isotopeValue,
+    "Internal stdev": stdDev?.value ?? null,
+    Line: row.line ?? line?.value ?? null,
+    "Analysis date": date?.value ?? null,
+    "Analysis time": time?.value ?? null,
+    "Origin file": origin?.value ?? null,
+  };
+  for (const [column, value] of Object.entries(attributes)) {
+    if (!consumedColumns.has(column) && !(column in info)) {
+      info[column] = value;
+    }
+  }
+  for (const [column, value] of Object.entries(row.intensities ?? {})) {
+    if (!(column in info)) {
+      info[column] = value;
+    }
+  }
+  return info;
 }
 
 function parseNumericToken(value: unknown): number | null {
@@ -1256,7 +1328,7 @@ function previewColorLabel(colorParam: string): string {
   if (key === "1 cycle int samp 44") return "Initial sample intensity";
   if (key === "1 cycle int ref 44") return "Initial reference gas intensity";
   if (key === "p_no_acid") return "P no Acid";
-  if (key === "total_co2") return "total CO2";
+  if (key === "total_co2") return "total CO₂";
   if (key === "p_gases") return "P gasses";
   return colorParam;
 }
@@ -3429,6 +3501,15 @@ function configEquals(left: ProcessingConfig | null | undefined, right: Processi
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function reconcileProcessingConfigDraft(
+  current: ProcessingConfig | null,
+  incoming: ProcessingConfig,
+  previousSaved: ProcessingConfig | null,
+): ProcessingConfig {
+  const hasUnsavedDraft = Boolean(current && previousSaved && !configEquals(current, previousSaved));
+  return hasUnsavedDraft && current ? current : incoming;
+}
+
 function asNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -3601,7 +3682,7 @@ function DataTable({
             {selectable ? <th className="w-12 px-3 py-2 font-medium text-stone-700">Sel</th> : null}
             {columns.map((column) => (
               <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                {column}
+                {formatScientificText(column)}
               </th>
             ))}
           </tr>
@@ -3630,7 +3711,7 @@ function DataTable({
                 ) : null}
               {columns.map((column) => (
                 <td key={column} className="px-3 py-2 text-stone-600">
-                  {formatValue(row[column], column)}
+                  {formatScientificText(formatValue(row[column], column))}
                 </td>
               ))}
             </tr>
@@ -3701,10 +3782,10 @@ function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefin
       xanchor: "center",
       font: { size: 14 },
     },
-    margin: { l: 42, r: 12, t: 46, b: 126 },
+    margin: { l: 42, r: 12, t: 42, b: 112 },
     legend: { orientation: "h", yanchor: "top", y: -0.28, x: 0, xanchor: "left", font: { size: 10 } },
     hovermode: "closest",
-    height: 460,
+    height: 390,
   };
   return {
     ...cloned,
@@ -3994,7 +4075,7 @@ function ProcessingColorScaleBar({
   const ticks = processingColorScaleTicks(range);
   return (
     <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
-      <div className="mb-1 font-semibold text-stone-900">{label}</div>
+      <div className="mb-1 font-semibold text-stone-900">{formatScientificText(label)}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
@@ -4274,7 +4355,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             <tr>
               {columns.map((column) => (
                 <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                  {column}
+                  {formatScientificText(column)}
                 </th>
               ))}
             </tr>
@@ -4325,7 +4406,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
                             : "text-stone-700",
                         )}
                       >
-                        {formatCell(cellValue, column)}
+                        {formatScientificText(formatCell(cellValue, column))}
                       </td>
                     );
                   })}
@@ -4405,7 +4486,7 @@ function OutlierTablesPanel({
               <details open key={tableKey} className="group/table rounded-lg border border-stone-200 bg-white px-3 py-2.5">
                 <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-medium text-stone-800">
                   <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-400 transition-transform group-open/table:rotate-90" aria-hidden="true" />
-                  <span>{table.title ?? table.name} ({table.rows.length})</span>
+                  <span>{formatScientificText(table.title ?? table.name)} ({table.rows.length})</span>
                 </summary>
                 <div className="mt-3">
                   <DataTable
@@ -4467,7 +4548,7 @@ function CheckboxField({
         onChange={(event) => onChange(event.target.checked)}
         className="h-4 w-4"
       />
-      <span className="font-medium text-stone-800">{label}</span>
+      <span className="font-medium text-stone-800">{formatScientificText(label)}</span>
       {description ? (
         <Tooltip label={description}>
           <span tabIndex={0} aria-label={`More information about ${label}`} className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">
@@ -4535,12 +4616,16 @@ function DiagnosticsPanel({
   loading,
   displayDelta = 0,
   onPickDeltaValue,
+  showCycleEvidence = true,
+  legendCollapsed = false,
 }: {
   title: string;
   diagnostics?: CycleDiagnosticsPayload;
   loading: boolean;
   displayDelta?: number;
   onPickDeltaValue?: (value: number, valueSpace?: "raw" | "display", stdev?: number | null) => void;
+  showCycleEvidence?: boolean;
+  legendCollapsed?: boolean;
 }) {
   const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
   const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
@@ -4815,7 +4900,7 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
                     )}
                   >
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{item.label}</div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{formatScientificText(item.label)}</div>
                     <div className="mt-0.5 text-base font-semibold">
                       {blockedByLinearityCycleCount ? (
                         <Tooltip label="not enough cycles for linearity calculation" align="start">
@@ -4835,16 +4920,21 @@ function DiagnosticsPanel({
 
             {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
 
-            <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
-              <PlotlyChart
-                figure={diagnosticsFigure}
-                className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
-                deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-              />
-              <div className="min-w-0">
-                <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
+            {showCycleEvidence ? (
+              <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
+                <PlotlyChart
+                  figure={diagnosticsFigure}
+                  className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
+                  collapsibleLegend
+                  legendCollapsed={legendCollapsed}
+                  verticallyResizable
+                  deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+                />
+                <div className="min-w-0">
+                  <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
+                </div>
               </div>
-            </div>
+            ) : null}
 
             {saturationFigureItems.length ? (
               <>
@@ -4889,6 +4979,9 @@ function DiagnosticsPanel({
                       figure={item.figure}
                       colorAxis={saturationColorAxis}
                       yAxis={saturationYAxis}
+                      collapsibleLegend
+                      legendCollapsed={legendCollapsed}
+                      verticallyResizable
                       deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
                     />
                   ))}
@@ -4904,6 +4997,131 @@ function DiagnosticsPanel({
   );
 }
 
+function DuplicateCycleDiagnostics({
+  sessionId,
+  targets,
+  isotopeKey,
+  activeRowLabel,
+  onInspect,
+  legendCollapsed = false,
+}: {
+  sessionId: string;
+  targets: SelectedTarget[];
+  isotopeKey: IsotopeKey;
+  activeRowLabel: string;
+  onInspect: (target: SelectedTarget) => void;
+  legendCollapsed?: boolean;
+}) {
+  const diagnosticQueries = useQueries({
+    queries: targets.map((target) => ({
+      queryKey: ["processing-diagnostics", sessionId, target.rowLabel, isotopeKey],
+      queryFn: () => api.getProcessingCycleDiagnostics(sessionId, diagnosticsTargetPayload(target, isotopeKey)),
+      enabled: Boolean(sessionId),
+      staleTime: 60_000,
+    })),
+  });
+
+  const samples = targets.map((target, index) => {
+    const query = diagnosticQueries[index];
+    const diagnostics = query?.data;
+    const currentValue = asNumber((diagnostics?.target ?? {})["current_value"]);
+    const currentMethod = formatMethodLabel((diagnostics?.target ?? {})["current_method"]);
+    const cycleMean = asNumber((diagnostics?.cycle_mean ?? {})["valid_mean"]);
+    return {
+      target,
+      index,
+      query,
+      diagnostics,
+      currentValue,
+      currentMethod,
+      cycleMean,
+      valuesDiffer: currentValue != null && cycleMean != null && Math.abs(currentValue - cycleMean) > 0.0005,
+      isActive: target.rowLabel === activeRowLabel,
+    };
+  });
+
+  return (
+    <section className="space-y-4" aria-labelledby="duplicate-cycle-diagnostics-heading">
+      <div>
+        <h3 id="duplicate-cycle-diagnostics-heading" className="text-sm font-semibold text-stone-900">
+          Cycle evidence for matching samples
+        </h3>
+        <p className="mt-0.5 max-w-3xl text-xs leading-5 text-stone-500">
+          Each chart and table belongs to one analysis row. Current analysis values can differ from cycle evidence after an edit, restoration, or interpolation.
+        </p>
+      </div>
+      <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
+        {samples.map(({ target, index, query, diagnostics, currentValue, currentMethod, cycleMean, valuesDiffer, isActive }) => (
+          <section key={target.rowLabel} className="min-w-0 overflow-hidden rounded-lg border border-stone-300 bg-white">
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-stone-200 px-3 py-2.5">
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h4 className="text-sm font-semibold text-stone-900">Sample {index + 1}</h4>
+                  <span className="rounded-md bg-stone-100 px-1.5 py-0.5 text-[11px] tabular-nums text-stone-600">Row {target.rowLabel}</span>
+                  {isActive ? (
+                    <span className="rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-800">Active sample</span>
+                  ) : null}
+                </div>
+                <div className="truncate text-xs text-stone-500">
+                  {(target.identifier1 || "No Identifier 1").trim()} · {(target.identifier2 || "No Identifier 2").trim()}
+                </div>
+                <dl className="flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
+                  <div className="flex gap-1">
+                    <dt className="text-stone-500">Current value:</dt>
+                    <dd className="font-semibold tabular-nums text-stone-800">{currentValue == null ? "N/A" : formatDeltaValue(currentValue)}</dd>
+                  </div>
+                  <div className="flex gap-1">
+                    <dt className="text-stone-500">Cycle mean:</dt>
+                    <dd className="font-semibold tabular-nums text-stone-800">{cycleMean == null ? "N/A" : formatDeltaValue(cycleMean)}</dd>
+                  </div>
+                  <div className="flex gap-1">
+                    <dt className="text-stone-500">Source:</dt>
+                    <dd className="font-medium text-stone-700">{currentMethod}</dd>
+                  </div>
+                </dl>
+              </div>
+              {!isActive ? (
+                <Button type="button" variant="outline" size="sm" onClick={() => onInspect(target)}>
+                  Inspect/edit sample
+                </Button>
+              ) : null}
+            </div>
+            <div className="space-y-3 p-3">
+              {valuesDiffer ? (
+                <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950" role="note">
+                  The current analysis value uses <span className="font-semibold">{currentMethod.toLowerCase()}</span> data, while the chart and table preserve the original cycle-level evidence.
+                </div>
+              ) : null}
+              {query?.isLoading ? <div className="text-sm text-stone-500">Loading cycle evidence...</div> : null}
+              <div aria-label={`Cycle intensity chart for sample ${index + 1}, row ${target.rowLabel}`}>
+                {query?.isError ? (
+                  <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+                    Unable to load cycle evidence for row {target.rowLabel}.
+                  </div>
+                ) : diagnostics ? (
+                  <PlotlyChart
+                    figure={ensureCollectorIntensityTraces(diagnostics.figure, diagnostics.table ?? [])}
+                    className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
+                    collapsibleLegend
+                    legendCollapsed={legendCollapsed}
+                    verticallyResizable
+                    deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
+                  />
+                ) : null}
+              </div>
+              {diagnostics && !query?.isError ? (
+                <div className="min-w-0 border-t border-stone-200 pt-3" aria-label={`Cycle table for sample ${index + 1}, row ${target.rowLabel}`}>
+                  <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
+                </div>
+              ) : null}
+            </div>
+          </section>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function FigureCard({
   chartKey,
   title,
@@ -4913,6 +5131,7 @@ function FigureCard({
   cardClassName,
   chartClassName,
   fitContainer = false,
+  legendCollapsed = false,
   onPointClick,
   onSelection,
   onPointHover,
@@ -4926,6 +5145,7 @@ function FigureCard({
   cardClassName?: string;
   chartClassName?: string;
   fitContainer?: boolean;
+  legendCollapsed?: boolean;
   onPointClick?: (points: PlotlyPoint[]) => void;
   onSelection?: (points: PlotlyPoint[]) => void;
   onPointHover?: (payload: PlotlyHoverPayload) => void;
@@ -4945,6 +5165,9 @@ function FigureCard({
           figure={figure}
           className={chartClassName ?? "min-h-[340px]"}
           fitContainer={fitContainer}
+          collapsibleLegend
+          legendCollapsed={legendCollapsed}
+          verticallyResizable
           uiRevision={chartKey ? `processing:${chartKey}` : undefined}
           onPointClick={onPointClick}
           onSelection={onSelection}
@@ -4967,6 +5190,7 @@ export default function ProcessingPage() {
   const [selectedTargets, setSelectedTargets] = useState<SelectedTarget[]>([]);
   const [activeTargetIndex, setActiveTargetIndex] = useState(0);
   const [displayState, setDisplayState] = useState<DisplayStateMap>({});
+  const [hideDuplicateSymbologyAndCollapseLegends, setHideDuplicateSymbologyAndCollapseLegends] = useState(false);
   const [selectionEditorTab, setSelectionEditorTab] = useState<IsotopeKey>("d13C");
   const [singleValues, setSingleValues] = useState<IsotopeNumericMap>({ d13C: 0, d18O: 0 });
   const [singleValueSpaces, setSingleValueSpaces] = useState<Record<IsotopeKey, "raw" | "display">>({
@@ -5018,6 +5242,7 @@ export default function ProcessingPage() {
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
   const preserveLinearityPreviewOnWorkspaceUpdateRef = useRef(false);
+  const synchronizedWorkspaceConfigRef = useRef<{ sessionId: string; config: ProcessingConfig } | null>(null);
   const clientOutputDraftSourceRef = useRef("");
   const speciesDefaultsSessionRef = useRef<string | null>(null);
   const colorScaleFigureCacheRef = useRef<
@@ -5111,7 +5336,16 @@ export default function ProcessingPage() {
 
   useEffect(() => {
     if (workspaceQuery.data) {
-      setConfig(workspaceQuery.data.config);
+      const incomingWorkspace = workspaceQuery.data;
+      const previousSaved =
+        synchronizedWorkspaceConfigRef.current?.sessionId === incomingWorkspace.session_id
+          ? synchronizedWorkspaceConfigRef.current.config
+          : null;
+      setConfig((current) => reconcileProcessingConfigDraft(current, incomingWorkspace.config, previousSaved));
+      synchronizedWorkspaceConfigRef.current = {
+        sessionId: incomingWorkspace.session_id,
+        config: incomingWorkspace.config,
+      };
       if (preserveLinearityPreviewOnWorkspaceUpdateRef.current) {
         preserveLinearityPreviewOnWorkspaceUpdateRef.current = false;
       } else {
@@ -6711,6 +6945,14 @@ export default function ProcessingPage() {
     activeConfig.identifier1_name_map,
     activeConfig.species_name_map,
   );
+  const originalDuplicateSampleState = buildDuplicateSampleState(
+    linearityPreviewDataQuery.data,
+    {},
+    {},
+    {},
+    activeConfig.identifier1_name_map,
+    activeConfig.species_name_map,
+  );
   const applyPreviewFigure = (figure: Record<string, unknown> | undefined) => {
     const linearityFigure = shouldApplyLinearityPreview
       ? applyLinearityPreviewToFigure(figure, linearityPreviewDataQuery.data, previewLinearity, activeConfig)
@@ -6721,7 +6963,9 @@ export default function ProcessingPage() {
     const draftFigure = hasPendingSelectionDrafts
       ? applySelectionDraftPreviewToFigure(processingFigure, selectionDraftValues, activeConfig, selectionDraftRowLabels)
       : processingFigure;
-    return applyDuplicateHighlightsToFigure(draftFigure, duplicateSampleState.rowLabels);
+    return hideDuplicateSymbologyAndCollapseLegends
+      ? draftFigure
+      : applyDuplicateHighlightsToFigure(draftFigure, duplicateSampleState.rowLabels);
   };
   const selectedLinearityIntensityCol = previewLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(previewLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
@@ -7010,10 +7254,65 @@ export default function ProcessingPage() {
   const activeDuplicateGroupSize = activeTarget
     ? duplicateSampleState.groupSizeByRow.get(activeTarget.rowLabel) ?? 0
     : 0;
+  const originalDuplicateRowLabels = activeTarget
+    ? originalDuplicateSampleState.groupRowLabelsByRow.get(activeTarget.rowLabel) ?? []
+    : [];
+  const originalDuplicateRowLabelSet = new Set(originalDuplicateRowLabels);
+  const previewRows = linearityPreviewDataQuery.data?.rows ?? [];
+  const previewRowIndexByLabel = new Map(
+    previewRows.map((row, index) => [String(row.row_label).trim(), index]),
+  );
+  const duplicateGroupTargets: SelectedTarget[] = originalDuplicateRowLabels
+    .flatMap((rowLabel) => {
+      const row = processingPreviewRowLookup.get(rowLabel);
+      if (!row || !activeTarget) return [];
+      const target: SelectedTarget = {
+        rowLabel,
+        isotopeKey: activeTarget.isotopeKey,
+        identifier1: String(row.identifier1 ?? ""),
+        identifier2: String(row.identifier2 ?? ""),
+        species: String(row.species ?? row.identifier1 ?? ""),
+        currentValue:
+          activeTarget.isotopeKey === "d13C"
+            ? row.d13_raw
+            : activeTarget.isotopeKey === "d18O"
+              ? row.d18_raw
+              : null,
+        currentD13: row.d13_raw,
+        currentD18: row.d18_raw,
+        chartKey: activeTarget.chartKey,
+      };
+      return [target];
+    })
+    .sort(
+      (left, right) =>
+        (previewRowIndexByLabel.get(left.rowLabel) ?? Number.MAX_SAFE_INTEGER) -
+        (previewRowIndexByLabel.get(right.rowLabel) ?? Number.MAX_SAFE_INTEGER),
+    );
+  const duplicateSequenceIndexes = new Set<number>();
+  for (const rowLabel of originalDuplicateRowLabels) {
+    const rowIndex = previewRowIndexByLabel.get(rowLabel);
+    if (rowIndex == null) continue;
+    for (let contextIndex = Math.max(0, rowIndex - 2); contextIndex <= Math.min(previewRows.length - 1, rowIndex + 2); contextIndex += 1) {
+      duplicateSequenceIndexes.add(contextIndex);
+    }
+  }
+  const duplicateSequenceRows = Array.from(duplicateSequenceIndexes)
+    .sort((left, right) => left - right)
+    .map((rowIndex, index, indexes) => ({
+      row: previewRows[rowIndex],
+      rowIndex,
+      hasGapBefore: index > 0 && rowIndex - indexes[index - 1] > 1,
+    }));
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
-  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
+  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 720, 680) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
     ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
+  );
+  const hoverAnalysisInfo = buildHoverAnalysisInfo(
+    hoverDiagnosticsQuery.data,
+    hoverPreviewTarget ? processingPreviewRowLookup.get(hoverPreviewTarget.rowLabel) : undefined,
+    hoverPreviewDiagnosticsTarget,
   );
   const hasHoverDiagnosticsFigureData = Boolean(
     hoverDiagnosticsFigure &&
@@ -7115,7 +7414,7 @@ export default function ProcessingPage() {
         : false;
   const activeTargetCollectorStatus = d13ActiveStatus || d18ActiveStatus;
   const singleInterpolateLabel = isFailedSampleCollectorStatus(activeTargetCollectorStatus)
-    ? "Interpolate d13C + d18O"
+    ? "Interpolate δ¹³C + δ¹⁸O"
     : `Interpolate ${selectionEditorTab}`;
   const overviewCards = {
     processing3d: {
@@ -7126,20 +7425,20 @@ export default function ProcessingPage() {
     },
     d13Summary: {
       key: "d13_summary",
-      title: "d13C Summary",
-      description: "Summary curve for d13C across the active scope.",
+      title: "δ¹³C Summary",
+      description: "Summary curve for δ¹³C across the active scope.",
       figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.d13_summary)),
     },
     d18Summary: {
       key: "d18_summary",
-      title: "d18O Summary",
-      description: "Summary curve for d18O across the active scope.",
+      title: "δ¹⁸O Summary",
+      description: "Summary curve for δ¹⁸O across the active scope.",
       figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.d18_summary)),
     },
     crossplot: {
       key: "crossplot",
       title: "Crossplot",
-      description: "d13C vs d18O selection surface for dual-isotope edits.",
+      description: "δ¹³C vs δ¹⁸O selection surface for dual-isotope edits.",
       figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.crossplot)),
     },
   };
@@ -7182,13 +7481,13 @@ export default function ProcessingPage() {
               {
                 key: `${d13Key}:selection-source`,
                 chartKey: d13Key,
-                title: "d13C series",
+                title: "δ¹³C series",
                 figure: highlightSelectionSourceFigure(applyPreviewFigure(d13FigureBase), activeTarget),
               },
               {
                 key: `${d18Key}:selection-source`,
                 chartKey: d18Key,
-                title: "d18O series",
+                title: "δ¹⁸O series",
                 figure: highlightSelectionSourceFigure(applyPreviewFigure(d18FigureBase), activeTarget),
               },
             ],
@@ -7256,6 +7555,107 @@ export default function ProcessingPage() {
       ),
     };
   })();
+
+  function renderSelectionIdentityFields(target: SelectedTarget, fieldIdPrefix: string) {
+    const identifier1Source =
+      selectionDraftIdentifier1[target.rowLabel] ??
+      resolveIdentifier1Source(target.identifier1, identifier1Sources, activeConfig!.identifier1_name_map);
+    const identifier2 = selectionDraftIdentifier2[target.rowLabel] ?? target.identifier2;
+    const speciesSource =
+      selectionDraftSpecies[target.rowLabel] ??
+      resolveSpeciesSource(target.species, speciesSources, activeConfig!.species_name_map);
+    const hasIdentifier1Draft = Object.prototype.hasOwnProperty.call(selectionDraftIdentifier1, target.rowLabel);
+    const hasIdentifier2Draft = Object.prototype.hasOwnProperty.call(selectionDraftIdentifier2, target.rowLabel);
+    const hasSpeciesDraft = Object.prototype.hasOwnProperty.call(selectionDraftSpecies, target.rowLabel);
+    const inputClassName =
+      "h-9 w-full rounded-md border border-stone-300 bg-white px-3 text-sm text-stone-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-stone-100";
+
+    return (
+      <div className="grid gap-3 sm:grid-cols-3">
+        <label className="block min-w-0 text-sm" htmlFor={`${fieldIdPrefix}-identifier1`}>
+          <span className="mb-1 block text-xs font-semibold text-stone-700">Identifier 1</span>
+          <input
+            id={`${fieldIdPrefix}-identifier1`}
+            key={`identifier1:${target.rowLabel}:${identifier1Source}`}
+            type="text"
+            list="selection-identifier1-options"
+            defaultValue={identifier1Source}
+            disabled={busy}
+            aria-describedby={`${fieldIdPrefix}-identifier1-help`}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
+            onBlur={(event) => {
+              const value = event.currentTarget.value.trim();
+              if (!value) {
+                event.currentTarget.value = identifier1Source;
+              } else if (value !== identifier1Source) {
+                queueIdentifier1Override(target, value);
+              }
+            }}
+            className={inputClassName}
+          />
+          <span id={`${fieldIdPrefix}-identifier1-help`} className="mt-1 block text-[11px] leading-4 text-stone-500">
+            {hasIdentifier1Draft ? "Draft change queued." : "Type or choose an existing value."}
+          </span>
+        </label>
+        <label className="block min-w-0 text-sm" htmlFor={`${fieldIdPrefix}-identifier2`}>
+          <span className="mb-1 block text-xs font-semibold text-stone-700">Identifier 2</span>
+          <input
+            id={`${fieldIdPrefix}-identifier2`}
+            key={`identifier2:${target.rowLabel}:${identifier2}`}
+            type="text"
+            list="selection-identifier2-options"
+            defaultValue={identifier2}
+            disabled={busy}
+            aria-describedby={`${fieldIdPrefix}-identifier2-help`}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
+            onBlur={(event) => {
+              const value = event.currentTarget.value.trim();
+              if (!value) {
+                event.currentTarget.value = identifier2;
+              } else if (value !== identifier2) {
+                queueIdentifier2Override(target, value);
+              }
+            }}
+            className={inputClassName}
+          />
+          <span id={`${fieldIdPrefix}-identifier2-help`} className="mt-1 block text-[11px] leading-4 text-stone-500">
+            {hasIdentifier2Draft ? "Draft change queued." : "Type or choose an existing value."}
+          </span>
+        </label>
+        <label className="block min-w-0 text-sm" htmlFor={`${fieldIdPrefix}-species`}>
+          <span className="mb-1 block text-xs font-semibold text-stone-700">Species</span>
+          <input
+            id={`${fieldIdPrefix}-species`}
+            key={`species:${target.rowLabel}:${speciesSource}`}
+            type="text"
+            list="selection-species-options"
+            defaultValue={speciesSource}
+            disabled={busy}
+            aria-describedby={`${fieldIdPrefix}-species-help`}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
+            onBlur={(event) => {
+              const value = event.currentTarget.value.trim();
+              if (!value) {
+                event.currentTarget.value = speciesSource;
+              } else if (value !== speciesSource) {
+                queueSpeciesOverride(target, value);
+              }
+            }}
+            className={cn(inputClassName, "italic")}
+          />
+          <span id={`${fieldIdPrefix}-species-help`} className="mt-1 block text-[11px] leading-4 text-stone-500">
+            {hasSpeciesDraft ? "Draft change queued." : "Type or choose an existing value."}
+          </span>
+        </label>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -7440,7 +7840,7 @@ export default function ProcessingPage() {
                     onChange={(nextRange) => updateConfig("leak_range", nextRange)}
                   />
                   <RangeSliderField
-                    label="d13C range"
+                    label="δ¹³C range"
                     value={activeConfig.d13c_range}
                     min={Math.min(-50, activeConfig.d13c_range[0], activeConfig.d13c_range[1])}
                     max={Math.max(50, activeConfig.d13c_range[0], activeConfig.d13c_range[1])}
@@ -7450,7 +7850,7 @@ export default function ProcessingPage() {
                     onChange={(nextRange) => updateConfig("d13c_range", nextRange)}
                   />
                   <RangeSliderField
-                    label="d18O range"
+                    label="δ¹⁸O range"
                     value={activeConfig.d18o_range}
                     min={Math.min(-50, activeConfig.d18o_range[0], activeConfig.d18o_range[1])}
                     max={Math.max(50, activeConfig.d18o_range[0], activeConfig.d18o_range[1])}
@@ -7497,6 +7897,12 @@ export default function ProcessingPage() {
 
               <div className="space-y-3">
                 <div className="text-sm font-medium text-stone-800">Show on chart</div>
+                <CheckboxField
+                  checked={hideDuplicateSymbologyAndCollapseLegends}
+                  label="Hide duplicate symbols and collapse legends"
+                  description="Removes the duplicate-sample diamond overlay and closes every chart legend. Duplicate detection and editing stay active."
+                  onChange={setHideDuplicateSymbologyAndCollapseLegends}
+                />
                 <CheckboxField checked={activeConfig.overlays.show_statistical_outliers} label="Statistical outliers" onChange={(checked) => updateOverlay("show_statistical_outliers", checked)} />
                 <CheckboxField checked={activeConfig.overlays.show_range_outliers} label="Range outliers" onChange={(checked) => updateOverlay("show_range_outliers", checked)} />
                 <CheckboxField checked={activeConfig.overlays.show_manual_outliers} label="Manual outliers" onChange={(checked) => updateOverlay("show_manual_outliers", checked)} />
@@ -7529,7 +7935,7 @@ export default function ProcessingPage() {
                 {activeConfig.enable_saturation_correction ? (
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">d13C default method</span>
+                      <span className="mb-1 block text-stone-700">δ¹³C default method</span>
                       <select
                         value={activeConfig.saturation_correction_method_d13 ?? activeConfig.saturation_correction_method}
                         onChange={(event) => updateSaturationMethod("d13C", event.target.value as SaturationCorrectionMethod)}
@@ -7543,7 +7949,7 @@ export default function ProcessingPage() {
                       </select>
                     </label>
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">d18O default method</span>
+                      <span className="mb-1 block text-stone-700">δ¹⁸O default method</span>
                       <select
                         value={activeConfig.saturation_correction_method_d18 ?? activeConfig.saturation_correction_method}
                         onChange={(event) => updateSaturationMethod("d18O", event.target.value as SaturationCorrectionMethod)}
@@ -7652,7 +8058,7 @@ export default function ProcessingPage() {
                     ) : null}
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div className="border-t border-stone-200 pt-2 text-sm">
-                        <div className="text-xs font-medium text-stone-500">d13C fitted coefficients</div>
+                        <div className="text-xs font-medium text-stone-500">δ¹³C fitted coefficients</div>
                         <div className="mt-1 space-y-1 font-semibold text-stone-900">
                           <div>
                             <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -7667,7 +8073,7 @@ export default function ProcessingPage() {
                         </div>
                       </div>
                       <div className="border-t border-stone-200 pt-2 text-sm">
-                        <div className="text-xs font-medium text-stone-500">d18O fitted coefficients</div>
+                        <div className="text-xs font-medium text-stone-500">δ¹⁸O fitted coefficients</div>
                         <div className="mt-1 space-y-1 font-semibold text-stone-900">
                           <div>
                             <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -7736,7 +8142,7 @@ export default function ProcessingPage() {
                         <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
                         <div className="grid gap-3 sm:grid-cols-2">
                           <label className="text-sm">
-                            <span className="mb-1 block text-stone-700">d13C</span>
+                            <span className="mb-1 block text-stone-700">δ¹³C</span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -7749,7 +8155,7 @@ export default function ProcessingPage() {
                             />
                           </label>
                           <label className="text-sm">
-                            <span className="mb-1 block text-stone-700">d18O</span>
+                            <span className="mb-1 block text-stone-700">δ¹⁸O</span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -7767,7 +8173,7 @@ export default function ProcessingPage() {
                         <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
                         <div className="grid gap-3 sm:grid-cols-2">
                           <label className="text-sm">
-                            <span className="mb-1 block text-stone-700">d13C</span>
+                            <span className="mb-1 block text-stone-700">δ¹³C</span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -7780,7 +8186,7 @@ export default function ProcessingPage() {
                             />
                           </label>
                           <label className="text-sm">
-                            <span className="mb-1 block text-stone-700">d18O</span>
+                            <span className="mb-1 block text-stone-700">δ¹⁸O</span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -7804,8 +8210,8 @@ export default function ProcessingPage() {
                           standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
                             <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
                               <span className="font-medium text-stone-800">{summary.standard}</span>
-                              <span>δ13C: {formatPrecisionMetric(summary.d13_linearity_corrected_precision)}</span>
-                              <span>δ18O: {formatPrecisionMetric(summary.d18_linearity_corrected_precision)}</span>
+                              <span>δ¹³C: {formatPrecisionMetric(summary.d13_linearity_corrected_precision)}</span>
+                              <span>δ¹⁸O: {formatPrecisionMetric(summary.d18_linearity_corrected_precision)}</span>
                             </div>
                           ))
                         ) : (
@@ -7882,6 +8288,7 @@ export default function ProcessingPage() {
                 title={overviewCards.processing3d.title}
                 description={overviewCards.processing3d.description}
                 figure={hideEmbeddedColorbars(overviewCards.processing3d.figure)}
+                legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
                 chartClassName="h-[clamp(380px,42vw,620px)] w-full"
                 fitContainer
                 {...chartHoverProps(overviewCards.processing3d.key)}
@@ -7895,6 +8302,7 @@ export default function ProcessingPage() {
                   title={overviewCards.crossplot.title}
                   description={overviewCards.crossplot.description}
                   figure={hideEmbeddedColorbars(overviewCards.crossplot.figure)}
+                  legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
                   chartClassName="h-[clamp(380px,42vw,620px)] w-full"
                   fitContainer
                   {...chartHoverProps(overviewCards.crossplot.key)}
@@ -8040,7 +8448,7 @@ export default function ProcessingPage() {
                                 ["Species", "client_output_species_source"],
                               ] as const).map(([label, key]) => (
                                 <label key={key} className="form-field min-w-0">
-                                  <span className="form-label">{label}</span>
+                                  <span className="form-label">{formatScientificText(label)}</span>
                                   <select
                                     value={activeConfig.export[key]}
                                     onChange={(event) => updateExport(key, event.target.value as ProcessingConfig["export"][typeof key])}
@@ -8294,7 +8702,7 @@ export default function ProcessingPage() {
                                     <tr>
                                       {clientOutputPreviewQuery.data.columns.map((column) => (
                                         <th key={column} className={cn("max-w-56 whitespace-normal px-3 py-2.5 font-semibold", column === "Species" && "italic")}>
-                                          {column}
+                                          {formatScientificText(column)}
                                         </th>
                                       ))}
                                       <th className="sticky right-0 min-w-28 bg-slate-100 px-3 py-2.5 text-right font-semibold">Actions</th>
@@ -8523,9 +8931,18 @@ export default function ProcessingPage() {
                             <span className="rounded-md bg-white px-1.5 py-0.5 text-[11px] text-stone-500 ring-1 ring-stone-200">
                               Row {(activeTarget?.rowLabel || "").trim()}
                             </span>
-                            {activeDuplicateGroupSize > 1 ? (
-                              <span className="rounded-md bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-900 ring-1 ring-amber-300">
-                                Duplicate · {activeDuplicateGroupSize} matching rows
+                            {duplicateGroupTargets.length > 1 ? (
+                              <span
+                                className={cn(
+                                  "rounded-md px-2 py-0.5 text-[11px] font-semibold ring-1",
+                                  activeDuplicateGroupSize > 1
+                                    ? "bg-amber-100 text-amber-900 ring-amber-300"
+                                    : "bg-emerald-100 text-emerald-900 ring-emerald-300",
+                                )}
+                              >
+                                {activeDuplicateGroupSize > 1
+                                  ? `Duplicate · ${duplicateGroupTargets.length} matching rows`
+                                  : "Duplicate resolved in draft"}
                               </span>
                             ) : null}
                           </div>
@@ -8543,112 +8960,81 @@ export default function ProcessingPage() {
                             </Button>
                           </div>
                         </div>
-                        {activeDuplicateGroupSize > 1 ? (
-                          <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                            Change Identifier 1, Identifier 2, or Species to make this sample unique. The orange chart marker clears as soon as the draft resolves the duplicate.
+                        {duplicateGroupTargets.length > 1 ? (
+                          <div className="space-y-2.5">
+                            <div
+                              className={cn(
+                                "rounded-md border px-3 py-2 text-xs",
+                                activeDuplicateGroupSize > 1
+                                  ? "border-amber-300 bg-amber-50 text-amber-900"
+                                  : "border-emerald-300 bg-emerald-50 text-emerald-900",
+                              )}
+                              role="status"
+                            >
+                              {activeDuplicateGroupSize > 1
+                                ? "Edit either matching sample below. Changing Identifier 1, Identifier 2, or Species resolves the duplicate immediately in the draft."
+                                : "Duplicate resolved in this draft. Both original matches remain visible until you apply or discard the changes."}
+                            </div>
+                            <div className="flex items-end justify-between gap-3">
+                              <div>
+                                <div className="text-sm font-semibold text-stone-900">Matching samples</div>
+                                <div className="text-[11px] text-stone-500">Edit each analysis independently.</div>
+                              </div>
+                              <span className="text-xs tabular-nums text-stone-500">{duplicateGroupTargets.length} rows</span>
+                            </div>
+                            <div className="grid gap-3 xl:grid-cols-2">
+                              {duplicateGroupTargets.map((target, duplicateIndex) => {
+                                const isActiveDuplicate = target.rowLabel === activeTarget?.rowLabel;
+                                return (
+                                  <section
+                                    key={target.rowLabel}
+                                    className={cn(
+                                      "min-w-0 rounded-lg border bg-white p-3",
+                                      isActiveDuplicate ? "border-blue-300 ring-2 ring-blue-100" : "border-stone-200",
+                                    )}
+                                    aria-label={`Matching sample ${duplicateIndex + 1}, row ${target.rowLabel}`}
+                                  >
+                                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-xs font-semibold text-stone-900">Sample {duplicateIndex + 1}</span>
+                                        <span className="rounded-md bg-stone-100 px-1.5 py-0.5 text-[11px] tabular-nums text-stone-600">
+                                          Row {target.rowLabel}
+                                        </span>
+                                        {isActiveDuplicate ? (
+                                          <span className="rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-800">Inspecting cycles</span>
+                                        ) : null}
+                                      </div>
+                                      {!isActiveDuplicate ? (
+                                        <button
+                                          type="button"
+                                          className="text-xs font-medium text-blue-700 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
+                                          onClick={() => setTargets([target])}
+                                        >
+                                          Inspect cycles
+                                        </button>
+                                      ) : null}
+                                    </div>
+                                    {renderSelectionIdentityFields(target, `duplicate-${duplicateIndex}`)}
+                                  </section>
+                                );
+                              })}
+                            </div>
                           </div>
+                        ) : activeTarget ? (
+                          renderSelectionIdentityFields(activeTarget, "selection-active")
                         ) : null}
-                        <div className="grid gap-3 lg:grid-cols-3">
-                          <label className="block min-w-0 text-sm">
-                            <span className="mb-1 block text-xs font-semibold text-stone-700">Identifier 1</span>
-                            <input
-                              key={`identifier1:${activeTarget?.rowLabel ?? ""}:${activeIdentifier1Source}`}
-                              type="text"
-                              list="selection-identifier1-options"
-                              defaultValue={activeIdentifier1Source}
-                              disabled={busy || !activeTarget}
-                              aria-describedby="selection-identifier1-help"
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") event.currentTarget.blur();
-                              }}
-                              onBlur={(event) => {
-                                if (!activeTarget) return;
-                                const value = event.currentTarget.value.trim();
-                                if (!value) {
-                                  event.currentTarget.value = activeIdentifier1Source;
-                                } else if (value !== activeIdentifier1Source) {
-                                  queueIdentifier1Override(activeTarget, value);
-                                }
-                              }}
-                              className="h-9 w-full rounded-md border border-stone-300 bg-white px-3 text-sm text-stone-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-stone-100"
-                            />
-                            <datalist id="selection-identifier1-options">
-                              {identifier1Sources.map((source) => <option key={source} value={source} />)}
-                            </datalist>
-                            <span id="selection-identifier1-help" className="mt-1 block text-[11px] leading-4 text-stone-500">
-                              {selectionDraftIdentifier1[activeTarget?.rowLabel ?? ""]
-                                ? "Manual override queued. Apply changes to save it."
-                                : "Type any value or choose an existing suggestion."}
-                            </span>
-                          </label>
-                          <label className="block min-w-0 text-sm">
-                            <span className="mb-1 block text-xs font-semibold text-stone-700">Identifier 2</span>
-                            <input
-                              key={`identifier2:${activeTarget?.rowLabel ?? ""}:${activeIdentifier2}`}
-                              type="text"
-                              list="selection-identifier2-options"
-                              defaultValue={activeIdentifier2}
-                              disabled={busy || !activeTarget}
-                              aria-describedby="selection-identifier2-help"
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") event.currentTarget.blur();
-                              }}
-                              onBlur={(event) => {
-                                if (!activeTarget) return;
-                                const value = event.currentTarget.value.trim();
-                                if (!value) {
-                                  event.currentTarget.value = activeIdentifier2;
-                                } else if (value !== activeIdentifier2) {
-                                  queueIdentifier2Override(activeTarget, value);
-                                }
-                              }}
-                              className="h-9 w-full rounded-md border border-stone-300 bg-white px-3 text-sm text-stone-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-stone-100"
-                            />
-                            <datalist id="selection-identifier2-options">
-                              {identifier2Sources.map((source) => <option key={source} value={source} />)}
-                            </datalist>
-                            <span id="selection-identifier2-help" className="mt-1 block text-[11px] leading-4 text-stone-500">
-                              {selectionDraftIdentifier2[activeTarget?.rowLabel ?? ""]
-                                ? "Manual override queued. Apply changes to save it."
-                                : "Type any value or choose an existing suggestion."}
-                            </span>
-                          </label>
-                          <label className="block min-w-0 text-sm">
-                            <span className="mb-1 block text-xs font-semibold text-stone-700">Species</span>
-                            <input
-                              key={`species:${activeTarget?.rowLabel ?? ""}:${activeSpeciesSource}`}
-                              type="text"
-                              list="selection-species-options"
-                              defaultValue={activeSpeciesSource}
-                              disabled={busy || !activeTarget}
-                              aria-describedby="selection-species-help"
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") event.currentTarget.blur();
-                              }}
-                              onBlur={(event) => {
-                                if (!activeTarget) return;
-                                const value = event.currentTarget.value.trim();
-                                if (!value) {
-                                  event.currentTarget.value = activeSpeciesSource;
-                                } else if (value !== activeSpeciesSource) {
-                                  queueSpeciesOverride(activeTarget, value);
-                                }
-                              }}
-                              className="h-9 w-full rounded-md border border-stone-300 bg-white px-3 text-sm italic text-stone-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-stone-100"
-                            />
-                            <datalist id="selection-species-options">
-                              {speciesSources.map((source) => <option key={source} value={source} />)}
-                            </datalist>
-                            <span id="selection-species-help" className="mt-1 block text-[11px] leading-4 text-stone-500">
-                              {selectionDraftSpecies[activeTarget?.rowLabel ?? ""]
-                                ? "Manual override queued. Apply changes to save it."
-                                : "Type any value or choose an existing suggestion."}
-                            </span>
-                          </label>
-                        </div>
+                        <datalist id="selection-identifier1-options">
+                          {identifier1Sources.map((source) => <option key={source} value={source} />)}
+                        </datalist>
+                        <datalist id="selection-identifier2-options">
+                          {identifier2Sources.map((source) => <option key={source} value={source} />)}
+                        </datalist>
+                        <datalist id="selection-species-options">
+                          {speciesSources.map((source) => <option key={source} value={source} />)}
+                        </datalist>
                         <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-white sm:grid-cols-[1.2fr_1fr_1fr] sm:divide-x sm:divide-stone-200">
                           <div className="px-3 py-2">
-                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{selectionEditorTab} delta</div>
+                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{formatScientificText(selectionEditorTab)} delta</div>
                             <div className="mt-0.5 text-3xl font-semibold leading-none tabular-nums text-stone-950">
                               {activeCurrentDelta == null ? "N/A" : formatDeltaValue(activeCurrentDelta)}
                             </div>
@@ -8661,7 +9047,7 @@ export default function ProcessingPage() {
                           </div>
                           <div className="border-t border-stone-200 px-3 py-2 sm:border-t-0">
                             <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
-                              {selectionEditorTab === "d13C" ? "d18O delta" : "d13C delta"}
+                              {selectionEditorTab === "d13C" ? "δ¹⁸O delta" : "δ¹³C delta"}
                             </div>
                             <div className="mt-0.5 text-2xl font-semibold leading-none tabular-nums text-stone-800">
                               {(selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue) == null
@@ -8674,11 +9060,77 @@ export default function ProcessingPage() {
                           <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-stone-600">
                             {activeTargetMetadataItems.map((item, index) => (
                               <span key={`${item.label}:${item.value}:${index}`} className="max-w-full truncate" title={`${item.label}: ${item.value}`}>
-                                <span className="font-medium text-stone-500">{item.label}:</span> {item.value}
+                                <span className="font-medium text-stone-500">{formatScientificText(item.label)}:</span> {formatScientificText(item.value)}
                                 {item.unit ? ` ${item.unit}` : ""}
                               </span>
                             ))}
                           </div>
+                        ) : null}
+                        {duplicateSequenceRows.length ? (
+                          <section className="overflow-hidden rounded-lg border border-stone-200 bg-white" aria-labelledby="duplicate-sequence-heading">
+                            <div className="flex flex-wrap items-end justify-between gap-2 border-b border-stone-200 px-3 py-2.5">
+                              <div>
+                                <h3 id="duplicate-sequence-heading" className="text-xs font-semibold text-stone-900">Raw data sequence</h3>
+                                <p className="mt-0.5 text-[11px] text-stone-500">Original row order and source fields; isotope columns show the current analysis values.</p>
+                              </div>
+                              <span className="text-[11px] text-stone-500">Matching analyses are highlighted</span>
+                            </div>
+                            <div className="overflow-x-auto">
+                              <table className="w-full min-w-[1080px] border-collapse text-left text-xs">
+                                <thead className="bg-stone-50 text-[11px] font-semibold text-stone-600">
+                                  <tr>
+                                    <th className="px-3 py-2">Sequence</th>
+                                    <th className="px-3 py-2">Raw row</th>
+                                    <th className="px-3 py-2">Raw label</th>
+                                    <th className="px-3 py-2">Raw comment</th>
+                                    <th className="px-3 py-2">Identifier 1</th>
+                                    <th className="px-3 py-2">Identifier 2</th>
+                                    <th className="px-3 py-2">Species</th>
+                                    <th className="px-3 py-2 text-right">Current δ¹³C</th>
+                                    <th className="px-3 py-2 text-right">Current δ¹⁸O</th>
+                                    <th className="px-3 py-2 text-right">Signal</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-stone-100">
+                                  {duplicateSequenceRows.map(({ row, rowIndex, hasGapBefore }) => {
+                                    const rowLabel = String(row.row_label).trim();
+                                    const isMatch = originalDuplicateRowLabelSet.has(rowLabel);
+                                    const rowIdentifier1 = selectionDraftIdentifier1[rowLabel] ?? String(row.identifier1 ?? "");
+                                    const rowIdentifier2 = selectionDraftIdentifier2[rowLabel] ?? String(row.identifier2 ?? "");
+                                    const rowSpecies = selectionDraftSpecies[rowLabel] ?? String(row.species ?? row.identifier1 ?? "");
+                                    const rowRawLabel = String(row.attributes?.["Raw Label"] ?? row.attributes?.Label ?? "");
+                                    const rowRawComment = String(row.attributes?.["Raw Comment"] ?? row.attributes?.Comment ?? "");
+                                    const rowToneClassName = isMatch
+                                      ? "bg-amber-50 text-amber-950"
+                                      : "text-stone-600";
+                                    return (
+                                      <Fragment key={rowLabel || rowIndex}>
+                                        {hasGapBefore ? (
+                                          <tr aria-hidden="true">
+                                            <td colSpan={10} className="bg-stone-50 px-3 py-1 text-center text-[11px] text-stone-400">
+                                              ··· rows between matching sequence windows ···
+                                            </td>
+                                          </tr>
+                                        ) : null}
+                                        <tr className={cn(rowToneClassName, rowLabel === activeTarget?.rowLabel && "ring-1 ring-inset ring-blue-300")}>
+                                          <td className="whitespace-nowrap px-3 py-2 font-medium tabular-nums">{rowIndex + 1}</td>
+                                          <td className="whitespace-nowrap px-3 py-2 tabular-nums">{rowLabel || "—"}</td>
+                                          <td className="max-w-56 truncate px-3 py-2" title={rowRawLabel}>{rowRawLabel || "—"}</td>
+                                          <td className="max-w-64 truncate px-3 py-2" title={rowRawComment}>{rowRawComment || "—"}</td>
+                                          <td className="max-w-44 truncate px-3 py-2 font-medium" title={rowIdentifier1}>{rowIdentifier1 || "—"}</td>
+                                          <td className="max-w-36 truncate px-3 py-2" title={rowIdentifier2}>{rowIdentifier2 || "—"}</td>
+                                          <td className="max-w-48 truncate px-3 py-2 italic" title={rowSpecies}>{rowSpecies || "—"}</td>
+                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{row.d13_raw == null ? "—" : formatDeltaValue(row.d13_raw)}</td>
+                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{row.d18_raw == null ? "—" : formatDeltaValue(row.d18_raw)}</td>
+                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{row.signal == null ? "—" : row.signal.toFixed(3)}</td>
+                                        </tr>
+                                      </Fragment>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </section>
                         ) : null}
                         {selectedRowLabels.length > 1 ? (
                           <div className="flex flex-wrap gap-1.5">
@@ -8690,12 +9142,23 @@ export default function ProcessingPage() {
                                   label === `${activeTarget?.rowLabel}:${activeTarget?.isotopeKey}` ? "bg-stone-900 text-white" : "bg-white text-stone-700",
                                 )}
                               >
-                                {label}
+                                {formatScientificText(label)}
                               </span>
                             ))}
                           </div>
                         ) : null}
                       </div>
+
+                      {duplicateGroupTargets.length > 1 && activeTarget && sessionId ? (
+                        <DuplicateCycleDiagnostics
+                          sessionId={sessionId}
+                          targets={duplicateGroupTargets}
+                          isotopeKey={selectionEditorTab}
+                          activeRowLabel={activeTarget.rowLabel}
+                          onInspect={(target) => setTargets([{ ...target, isotopeKey: selectionEditorTab }])}
+                          legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                        />
+                      ) : null}
 
                       {selectionSourceChart?.figure || selectionSourceChart?.stackedFigures?.length ? (
                         <details className="group rounded-lg border border-stone-200 bg-white">
@@ -8704,7 +9167,7 @@ export default function ProcessingPage() {
                               <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-400 transition-transform group-open:rotate-90" />
                               <div className="min-w-0">
                                 <div className="text-xs font-semibold text-stone-800">Selection source chart</div>
-                                <div className="truncate text-[11px] text-stone-500">{selectionSourceChart.title}</div>
+                                <div className="truncate text-[11px] text-stone-500">{formatScientificText(selectionSourceChart.title)}</div>
                               </div>
                             </div>
                             <span className="shrink-0 text-[11px] text-stone-500">Expand</span>
@@ -8714,7 +9177,7 @@ export default function ProcessingPage() {
                               <div className="space-y-3">
                                 {selectionSourceChart.stackedFigures.map((item) => (
                                   <div key={item.key} className="rounded-lg border border-stone-200 p-2">
-                                    <div className="px-1 pb-2 text-sm font-medium text-stone-700">{item.title}</div>
+                                    <div className="px-1 pb-2 text-sm font-medium text-stone-700">{formatScientificText(item.title)}</div>
                                     <PlotlyChart
                                       figure={item.figure}
                                       className="pointer-events-none h-[280px] w-full"
@@ -8736,44 +9199,46 @@ export default function ProcessingPage() {
 
                       {activeTarget ? (
                         <div className="space-y-4">
-                          <details className="group rounded-lg border border-stone-200 bg-white">
-                            <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-semibold text-stone-700">
-                              <ChevronRight className="h-3.5 w-3.5 text-stone-400 transition-transform group-open:rotate-90" />
-                              Isotope method details
-                            </summary>
-                            <div className="grid gap-2 border-t border-stone-200 p-3 md:grid-cols-2">
-                              <div className="rounded-lg bg-stone-50/70 p-3">
-                                <div className="text-xs font-semibold text-stone-700">d13C</div>
-                                <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
-                                  <div className="text-stone-500">Current</div>
-                                  <div className="text-right font-medium text-stone-900">
-                                    {d13CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d13CurrentDisplayValue)}
+                          {duplicateGroupTargets.length <= 1 ? (
+                            <details className="group rounded-lg border border-stone-200 bg-white">
+                              <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-semibold text-stone-700">
+                                <ChevronRight className="h-3.5 w-3.5 text-stone-400 transition-transform group-open:rotate-90" />
+                                Isotope method details
+                              </summary>
+                              <div className="grid gap-2 border-t border-stone-200 p-3 md:grid-cols-2">
+                                <div className="rounded-lg bg-stone-50/70 p-3">
+                                  <div className="text-xs font-semibold text-stone-700">δ¹³C</div>
+                                  <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
+                                    <div className="text-stone-500">Current</div>
+                                    <div className="text-right font-medium text-stone-900">
+                                      {d13CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d13CurrentDisplayValue)}
+                                    </div>
+                                    <div className="text-stone-500">Linearity corrected</div>
+                                    <div className="text-right font-medium text-stone-900">
+                                      {d13LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d13LinearityCorrectedDisplayValue)}
+                                    </div>
+                                    <div className="text-stone-500">Method</div>
+                                    <div className="text-right font-medium text-stone-900">{d13Method}</div>
                                   </div>
-                                  <div className="text-stone-500">Linearity corrected</div>
-                                  <div className="text-right font-medium text-stone-900">
-                                    {d13LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d13LinearityCorrectedDisplayValue)}
+                                </div>
+                                <div className="rounded-lg bg-stone-50/70 p-3">
+                                  <div className="text-xs font-semibold text-stone-700">δ¹⁸O</div>
+                                  <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
+                                    <div className="text-stone-500">Current</div>
+                                    <div className="text-right font-medium text-stone-900">
+                                      {d18CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d18CurrentDisplayValue)}
+                                    </div>
+                                    <div className="text-stone-500">Linearity corrected</div>
+                                    <div className="text-right font-medium text-stone-900">
+                                      {d18LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d18LinearityCorrectedDisplayValue)}
+                                    </div>
+                                    <div className="text-stone-500">Method</div>
+                                    <div className="text-right font-medium text-stone-900">{d18Method}</div>
                                   </div>
-                                  <div className="text-stone-500">Method</div>
-                                  <div className="text-right font-medium text-stone-900">{d13Method}</div>
                                 </div>
                               </div>
-                              <div className="rounded-lg bg-stone-50/70 p-3">
-                                <div className="text-xs font-semibold text-stone-700">d18O</div>
-                                <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
-                                  <div className="text-stone-500">Current</div>
-                                  <div className="text-right font-medium text-stone-900">
-                                    {d18CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d18CurrentDisplayValue)}
-                                  </div>
-                                  <div className="text-stone-500">Linearity corrected</div>
-                                  <div className="text-right font-medium text-stone-900">
-                                    {d18LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d18LinearityCorrectedDisplayValue)}
-                                  </div>
-                                  <div className="text-stone-500">Method</div>
-                                  <div className="text-right font-medium text-stone-900">{d18Method}</div>
-                                </div>
-                              </div>
-                            </div>
-                          </details>
+                            </details>
+                          ) : null}
 
                           <div className="inline-flex rounded-lg border border-stone-300 bg-white p-1 shadow-sm">
                             {ISOTOPE_KEYS.map((isotopeKey) => {
@@ -8790,7 +9255,7 @@ export default function ProcessingPage() {
                                     isActive ? "bg-stone-900 text-white shadow-sm" : "text-stone-700 hover:bg-stone-100",
                                   )}
                                 >
-                                  {isotopeKey}
+                                  {formatScientificText(isotopeKey)}
                                 </button>
                               );
                             })}
@@ -8798,7 +9263,7 @@ export default function ProcessingPage() {
 
                           <div className="grid gap-3 sm:grid-cols-2">
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Set value ({selectionEditorTab})</span>
+                              <span className="mb-1 block text-stone-700">Set value ({formatScientificText(selectionEditorTab)})</span>
                               <input
                                 type="number"
                                 step="0.001"
@@ -8816,7 +9281,7 @@ export default function ProcessingPage() {
                               />
                             </label>
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Offset ({selectionEditorTab})</span>
+                              <span className="mb-1 block text-stone-700">Offset ({formatScientificText(selectionEditorTab)})</span>
                               <input
                                 type="number"
                                 step="0.001"
@@ -8831,10 +9296,10 @@ export default function ProcessingPage() {
 
                           <div className="flex flex-wrap gap-2">
                             <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>
-                              Set {selectionEditorTab}
+                              Set {formatScientificText(selectionEditorTab)}
                             </Button>
                             <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>
-                              Offset {selectionEditorTab}
+                              Offset {formatScientificText(selectionEditorTab)}
                             </Button>
                             <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
                               {singleInterpolateLabel}
@@ -8853,15 +9318,18 @@ export default function ProcessingPage() {
                             </Button>
                           </div>
 
-                          <DiagnosticsPanel
-                            title={`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`}
-                            diagnostics={activeDiagnostics}
-                            loading={activeDiagnosticsLoading}
-                            displayDelta={rawToDisplayDelta(selectionEditorTab)}
-                            onPickDeltaValue={(value, valueSpace = "raw", stdev = null) =>
-                              setSingleValueFromSuggestion(selectionEditorTab, value, valueSpace, stdev)
-                            }
-                          />
+                          {duplicateGroupTargets.length <= 1 ? (
+                            <DiagnosticsPanel
+                              title={`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`}
+                              diagnostics={activeDiagnostics}
+                              loading={activeDiagnosticsLoading}
+                              displayDelta={rawToDisplayDelta(selectionEditorTab)}
+                              legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                              onPickDeltaValue={(value, valueSpace = "raw", stdev = null) =>
+                                setSingleValueFromSuggestion(selectionEditorTab, value, valueSpace, stdev)
+                              }
+                            />
+                          ) : null}
                         </div>
                       ) : null}
 
@@ -8870,7 +9338,7 @@ export default function ProcessingPage() {
                           <div className="text-sm font-medium text-stone-800">Multi-point actions</div>
                           <div className="grid gap-3 sm:grid-cols-2">
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">d13C offset for selection</span>
+                              <span className="mb-1 block text-stone-700">δ¹³C offset for selection</span>
                               <input
                                 type="number"
                                 step="0.001"
@@ -8880,7 +9348,7 @@ export default function ProcessingPage() {
                               />
                             </label>
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">d18O offset for selection</span>
+                              <span className="mb-1 block text-stone-700">δ¹⁸O offset for selection</span>
                               <input
                                 type="number"
                                 step="0.001"
@@ -8892,10 +9360,10 @@ export default function ProcessingPage() {
                           </div>
                           <div className="flex flex-wrap gap-2">
                             <Button variant="outline" onClick={() => applyMultiOffset("d13C", multiOffsetD13)} disabled={busy}>
-                              Offset selected d13C
+                              Offset selected δ¹³C
                             </Button>
                             <Button variant="outline" onClick={() => applyMultiOffset("d18O", multiOffsetD18)} disabled={busy}>
-                              Offset selected d18O
+                              Offset selected δ¹⁸O
                             </Button>
                             <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>
                               Interpolate selected
@@ -8922,6 +9390,7 @@ export default function ProcessingPage() {
                 title={overviewCards.d13Summary.title}
                 description={overviewCards.d13Summary.description}
                 figure={hideEmbeddedColorbars(d13SummaryFigure)}
+                legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
                 headerActions={
                   <TraceModeControl
                     state={d13SummaryState}
@@ -8941,6 +9410,7 @@ export default function ProcessingPage() {
                 title={overviewCards.d18Summary.title}
                 description={overviewCards.d18Summary.description}
                 figure={hideEmbeddedColorbars(d18SummaryFigure)}
+                legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
                 headerActions={
                   <TraceModeControl
                     state={d18SummaryState}
@@ -9009,7 +9479,7 @@ export default function ProcessingPage() {
                             <div className="space-y-3">
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
-                                  <div className="text-sm font-medium text-stone-800">d13C chart</div>
+                                  <div className="text-sm font-medium text-stone-800">δ¹³C chart</div>
                                 </div>
                                 <TraceModeControl
                                   state={d13State}
@@ -9018,11 +9488,14 @@ export default function ProcessingPage() {
                                   onChange={(patch) => updateChartDisplayState(d13Key, patch)}
                                 />
                               </div>
-                              <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
+                              <div className="w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
                                   figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d13c))), d13State)}
-                                  className="h-full w-full"
+                                  className="h-[380px] w-full"
                                   fitContainer
+                                  collapsibleLegend
+                                  legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                                  verticallyResizable
                                   uiRevision={`processing:${d13Key}`}
                                   {...chartHoverProps(d13Key)}
                                   onPointClick={(points) => handleChartClick(d13Key, points)}
@@ -9034,7 +9507,7 @@ export default function ProcessingPage() {
                             <div className="space-y-3">
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
-                                  <div className="text-sm font-medium text-stone-800">d18O chart</div>
+                                  <div className="text-sm font-medium text-stone-800">δ¹⁸O chart</div>
                                 </div>
                                 <TraceModeControl
                                   state={d18State}
@@ -9043,11 +9516,14 @@ export default function ProcessingPage() {
                                   onChange={(patch) => updateChartDisplayState(d18Key, patch)}
                                 />
                               </div>
-                              <div className="h-[380px] w-full overflow-hidden rounded-lg border border-stone-200/80">
+                              <div className="w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
                                   figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d18o))), d18State)}
-                                  className="h-full w-full"
+                                  className="h-[380px] w-full"
                                   fitContainer
+                                  collapsibleLegend
+                                  legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                                  verticallyResizable
                                   uiRevision={`processing:${d18Key}`}
                                   {...chartHoverProps(d18Key)}
                                   onPointClick={(points) => handleChartClick(d18Key, points)}
@@ -9078,8 +9554,10 @@ export default function ProcessingPage() {
       </div>
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="pointer-events-none fixed z-[80] w-[min(560px,calc(100vw-20px))] rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          className="fixed z-[80] max-h-[calc(100vh-20px)] w-[min(720px,calc(100vw-20px))] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
+          onMouseEnter={clearHoverPreviewHideTimer}
+          onMouseLeave={scheduleHoverPreviewHide}
         >
           <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
             <span className="font-medium text-stone-800">
@@ -9089,6 +9567,7 @@ export default function ProcessingPage() {
               {hoverPreview.target.isotopeKey}
             </span>
           </div>
+          <RawAnalysisInfoTable info={hoverAnalysisInfo} />
           {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
             <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
           ) : hasHoverDiagnosticsFigureData ? (

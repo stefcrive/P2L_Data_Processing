@@ -17,7 +17,7 @@ pip install -r requirements.txt
 Run the FastAPI app:
 
 ```bash
-python -m uvicorn services.irms_api.api.main:app --reload
+python -m uvicorn services.irms_api.api.main:app --reload --port 8100
 ```
 
 ## Next.js Dashboard
@@ -35,7 +35,29 @@ Run the dashboard:
 npm run dev
 ```
 
-The frontend calls the same-origin `/api/irms` route. Next.js proxies that route to `http://127.0.0.1:8000` unless `IRMS_API_PROXY_TARGET` is set.
+The frontend calls the same-origin `/api/irms` route. Next.js proxies that route to `http://127.0.0.1:8100` unless `IRMS_API_PROXY_TARGET` is set. The dedicated default avoids collisions with other local applications that commonly use port `8000`.
+
+## Scientific Results Assistant
+
+The dashboard includes a full-page assistant at `/assistant` and a floating assistant on the other dashboard pages. It can inspect session metadata, measurement snapshots, cycle-level observations, processed-result fields, diagnostic flags, calibration/processing configuration, and session event logs through bounded read-only tools. The chat composer also accepts `.xls` and `.xlsx` attachments for temporary, read-only inspection and deterministic key/column comparisons against the active platform session; attachments are not imported into the session.
+
+Set the OpenAI API key persistently for your Windows user before starting the app:
+
+```powershell
+setx OPENAI_API_KEY "your-api-key"
+```
+
+Alternatively, open **Settings → OpenAI connection** and enter the key there. On Windows, the backend saves it as the current user's `OPENAI_API_KEY` environment variable, so it remains available after app restarts. The key is never returned by the status API or written to browser storage, application files, or chat history.
+
+Optional settings:
+
+- `IRMS_CHAT_MODEL` selects the server-side allowlisted model name (default `gpt-5.6-terra`).
+- `IRMS_CHAT_MAX_FILES` limits Excel attachments per assistant request (default `5`).
+- `IRMS_CHAT_MAX_UPLOAD_BYTES` limits the combined assistant attachment size (default `26214400`, or 25 MB).
+- `IRMS_PROCESSING_ENVIRONMENT` labels responses with the current processing mode (default `local`).
+- `IRMS_API_PROXY_TARGET` points the Next.js chat route and IRMS proxy at a non-default backend URL.
+
+Chat requests use the OpenAI Responses API with strict function schemas, sequential tool calls, a six-round loop bound, per-tool and per-request evidence budgets, and provider storage disabled. The browser receives the same redacted evidence supplied to the model. Conversation messages are shared between the two chat surfaces through local browser storage.
 
 ## Background Jobs
 

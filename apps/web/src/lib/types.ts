@@ -1,5 +1,10 @@
 export type JsonRecord = Record<string, unknown>;
 
+export type OpenAIApiKeyStatus = {
+  configured: boolean;
+  source: "application_memory" | "user_environment" | "environment" | "not_configured";
+};
+
 export type FigurePayload = JsonRecord & {
   data?: Array<JsonRecord>;
   layout?: JsonRecord;
@@ -69,6 +74,17 @@ export type ImportNamingWorkspace = {
   identifier1_name_map: Record<string, string>;
   identifier1_sources: string[];
   species_sources: string[];
+  species_source_details: Record<string, ImportNamingSourceDetail[]>;
+};
+
+export type ImportNamingSourceDetail = {
+  software: "qtegra" | "isodat" | "generic";
+  source_file: string;
+  raw_label: string;
+  raw_identifier1: string;
+  raw_identifier2: string;
+  raw_comment: string;
+  occurrences: number;
 };
 
 export type SessionArtifactKind = "events" | "snapshot" | "cycles" | "metadata" | "state";
@@ -387,6 +403,7 @@ export type CycleDiagnosticsPayload = {
   session_id: string;
   target: JsonRecord;
   inline_summary?: string;
+  analysis_info?: JsonRecord;
   figure: FigurePayload;
   saturation_correction: JsonRecord;
   intensity_linearity?: JsonRecord;

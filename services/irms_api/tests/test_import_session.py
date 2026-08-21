@@ -40,6 +40,34 @@ def build_workbook_bytes(frame: pd.DataFrame) -> bytes:
 
 
 class ImportSessionTests(unittest.TestCase):
+    def test_species_naming_details_follow_source_software(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Species": ["Coral", "Shell"],
+                "Excel File": ["qtegra.xlsx", "isodat.xlsx"],
+                "Raw Label": ["MD23-3678 - G. ruber", "Isodat composed label"],
+                "Raw Identifier 1": [None, "SHP2L"],
+                "Raw Identifier 2": [None, "901"],
+                "Raw Comment": ["3678", "N. dutertrei"],
+            }
+        )
+        metadata = {
+            "source_files": [
+                {"name": "qtegra.xlsx", "software": "qtegra"},
+                {"name": "isodat.xlsx", "software": "isodat"},
+            ]
+        }
+
+        details = api_main._build_species_source_details(frame, metadata)
+
+        self.assertEqual(details["Coral"][0]["software"], "qtegra")
+        self.assertEqual(details["Coral"][0]["raw_label"], "MD23-3678 - G. ruber")
+        self.assertEqual(details["Coral"][0]["raw_comment"], "3678")
+        self.assertEqual(details["Shell"][0]["software"], "isodat")
+        self.assertEqual(details["Shell"][0]["raw_identifier1"], "SHP2L")
+        self.assertEqual(details["Shell"][0]["raw_identifier2"], "901")
+        self.assertEqual(details["Shell"][0]["raw_comment"], "N. dutertrei")
+
     def test_empty_workbook_reports_actionable_error(self) -> None:
         uploaded = _NamedBytesIO(b"", "empty.xlsx")
 

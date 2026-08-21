@@ -9,10 +9,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeader } from "@/components/ui/page-header";
 import { api, type UploadProgress } from "@/lib/api";
+import { formatScientificText } from "@/lib/scientific-notation";
 import { describeSession, resolveSessionName } from "@/lib/session-label";
 import type {
   ImportFieldParsingRule,
   ImportNamingWorkspace,
+  ImportNamingSourceDetail,
   ImportParsingConfig,
   ImportWorkbookParsingConfig,
   JsonRecord,
@@ -37,9 +39,11 @@ const SESSION_ARTIFACTS: Array<{ kind: SessionArtifactKind; label: string; descr
 ];
 
 function humanizeKey(value: string): string {
-  return value
-    .replace(/[_-]+/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return formatScientificText(
+    value
+      .replace(/[_-]+/g, " ")
+      .replace(/\b\w/g, (letter) => letter.toUpperCase()),
+  );
 }
 
 function HumanReadableValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
@@ -50,7 +54,7 @@ function HumanReadableValue({ value, depth = 0 }: { value: unknown; depth?: numb
     return <Badge>{value ? "Yes" : "No"}</Badge>;
   }
   if (typeof value === "string" || typeof value === "number") {
-    return <span className="break-words text-slate-800">{String(value)}</span>;
+    return <span className="break-words text-slate-800">{formatScientificText(String(value))}</span>;
   }
   if (Array.isArray(value)) {
     if (!value.length) {
@@ -292,6 +296,33 @@ function nextNameMap(current: Record<string, string>, source: string, target: st
   return next;
 }
 
+function namingSourceDetailFields(detail: ImportNamingSourceDetail): Array<{ label: string; value: string }> {
+  const fields = detail.software === "qtegra"
+    ? [
+        { label: "Label", value: detail.raw_label },
+        { label: "Comment", value: detail.raw_comment },
+      ]
+    : detail.software === "isodat"
+      ? [
+          { label: "Identifier 1", value: detail.raw_identifier1 },
+          { label: "Identifier 2", value: detail.raw_identifier2 },
+          { label: "Comment", value: detail.raw_comment },
+        ]
+      : [
+          { label: "Label", value: detail.raw_label },
+          { label: "Identifier 1", value: detail.raw_identifier1 },
+          { label: "Identifier 2", value: detail.raw_identifier2 },
+          { label: "Comment", value: detail.raw_comment },
+        ];
+  return fields.filter((field) => field.value.trim().length > 0);
+}
+
+function namingSoftwareLabel(software: ImportNamingSourceDetail["software"]): string {
+  if (software === "qtegra") return "Qtegra";
+  if (software === "isodat") return "Isodat";
+  return "Imported";
+}
+
 function parsePreviewValue(row: JsonRecord, rule: ImportFieldParsingRule): string {
   const sourceColumn = String(rule.source_column ?? "").trim();
   const raw = sourceColumn ? row[sourceColumn] : null;
@@ -452,6 +483,7 @@ function NamingRows({
   definedLabel,
   sources,
   mapping,
+  sourceDetails,
   disabled,
   onChange,
 }: {
@@ -459,6 +491,7 @@ function NamingRows({
   definedLabel: string;
   sources: string[];
   mapping: Record<string, string>;
+  sourceDetails?: Record<string, ImportNamingSourceDetail[]>;
   disabled: boolean;
   onChange: (next: Record<string, string>) => void;
 }) {
@@ -475,15 +508,42 @@ function NamingRows({
       {sources.map((source) => {
         const target = mapping[source] ?? source;
         const draft = drafts[source] ?? target;
+        const details = sourceDetails?.[source] ?? [];
         const isRenamed = normalizeNameLabel(target) !== normalizeNameLabel(source);
         const commitDraft = () => onChange(nextNameMap(mapping, source, draft));
         return (
-          <div key={source} className="grid gap-2 px-4 py-2.5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-end">
+          <div key={source} className="grid gap-2 px-4 py-2.5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-start">
             <div className="min-w-0">
               <div className="text-xs font-medium text-slate-500">Source</div>
               <div className="truncate text-sm text-slate-800" title={source}>
                 {source}
               </div>
+              {details.length ? (
+                <div className="mt-2 space-y-2 border-t border-slate-100 pt-2">
+                  {details.map((detail, detailIndex) => {
+                    const fields = namingSourceDetailFields(detail);
+                    return (
+                      <div key={`${detail.software}:${detail.source_file}:${detailIndex}`} className="text-[11px] leading-4 text-slate-600">
+                        <div className="font-medium text-slate-500">
+                          {namingSoftwareLabel(detail.software)} raw input
+                          {detail.source_file ? ` · ${detail.source_file}` : ""}
+                          {detail.occurrences > 1 ? ` · ${detail.occurrences} matching rows` : ""}
+                        </div>
+                        {fields.length ? (
+                          <dl className="mt-0.5 space-y-0.5">
+                            {fields.map((field) => (
+                              <div key={field.label} className="flex min-w-0 gap-1.5">
+                                <dt className="shrink-0 text-slate-500">{field.label}:</dt>
+                                <dd className="min-w-0 break-words text-slate-700" title={field.value}>{field.value}</dd>
+                              </div>
+                            ))}
+                          </dl>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
             </div>
             <label className="min-w-0 text-xs text-slate-600">
               {definedLabel}
@@ -518,6 +578,7 @@ function NamingRows({
               type="button"
               variant="outline"
               size="sm"
+              className="md:mt-5"
               disabled={disabled || !isRenamed}
               onClick={() => {
                 setDrafts((current) => ({ ...current, [source]: source }));
@@ -1055,6 +1116,7 @@ export default function ImportPage() {
                   definedLabel="Defined species name"
                   sources={namingDraft.species_sources}
                   mapping={namingDraft.species_name_map}
+                  sourceDetails={namingDraft.species_source_details}
                   disabled={saveNamingMutation.isPending}
                   onChange={(speciesNameMap) =>
                     setNamingDraft((current) =>
@@ -1148,7 +1210,7 @@ export default function ImportPage() {
                     onClick={() => setActiveArtifactKind(artifact.kind)}
                     className="group flex min-w-0 items-start gap-3 rounded-lg border border-slate-200 bg-white px-3 py-3 text-left transition hover:border-blue-300 hover:bg-blue-50/50 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    <span className="rounded-md bg-slate-100 p-1.5 text-slate-600 group-hover:bg-blue-100 group-hover:text-blue-700">
+                    <span className="rounded-md bg-slate-100 p-1.5 text-blue-700 group-hover:bg-blue-100 group-hover:text-blue-800">
                       <Icon className="h-4 w-4" />
                     </span>
                     <span className="min-w-0">

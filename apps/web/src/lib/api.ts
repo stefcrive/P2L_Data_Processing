@@ -13,6 +13,7 @@ import type {
   ImportPreviewResponse,
   ImportResult,
   LinearityConfig,
+  OpenAIApiKeyStatus,
   ProcessingConfig,
   ProcessingLinearityPreviewData,
   ProcessingWorkspace,
@@ -339,6 +340,14 @@ async function exportDataset(
 }
 
 export const api = {
+  getOpenAIApiKeyStatus: () => requestJson<OpenAIApiKeyStatus>("/settings/openai-api-key"),
+  setOpenAIApiKey: (apiKey: string) =>
+    requestJson<OpenAIApiKeyStatus>("/settings/openai-api-key", {
+      method: "PUT",
+      body: body({ api_key: apiKey }),
+    }),
+  clearOpenAIApiKey: () =>
+    requestJson<OpenAIApiKeyStatus>("/settings/openai-api-key", { method: "DELETE" }),
   listSessions: () => requestJson<SessionSnapshot[]>("/sessions"),
   getSession: (sessionId: string) => requestJson<SessionSnapshot>(`/sessions/${encodeURIComponent(sessionId)}`),
   getSessionArtifact: (sessionId: string, kind: SessionArtifactKind) =>

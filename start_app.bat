@@ -28,7 +28,7 @@ call :parse_args %*
 if errorlevel 1 exit /b 1
 if defined SHOW_HELP exit /b 0
 
-if not defined BACKEND_PORT set "BACKEND_PORT=8000"
+if not defined BACKEND_PORT set "BACKEND_PORT=8100"
 if not defined FRONTEND_PORT set "FRONTEND_PORT=3000"
 
 call :validate_port "%BACKEND_PORT%"
@@ -161,6 +161,18 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Existing virtual environments may predate newly added backend packages.
+rem Synchronize requirements when the scientific assistant SDK is missing.
+"%VENV_PYTHON%" -c "import openai" >nul 2>&1
+if errorlevel 1 (
+  echo Updating backend dependencies for the scientific assistant...
+  "%VENV_PYTHON%" -m pip install -r "%ROOT_DIR%\requirements.txt"
+  if errorlevel 1 (
+    echo Failed to install updated backend requirements.
+    exit /b 1
+  )
+)
+
 rem Install frontend dependencies if node_modules is missing.
 pushd "%WEB_DIR%" || (
   echo Could not switch to apps\web.
@@ -264,7 +276,7 @@ echo Usage: start_app.bat [--dev^|--prod] [--backend-port PORT] [--frontend-port
 echo.
 echo   --dev             Start in development mode ^(default^)
 echo   --prod            Start in production mode
-echo   --backend-port    Preferred backend port ^(default 8000^)
+echo   --backend-port    Preferred backend port ^(default 8100^)
 echo   --frontend-port   Preferred frontend port ^(default 3000^)
 echo.
 echo If a preferred port is busy, the script automatically picks the next free port.

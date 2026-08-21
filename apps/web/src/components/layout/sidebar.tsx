@@ -1,10 +1,12 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { FlaskConical, Import, Microscope, Settings, SlidersHorizontal } from "lucide-react";
+import { Bot, FlaskConical, Import, Microscope, Settings, SlidersHorizontal } from "lucide-react";
 import { useEffect, useRef } from "react";
 
+import brandIcon from "@/app/icon.png";
 import { SessionHeader } from "@/components/layout/session-header";
 import { cn } from "@/lib/utils";
 
@@ -13,6 +15,7 @@ const navItems = [
   { href: "/diagnostics", label: "Diagnostics", icon: Microscope },
   { href: "/calibration", label: "Calibration", icon: FlaskConical },
   { href: "/processing", label: "Processing", icon: SlidersHorizontal },
+  { href: "/assistant", label: "Assistant", icon: Bot },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
@@ -40,12 +43,16 @@ export function AppHeader() {
   return (
     <header ref={headerRef} className="fixed inset-x-0 top-0 z-40 border-b border-slate-200 bg-white/95 shadow-sm backdrop-blur">
       <div className="mx-auto flex min-h-14 max-w-[1680px] items-center gap-3 px-3 sm:px-4 lg:px-6">
-        <Link href="/import" className="group flex min-w-0 items-center gap-2.5" aria-label="IRMS Results Analyzer home">
-          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-blue-700 font-mono text-[11px] font-semibold text-white shadow-sm">
-            IR
-          </span>
+        <Link href="/import" className="group flex min-w-0 items-center gap-2.5" aria-label="IRMS Results Station home">
+          <Image
+            src={brandIcon}
+            alt=""
+            aria-hidden="true"
+            priority
+            className="h-8 w-8 shrink-0 rounded-md border border-slate-200 bg-white object-contain shadow-sm transition-transform group-hover:scale-95"
+          />
           <span className="min-w-0">
-            <span className="block truncate font-display text-sm font-semibold leading-tight text-slate-950">IRMS Results Analyzer</span>
+            <span className="block truncate font-display text-sm font-semibold leading-tight text-slate-950">IRMS Results Station</span>
             <span className="hidden truncate font-mono text-[10px] text-slate-500 sm:block">Isotope measurement workspace</span>
           </span>
         </Link>

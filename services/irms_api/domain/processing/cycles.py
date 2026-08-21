@@ -2419,6 +2419,88 @@ def build_selected_point_diagnostics_inline(
     return " | ".join(parts)
 
 
+def build_raw_analysis_info(
+    df: pd.DataFrame,
+    target: dict[str, Any],
+    pre_row: pd.Series | None = None,
+) -> dict[str, Any]:
+    """Return the selected raw analysis row with high-value fields first."""
+    processed_row: pd.Series | None = None
+    row_label = target.get("row_label")
+    if df is not None and row_label in df.index:
+        selected = df.loc[row_label]
+        processed_row = selected.iloc[0] if isinstance(selected, pd.DataFrame) else selected
+
+    row_sources = [
+        source
+        for source in (pre_row, processed_row)
+        if isinstance(source, pd.Series)
+    ]
+    if not row_sources:
+        return {}
+
+    def raw_value(*candidates: str) -> tuple[Any, str | None]:
+        for source in row_sources:
+            normalized_columns = {_normalize_column_key(column): column for column in source.index}
+            for candidate in candidates:
+                if candidate in source.index:
+                    return source.get(candidate), candidate
+            for candidate in candidates:
+                source_column = normalized_columns.get(_normalize_column_key(candidate))
+                if source_column is not None:
+                    return source.get(source_column), str(source_column)
+        return None, None
+
+    target_col = str(target.get("target_col", "")).strip()
+    std_dev_col = _get_isotope_std_dev_column(str(target.get("isotope_key", "")))
+    raw_isotope_value, isotope_source = raw_value(target_col)
+    if pd.isna(pd.to_numeric(pd.Series([raw_isotope_value]), errors="coerce").iloc[0]):
+        raw_isotope_value = target.get("original_value", target.get("current_value"))
+    raw_std_dev, std_source = raw_value(std_dev_col or "")
+    if pd.isna(pd.to_numeric(pd.Series([raw_std_dev]), errors="coerce").iloc[0]):
+        raw_std_dev = target.get("internal_std_dev")
+
+    line_value, line_source = raw_value("Line")
+    date_value, date_source = raw_value("Date")
+    time_value, time_source = raw_value("Start Time", "Analysis Time", "Time")
+    stop_time_value, stop_time_source = raw_value("Stop Time")
+    origin_value, origin_source = raw_value("Excel File", "Origin File", "Source File", "File")
+    if origin_value is None or str(origin_value).strip() == "":
+        origin_value = target.get("source_excel")
+
+    info: dict[str, Any] = {
+        "Isotopic value": raw_isotope_value,
+        "Internal stdev": raw_std_dev,
+        "Line": line_value,
+        "Analysis date": date_value,
+        "Analysis time": time_value,
+    }
+    if stop_time_source is not None:
+        info["Stop time"] = stop_time_value
+    info["Origin file"] = origin_value
+
+    represented_columns = {
+        str(column)
+        for column in (
+            isotope_source,
+            std_source,
+            line_source,
+            date_source,
+            time_source,
+            stop_time_source,
+            origin_source,
+        )
+        if column is not None
+    }
+    for source in row_sources:
+        for column, value in source.items():
+            column_label = str(column)
+            if column_label.startswith("_") or column_label in represented_columns or column_label in info:
+                continue
+            info[column_label] = value
+    return to_json_compatible(info)
+
+
 def find_interpolation_neighbors(
     df: pd.DataFrame,
     target: dict[str, Any],
@@ -2564,11 +2646,13 @@ def build_cycle_diagnostics_payload(
         if not resolved_std.empty:
             target["internal_std_dev"] = float(resolved_std.iloc[0])
     inline_summary = build_selected_point_diagnostics_inline(df, target, pre_row=pre_row)
+    analysis_info = build_raw_analysis_info(df, target, pre_row=pre_row)
     if cycles is None or cycles.empty:
         return CycleDiagnosticsPayload(
             session_id=session_id,
-            target=target,
+            target=to_json_compatible(target),
             inline_summary=inline_summary,
+            analysis_info=analysis_info,
             intensity_linearity={"available": False, "reason": "no_cycle_data"},
             cycle_mean={"reason": "no_cycle_data"},
         )
@@ -2707,6 +2791,7 @@ def build_cycle_diagnostics_payload(
         session_id=session_id,
         target=target_payload,
         inline_summary=inline_summary,
+        analysis_info=analysis_info,
         figure=figure_json,
         saturation_correction=saturation_correction,
         intensity_linearity=to_json_compatible(saturation_correction.get("intensity_linearity", {})),

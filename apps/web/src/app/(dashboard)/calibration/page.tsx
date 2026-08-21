@@ -43,6 +43,7 @@ import type {
   SessionSnapshot,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { formatScientificText } from "@/lib/scientific-notation";
 import { useSessionStore } from "@/store/use-session-store";
 
 type SelectedTarget = {
@@ -247,7 +248,7 @@ function getLinearityCoefficientLabel(
   term: LinearityCoefficientTerm,
   aggregation: LinearityCycleIntensityAggregation = "run_median",
 ): string {
-  const prefix = isotope === "d13C" ? "d13C" : "d18O";
+  const prefix = isotope === "d13C" ? "δ¹³C" : "δ¹⁸O";
   const coefficient = getLinearityCoefficientTermLabel(term, intensityCol).replace(" coefficient", "");
   return `${prefix} ${coefficient} offset, ${getLinearityBasisTerm(intensityCol, aggregation)} ${getLinearityCoefficientUnit(term, intensityCol)}`;
 }
@@ -2055,7 +2056,7 @@ function CheckboxField({
         onChange={(event) => onChange(event.target.checked)}
         className="h-4 w-4"
       />
-      <span className="font-medium text-stone-800">{label}</span>
+      <span className="font-medium text-stone-800">{formatScientificText(label)}</span>
       {description ? (
         <Tooltip label={description}>
           <span tabIndex={0} aria-label={`More information about ${label}`} className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">
@@ -2181,9 +2182,13 @@ function calibrationColorParameterLabel(colorParam: string | null): string {
   if (key === "1 cycle int samp 44") return "Initial sample intensity";
   if (key === "1 cycle int ref 44") return "Initial reference gas intensity";
   if (key === "p_no_acid") return "P no Acid";
-  if (key === "total_co2") return "total CO2";
+  if (key === "total_co2") return "total CO₂";
   if (key === "p_gases") return "P gasses";
   return colorParam ?? "Color";
+}
+
+function isSameCalibrationColorParameter(left: string | null | undefined, right: string | null | undefined): boolean {
+  return String(left ?? "").trim() === String(right ?? "").trim();
 }
 
 function calibrationColorScaleTicks(range: [number, number], count = 6): number[] {
@@ -2203,7 +2208,7 @@ function CalibrationColorScaleBar({
   const ticks = calibrationColorScaleTicks(range);
   return (
     <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
-      <div className="mb-1 font-semibold text-stone-900">{label}</div>
+      <div className="mb-1 font-semibold text-stone-900">{formatScientificText(label)}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
@@ -2477,7 +2482,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             <tr>
               {columns.map((column) => (
                 <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                  {column}
+                  {formatScientificText(column)}
                 </th>
               ))}
             </tr>
@@ -2528,7 +2533,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
                             : "text-stone-700",
                         )}
                       >
-                        {formatCell(cellValue, column)}
+                        {formatScientificText(formatCell(cellValue, column))}
                       </td>
                     );
                   })}
@@ -2692,7 +2697,7 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
                     )}
                   >
-                    <div className="text-xs uppercase tracking-normal text-stone-500">{item.label}</div>
+                    <div className="text-xs uppercase tracking-normal text-stone-500">{formatScientificText(item.label)}</div>
                     <div className="mt-1 text-lg font-semibold">
                       {blockedByLinearityCycleCount ? (
                         <Tooltip label="not enough cycles for linearity calculation" align="start">
@@ -2838,7 +2843,7 @@ function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>;
           <tr>
             {columns.map((column) => (
               <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                {column}
+                {formatScientificText(column)}
               </th>
             ))}
           </tr>
@@ -2848,7 +2853,7 @@ function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>;
             <tr key={index}>
               {columns.map((column) => (
                 <td key={column} className="px-3 py-2 text-stone-600">
-                  {String(row[column] ?? "")}
+                  {formatScientificText(String(row[column] ?? ""))}
                 </td>
               ))}
             </tr>
@@ -2871,7 +2876,7 @@ function PrecisionMetricPanel({
   const styles = toneClasses(classifyPrecision(value));
   return (
     <div className={`rounded-lg border px-4 py-3 ${styles.shell}`}>
-      <div className={`text-xs font-medium ${styles.subtle}`}>{label}</div>
+      <div className={`text-xs font-medium ${styles.subtle}`}>{formatScientificText(label)}</div>
       <div className={`mt-1.5 text-2xl font-semibold leading-none tabular-nums ${styles.value}`}>{formatMetricWithUnit(value)}</div>
       {detail ? <div className={`mt-2 text-xs tabular-nums ${styles.subtle}`}>{detail}</div> : null}
     </div>
@@ -2930,7 +2935,7 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
       <CardContent className="space-y-4 p-4">
         <div className="grid gap-3 md:grid-cols-2">
           <IsotopeSummaryTile
-            label="Carbon isotope (d13C)"
+            label="Carbon isotope (δ¹³C)"
             precision={summary.d13_precision}
             correctedPrecision={summary.d13_linearity_corrected_precision}
             linearityEnabled={linearityEnabled}
@@ -2939,7 +2944,7 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
             includedPct={summary.included_pct_d13}
           />
           <IsotopeSummaryTile
-            label="Oxygen isotope (d18O)"
+            label="Oxygen isotope (δ¹⁸O)"
             precision={summary.d18_precision}
             correctedPrecision={summary.d18_linearity_corrected_precision}
             linearityEnabled={linearityEnabled}
@@ -2957,8 +2962,8 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
             <div className="overflow-x-auto rounded-lg border border-stone-200">
               <div className="grid min-w-[460px] grid-cols-[100px_repeat(2,minmax(0,1fr))] bg-stone-100 px-3 py-2 text-xs font-medium text-stone-600">
                 <span>Line</span>
-                <span>d13C (permil)</span>
-                <span>d18O (permil)</span>
+                <span>δ¹³C (‰)</span>
+                <span>δ¹⁸O (‰)</span>
               </div>
               {linePrecisionEntries.map(([line, values], index) => {
                 const d13Precision = linearityEnabled ? values.d13_linearity_corrected_precision : values.d13_precision;
@@ -3345,14 +3350,23 @@ export default function CalibrationPage() {
     [activeDraftConfig, linearityPreviewDataQuery.data],
   );
   const activeColorParam = activeDraftConfig?.color_param ?? persistedWorkspace?.config.color_param ?? null;
+  const colorCompatiblePreviewWorkspace =
+    calibrationPreviewWorkspaceQuery.data &&
+    isSameCalibrationColorParameter(calibrationPreviewWorkspaceQuery.data.config.color_param, activeColorParam)
+      ? calibrationPreviewWorkspaceQuery.data
+      : undefined;
   const colorScaleFigures = useMemo<Array<Record<string, unknown> | undefined>>(() => {
-    const previewWorkspace = calibrationPreviewWorkspaceQuery.data;
-    return collectCalibrationPreviewFigures(
-      previewWorkspace ?? persistedWorkspace,
-      previewWorkspace ? null : calibrationPreviewMasks,
-      activeDraftConfig,
-    );
-  }, [activeDraftConfig, calibrationPreviewMasks, calibrationPreviewWorkspaceQuery.data, persistedWorkspace]);
+    if (colorCompatiblePreviewWorkspace) {
+      return collectCalibrationPreviewFigures(colorCompatiblePreviewWorkspace, null, activeDraftConfig);
+    }
+    if (isSameCalibrationColorParameter(calibrationPreviewMasks?.color?.param, activeColorParam)) {
+      return collectCalibrationPreviewFigures(persistedWorkspace, calibrationPreviewMasks, activeDraftConfig);
+    }
+    if (isSameCalibrationColorParameter(persistedWorkspace?.config.color_param, activeColorParam)) {
+      return collectCalibrationPreviewFigures(persistedWorkspace, null, activeDraftConfig);
+    }
+    return [];
+  }, [activeColorParam, activeDraftConfig, calibrationPreviewMasks, colorCompatiblePreviewWorkspace, persistedWorkspace]);
   const colorScaleBounds = useMemo(
     () => deriveColorScaleBounds(colorScaleFigures) ?? deriveColorScaleBoundsFromState(calibrationPreviewMasks?.color),
     [calibrationPreviewMasks?.color, colorScaleFigures],
@@ -3945,7 +3959,7 @@ export default function CalibrationPage() {
       return;
     }
     if (d13 == null || d18 == null) {
-      setOfficialValuesError("Enter valid numeric d13C and d18O values for the new standard.");
+      setOfficialValuesError("Enter valid numeric δ¹³C and δ¹⁸O values for the new standard.");
       return;
     }
     try {
@@ -4048,7 +4062,7 @@ export default function CalibrationPage() {
 
   const workspace = persistedWorkspace;
   const activeConfig = activeDraftConfig;
-  const displayedWorkspace = calibrationPreviewWorkspaceQuery.data ?? workspace;
+  const displayedWorkspace = colorCompatiblePreviewWorkspace ?? workspace;
 
   if (!workspace || !activeConfig || !displayedWorkspace) {
     return null;
@@ -4063,7 +4077,7 @@ export default function CalibrationPage() {
     colorScaleSignatureRef.current = colorScaleSignature;
     colorScaledFigureCacheRef.current = new WeakMap();
   }
-  const hasServerPreviewWorkspace = Boolean(calibrationPreviewWorkspaceQuery.data);
+  const hasServerPreviewWorkspace = Boolean(colorCompatiblePreviewWorkspace);
   const withCalibrationPreview = (figure: Record<string, unknown> | undefined, chartKey: string) =>
     hasServerPreviewWorkspace ? figure : applyCalibrationConfigPreviewToFigure(figure, calibrationPreviewMasks, activeConfig, chartKey);
   const withColorScaleRange = (figure: Record<string, unknown> | undefined) => {
@@ -4203,13 +4217,13 @@ export default function CalibrationPage() {
     const chartKey = activeTarget.chartKey;
     const figureMap: Record<string, SelectionSourceChart> = {
       "VPDB(13C)": {
-        title: "d13C Calibration",
+        title: "δ¹³C Calibration",
         description: "Source chart for current selection.",
         chartKey: "VPDB(13C)",
         figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VPDB(13C)"], "VPDB(13C)")),
       },
       "VSMOW(18O)": {
-        title: "d18O Calibration",
+        title: "δ¹⁸O Calibration",
         description: "Source chart for current selection.",
         chartKey: "VSMOW(18O)",
         figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VSMOW(18O)"], "VSMOW(18O)")),
@@ -4227,25 +4241,25 @@ export default function CalibrationPage() {
         figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.crossplot, "crossplot")),
       },
       "linearity|d13_raw": {
-        title: "Linearity d13C Raw",
+        title: "Linearity δ¹³C Raw",
         description: "Source chart for current selection.",
         chartKey: "linearity|d13_raw",
         figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_raw, "linearity|d13_raw")),
       },
       "linearity|d13_corrected": {
-        title: "Linearity d13C Corrected",
+        title: "Linearity δ¹³C Corrected",
         description: "Source chart for current selection.",
         chartKey: "linearity|d13_corrected",
         figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_corrected, "linearity|d13_corrected")),
       },
       "linearity|d18_raw": {
-        title: "Linearity d18O Raw",
+        title: "Linearity δ¹⁸O Raw",
         description: "Source chart for current selection.",
         chartKey: "linearity|d18_raw",
         figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_raw, "linearity|d18_raw")),
       },
       "linearity|d18_corrected": {
-        title: "Linearity d18O Corrected",
+        title: "Linearity δ¹⁸O Corrected",
         description: "Source chart for current selection.",
         chartKey: "linearity|d18_corrected",
         figure: withColorScaleRange(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_corrected, "linearity|d18_corrected")),
@@ -4353,8 +4367,8 @@ export default function CalibrationPage() {
                         <tr>
                           <th className="w-10 px-2 py-2.5 font-semibold" aria-label="Reorder" />
                           <th className="px-3 py-2.5 font-semibold">Standard</th>
-                          <th className="px-3 py-2.5 font-semibold">d13C ({OFFICIAL_VALUE_TYPE_D13})</th>
-                          <th className="px-3 py-2.5 font-semibold">d18O ({OFFICIAL_VALUE_TYPE_D18})</th>
+                          <th className="px-3 py-2.5 font-semibold">δ¹³C ({OFFICIAL_VALUE_TYPE_D13})</th>
+                          <th className="px-3 py-2.5 font-semibold">δ¹⁸O ({OFFICIAL_VALUE_TYPE_D18})</th>
                           {isOfficialValuesEditMode ? <th className="px-3 py-2.5 font-semibold">Actions</th> : null}
                         </tr>
                       </thead>
@@ -4488,7 +4502,7 @@ export default function CalibrationPage() {
                       />
                     </label>
                     <label className="form-field">
-                      <span className="form-label">d13C</span>
+                      <span className="form-label">δ¹³C</span>
                       <input
                         type="number"
                         step="0.001"
@@ -4499,7 +4513,7 @@ export default function CalibrationPage() {
                       />
                     </label>
                     <label className="form-field">
-                      <span className="form-label">d18O</span>
+                      <span className="form-label">δ¹⁸O</span>
                       <input
                         type="number"
                         step="0.001"
@@ -4610,10 +4624,10 @@ export default function CalibrationPage() {
                             )}
                           >
                             <div className="text-[11px] font-semibold uppercase tracking-normal text-stone-500">
-                              {item.label}
+                              {formatScientificText(item.label)}
                               {item.unit ? ` (${item.unit})` : ""}
                             </div>
-                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{item.value}</div>
+                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{formatScientificText(item.value)}</div>
                           </div>
                         ))}
                       </div>
@@ -4626,7 +4640,7 @@ export default function CalibrationPage() {
                             label === `${activeTarget?.rowLabel}:${activeTarget?.isotopeKey}` ? "bg-stone-900 text-white" : "bg-white text-stone-700"
                           }`}
                         >
-                          {label}
+                          {formatScientificText(label)}
                         </span>
                       ))}
                     </div>
@@ -4700,7 +4714,7 @@ export default function CalibrationPage() {
                     <div className="space-y-4">
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">Set d13C</span>
+                          <span className="mb-1 block text-stone-700">Set δ¹³C</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4710,7 +4724,7 @@ export default function CalibrationPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">Set d18O</span>
+                          <span className="mb-1 block text-stone-700">Set δ¹⁸O</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4742,7 +4756,7 @@ export default function CalibrationPage() {
                       </div>
                       <div className="grid gap-3 md:grid-cols-2">
                         <div className="rounded-lg border border-stone-200 p-3">
-                          <div className="text-xs uppercase tracking-normal text-stone-500">d13C details</div>
+                          <div className="text-xs uppercase tracking-normal text-stone-500">δ¹³C details</div>
                           <div className="mt-1 text-sm text-stone-800">
                             Current:{" "}
                             {asNumber((crossD13DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
@@ -4760,7 +4774,7 @@ export default function CalibrationPage() {
                           </div>
                         </div>
                         <div className="rounded-lg border border-stone-200 p-3">
-                          <div className="text-xs uppercase tracking-normal text-stone-500">d18O details</div>
+                          <div className="text-xs uppercase tracking-normal text-stone-500">δ¹⁸O details</div>
                           <div className="mt-1 text-sm text-stone-800">
                             Current:{" "}
                             {asNumber((crossD18DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
@@ -4779,7 +4793,7 @@ export default function CalibrationPage() {
                         </div>
                       </div>
                       <DiagnosticsPanel
-                        title="Crossplot cycle diagnostics (shared intensity chart/table, d18O)"
+                        title="Crossplot cycle diagnostics, shared intensity chart and table, δ¹⁸O"
                         diagnostics={crossSharedDiagnostics}
                         loading={crossSharedDiagnosticsLoading}
                       />
@@ -4791,7 +4805,7 @@ export default function CalibrationPage() {
                       <div className="text-sm font-medium text-stone-800">Multi-point actions</div>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">d13C offset for selection</span>
+                          <span className="mb-1 block text-stone-700">δ¹³C offset for selection</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4801,7 +4815,7 @@ export default function CalibrationPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">d18O offset for selection</span>
+                          <span className="mb-1 block text-stone-700">δ¹⁸O offset for selection</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4813,10 +4827,10 @@ export default function CalibrationPage() {
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <Button variant="outline" onClick={() => applyMultiOffset("d13C", multiOffsetD13)} disabled={busy}>
-                          Offset selected d13C
+                          Offset selected δ¹³C
                         </Button>
                         <Button variant="outline" onClick={() => applyMultiOffset("d18O", multiOffsetD18)} disabled={busy}>
-                          Offset selected d18O
+                          Offset selected δ¹⁸O
                         </Button>
                         <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>
                           Interpolate selected
@@ -5008,7 +5022,7 @@ export default function CalibrationPage() {
                 ) : null}
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="border-t border-stone-200 pt-2 text-sm">
-                    <div className="text-xs font-medium text-stone-500">d13C fitted coefficients</div>
+                    <div className="text-xs font-medium text-stone-500">δ¹³C fitted coefficients</div>
                     <div className="mt-1 space-y-1 font-semibold text-stone-900">
                       <div>
                         <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -5023,7 +5037,7 @@ export default function CalibrationPage() {
                     </div>
                   </div>
                   <div className="border-t border-stone-200 pt-2 text-sm">
-                    <div className="text-xs font-medium text-stone-500">d18O fitted coefficients</div>
+                    <div className="text-xs font-medium text-stone-500">δ¹⁸O fitted coefficients</div>
                     <div className="mt-1 space-y-1 font-semibold text-stone-900">
                       <div>
                         <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -5092,7 +5106,7 @@ export default function CalibrationPage() {
                     <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">d13C</span>
+                        <span className="mb-1 block text-stone-700">δ¹³C</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -5105,7 +5119,7 @@ export default function CalibrationPage() {
                         />
                       </label>
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">d18O</span>
+                        <span className="mb-1 block text-stone-700">δ¹⁸O</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -5123,7 +5137,7 @@ export default function CalibrationPage() {
                     <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">d13C</span>
+                        <span className="mb-1 block text-stone-700">δ¹³C</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -5136,7 +5150,7 @@ export default function CalibrationPage() {
                         />
                       </label>
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">d18O</span>
+                        <span className="mb-1 block text-stone-700">δ¹⁸O</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -5160,8 +5174,8 @@ export default function CalibrationPage() {
                       standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
                         <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
                           <span className="font-medium text-stone-800">{summary.standard}</span>
-                          <span>d13C: {formatMetricWithUnit(summary.d13_linearity_corrected_precision)}</span>
-                          <span>d18O: {formatMetricWithUnit(summary.d18_linearity_corrected_precision)}</span>
+                          <span>δ¹³C: {formatMetricWithUnit(summary.d13_linearity_corrected_precision)}</span>
+                          <span>δ¹⁸O: {formatMetricWithUnit(summary.d18_linearity_corrected_precision)}</span>
                         </div>
                       ))
                     ) : (
@@ -5224,7 +5238,7 @@ export default function CalibrationPage() {
                   <span>
                     <span className="text-sm font-medium tracking-normal text-stone-800">Independent isotope outliers</span>
                   </span>
-                  <Tooltip label="Keep d13C and d18O outlier filtering independent for each standard row.">
+                  <Tooltip label="Keep δ¹³C and δ¹⁸O outlier filtering independent for each standard row.">
                     <span tabIndex={0} aria-label="More information about independent isotope outliers" className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">?</span>
                   </Tooltip>
                 </label>
@@ -5342,7 +5356,7 @@ export default function CalibrationPage() {
                 <div className="grid gap-6 2xl:grid-cols-2">
                 <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
-                    <CardTitle>d13C Calibration</CardTitle>
+                    <CardTitle>δ¹³C Calibration</CardTitle>
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
@@ -5358,7 +5372,7 @@ export default function CalibrationPage() {
                 </Card>
                 <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
-                    <CardTitle>d18O Calibration</CardTitle>
+                    <CardTitle>δ¹⁸O Calibration</CardTitle>
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
@@ -5397,7 +5411,7 @@ export default function CalibrationPage() {
                 <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
                     <CardTitle>Calibration Crossplot</CardTitle>
-                    <CardDescription>d13C vs d18O crossplot for the filtered standards set.</CardDescription>
+                    <CardDescription>δ¹³C vs δ¹⁸O crossplot for the filtered standards set.</CardDescription>
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
@@ -5429,7 +5443,7 @@ export default function CalibrationPage() {
                 <CardContent className="bg-stone-200 p-0">
                   <div className="grid min-w-0 gap-px 2xl:grid-cols-2">
                     <div className="min-w-0 bg-white">
-                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">d13C · Raw</div>
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">δ¹³C · Raw</div>
                     <PlotlyChart
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_raw, "linearity|d13_raw"))}
                       className="h-[420px] w-full"
@@ -5441,7 +5455,7 @@ export default function CalibrationPage() {
                     />
                     </div>
                     <div className="min-w-0 bg-white">
-                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">d13C · Linearity corrected</div>
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">δ¹³C · Linearity corrected</div>
                     <PlotlyChart
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_corrected, "linearity|d13_corrected"))}
                       className="h-[420px] w-full"
@@ -5453,7 +5467,7 @@ export default function CalibrationPage() {
                     />
                     </div>
                     <div className="min-w-0 bg-white">
-                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">d18O · Raw</div>
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">δ¹⁸O · Raw</div>
                     <PlotlyChart
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_raw, "linearity|d18_raw"))}
                       className="h-[420px] w-full"
@@ -5465,7 +5479,7 @@ export default function CalibrationPage() {
                     />
                     </div>
                     <div className="min-w-0 bg-white">
-                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">d18O · Linearity corrected</div>
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">δ¹⁸O · Linearity corrected</div>
                     <PlotlyChart
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_corrected, "linearity|d18_corrected"))}
                       className="h-[420px] w-full"
@@ -5494,7 +5508,7 @@ export default function CalibrationPage() {
                       <div className="grid gap-6">
                         <Card className="flex flex-col overflow-hidden">
                           <CardHeader>
-                            <CardTitle className="text-base">d13C Outlier Trace</CardTitle>
+                            <CardTitle className="text-base">δ¹³C Outlier Trace</CardTitle>
                           </CardHeader>
                           <CardContent className="min-h-0 flex-1 p-0">
                             <PlotlyChart
@@ -5510,7 +5524,7 @@ export default function CalibrationPage() {
                         </Card>
                         <Card className="flex flex-col overflow-hidden">
                           <CardHeader>
-                            <CardTitle className="text-base">d18O Outlier Trace</CardTitle>
+                            <CardTitle className="text-base">δ¹⁸O Outlier Trace</CardTitle>
                           </CardHeader>
                           <CardContent className="min-h-0 flex-1 p-0">
                             <PlotlyChart
@@ -5529,19 +5543,19 @@ export default function CalibrationPage() {
                         <details className="rounded-lg border border-stone-200 bg-white shadow-sm">
                           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold text-stone-900">
                             <ChevronRight className="h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
-                            <span>d13C Outliers ({section.d13_outliers.length})</span>
+                            <span>δ¹³C Outliers ({section.d13_outliers.length})</span>
                           </summary>
                           <div className="px-6 pb-6">
-                            <DataTable rows={section.d13_outliers} emptyLabel="No d13C outliers for this standard." />
+                            <DataTable rows={section.d13_outliers} emptyLabel="No δ¹³C outliers for this standard." />
                           </div>
                         </details>
                         <details className="rounded-lg border border-stone-200 bg-white shadow-sm">
                           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold text-stone-900">
                             <ChevronRight className="h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
-                            <span>d18O Outliers ({section.d18_outliers.length})</span>
+                            <span>δ¹⁸O Outliers ({section.d18_outliers.length})</span>
                           </summary>
                           <div className="px-6 pb-6">
-                            <DataTable rows={section.d18_outliers} emptyLabel="No d18O outliers for this standard." />
+                            <DataTable rows={section.d18_outliers} emptyLabel="No δ¹⁸O outliers for this standard." />
                           </div>
                         </details>
                       </div>

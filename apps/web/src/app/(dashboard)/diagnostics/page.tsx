@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
+import { RawAnalysisInfoTable } from "@/components/diagnostics/raw-analysis-info-table";
 import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
 import {
   SATURATION_COLOR_AXIS_OPTIONS,
@@ -24,11 +25,13 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type { CalibrationConfig, CalibrationPrecisionSummary, CycleDiagnosticsPayload, EditAction } from "@/lib/types";
+import { formatScientificText } from "@/lib/scientific-notation";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
 
 const RANGE_FETCH_DEBOUNCE_MS = 300;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
+const CORRELATION_PREVIEW_SHOW_DELAY_MS = 240;
 const SELECTION_EDITOR_CHART_DEFER_MS = 350;
 type LinearityOffsetField = "line_1_offset_d13" | "line_1_offset_d18" | "line_2_offset_d13" | "line_2_offset_d18";
 type LinearityCycleIntensityAggregation = "run_median" | "first_valid_cycle" | "last_valid_cycle";
@@ -80,11 +83,24 @@ type StoredSelectedTarget = {
 type IsotopeKey = "d13C" | "d18O";
 type IsotopeNumericMap = Record<IsotopeKey, number>;
 const ISOTOPE_KEYS: IsotopeKey[] = ["d13C", "d18O"];
-type HoverPreviewState = {
+type CycleHoverPreviewState = {
+  kind: "cycle";
   target: StoredSelectedTarget;
   clientX: number;
   clientY: number;
 };
+type CorrelationHoverPreviewState = {
+  kind: "correlation";
+  xLabel: string;
+  yLabel: string;
+  rho: number | null;
+  pairCount: number;
+  colorLabel: string;
+  figure: FigureShape;
+  clientX: number;
+  clientY: number;
+};
+type HoverPreviewState = CycleHoverPreviewState | CorrelationHoverPreviewState;
 
 function getLinearityIntensityOptionLabel(value: string): string {
   if (value in LINEARITY_INTENSITY_OPTION_LABELS) {
@@ -186,7 +202,7 @@ function getLinearityCoefficientLabel(
   term: LinearityCoefficientTerm,
   aggregation: LinearityCycleIntensityAggregation = "run_median",
 ): string {
-  const prefix = isotope === "d13C" ? "d13C" : "d18O";
+  const prefix = isotope === "d13C" ? "δ¹³C" : "δ¹⁸O";
   const coefficient = getLinearityCoefficientTermLabel(term, intensityCol).replace(" coefficient", "");
   return `${prefix} ${coefficient} offset, ${getLinearityBasisTerm(intensityCol, aggregation)} ${getLinearityCoefficientUnit(term, intensityCol)}`;
 }
@@ -343,9 +359,9 @@ function computeHoverPreviewPosition(
   clientY: number,
   tooltipWidth = 440,
   tooltipHeight = 340,
-): { left: number; top: number } {
+): { left: number; top: number; tableSide: "left" | "right" } {
   if (typeof window === "undefined") {
-    return { left: clientX + 220, top: clientY - 24 };
+    return { left: clientX + 220, top: clientY - 24, tableSide: "left" };
   }
   // Keep the diagnostics card to the right of Plotly's native hover label.
   const horizontalOffset = 220;
@@ -355,9 +371,11 @@ function computeHoverPreviewPosition(
   const viewportWidth = window.innerWidth;
   const viewportHeight = window.innerHeight;
 
+  let opensToRight = true;
   let left = clientX + horizontalOffset;
   if (left + tooltipWidth > viewportWidth - edgePadding) {
     left = clientX - tooltipWidth - fallbackLeftOffset;
+    opensToRight = false;
   }
   if (left < edgePadding) {
     left = edgePadding;
@@ -371,7 +389,7 @@ function computeHoverPreviewPosition(
     top = edgePadding;
   }
 
-  return { left, top };
+  return { left, top, tableSide: opensToRight ? "left" : "right" };
 }
 
 function figureTitleText(layout: Record<string, unknown>): string {
@@ -464,10 +482,10 @@ function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefin
       xanchor: "center",
       font: { size: 14 },
     },
-    margin: { l: 42, r: 12, t: 46, b: 126 },
+    margin: { l: 42, r: 12, t: 42, b: 112 },
     legend: { orientation: "h", yanchor: "top", y: -0.28, x: 0, xanchor: "left", font: { size: 10 } },
     hovermode: "closest",
-    height: 460,
+    height: 390,
   };
   return ensureFigureUiRevision(cloned, "diagnostics:hover-preview");
 }
@@ -888,7 +906,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             <tr>
               {columns.map((column) => (
                 <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                  {column}
+                  {formatScientificText(column)}
                 </th>
               ))}
             </tr>
@@ -939,7 +957,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
                             : "text-stone-700",
                         )}
                       >
-                        {formatCell(cellValue, column)}
+                        {formatScientificText(formatCell(cellValue, column))}
                       </td>
                     );
                   })}
@@ -1008,6 +1026,36 @@ function parseInlineDiagnosticsSummary(summary: string | undefined): Array<{ lab
       return null;
     })
     .filter((item): item is { label: string; value: string } => item != null);
+}
+
+function buildDiagnosticsHoverAnalysisInfo(diagnostics: CycleDiagnosticsPayload | undefined): Record<string, unknown> {
+  const rawInfo = diagnostics?.analysis_info;
+  if (rawInfo && Object.keys(rawInfo).length) {
+    return rawInfo;
+  }
+  if (!diagnostics) {
+    return {};
+  }
+
+  const target = diagnostics.target ?? {};
+  const inlineItems = parseInlineDiagnosticsSummary(diagnostics.inline_summary);
+  const inlineValues = new Map(inlineItems.map((item) => [normalizeInlineLabel(item.label), item.value]));
+  const isotopeKey = asString(target.isotope_key);
+  const isotopeInlineLabel = isotopeKey === "d18O" ? "d18o values" : "d13c values";
+  const info: Record<string, unknown> = {
+    "Isotopic value": target.original_value ?? inlineValues.get(isotopeInlineLabel) ?? target.current_value ?? null,
+    "Internal stdev": target.internal_std_dev ?? null,
+    Line: inlineValues.get("line") ?? null,
+    "Analysis date": inlineValues.get("date") ?? null,
+    "Analysis time": target.analysis_time ?? target.start_time ?? null,
+    "Origin file": target.source_excel ?? null,
+  };
+  for (const item of inlineItems) {
+    if (!(item.label in info)) {
+      info[item.label] = item.value;
+    }
+  }
+  return info;
 }
 
 function DiagnosticsPanel({
@@ -1150,7 +1198,7 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
                     )}
                   >
-                    <div className="text-xs uppercase tracking-normal text-stone-500">{item.label}</div>
+                    <div className="text-xs uppercase tracking-normal text-stone-500">{formatScientificText(item.label)}</div>
                     <div className="mt-1 text-lg font-semibold">
                       {blockedByLinearityCycleCount ? (
                         <Tooltip label="not enough cycles for linearity calculation" align="start">
@@ -1387,6 +1435,181 @@ function parseDiagnosticsSelectedTargets(points: PlotlyPoint[]): StoredSelectedT
   return targets;
 }
 
+function traceForPoint(
+  point: PlotlyPoint | undefined,
+  sourceFigure: Record<string, unknown> | undefined,
+): Record<string, unknown> | null {
+  if (!point || !sourceFigure) {
+    return null;
+  }
+  const traces = Array.isArray((sourceFigure as FigureShape).data)
+    ? ((sourceFigure as FigureShape).data as Array<Record<string, unknown>>)
+    : [];
+  const traceIndex = typeof point.curveNumber === "number" ? point.curveNumber : 0;
+  return traceIndex >= 0 && traceIndex < traces.length ? traces[traceIndex] : null;
+}
+
+function correlationPreviewMeta(
+  point: PlotlyPoint | undefined,
+  sourceFigure: Record<string, unknown> | undefined,
+): Record<string, unknown> | null {
+  const trace = traceForPoint(point, sourceFigure);
+  if (asString(trace?.type).toLowerCase() !== "heatmap") {
+    return null;
+  }
+  const traceMeta = trace?.meta && typeof trace.meta === "object" ? (trace.meta as Record<string, unknown>) : null;
+  const preview = traceMeta?.correlationScatterPreview;
+  if (!preview || typeof preview !== "object") {
+    return null;
+  }
+  const previewMeta = preview as Record<string, unknown>;
+  return previewMeta.kind === "spearman-scatter-preview" ? previewMeta : null;
+}
+
+function buildCorrelationHoverPreview(
+  payload: PlotlyHoverPayload,
+  sourceFigure: Record<string, unknown> | undefined,
+  colorBounds: ColorScaleBounds,
+): { handled: boolean; preview: CorrelationHoverPreviewState | null } {
+  const point = payload.points[0];
+  const previewMeta = correlationPreviewMeta(point, sourceFigure);
+  if (!previewMeta) {
+    return { handled: false, preview: null };
+  }
+
+  const xLabel = asString(point?.x).trim();
+  const yLabel = asString(point?.y).trim();
+  if (!xLabel || !yLabel || xLabel === yLabel) {
+    return { handled: true, preview: null };
+  }
+
+  const featureLabels = (coerceVector(previewMeta.featureLabels) ?? []).map(asString);
+  const axisLabels = (coerceVector(previewMeta.axisLabels) ?? []).map(asString);
+  const xIndex = featureLabels.indexOf(xLabel);
+  const yIndex = featureLabels.indexOf(yLabel);
+  if (xIndex < 0 || yIndex < 0) {
+    return { handled: true, preview: null };
+  }
+
+  const valueRows = coerceVector(previewMeta.values) ?? [];
+  const rowLabels = (coerceVector(previewMeta.rowLabels) ?? []).map(asString);
+  const identifiers1 = (coerceVector(previewMeta.identifier1) ?? []).map(asString);
+  const identifiers2 = (coerceVector(previewMeta.identifier2) ?? []).map(asString);
+  const species = (coerceVector(previewMeta.species) ?? []).map(asString);
+  const colorValues = coerceVector(previewMeta.colorValues) ?? [];
+  const colorDisplay = (coerceVector(previewMeta.colorDisplay) ?? []).map(asString);
+  const markerSymbols = (coerceVector(previewMeta.markerSymbols) ?? []).map(asString);
+  const scatterX: number[] = [];
+  const scatterY: number[] = [];
+  const scatterColor: Array<number | null> = [];
+  const scatterSymbols: string[] = [];
+  const scatterCustomdata: string[][] = [];
+
+  valueRows.forEach((rawRow, rowIndex) => {
+    const row = coerceVector(rawRow);
+    if (!row) {
+      return;
+    }
+    const xValue = toFiniteNumber(row[xIndex]);
+    const yValue = toFiniteNumber(row[yIndex]);
+    if (xValue == null || yValue == null) {
+      return;
+    }
+    scatterX.push(xValue);
+    scatterY.push(yValue);
+    scatterColor.push(toFiniteNumber(colorValues[rowIndex]));
+    scatterSymbols.push(markerSymbols[rowIndex] || "circle");
+    scatterCustomdata.push([
+      rowLabels[rowIndex] || "N/A",
+      identifiers1[rowIndex] || "N/A",
+      identifiers2[rowIndex] || "N/A",
+      species[rowIndex] || "Unknown",
+      colorDisplay[rowIndex] || "N/A",
+    ]);
+  });
+
+  if (!scatterX.length) {
+    return { handled: true, preview: null };
+  }
+
+  const colorLabel = asString(previewMeta.colorLabel).trim() || "Color";
+  const hasNumericColor = scatterColor.some((value) => value != null);
+  const xAxisLabel = axisLabels[xIndex] || xLabel;
+  const yAxisLabel = axisLabels[yIndex] || yLabel;
+  const marker: Record<string, unknown> = {
+    color: hasNumericColor ? scatterColor : "#315f8c",
+    size: 8,
+    symbol: scatterSymbols,
+    opacity: 0.88,
+    line: { color: "#ffffff", width: 0.8 },
+    showscale: false,
+  };
+  if (hasNumericColor) {
+    marker.colorscale = "Viridis";
+    marker.cmin = colorBounds.min;
+    marker.cmax = colorBounds.max;
+  }
+
+  const figure: FigureShape = {
+    data: [
+      {
+        type: "scatter",
+        mode: "markers",
+        x: scatterX,
+        y: scatterY,
+        marker,
+        customdata: scatterCustomdata,
+        hovertemplate: [
+          "Identifier 1: %{customdata[1]}",
+          "Identifier 2: %{customdata[2]}",
+          "Species: %{customdata[3]}",
+          "Row: %{customdata[0]}",
+          `${colorLabel}: %{customdata[4]}`,
+          `${xAxisLabel}: %{x}`,
+          `${yAxisLabel}: %{y}<extra></extra>`,
+        ].join("<br>"),
+      },
+    ],
+    layout: {
+      autosize: true,
+      showlegend: false,
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "#f8fafc",
+      margin: { l: 62, r: 16, t: 12, b: 58 },
+      font: { family: "Inter, Segoe UI, sans-serif", color: "#475569", size: 11 },
+      hovermode: "closest",
+      uirevision: `correlation-preview:${xLabel}:${yLabel}`,
+      xaxis: {
+        title: { text: xAxisLabel, font: { size: 11, color: "#334155" }, standoff: 8 },
+        automargin: true,
+        gridcolor: "#dce3ec",
+        zerolinecolor: "#94a3b8",
+      },
+      yaxis: {
+        title: { text: yAxisLabel, font: { size: 11, color: "#334155" }, standoff: 8 },
+        automargin: true,
+        gridcolor: "#dce3ec",
+        zerolinecolor: "#94a3b8",
+      },
+    },
+  };
+
+  return {
+    handled: true,
+    preview: {
+      kind: "correlation",
+      xLabel,
+      yLabel,
+      rho: toFiniteNumber(point?.z),
+      pairCount: Math.round(toFiniteNumber(point?.customdata) ?? scatterX.length),
+      colorLabel,
+      figure,
+      clientX: payload.clientX,
+      clientY: payload.clientY,
+    },
+  };
+}
+
 function collectNumericColorValues(figure?: Record<string, unknown>): number[] {
   if (!figure) {
     return [];
@@ -1479,7 +1702,7 @@ function diagnosticsColorParameterLabel(colorParam: string): string {
   if (key === "1 cycle int samp 44") return "Initial sample intensity";
   if (key === "1 cycle int ref 44") return "Initial reference gas intensity";
   if (key === "p_no_acid") return "P no Acid";
-  if (key === "total_co2") return "total CO2";
+  if (key === "total_co2") return "total CO₂";
   if (key === "p_gases") return "P gasses";
   return colorParam;
 }
@@ -1495,7 +1718,7 @@ function DiagnosticsColorScaleBar({ colorParam, range }: { colorParam: string; r
   const ticks = diagnosticsColorScaleTicks(range);
   return (
     <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
-      <div className="mb-1 font-semibold text-stone-900">{label}</div>
+      <div className="mb-1 font-semibold text-stone-900">{formatScientificText(label)}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
@@ -1703,7 +1926,8 @@ export default function DiagnosticsPage() {
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
-  const hoverPreviewTarget = hoverPreview?.target ?? null;
+  const hoverPreviewPointerInsideRef = useRef(false);
+  const hoverPreviewTarget = hoverPreview?.kind === "cycle" ? hoverPreview.target : null;
   const hoverPreviewDiagnosticsTarget =
     hoverPreviewTarget == null
       ? null
@@ -1906,10 +2130,21 @@ export default function DiagnosticsPage() {
     ? (activeSelectionTargetPayload.effective_outlier as boolean)
     : false;
   const busy = saveSharedLinearityMutation.isPending || editMutation.isPending;
-  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
+  const hoverPreviewDimensions = hoverPreview?.kind === "correlation"
+    ? { width: 480, height: 430 }
+    : { width: 980, height: 450 };
+  const hoverPreviewPosition = hoverPreview
+    ? computeHoverPreviewPosition(
+        hoverPreview.clientX,
+        hoverPreview.clientY,
+        hoverPreviewDimensions.width,
+        hoverPreviewDimensions.height,
+      )
+    : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
     ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
   );
+  const hoverAnalysisInfo = buildDiagnosticsHoverAnalysisInfo(hoverDiagnosticsQuery.data);
   const hasHoverDiagnosticsFigureData = Boolean(
     hoverDiagnosticsFigure &&
       Array.isArray((hoverDiagnosticsFigure as FigureShape).data) &&
@@ -2281,8 +2516,21 @@ export default function DiagnosticsPage() {
     pendingHoverPreviewRef.current = null;
     clearHoverPreviewHideTimer();
     hoverPreviewHideTimerRef.current = setTimeout(() => {
+      if (hoverPreviewPointerInsideRef.current) {
+        return;
+      }
       setHoverPreview(null);
-    }, 140);
+    }, 650);
+  }
+
+  function handleHoverPreviewPointerEnter() {
+    hoverPreviewPointerInsideRef.current = true;
+    clearHoverPreviewHideTimer();
+  }
+
+  function handleHoverPreviewPointerLeave() {
+    hoverPreviewPointerInsideRef.current = false;
+    scheduleHoverPreviewHide();
   }
 
   function handleDiagnosticsPointHover(
@@ -2292,6 +2540,38 @@ export default function DiagnosticsPage() {
     if (isSelectionEditorOpen) {
       return;
     }
+    const correlationResult = buildCorrelationHoverPreview(
+      payload,
+      sourceFigure,
+      { min: effectiveColorScaleRange[0], max: effectiveColorScaleRange[1] },
+    );
+    if (correlationResult.handled) {
+      clearHoverPreviewHideTimer();
+      clearHoverPreviewShowTimer();
+      pendingHoverPreviewRef.current = correlationResult.preview;
+      if (!correlationResult.preview) {
+        setHoverPreview(null);
+        return;
+      }
+      hoverPreviewShowTimerRef.current = setTimeout(() => {
+        const pending = pendingHoverPreviewRef.current;
+        if (!pending || pending.kind !== "correlation") {
+          return;
+        }
+        setHoverPreview((current) => {
+          if (
+            current?.kind === "correlation" &&
+            current.xLabel === pending.xLabel &&
+            current.yLabel === pending.yLabel
+          ) {
+            return current;
+          }
+          return pending;
+        });
+      }, CORRELATION_PREVIEW_SHOW_DELAY_MS);
+      return;
+    }
+
     const targets = parseDiagnosticsSelectedTargets(payload.points);
     if (!targets.length) {
       clearHoverPreviewShowTimer();
@@ -2306,6 +2586,7 @@ export default function DiagnosticsPage() {
       isotopeKey: inferredIsotope,
     };
     pendingHoverPreviewRef.current = {
+      kind: "cycle",
       target,
       clientX: payload.clientX,
       clientY: payload.clientY,
@@ -2318,7 +2599,8 @@ export default function DiagnosticsPage() {
       }
       setHoverPreview((current) => {
         if (
-          current &&
+          current?.kind === "cycle" &&
+          pending.kind === "cycle" &&
           current.target.rowLabel === pending.target.rowLabel &&
           current.target.isotopeKey === pending.target.isotopeKey &&
           current.target.chartKey === pending.target.chartKey
@@ -2335,6 +2617,9 @@ export default function DiagnosticsPage() {
     sourceFigure: Record<string, unknown> | undefined,
   ) {
     if (!sessionId) {
+      return;
+    }
+    if (correlationPreviewMeta(points[0], sourceFigure)) {
       return;
     }
     const targets = parseDiagnosticsSelectedTargets(points);
@@ -2432,7 +2717,7 @@ export default function DiagnosticsPage() {
               <div className="space-y-4">
                 <div className="form-section-title">Value Ranges</div>
                 <RangeSliderControl
-                  label="d13C/12C Mean"
+                  label="δ¹³C/¹²C Mean"
                   bounds={d13Bounds}
                   value={d13Range}
                   step={0.001}
@@ -2440,7 +2725,7 @@ export default function DiagnosticsPage() {
                   onChange={(nextRange) => setD13Range(nextRange)}
                 />
                 <RangeSliderControl
-                  label="d18O/16O Mean"
+                  label="δ¹⁸O/¹⁶O Mean"
                   bounds={d18Bounds}
                   value={d18Range}
                   step={0.001}
@@ -2541,7 +2826,7 @@ export default function DiagnosticsPage() {
                   ) : null}
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="border-t border-stone-200 pt-2 text-sm">
-                      <div className="text-xs font-medium text-stone-500">d13C fitted coefficients</div>
+                      <div className="text-xs font-medium text-stone-500">δ¹³C fitted coefficients</div>
                       <div className="mt-1 space-y-1 font-semibold text-stone-900">
                         <div>
                           <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -2556,7 +2841,7 @@ export default function DiagnosticsPage() {
                       </div>
                     </div>
                     <div className="border-t border-stone-200 pt-2 text-sm">
-                      <div className="text-xs font-medium text-stone-500">d18O fitted coefficients</div>
+                      <div className="text-xs font-medium text-stone-500">δ¹⁸O fitted coefficients</div>
                       <div className="mt-1 space-y-1 font-semibold text-stone-900">
                         <div>
                           <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
@@ -2625,7 +2910,7 @@ export default function DiagnosticsPage() {
                       <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">d13C</span>
+                          <span className="mb-1 block text-stone-700">δ¹³C</span>
                           <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_1_offset_d13")}
                             onValueChange={(value) => updateSharedLinearity("line_1_offset_d13", value)}
@@ -2633,7 +2918,7 @@ export default function DiagnosticsPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">d18O</span>
+                          <span className="mb-1 block text-stone-700">δ¹⁸O</span>
                           <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_1_offset_d18")}
                             onValueChange={(value) => updateSharedLinearity("line_1_offset_d18", value)}
@@ -2646,7 +2931,7 @@ export default function DiagnosticsPage() {
                       <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">d13C</span>
+                          <span className="mb-1 block text-stone-700">δ¹³C</span>
                           <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_2_offset_d13")}
                             onValueChange={(value) => updateSharedLinearity("line_2_offset_d13", value)}
@@ -2654,7 +2939,7 @@ export default function DiagnosticsPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">d18O</span>
+                          <span className="mb-1 block text-stone-700">δ¹⁸O</span>
                           <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_2_offset_d18")}
                             onValueChange={(value) => updateSharedLinearity("line_2_offset_d18", value)}
@@ -2673,8 +2958,8 @@ export default function DiagnosticsPage() {
                         standardPrecisionRows.map((item: CalibrationPrecisionSummary) => (
                           <div key={item.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
                             <span className="font-medium text-stone-800">{item.standard}</span>
-                            <span>d13C: {formatPrecisionMetric(item.d13_linearity_corrected_precision)}</span>
-                            <span>d18O: {formatPrecisionMetric(item.d18_linearity_corrected_precision)}</span>
+                            <span>δ¹³C: {formatPrecisionMetric(item.d13_linearity_corrected_precision)}</span>
+                            <span>δ¹⁸O: {formatPrecisionMetric(item.d18_linearity_corrected_precision)}</span>
                           </div>
                         ))
                       ) : (
@@ -2785,10 +3070,10 @@ export default function DiagnosticsPage() {
                             )}
                           >
                             <div className="text-[11px] font-semibold uppercase tracking-normal text-stone-500">
-                              {item.label}
+                              {formatScientificText(item.label)}
                               {item.unit ? ` (${item.unit})` : ""}
                             </div>
-                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{item.value}</div>
+                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{formatScientificText(item.value)}</div>
                           </div>
                         ))}
                       </div>
@@ -2811,7 +3096,7 @@ export default function DiagnosticsPage() {
                               : "min-w-[92px] rounded-lg px-4 py-2 text-sm font-semibold text-stone-700 hover:bg-stone-100"
                           }
                         >
-                          {isotopeKey}
+                          {formatScientificText(isotopeKey)}
                         </button>
                       );
                     })}
@@ -2821,7 +3106,7 @@ export default function DiagnosticsPage() {
                     <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Details</div>
                     <div className="grid gap-3 md:grid-cols-2">
                       <div className="rounded-lg border border-stone-200 bg-stone-50/50 p-4">
-                        <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">{selectionEditorTab}</div>
+                        <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">{formatScientificText(selectionEditorTab)}</div>
                         <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
                           <div className="text-stone-500">Current</div>
                           <div className="text-right font-medium text-stone-900">{formatDeltaValue(activeSelectionCurrentValue)}</div>
@@ -2839,7 +3124,7 @@ export default function DiagnosticsPage() {
 
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">Set value ({selectionEditorTab})</span>
+                      <span className="mb-1 block text-stone-700">Set value ({formatScientificText(selectionEditorTab)})</span>
                       <input
                         type="number"
                         step="0.001"
@@ -2852,7 +3137,7 @@ export default function DiagnosticsPage() {
                       />
                     </label>
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">Offset ({selectionEditorTab})</span>
+                      <span className="mb-1 block text-stone-700">Offset ({formatScientificText(selectionEditorTab)})</span>
                       <input
                         type="number"
                         step="0.001"
@@ -2867,13 +3152,13 @@ export default function DiagnosticsPage() {
 
                   <div className="flex flex-wrap gap-2">
                     <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>
-                      Set {selectionEditorTab}
+                      Set {formatScientificText(selectionEditorTab)}
                     </Button>
                     <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>
-                      Offset {selectionEditorTab}
+                      Offset {formatScientificText(selectionEditorTab)}
                     </Button>
                     <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
-                      Interpolate {selectionEditorTab}
+                      Interpolate {formatScientificText(selectionEditorTab)}
                     </Button>
                     <Button variant="outline" onClick={resetSelected} disabled={busy}>
                       Reset selected
@@ -2917,25 +3202,82 @@ export default function DiagnosticsPage() {
       ) : null}
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="pointer-events-none fixed z-[80] w-[min(560px,calc(100vw-20px))] rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          role="tooltip"
+          className={cn(
+            "fixed z-[80] max-h-[calc(100vh-20px)] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]",
+            hoverPreview.kind === "correlation"
+              ? "w-[min(480px,calc(100vw-20px))]"
+              : "w-[min(980px,calc(100vw-20px))]",
+          )}
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
+          onPointerEnter={handleHoverPreviewPointerEnter}
+          onPointerLeave={handleHoverPreviewPointerLeave}
         >
-          <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
-            <span className="font-medium text-stone-800">
-              {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
-            </span>
-            <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
-              {hoverPreview.target.isotopeKey}
-            </span>
-          </div>
-          {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
-            <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
-          ) : hasHoverDiagnosticsFigureData ? (
-            <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
-          ) : (
-            <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-              Cycle-intensity preview unavailable for this point.
+          {hoverPreview.kind === "correlation" ? (
+            <div>
+              <div className="mb-2 flex items-start justify-between gap-4 border-b border-stone-200 pb-2">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-stone-900">
+                    {hoverPreview.yLabel} vs {hoverPreview.xLabel}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-stone-500">
+                    Point-level relationship for complete measurement pairs
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-3 font-mono text-[11px] tabular-nums text-stone-700">
+                  <span>rho {hoverPreview.rho == null ? "N/A" : hoverPreview.rho.toFixed(2)}</span>
+                  <span>n {hoverPreview.pairCount}</span>
+                </div>
+              </div>
+              <div className="h-[330px] min-w-0 overflow-hidden">
+                <PlotlyChart
+                  figure={hoverPreview.figure}
+                  className="h-full w-full"
+                  fitContainer
+                  uiRevision={`correlation-preview:${hoverPreview.xLabel}:${hoverPreview.yLabel}`}
+                />
+              </div>
+              <p className="mt-1 border-t border-stone-100 pt-2 text-[11px] text-stone-500">
+                Colored by {hoverPreview.colorLabel}. Hover a point for sample details.
+              </p>
             </div>
+          ) : (
+            <>
+              <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
+                <span className="font-medium text-stone-800">
+                  {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
+                </span>
+                <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
+                  {hoverPreview.target.isotopeKey}
+                </span>
+              </div>
+              <div className="grid min-h-0 gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:items-stretch">
+                <div
+                  className={cn(
+                    "h-[390px] min-w-0",
+                    hoverPreviewPosition.tableSide === "left" ? "md:order-1" : "md:order-2",
+                  )}
+                >
+                  <RawAnalysisInfoTable info={hoverAnalysisInfo} layout="vertical" />
+                </div>
+                <div
+                  className={cn(
+                    "flex min-h-[390px] min-w-0 items-center",
+                    hoverPreviewPosition.tableSide === "left" ? "md:order-2" : "md:order-1",
+                  )}
+                >
+                  {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
+                    <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
+                  ) : hasHoverDiagnosticsFigureData ? (
+                    <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
+                  ) : (
+                    <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
+                      Cycle-intensity preview unavailable for this point.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
           )}
         </div>
       ) : null}

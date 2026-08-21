@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { formatScientificText } from "@/lib/scientific-notation";
+
 export function Tooltip({
   label,
   children,
@@ -25,7 +27,7 @@ export function Tooltip({
         role="tooltip"
         className={`pointer-events-none absolute top-full z-50 mt-2 hidden max-w-[min(24rem,calc(100vw-2rem))] whitespace-normal break-words rounded-md border border-stone-200 bg-stone-950 px-3 py-2 text-left text-xs font-medium leading-5 text-white shadow-lg group-hover:block group-focus-within:block ${alignClass} ${contentClassName}`}
       >
-        {label}
+        {formatScientificText(label)}
       </span>
     </span>
   );

@@ -1,9 +1,18 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronUp, GripHorizontal } from "lucide-react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { cn } from "@/lib/utils";
+import { formatPlotlyDisplayText } from "@/lib/scientific-notation";
 
 const Plot = dynamic(
   async () => {
@@ -35,6 +44,11 @@ export type PlotlyChartProps = {
   figure?: Record<string, unknown>;
   className?: string;
   fitContainer?: boolean;
+  collapsibleLegend?: boolean;
+  legendCollapsed?: boolean;
+  verticallyResizable?: boolean;
+  minHeight?: number;
+  maxHeight?: number;
   deferRenderMs?: number;
   uiRevision?: string;
   onPointClick?: (points: PlotlyPoint[]) => void;
@@ -293,6 +307,30 @@ function compactFigureColorbars(
   return { data: compactData, hasColorbar };
 }
 
+function reclaimHiddenLegendMargin(layout: Record<string, unknown>) {
+  const legend = layout.legend && typeof layout.legend === "object" ? (layout.legend as Record<string, unknown>) : null;
+  if (!legend) {
+    return;
+  }
+  const y = typeof legend.y === "number" ? legend.y : null;
+  const yAnchor = typeof legend.yanchor === "string" ? legend.yanchor : "auto";
+  const legendIsAbovePlot = y != null && (y > 1 || (y >= 1 && yAnchor === "bottom"));
+  const legendIsBelowPlot = y != null && (y < 0 || (y <= 0 && yAnchor === "top"));
+  if (!legendIsAbovePlot && !legendIsBelowPlot) {
+    return;
+  }
+
+  const margin = layout.margin && typeof layout.margin === "object" ? { ...(layout.margin as Record<string, unknown>) } : {};
+  if (legendIsAbovePlot) {
+    margin.t = Math.min(typeof margin.t === "number" ? margin.t : 100, 64);
+  }
+  if (legendIsBelowPlot) {
+    margin.b = Math.min(typeof margin.b === "number" ? margin.b : 80, 56);
+  }
+  margin.autoexpand = true;
+  layout.margin = margin;
+}
+
 function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
   if (typeof structuredClone === "function") {
     try {
@@ -416,6 +454,11 @@ export function PlotlyChart({
   figure,
   className,
   fitContainer = false,
+  collapsibleLegend = false,
+  legendCollapsed = false,
+  verticallyResizable = false,
+  minHeight = 280,
+  maxHeight = 960,
   deferRenderMs = 0,
   uiRevision,
   onPointClick,
@@ -425,13 +468,40 @@ export function PlotlyChart({
 }: PlotlyChartProps) {
   const [renderRevision, setRenderRevision] = useState(0);
   const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
+  const [isLegendExpanded, setIsLegendExpanded] = useState(true);
+  const [chartHeight, setChartHeight] = useState<number | null>(null);
+  const [isResizing, setIsResizing] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const plotContainerRef = useRef<HTMLDivElement>(null);
   const graphDivRef = useRef<PlotlyGraphDiv | null>(null);
+  const initialHeightRef = useRef<number | null>(null);
+  const resizeDragRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null);
   const didRefreshAfterInitializeRef = useRef(false);
   const pointerInteractionTokenRef = useRef(0);
   const consumedPointerInteractionTokenRef = useRef(0);
   const isSynchronizingStandardAxisRef = useRef(false);
   const shouldDeferRender = deferRenderMs > 0;
+  const normalizedMinHeight = Math.max(200, minHeight);
+  const normalizedMaxHeight = Math.max(normalizedMinHeight, maxHeight);
+  const hasCollapsibleLegend = useMemo(() => {
+    if (!collapsibleLegend || !figure) {
+      return false;
+    }
+    const layout = figure.layout && typeof figure.layout === "object" ? (figure.layout as Record<string, unknown>) : {};
+    if (layout.showlegend === false) {
+      return false;
+    }
+    const traces = Array.isArray(figure.data) ? figure.data : [];
+    return traces.some((traceValue) => {
+      if (!traceValue || typeof traceValue !== "object") {
+        return false;
+      }
+      const trace = traceValue as Record<string, unknown>;
+      return trace.showlegend !== false && typeof trace.name === "string" && trace.name.trim().length > 0;
+    });
+  }, [collapsibleLegend, figure]);
+  const isLegendVisible = isLegendExpanded && !legendCollapsed;
+  const shouldFillContainer = fitContainer || verticallyResizable || hasCollapsibleLegend;
   const preparedFigure = useMemo(() => {
     if (!figure || Object.keys(figure).length === 0) {
       return null;
@@ -446,8 +516,14 @@ export function PlotlyChart({
     const hasExplicitHeight = typeof (layout as { height?: unknown }).height === "number";
     delete (layout as { width?: unknown }).width;
     layout.autosize = true;
-    if (fitContainer) {
+    if (shouldFillContainer) {
       delete (layout as { height?: unknown }).height;
+    }
+    if (hasCollapsibleLegend) {
+      layout.showlegend = isLegendVisible;
+      if (!isLegendVisible) {
+        reclaimHiddenLegendMargin(layout);
+      }
     }
     if (compacted.hasColorbar) {
       const margin = layout.margin && typeof layout.margin === "object" ? { ...(layout.margin as Record<string, unknown>) } : {};
@@ -462,13 +538,27 @@ export function PlotlyChart({
     }
     applyPersistedViewport(layout, uiRevision ? persistedViewports.get(uiRevision) : undefined);
     return {
-      data: compacted.data as never[],
-      layout: layout as never,
+      data: formatPlotlyDisplayText(compacted.data) as never[],
+      layout: formatPlotlyDisplayText(layout) as never,
       useResizeHandler: true,
-      fillContainerHeight: fitContainer,
+      fillContainerHeight: shouldFillContainer,
       hasExplicitHeight,
     };
-  }, [figure, fitContainer, uiRevision]);
+  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, uiRevision]);
+
+  useEffect(() => {
+    if (!verticallyResizable || chartHeight !== null) {
+      return;
+    }
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    const measuredHeight = Math.round(container.getBoundingClientRect().height);
+    const initialHeight = Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, measuredHeight));
+    initialHeightRef.current = initialHeight;
+    setChartHeight(initialHeight);
+  }, [chartHeight, isDeferredReady, normalizedMaxHeight, normalizedMinHeight, preparedFigure, verticallyResizable]);
 
   useEffect(() => {
     if (!shouldDeferRender) {
@@ -484,13 +574,14 @@ export function PlotlyChart({
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || !preparedFigure || !isDeferredReady || typeof ResizeObserver === "undefined") {
+    const resizeTarget = plotContainerRef.current ?? container;
+    if (!container || !resizeTarget || !preparedFigure || !isDeferredReady || typeof ResizeObserver === "undefined") {
       return;
     }
 
     let resizeFrame: number | null = null;
-    let lastWidth = container.getBoundingClientRect().width;
-    let lastHeight = container.getBoundingClientRect().height;
+    let lastWidth = resizeTarget.getBoundingClientRect().width;
+    let lastHeight = resizeTarget.getBoundingClientRect().height;
 
     const observer = new ResizeObserver(([entry]) => {
       if (!entry) {
@@ -522,7 +613,7 @@ export function PlotlyChart({
       });
     });
 
-    observer.observe(container);
+    observer.observe(resizeTarget);
     return () => {
       observer.disconnect();
       if (resizeFrame !== null) {
@@ -530,6 +621,25 @@ export function PlotlyChart({
       }
     };
   }, [isDeferredReady, preparedFigure]);
+
+  useEffect(() => {
+    if (!hasCollapsibleLegend || !isDeferredReady) {
+      return;
+    }
+    const resizeFrame = window.requestAnimationFrame(() => {
+      const graphDiv = graphDivRef.current;
+      if (!graphDiv?.isConnected) {
+        return;
+      }
+      void import("@/lib/plotly-core").then(({ default: plotlyModule }) => {
+        if (graphDiv.isConnected) {
+          const Plotly = plotlyModule as unknown as PlotlyResizeApi;
+          void Plotly.Plots.resize(graphDiv);
+        }
+      });
+    });
+    return () => window.cancelAnimationFrame(resizeFrame);
+  }, [hasCollapsibleLegend, isDeferredReady, isLegendVisible]);
 
   function refreshAfterInitialize(_figure?: unknown, graphDiv?: PlotlyGraphDiv) {
     graphDivRef.current = graphDiv ?? null;
@@ -567,6 +677,59 @@ export function PlotlyChart({
     }
     consumedPointerInteractionTokenRef.current = token;
     return true;
+  }
+
+  function clampHeight(value: number): number {
+    return Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, Math.round(value)));
+  }
+
+  function beginVerticalResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!verticallyResizable || event.button !== 0) {
+      return;
+    }
+    const containerHeight = containerRef.current?.getBoundingClientRect().height ?? chartHeight ?? normalizedMinHeight;
+    resizeDragRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startHeight: containerHeight,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setIsResizing(true);
+    event.preventDefault();
+  }
+
+  function continueVerticalResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = resizeDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    setChartHeight(clampHeight(drag.startHeight + event.clientY - drag.startY));
+  }
+
+  function endVerticalResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = resizeDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    resizeDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setIsResizing(false);
+  }
+
+  function resizeWithKeyboard(event: ReactKeyboardEvent<HTMLDivElement>) {
+    const currentHeight = chartHeight ?? containerRef.current?.getBoundingClientRect().height ?? normalizedMinHeight;
+    if (event.key === "ArrowUp") {
+      setChartHeight(clampHeight(currentHeight - 24));
+    } else if (event.key === "ArrowDown") {
+      setChartHeight(clampHeight(currentHeight + 24));
+    } else if (event.key === "Home" && initialHeightRef.current != null) {
+      setChartHeight(initialHeightRef.current);
+    } else {
+      return;
+    }
+    event.preventDefault();
   }
 
   if (!preparedFigure) {
@@ -617,39 +780,97 @@ export function PlotlyChart({
   return (
     <div
       ref={containerRef}
-      className={cn("min-w-0 w-full overflow-hidden", className)}
-      onPointerDownCapture={registerPointerInteraction}
+      className={cn("flex min-w-0 w-full flex-col overflow-hidden", className)}
+      style={chartHeight == null ? undefined : { height: `${chartHeight}px` }}
     >
-      <Plot
-        data={preparedFigure.data}
-        layout={preparedFigure.layout}
-        config={{ responsive: true }}
-        revision={renderRevision}
-        onInitialized={refreshAfterInitialize}
-        onUpdate={(_figure: unknown, graphDiv: PlotlyGraphDiv) => {
-          graphDivRef.current = graphDiv;
-          syncStandardAxisScale(graphDiv, (active) => {
-            isSynchronizingStandardAxisRef.current = active;
-          })
-        }}
-        onRelayout={persistViewportUpdate}
-        useResizeHandler={preparedFigure.useResizeHandler}
-        className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}
-        style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%" }}
-        onClick={(event: { points?: PlotlyPoint[] }) => {
-          if (!onPointClick || !consumePointerInteraction()) {
-            return;
-          }
-          onPointClick(event.points ?? []);
-        }}
-        onSelected={(event: { points?: PlotlyPoint[] } | undefined) => {
-          if (!onSelection || !consumePointerInteraction()) {
-            return;
-          }
-          onSelection(event?.points ?? []);
-        }}
-        {...hoverHandlers}
-      />
+      {hasCollapsibleLegend && isLegendVisible ? (
+        <div className="flex shrink-0 justify-end border-b border-slate-100 bg-slate-50/70 px-2 py-1.5">
+          <button
+            type="button"
+            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-slate-600 transition-colors hover:bg-white hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1"
+            aria-expanded={isLegendVisible}
+            onClick={() => setIsLegendExpanded((current) => !current)}
+          >
+            <ChevronUp className="h-3.5 w-3.5" />
+            Hide legend
+          </button>
+        </div>
+      ) : null}
+      <div
+        ref={plotContainerRef}
+        className={cn("relative min-h-0 w-full", shouldUseContainerHeight ? "flex-1" : "")}
+        onPointerDownCapture={registerPointerInteraction}
+      >
+        {hasCollapsibleLegend && !isLegendVisible && !legendCollapsed ? (
+          <button
+            type="button"
+            className="absolute right-2 top-10 z-20 inline-flex h-7 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2 text-xs font-medium text-slate-700 shadow-sm transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1"
+            aria-expanded={false}
+            onClick={() => setIsLegendExpanded(true)}
+          >
+            <ChevronDown className="h-3.5 w-3.5" />
+            Show legend
+          </button>
+        ) : null}
+        <Plot
+          data={preparedFigure.data}
+          layout={preparedFigure.layout}
+          config={{ responsive: true }}
+          revision={renderRevision}
+          onInitialized={refreshAfterInitialize}
+          onUpdate={(_figure: unknown, graphDiv: PlotlyGraphDiv) => {
+            graphDivRef.current = graphDiv;
+            syncStandardAxisScale(graphDiv, (active) => {
+              isSynchronizingStandardAxisRef.current = active;
+            })
+          }}
+          onRelayout={persistViewportUpdate}
+          useResizeHandler={preparedFigure.useResizeHandler}
+          className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}
+          style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%" }}
+          onClick={(event: { points?: PlotlyPoint[] }) => {
+            if (!onPointClick || !consumePointerInteraction()) {
+              return;
+            }
+            onPointClick(event.points ?? []);
+          }}
+          onSelected={(event: { points?: PlotlyPoint[] } | undefined) => {
+            if (!onSelection || !consumePointerInteraction()) {
+              return;
+            }
+            onSelection(event?.points ?? []);
+          }}
+          {...hoverHandlers}
+        />
+      </div>
+      {verticallyResizable ? (
+        <div
+          role="separator"
+          aria-label="Resize chart height"
+          aria-orientation="horizontal"
+          aria-valuemin={normalizedMinHeight}
+          aria-valuemax={normalizedMaxHeight}
+          aria-valuenow={chartHeight ?? undefined}
+          tabIndex={0}
+          title="Drag to resize chart height. Use the up and down arrow keys for precise changes."
+          className={cn(
+            "group flex h-3 shrink-0 touch-none cursor-ns-resize items-center justify-center border-t border-slate-200 bg-slate-50 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-400",
+            isResizing && "bg-slate-100 text-blue-700",
+          )}
+          onPointerDown={beginVerticalResize}
+          onPointerMove={continueVerticalResize}
+          onPointerUp={endVerticalResize}
+          onPointerCancel={endVerticalResize}
+          onKeyDown={resizeWithKeyboard}
+          onDoubleClick={() => {
+            if (initialHeightRef.current != null) {
+              setChartHeight(initialHeightRef.current);
+            }
+          }}
+        >
+          <GripHorizontal className="h-3.5 w-5" aria-hidden="true" />
+        </div>
+      ) : null}
     </div>
   );
 }

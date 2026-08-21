@@ -20,6 +20,7 @@ import plotly.graph_objects as go
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from ..domain.calibration.core import (
     _apply_isotope_line_offsets,
@@ -66,7 +67,11 @@ from ..domain.contracts import (
     ProcessingExportConfig,
     ProcessingLinearityPreviewData,
     ProcessingWorkspace,
+    OpenAIApiKeyStatus,
+    OpenAIApiKeyUpdate,
     SessionSnapshot,
+    ScientificChatRequest,
+    ScientificChatResponse,
     SpeciesSection,
 )
 from ..domain.constants import (
@@ -104,6 +109,7 @@ from ..domain.processing.cycles import (
 from ..domain.processing.edits import apply_edit_action
 from ..domain.processing.export import (
     CLIENT_OUTPUT_NUMERIC_COLUMNS,
+    DUPLICATE_QUALITY_KEY_COLUMN,
     _build_client_output_frame,
     _build_client_filename,
     _round_client_output_columns,
@@ -145,6 +151,12 @@ from ..domain.shared.plotting import _build_isotope_3d_scatter
 from ..domain.standards import StandardsRepository
 from ..session_store import FileSessionStore
 from ..jobs import JobContext, JobQueueFullError, JobRegistry, TERMINAL_JOB_STATES
+from ..scientific_chat_assistant import run_scientific_chat
+from ..runtime_secrets import (
+    clear_persistent_openai_api_key,
+    get_openai_api_key_status,
+    set_persistent_openai_api_key,
+)
 
 app = FastAPI(title="IRMS API", version="0.1.0")
 
@@ -964,7 +976,127 @@ def _persist_session_update(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "application": "irms-results-analyzer", "version": app.version}
+
+
+@app.get("/settings/openai-api-key", response_model=OpenAIApiKeyStatus)
+def openai_api_key_status() -> OpenAIApiKeyStatus:
+    return OpenAIApiKeyStatus.model_validate(get_openai_api_key_status())
+
+
+@app.put("/settings/openai-api-key", response_model=OpenAIApiKeyStatus)
+def configure_openai_api_key(request: OpenAIApiKeyUpdate) -> OpenAIApiKeyStatus:
+    set_persistent_openai_api_key(request.api_key.get_secret_value())
+    return OpenAIApiKeyStatus.model_validate(get_openai_api_key_status())
+
+
+@app.delete("/settings/openai-api-key", response_model=OpenAIApiKeyStatus)
+def remove_openai_api_key_override() -> OpenAIApiKeyStatus:
+    clear_persistent_openai_api_key()
+    return OpenAIApiKeyStatus.model_validate(get_openai_api_key_status())
+
+
+@app.post("/chat/scientific-assistant", response_model=ScientificChatResponse)
+async def scientific_chat(request: ScientificChatRequest) -> ScientificChatResponse:
+    if not request.message.strip():
+        raise HTTPException(status_code=422, detail="Message must not be blank")
+    if request.current_session_id is not None:
+        _session_exists_or_404(request.current_session_id)
+    try:
+        result = await run_in_threadpool(run_scientific_chat, request, store)
+    except ModuleNotFoundError as exc:
+        if exc.name == "openai":
+            raise HTTPException(
+                status_code=503,
+                detail="The OpenAI SDK is not installed in the IRMS backend environment. Restart the app so requirements can be synchronized.",
+            ) from exc
+        raise
+    except RuntimeError as exc:
+        if "OPENAI_API_KEY" in str(exc):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise
+    return ScientificChatResponse.model_validate(result)
+
+
+async def _read_chat_workbooks(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+    maximum_files = max(1, int(os.getenv("IRMS_CHAT_MAX_FILES", "5")))
+    maximum_bytes = max(1, int(os.getenv("IRMS_CHAT_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024))))
+    if len(files) > maximum_files:
+        raise HTTPException(
+            status_code=413,
+            detail=f"The scientific assistant accepts at most {maximum_files} workbook(s) per request.",
+        )
+    uploaded: list[tuple[str, bytes]] = []
+    total = 0
+    for file in files:
+        filename = Path(file.filename or "upload.xlsx").name
+        if Path(filename).suffix.casefold() not in {".xls", ".xlsx"}:
+            raise HTTPException(
+                status_code=415,
+                detail=f"Unsupported attachment {filename!r}; upload an .xls or .xlsx workbook.",
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "Excel attachments exceed the scientific assistant's combined "
+                        f"{maximum_bytes // (1024 * 1024)} MB limit."
+                    ),
+                )
+            chunks.append(chunk)
+        uploaded.append((filename, b"".join(chunks)))
+    return uploaded
+
+
+@app.post("/chat/scientific-assistant-with-files", response_model=ScientificChatResponse)
+async def scientific_chat_with_files(
+    message: str = Form(...),
+    history: str = Form(default="[]"),
+    current_session_id: str | None = Form(default=None),
+    files: list[UploadFile] = File(default=[]),
+) -> ScientificChatResponse:
+    try:
+        parsed_history = json.loads(history)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="Chat history must be valid JSON.") from exc
+    try:
+        request = ScientificChatRequest.model_validate(
+            {
+                "message": message,
+                "history": parsed_history,
+                "current_session_id": current_session_id or None,
+            }
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid scientific chat request: {exc}") from exc
+    if request.current_session_id is not None:
+        _session_exists_or_404(request.current_session_id)
+    uploaded = await _read_chat_workbooks(files)
+    try:
+        result = await run_in_threadpool(
+            run_scientific_chat, request, store, None, uploaded
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "openai":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The OpenAI SDK is not installed in the IRMS backend environment. "
+                    "Restart the app so requirements can be synchronized."
+                ),
+            ) from exc
+        raise
+    except RuntimeError as exc:
+        if "OPENAI_API_KEY" in str(exc):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise
+    return ScientificChatResponse.model_validate(result)
 
 
 def _job_or_404(job_id: str) -> JobSnapshot:
@@ -1375,6 +1507,88 @@ def exclude_session_file(session_id: str, file_index: int = Query(..., ge=0)) ->
     return ImportResult(session=_to_session_snapshot(session_id))
 
 
+def _import_naming_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def _import_source_file_key(value: Any) -> str:
+    text = _import_naming_text(value).replace("\\", "/")
+    return Path(text).name.casefold() if text else ""
+
+
+def _build_species_source_details(
+    df: pd.DataFrame,
+    metadata: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    software_by_file: dict[str, str] = {}
+    for source_file in metadata.get("source_files", []):
+        if not isinstance(source_file, dict):
+            continue
+        identity_parsing = source_file.get("identity_parsing", {})
+        if not isinstance(identity_parsing, dict):
+            identity_parsing = {}
+        software = _import_naming_text(source_file.get("software") or identity_parsing.get("software")).lower()
+        if software not in {"qtegra", "isodat"}:
+            software = "generic"
+        for candidate in (source_file.get("name"), source_file.get("raw_name")):
+            file_key = _import_source_file_key(candidate)
+            if file_key:
+                software_by_file[file_key] = software
+
+    known_software = {value for value in software_by_file.values() if value != "generic"}
+    default_software = next(iter(known_software)) if len(known_software) == 1 else "generic"
+    details_by_species: dict[str, list[dict[str, Any]]] = {}
+    detail_index_by_species: dict[str, dict[tuple[str, ...], int]] = {}
+    species_series = _get_species_series(df)
+
+    for position, species_value in enumerate(species_series.tolist()):
+        source = _import_naming_text(species_value)
+        if not source:
+            continue
+        row = df.iloc[position]
+        source_file = _import_naming_text(row.get("Excel File"))
+        software = software_by_file.get(_import_source_file_key(source_file), default_software)
+        raw_label = _import_naming_text(row.get("Raw Label")) or _import_naming_text(row.get("Label"))
+        raw_identifier1 = _import_naming_text(row.get("Raw Identifier 1")) or _import_naming_text(row.get("Identifier 1"))
+        raw_identifier2 = _import_naming_text(row.get("Raw Identifier 2")) or _import_naming_text(row.get("Identifier 2"))
+        raw_comment = _import_naming_text(row.get("Raw Comment")) or _import_naming_text(row.get("Comment"))
+        if software == "generic":
+            if raw_identifier1 or raw_identifier2:
+                software = "isodat"
+            elif raw_label:
+                software = "qtegra"
+
+        token = (software, source_file, raw_label, raw_identifier1, raw_identifier2, raw_comment)
+        source_indexes = detail_index_by_species.setdefault(source, {})
+        source_details = details_by_species.setdefault(source, [])
+        existing_index = source_indexes.get(token)
+        if existing_index is not None:
+            source_details[existing_index]["occurrences"] += 1
+            continue
+        if len(source_details) >= 3:
+            continue
+        source_indexes[token] = len(source_details)
+        source_details.append(
+            {
+                "software": software,
+                "source_file": source_file,
+                "raw_label": raw_label,
+                "raw_identifier1": raw_identifier1,
+                "raw_identifier2": raw_identifier2,
+                "raw_comment": raw_comment,
+                "occurrences": 1,
+            }
+        )
+    return details_by_species
+
+
 def _build_import_naming_workspace(
     session_id: str,
     *,
@@ -1402,6 +1616,7 @@ def _build_import_naming_workspace(
         identifier1_name_map=dict(config.identifier1_name_map),
         identifier1_sources=identifier1_sources,
         species_sources=species_sources,
+        species_source_details=_build_species_source_details(df, meta),
     )
 
 
@@ -2667,6 +2882,8 @@ def _processing_linearity_preview_rows(
         "Species",
         "Comment",
         "Label",
+        "Raw Comment",
+        "Raw Label",
         SAMPLE_SEQUENCE_COL,
         VALID_CYCLES_COL,
         CYCLE1_SIGNAL_SAMP44_COL,
@@ -3092,8 +3309,18 @@ def _build_final_client_output_frame(
         for row in request.client_output_rows:
             reviewed = {column: row.get(column) for column in visible_columns}
             reviewed["__identifier_2_key"] = row.get("__identifier_2_key", row.get("Sample #", ""))
+            reviewed[DUPLICATE_QUALITY_KEY_COLUMN] = bool(
+                row.get(DUPLICATE_QUALITY_KEY_COLUMN, False)
+            )
             reviewed_rows.append(reviewed)
-        client_df = pd.DataFrame(reviewed_rows, columns=[*visible_columns, "__identifier_2_key"])
+        client_df = pd.DataFrame(
+            reviewed_rows,
+            columns=[
+                *visible_columns,
+                "__identifier_2_key",
+                DUPLICATE_QUALITY_KEY_COLUMN,
+            ],
+        )
         for column in CLIENT_OUTPUT_NUMERIC_COLUMNS:
             if column in client_df.columns:
                 client_df[column] = pd.to_numeric(client_df[column], errors="coerce").round(2)
@@ -3188,7 +3415,10 @@ def _prepare_client_output_preview(
 @app.post("/sessions/{session_id}/exports/client-output/preview", response_model=ClientOutputPreviewResponse)
 def preview_client_output(session_id: str, request: ExportRequest) -> ClientOutputPreviewResponse:
     client_df, duplicate_summary = _prepare_client_output_preview(session_id, request)
-    export_df = client_df.drop(columns=["__identifier_2_key"], errors="ignore")
+    export_df = client_df.drop(
+        columns=[column for column in client_df.columns if str(column).startswith("__")],
+        errors="ignore",
+    )
     preview_df = client_df.astype(object).where(pd.notna(client_df), None)
     client_name = str(request.client_name or "")
     return ClientOutputPreviewResponse(

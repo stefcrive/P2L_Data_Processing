@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { cn } from "@/lib/utils";
+import { formatScientificText } from "@/lib/scientific-notation";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -72,8 +73,8 @@ export function DualRangeField({
 
   return (
     <fieldset className={cn("range-field", className)}>
-      <legend className="range-field__label">{label}</legend>
-      {description ? <p className="range-field__description">{description}</p> : null}
+      <legend className="range-field__label">{formatScientificText(label)}</legend>
+      {description ? <p className="range-field__description">{formatScientificText(description)}</p> : null}
       <div className="range-field__controls">
         <label className="range-field__number">
           <span>Low</span>

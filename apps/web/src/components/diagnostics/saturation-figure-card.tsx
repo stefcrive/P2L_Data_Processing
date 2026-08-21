@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { AlertTriangle, Info } from "lucide-react";
 
 import { PlotlyChart } from "@/components/charts/lazy-plotly-chart";
+import { formatScientificText } from "@/lib/scientific-notation";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 
@@ -16,8 +17,8 @@ export const SATURATION_COLOR_AXIS_OPTIONS: Array<{ value: SaturationAxisKey; la
   { value: "ref44", label: "Ref44" },
   { value: "mean44", label: "Mean44" },
   { value: "mismatch", label: "Mismatch" },
-  { value: "d13C", label: "d13C cycle signal" },
-  { value: "d18O", label: "d18O cycle signal" },
+  { value: "d13C", label: "δ¹³C cycle signal" },
+  { value: "d18O", label: "δ¹⁸O cycle signal" },
 ];
 
 const SATURATION_AXIS_HELP_TEXT =
@@ -30,6 +31,9 @@ type SaturationFigureCardProps = {
   figure?: Record<string, unknown>;
   colorAxis: SaturationAxisKey;
   yAxis: SaturationAxisKey;
+  collapsibleLegend?: boolean;
+  legendCollapsed?: boolean;
+  verticallyResizable?: boolean;
   deferRenderMs?: number;
 };
 
@@ -168,8 +172,8 @@ function normalHoverTemplate(xTitle: string, yTitle: string, colorTitle: string)
     "Ref44: %{customdata[3]:.4g} V",
     "Mean44: %{customdata[4]:.4g} V",
     "Mismatch: %{customdata[5]:.4g}",
-    "d13C: %{customdata[6]:.4g}",
-    "d18O: %{customdata[7]:.4g}",
+    "δ¹³C: %{customdata[6]:.4g}",
+    "δ¹⁸O: %{customdata[7]:.4g}",
     "<extra></extra>",
   ].join("<br>");
 }
@@ -184,8 +188,8 @@ function swappedHoverTemplate(colorTitle: string, originalXTitle: string, yTitle
     "Ref44: %{customdata[3]:.4g} V",
     "Mean44: %{customdata[4]:.4g} V",
     "Mismatch: %{customdata[5]:.4g}",
-    "d13C: %{customdata[6]:.4g}",
-    "d18O: %{customdata[7]:.4g}",
+    "δ¹³C: %{customdata[6]:.4g}",
+    "δ¹⁸O: %{customdata[7]:.4g}",
     "<extra></extra>",
   ].join("<br>");
 }
@@ -319,7 +323,7 @@ export function SaturationSharedColorbar({
   }
   return (
     <div className="w-full max-w-[280px] min-w-[180px] text-xs">
-      <div className="mb-1 text-stone-600">{axisLabel(colorAxis)} scale</div>
+      <div className="mb-1 text-stone-600">{formatScientificText(axisLabel(colorAxis))} scale</div>
       <div className="h-2 rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]" />
       <div className="mt-0.5 flex justify-between gap-3 text-[10px] tabular-nums text-stone-500">
         <span>{range ? formatRangeValue(range.min) : "N/A"}</span>
@@ -332,21 +336,32 @@ export function SaturationSharedColorbar({
 export function SaturationAxisHelpTooltip({ label }: { label: string }) {
   return (
     <span className="mb-1 flex items-center gap-1.5 text-stone-700">
-      <span>{label}</span>
+      <span>{formatScientificText(label)}</span>
       <Tooltip label={SATURATION_AXIS_HELP_TEXT} align="start" contentClassName="w-96">
         <span
           tabIndex={0}
           className="inline-flex h-5 w-5 items-center justify-center rounded-md text-stone-500 hover:bg-stone-100 hover:text-stone-700 focus:outline-none focus:ring-2 focus:ring-stone-300"
         >
           <Info className="h-3.5 w-3.5" />
-          <span className="sr-only">{label} parameter help</span>
+          <span className="sr-only">{formatScientificText(label)} parameter help</span>
         </span>
       </Tooltip>
     </span>
   );
 }
 
-export function SaturationFigureCard({ chartKey, title, description, figure, colorAxis, yAxis, deferRenderMs = 0 }: SaturationFigureCardProps) {
+export function SaturationFigureCard({
+  chartKey,
+  title,
+  description,
+  figure,
+  colorAxis,
+  yAxis,
+  collapsibleLegend = false,
+  legendCollapsed = false,
+  verticallyResizable = false,
+  deferRenderMs = 0,
+}: SaturationFigureCardProps) {
   const [swapped, setSwapped] = useState(false);
   const displayedFigure = useMemo(() => prepareFigure(figure, colorAxis, yAxis, swapped), [colorAxis, figure, swapped, yAxis]);
   const swappedMessage = `X is set to ${axisLabel(colorAxis)}; fit and prediction traces are hidden in this view.`;
@@ -369,17 +384,20 @@ export function SaturationFigureCard({ chartKey, title, description, figure, col
         figure={displayedFigure}
         className="h-[320px] w-full"
         fitContainer
+        collapsibleLegend={collapsibleLegend}
+        legendCollapsed={legendCollapsed}
+        verticallyResizable={verticallyResizable}
         deferRenderMs={deferRenderMs}
       />
       <div className="flex min-w-0 items-center gap-2 px-1 pt-2">
         {description ? (
           <Tooltip label={description} align="start" contentClassName="w-96">
             <button type="button" className="truncate text-left text-sm font-medium text-stone-700 underline decoration-stone-300 underline-offset-4">
-              {title}
+              {formatScientificText(title)}
             </button>
           </Tooltip>
         ) : (
-          <div className="truncate text-sm font-medium text-stone-700">{title}</div>
+          <div className="truncate text-sm font-medium text-stone-700">{formatScientificText(title)}</div>
         )}
         {swapped ? (
           <Tooltip label={swappedMessage} align="end" contentClassName="w-80">

@@ -6,8 +6,8 @@ import { BackToTopButton } from "@/components/layout/back-to-top-button";
 import { QueryProvider } from "@/components/layout/query-provider";
 
 export const metadata: Metadata = {
-  title: "IRMS Dashboard",
-  description: "Next.js dashboard for the IRMS analyzer refactor",
+  title: "IRMS Results Station",
+  description: "Workspace for processing and reviewing IRMS results",
 };
 
 const sans = Manrope({

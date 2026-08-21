@@ -1,8 +1,9 @@
 import * as React from "react";
 
 import { cn } from "@/lib/utils";
+import { formatScientificText } from "@/lib/scientific-notation";
 
-export function Badge({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+export function Badge({ className, children, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
       className={cn(
@@ -10,6 +11,8 @@ export function Badge({ className, ...props }: React.HTMLAttributes<HTMLDivEleme
         className,
       )}
       {...props}
-    />
+    >
+      {typeof children === "string" ? formatScientificText(children) : children}
+    </div>
   );
 }

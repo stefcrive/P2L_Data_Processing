@@ -1,6 +1,7 @@
 "use client";
 
 import { cn } from "@/lib/utils";
+import { formatScientificText } from "@/lib/scientific-notation";
 
 function asBoolean(value: unknown): boolean {
   if (typeof value === "boolean") {
@@ -118,7 +119,7 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
             <tr>
               {columns.map((column) => (
                 <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                  {column}
+                  {formatScientificText(column)}
                 </th>
               ))}
             </tr>

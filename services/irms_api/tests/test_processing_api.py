@@ -374,6 +374,8 @@ class ProcessingApiTests(unittest.TestCase):
         frame["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
         frame["total_co2"] = [1.0, 1.1, 1.2, 1.3]
         frame["p_gases"] = [201.0, 202.0, 203.0, 204.0]
+        frame["Raw Label"] = ["input label A", "input label B", "input label C", "input label D"]
+        frame["Raw Comment"] = ["input comment A", "input comment B", "input comment C", "input comment D"]
         api_main.store.save_frames(self.session_id, frame, sample_cycles_df())
         metadata = api_main.store.load_metadata(self.session_id)
         metadata_before = dict(metadata)
@@ -416,6 +418,8 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertAlmostEqual(float(row0.attributes["p_no_acid"]), 101.0, places=6)
         self.assertAlmostEqual(float(row0.attributes["total_co2"]), 1.0, places=6)
         self.assertAlmostEqual(float(row0.attributes["p_gases"]), 201.0, places=6)
+        self.assertEqual(row0.attributes["Raw Label"], "input label A")
+        self.assertEqual(row0.attributes["Raw Comment"], "input comment A")
         # Preview rows are intentionally pre-linearity and pre-line-offset so the client can draft edits locally.
         self.assertNotEqual(float(row0.d13_raw), 4.0)
         self.assertEqual(api_main.store.load_metadata(self.session_id)["calibration"], metadata["calibration"])
@@ -535,6 +539,8 @@ class ProcessingApiTests(unittest.TestCase):
     def test_cycle_diagnostics_and_export_endpoints(self) -> None:
         source_df = api_main.store.load_frame(self.session_id)
         source_df.loc[0, "d 13C/12C  Mean"] = 1.2345
+        source_df.loc[0, "Start Time"] = "09:10:11"
+        source_df.loc[0, "Instrument Method"] = "Carbonate"
         api_main.store.save_frames(self.session_id, source_df, api_main.store.load_cycles_frame(self.session_id))
         diagnostics = api_main.processing_cycle_diagnostics(
             self.session_id,
@@ -542,6 +548,12 @@ class ProcessingApiTests(unittest.TestCase):
         )
         self.assertEqual(len(diagnostics.table), 2)
         self.assertEqual(diagnostics.target["row_label"], 0)
+        self.assertAlmostEqual(float(diagnostics.analysis_info["Isotopic value"]), 1.0, places=6)
+        self.assertAlmostEqual(float(diagnostics.analysis_info["Internal stdev"]), 0.10, places=6)
+        self.assertEqual(diagnostics.analysis_info["Line"], 1)
+        self.assertEqual(diagnostics.analysis_info["Analysis time"], "09:10:11")
+        self.assertEqual(diagnostics.analysis_info["Origin file"], "run1.xlsx")
+        self.assertEqual(diagnostics.analysis_info["Instrument Method"], "Carbonate")
 
         export_without_outliers = api_main.export_dataset(
             self.session_id,
@@ -868,11 +880,23 @@ class ProcessingApiTests(unittest.TestCase):
                 "d18O",
                 "Leak Rate",
                 "Total CO2",
-                "P no Acid",
-                "P Gasses",
-                "Initial Sample Intensity",
+                "Line",
                 "Isotope Comparison",
                 "Multivariate Overview",
+            ],
+        )
+
+        line_items = [item for item in grid_meta if item["group"] == "Line"]
+        self.assertEqual(
+            [item["title"] for item in line_items],
+            [
+                "d13C vs Line",
+                "d18O vs Line",
+                "Leak Rate vs Line",
+                "Total CO2 vs Line",
+                "P no Acid vs Line",
+                "P Gasses vs Line",
+                "Initial Sample Intensity vs Line",
             ],
         )
 
@@ -917,7 +941,7 @@ class ProcessingApiTests(unittest.TestCase):
         )
 
         grid_meta = bundle.summary.get("diagnostic_grid", [])
-        self.assertEqual(len(grid_meta), 26)
+        self.assertEqual(len(grid_meta), 28)
         self.assertEqual(grid_meta[0]["group"], "d13C")
         self.assertEqual(bundle.summary.get("selected_standards"), ["SampleA"])
 
@@ -1027,9 +1051,9 @@ class ProcessingApiTests(unittest.TestCase):
 
         sheet = pd.read_excel(io.BytesIO(export_client_output.body), sheet_name="Client Output", header=None)
         text_cells = {str(value) for value in sheet.to_numpy().ravel() if isinstance(value, str) and value.strip()}
-        self.assertIn("d13C n=2, d18O n=2", text_cells)
-        self.assertNotIn("0.00 ‰ for d13C", text_cells)
-        self.assertNotIn("0.00 ‰ for d18O", text_cells)
+        self.assertIn("δ¹³C n=2, δ¹⁸O n=2", text_cells)
+        self.assertNotIn("0.00 ‰ for δ¹³C", text_cells)
+        self.assertNotIn("0.00 ‰ for δ¹⁸O", text_cells)
 
 
     def test_client_output_precision_matches_calibration_workspace_linearity_mode(self) -> None:
@@ -1088,12 +1112,12 @@ class ProcessingApiTests(unittest.TestCase):
 
         sheet = pd.read_excel(io.BytesIO(export_client_output.body), sheet_name="Client Output", header=None)
         text_cells = [str(value) for value in sheet.to_numpy().ravel() if isinstance(value, str) and value.strip()]
-        d13_line = next((cell for cell in text_cells if "for d13C" in cell), "")
-        d18_line = next((cell for cell in text_cells if "for d18O" in cell), "")
-        n_line = next((cell for cell in text_cells if cell.startswith("d13C n=")), "")
+        d13_line = next((cell for cell in text_cells if "for δ¹³C" in cell), "")
+        d18_line = next((cell for cell in text_cells if "for δ¹⁸O" in cell), "")
+        n_line = next((cell for cell in text_cells if cell.startswith("δ¹³C n=")), "")
         self.assertTrue(d13_line.startswith(f"{float(expected_d13):.2f}"))
         self.assertTrue(d18_line.startswith(f"{float(expected_d18):.2f}"))
-        self.assertEqual(n_line, f"d13C n={int(shp_summary.included_d13)}, d18O n={int(shp_summary.included_d18)}")
+        self.assertEqual(n_line, f"δ¹³C n={int(shp_summary.included_d13)}, δ¹⁸O n={int(shp_summary.included_d18)}")
 
     def test_duplicate_check_uses_identifier1_identifier2_species_composite(self) -> None:
         df = sample_processing_df().copy()
@@ -1155,6 +1179,41 @@ class ProcessingApiTests(unittest.TestCase):
         )
         self.assertEqual(resolved_preview.duplicate_row_count, 0)
         self.assertEqual(resolved_preview.duplicate_row_indexes, [])
+
+    def test_duplicate_check_ignores_failed_or_low_signal_attempt_followed_by_valid_reanalysis(self) -> None:
+        for failure_kind in ("failed", "low_signal"):
+            with self.subTest(failure_kind=failure_kind):
+                df = sample_processing_df().copy()
+                df.loc[3, ["Identifier 1", "Identifier 2", "Species"]] = ["SampleA", "1", "Coral"]
+                if failure_kind == "failed":
+                    df.loc[3, "Collector Status"] = "Failed Sample"
+                else:
+                    df.loc[3, "1  Cycle Int  Samp  44"] = 1.5
+                api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+                request = ExportRequest(
+                    include_outliers=True,
+                    selected_ids=["All"],
+                    interpolate_outliers=False,
+                    client_name="Client A",
+                    comment_map={"Coral": "Porites"},
+                    output_type="client_output",
+                )
+                preview = api_main.preview_client_output(self.session_id, request)
+
+                self.assertEqual(preview.duplicate_row_count, 0)
+                self.assertEqual(preview.duplicate_row_indexes, [])
+                self.assertEqual(
+                    sum(bool(row["__duplicate_failed_or_low_signal"]) for row in preview.rows),
+                    1,
+                )
+
+                reviewed_request = request.model_copy(update={"client_output_rows": preview.rows})
+                reviewed_check = api_main.check_client_output_duplicates(
+                    self.session_id,
+                    reviewed_request,
+                )
+                self.assertEqual(reviewed_check.duplicate_row_count, 0)
 
     def test_client_output_preview_returns_all_rows_and_supports_raw_field_mapping(self) -> None:
         base = sample_processing_df().iloc[[0]].copy()

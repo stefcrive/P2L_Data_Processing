@@ -3,6 +3,8 @@
 import { ChevronDown } from "lucide-react";
 import { useMemo } from "react";
 
+import { formatScientificText } from "@/lib/scientific-notation";
+
 type MultiSelectDropdownProps = {
   label: string;
   options: string[];
@@ -31,7 +33,7 @@ export function MultiSelectDropdown({
 
   return (
     <div className="form-field">
-      <span className="form-label">{label}</span>
+      <span className="form-label">{formatScientificText(label)}</span>
       <details className="group relative">
         <summary className="form-control list-none cursor-pointer">
           <div className="flex items-center justify-between gap-3">
@@ -58,7 +60,7 @@ export function MultiSelectDropdown({
                     onChange={(event) => toggleOption(option, event.target.checked)}
                     className="mt-0.5 h-4 w-4 accent-stone-900"
                   />
-                  <span className="truncate text-sm text-stone-700">{option}</span>
+                  <span className="truncate text-sm text-stone-700">{formatScientificText(option)}</span>
                 </label>
               ))
             ) : (

@@ -10,15 +10,15 @@ from ..shared.dataframe import _parse_numeric_token
 
 MATERIALS_METHODS_TEXT = (
     'When results produced at P2L are being published, we suggest using the following text in the "Material and Methods" section of the publication:\n\n'
-    '"Analyses on (your samples) for determination of d13C and d18O were performed at the Paleoceanography and Paleoclimatology '
+    '"Analyses on (your samples) for determination of δ¹³C and δ¹⁸O were performed at the Paleoceanography and Paleoclimatology '
     "Laboratory, School of Arts, Sciences and Humanities of the University of Sao Paulo, Brazil. The laboratory is equipped with a Thermo "
     "Fisher Scientific MAT253 isotope ratio mass spectrometer (IRMS) coupled with a Thermo Fisher Scientific Kiel IV carbonate "
     "preparation device. The details on the laboratory analytical setup and performance are described in Crivellari et al. (2021). The IRMS "
-    "measures the isotopic composition of the CO2 developed by the reaction between the sample carbonate and orthophosphoric acid at "
+    "measures the isotopic composition of the CO₂ developed by the reaction between the sample carbonate and orthophosphoric acid at "
     "70\u00b0C. Measurements were calibrated against repeated analyses of SHP2L reference material which is used as internal working "
     "standard (Crivellari et al., 2021). SHP2L is in turn calibrated against international reference material NBS19 and values are anchored to "
-    "the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) \u2030 for d13C "
-    "and (please use the value informed by P2L) \u2030 for d18O (\u00b11 s, n = please use the value informed by P2L).\"\n\n"
+    "the Vienna Pee Dee Belemnite (VPDB) scale. Analytical precision was better than (please use the value informed by P2L) \u2030 for δ¹³C "
+    "and (please use the value informed by P2L) \u2030 for δ¹⁸O (\u00b11 s, n = please use the value informed by P2L).\"\n\n"
     "Reference\n"
     "Crivellari, S., Viana, P.J., Campos, M.D., Kuhnert, H., Lopes, A.B.M., da Cruz, F.W., Chiessi, C.M., 2021. Development and "
     "characterization of a new in-house reference material for stable carbon and oxygen isotopes analyses. Journal of Analytical Atomic "
@@ -33,6 +33,9 @@ CLIENT_OUTPUT_NUMERIC_COLUMNS = [
     "Corrected d13C (\u2030, VPDB)",
     "Corrected d18O (\u2030, VPDB)",
 ]
+
+LOW_SIGNAL_THRESHOLD_V = 2.0
+DUPLICATE_QUALITY_KEY_COLUMN = "__duplicate_failed_or_low_signal"
 
 
 def _sanitize_filename(name: str) -> str:
@@ -185,6 +188,21 @@ def _build_client_output_frame(
                 data_sheet.get("d18O_calibrated_linearity_corrected", data_sheet.get("d18O_calibrated")),
                 errors="coerce",
             ),
+            DUPLICATE_QUALITY_KEY_COLUMN: (
+                data_sheet.get("Collector Status", pd.Series("", index=data_sheet.index, dtype=object))
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.casefold()
+                .eq("failed sample")
+                | pd.to_numeric(
+                    data_sheet.get(
+                        "1  Cycle Int  Samp  44",
+                        pd.Series(float("nan"), index=data_sheet.index, dtype=float),
+                    ),
+                    errors="coerce",
+                ).lt(LOW_SIGNAL_THRESHOLD_V)
+            ),
         }
     if show_sequence:
         columns = {"Identifier": columns.pop("Identifier"), "Sample #": columns.pop("Sample #"), "Sequence": sequence_series, **columns}
@@ -225,6 +243,14 @@ def summarize_client_output_duplicates(client_df: pd.DataFrame) -> dict[str, Any
     species_series = _normalize_duplicate_key_series(
         client_df.get("Species", pd.Series("", index=client_df.index, dtype=object))
     )
+    failed_or_low_signal_series = (
+        client_df.get(
+            DUPLICATE_QUALITY_KEY_COLUMN,
+            pd.Series(False, index=client_df.index, dtype=bool),
+        )
+        .fillna(False)
+        .astype(bool)
+    )
     duplicate_identity_series = pd.Series(
         (
             _build_duplicate_identity_key(identifier1_value, identifier2_value, species_value)
@@ -235,7 +261,14 @@ def summarize_client_output_duplicates(client_df: pd.DataFrame) -> dict[str, Any
         index=client_df.index,
         dtype=object,
     )
-    duplicate_identity_mask = identifier2_series.ne("") & duplicate_identity_series.duplicated(keep=False)
+    # A failed/low-signal attempt followed by a valid reanalysis is intentional, so
+    # compare duplicates only among rows with the same result-quality classification.
+    duplicate_comparison_key = pd.Series(
+        zip(duplicate_identity_series.tolist(), failed_or_low_signal_series.tolist()),
+        index=client_df.index,
+        dtype=object,
+    )
+    duplicate_identity_mask = identifier2_series.ne("") & duplicate_comparison_key.duplicated(keep=False)
     duplicate_row_mask = duplicate_identity_mask.astype(bool)
 
     duplicate_columns = [column for column in ["Identifier", "Sample #", "Species", "Sequence"] if column in client_df.columns]
@@ -336,9 +369,9 @@ def _format_client_output_worksheet(
     worksheet.write(1, equip_value_col, "ThermoFisher Scientific MAT253 gas isotope ratio mass spectrometer", equip_text_fmt)
     worksheet.write(2, equip_value_col, "Kiel IV automated carbonate preparation device", equip_text_fmt)
     worksheet.write(4, equip_title_col, "Standard deviation of SHP2L over measurement period:", equip_title_fmt)
-    worksheet.write(5, equip_value_col, f"{d13_std:.2f} \u2030 for d13C")
-    worksheet.write(6, equip_value_col, f"{d18_std:.2f} \u2030 for d18O")
-    worksheet.write(7, equip_value_col, f"d13C n={n13}, d18O n={n18}")
+    worksheet.write(5, equip_value_col, f"{d13_std:.2f} \u2030 for δ¹³C")
+    worksheet.write(6, equip_value_col, f"{d18_std:.2f} \u2030 for δ¹⁸O")
+    worksheet.write(7, equip_value_col, f"δ¹³C n={n13}, δ¹⁸O n={n18}")
     textbox_anchor = f"{_excel_col_name(equip_value_col)}10"
     worksheet.insert_textbox(
         textbox_anchor,
@@ -422,7 +455,10 @@ def build_client_output_workbook_bytes(
             kind="mergesort",
         ).reset_index(drop=True)
     duplicate_summary = summarize_client_output_duplicates(client_df)
-    export_df = client_df.drop(columns=["__identifier_2_key"], errors="ignore")
+    export_df = client_df.drop(
+        columns=[column for column in client_df.columns if str(column).startswith("__")],
+        errors="ignore",
+    )
     precision_df = precision_source_df if precision_source_df is not None else df
     with pd.ExcelWriter(towrite, engine="xlsxwriter") as writer:
         sheet_name = "Client Output"

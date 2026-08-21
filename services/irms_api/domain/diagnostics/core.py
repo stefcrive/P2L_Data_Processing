@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import least_squares
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
@@ -66,6 +67,134 @@ def _partially_saturated_mask(df: pd.DataFrame) -> pd.Series:
     normalized = pd.Series(status_series, index=df.index).fillna("").astype(str).str.strip().str.lower()
     return normalized.eq("partially saturated collectors")
 
+
+def _fit_saturating_co2_curve(
+    x_values: pd.Series,
+    y_values: pd.Series,
+    *,
+    grid_size: int = 200,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Fit a robust, nonnegative CO2 curve that approaches an upper plateau."""
+    x_numeric = pd.to_numeric(x_values, errors="coerce").to_numpy(dtype=float)
+    y_numeric = pd.to_numeric(y_values, errors="coerce").to_numpy(dtype=float)
+    nonnegative_x = np.isfinite(x_numeric) & (x_numeric >= 0.0)
+    valid = (
+        nonnegative_x
+        & np.isfinite(y_numeric)
+        & (y_numeric >= 0.0)
+    )
+    x_clean = x_numeric[valid]
+    y_clean = y_numeric[valid]
+    if len(x_clean) < 3 or np.unique(x_clean).size < 2:
+        return None
+
+    positive_x = x_clean[x_clean > 0.0]
+    if positive_x.size == 0 or float(np.max(y_clean)) <= 0.0:
+        return None
+
+    max_x = float(np.max(x_numeric[nonnegative_x]))
+    max_y = float(np.max(y_clean))
+    initial_plateau = max(float(np.percentile(y_clean, 75)), np.finfo(float).eps)
+    initial_scale = max(float(np.median(positive_x)), np.finfo(float).eps)
+    residual_scale = max(
+        float(np.median(np.abs(y_clean - np.median(y_clean)))),
+        max_y * 0.05,
+        np.finfo(float).eps,
+    )
+
+    def residuals(parameters: np.ndarray) -> np.ndarray:
+        plateau, scale = parameters
+        predicted = plateau * (-np.expm1(-x_clean / scale))
+        return predicted - y_clean
+
+    try:
+        fit = least_squares(
+            residuals,
+            x0=np.asarray([initial_plateau, initial_scale]),
+            bounds=(
+                np.asarray([np.finfo(float).eps, max_x * 1e-6]),
+                np.asarray([max(max_y * 10.0, 1.0), max_x * 100.0]),
+            ),
+            loss="soft_l1",
+            f_scale=residual_scale,
+        )
+    except (ValueError, FloatingPointError):
+        return None
+    if not fit.success or not np.isfinite(fit.x).all():
+        return None
+
+    plateau, scale = fit.x
+    x_curve = np.linspace(0.0, max_x, max(2, int(grid_size)))
+    y_curve = plateau * (-np.expm1(-x_curve / scale))
+    return x_curve, y_curve
+
+
+def _leading_variability_contributions(
+    frame: pd.DataFrame,
+    features: list[str],
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Rank variables by their weighted contribution to the first two principal axes."""
+    numeric = frame[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    complete = numeric.dropna()
+    if len(complete.index) < 2:
+        return None
+
+    scaled = StandardScaler().fit_transform(complete)
+    if not np.isfinite(scaled).all() or np.allclose(np.var(scaled, axis=0), 0.0):
+        return None
+
+    component_count = min(2, scaled.shape[0], scaled.shape[1])
+    pca = PCA(n_components=component_count)
+    pca.fit(scaled)
+    explained_ratio = np.nan_to_num(pca.explained_variance_ratio_, nan=0.0)
+    captured_ratio = float(explained_ratio.sum())
+    if captured_ratio <= 0.0:
+        return None
+
+    weighted = np.square(pca.components_.T) * explained_ratio
+    component_contributions = weighted / captured_ratio * 100.0
+    total_contributions = component_contributions.sum(axis=1)
+    return total_contributions, component_contributions, captured_ratio * 100.0
+
+
+def _explained_variance_by_component(
+    frame: pd.DataFrame,
+    features: list[str],
+) -> tuple[np.ndarray, np.ndarray, int] | None:
+    """Return explained and cumulative variance for all estimable principal components."""
+    numeric = frame[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    complete = numeric.dropna()
+    if len(complete.index) < 2:
+        return None
+
+    scaled = StandardScaler().fit_transform(complete)
+    if not np.isfinite(scaled).all() or np.allclose(np.var(scaled, axis=0), 0.0):
+        return None
+
+    component_count = min(scaled.shape[0], scaled.shape[1])
+    pca = PCA(n_components=component_count)
+    pca.fit(scaled)
+    explained = np.nan_to_num(pca.explained_variance_ratio_, nan=0.0) * 100.0
+    return explained, np.cumsum(explained), len(complete.index)
+
+
+def _spearman_correlation_summary(
+    frame: pd.DataFrame,
+    features: list[str],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return pairwise Spearman correlations and the complete-pair counts behind them."""
+    numeric = frame[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if len(numeric.index) < 3:
+        return None
+
+    correlation = numeric.corr(method="spearman", min_periods=3)
+    if not np.isfinite(correlation.to_numpy(dtype=float)).any():
+        return None
+
+    valid = numeric.notna().astype(int)
+    pair_counts = valid.T.dot(valid)
+    return correlation.to_numpy(dtype=float), pair_counts.to_numpy(dtype=int)
+
 def create_diagnostic_plots(
     df,
     color_param,
@@ -95,7 +224,7 @@ def create_diagnostic_plots(
     # The combined figure is an internal source for the standalone diagnostic cards.
     # Card reading order and visible grouping are defined by DIAGNOSTIC_GRID_SPECS.
     fig = make_subplots(
-        rows=13,
+        rows=14,
         cols=2,
         subplot_titles=(
             'd13C vs Leak Rate', 'd18O vs Leak Rate',
@@ -110,7 +239,8 @@ def create_diagnostic_plots(
             'Leak Rate vs Initial Sample Intensity', 'Leak Rate vs P no Acid',
             'Leak Rate vs P Gasses', 'd18O vs d13C',
             'P no Acid vs Line', 'P Gasses vs Line',
-            'Initial Sample Intensity vs Line', 'PCA: Principal Components',
+            'Initial Sample Intensity vs Line', 'Parameter Contributions to Variability',
+            'Explained Variance by Component', 'Spearman Correlation Matrix',
         ),
         vertical_spacing=0.035,
         horizontal_spacing=0.12,
@@ -128,6 +258,7 @@ def create_diagnostic_plots(
             [{'type': 'scatter'}, {'type': 'scatter'}],
             [{'type': 'box'}, {'type': 'box'}],
             [{'type': 'box'}, {'type': 'scatter'}],
+            [{'type': 'scatter'}, {'type': 'heatmap'}],
         ],
     )
 
@@ -231,30 +362,17 @@ def create_diagnostic_plots(
     fig.add_trace(go.Scatter(x=df['1  Cycle Int  Samp  44'], y=df['total_co2'], mode='markers', marker=dict(color=color_values, colorscale='Viridis', symbol=marker_symbols, showscale=False), text=hover_text,
         hoverinfo='text+x+y'), row=8, col=1)
 
-    # Prepare x_data and y_data with valid (non-NaN, non-inf) values for fitting
-    x_data = df['1  Cycle Int  Samp  44']
-    y_data = df['total_co2']
-
-    # Remove NaN and infinite values from x_data and y_data
-    valid_data = np.isfinite(x_data) & np.isfinite(y_data)
-    x_data_clean = x_data[valid_data]
-    y_data_clean = y_data[valid_data]
-
-    # Check if there is sufficient data after cleaning for a quadratic fit
-    if len(x_data_clean) >= 3:
-        # Fit quadratic polynomial (2nd degree)
-        coeffs = np.polyfit(x_data_clean, y_data_clean, 2)  # coeffs = [a, b, c]
-        quadratic_curve = np.polyval(coeffs, x_data_clean)  # Evaluate polynomial at cleaned x_data points
-
-        # Sort x_data_clean and quadratic_curve to ensure the line is smooth
-        sorted_indices = np.argsort(x_data_clean)
-        x_data_sorted = x_data_clean.iloc[sorted_indices]
-        quadratic_curve_sorted = quadratic_curve[sorted_indices]
-
-    # Plot the sorted quadratic fit as a line (only if fit succeeded)
-    if len(x_data_clean) >= 3:
+    saturating_curve = _fit_saturating_co2_curve(
+        df['1  Cycle Int  Samp  44'],
+        df['total_co2'],
+    )
+    if saturating_curve is not None:
+        x_curve, y_curve = saturating_curve
         fig.add_trace(go.Scatter(
-            x=x_data_sorted, y=quadratic_curve_sorted, mode='lines', name='Quadratic Fit',
+            x=x_curve,
+            y=y_curve,
+            mode='lines',
+            name='Asymptotic Fit',
             line=dict(color='red', dash='dash')
         ), row=8, col=1)
 
@@ -413,72 +531,158 @@ def create_diagnostic_plots(
     for x_col, y_col, row, col in partial_overlay_axes:
         _add_partial_overlay(x_col, y_col, row=row, col=col)
 
-    # Perform PCA
-    features = ['leak_rate', 'd 13C/12C  Mean', 'p_no_acid', 'total_co2', 'd 18O/16O  Mean', 'Line',
-                '1  Cycle Int  Samp  44']
-    X = df[features].dropna()
-    if X.empty:
-        fig.update_layout(
-            title_text=None,
-            height=4200,
-            showlegend=False,
-            plot_bgcolor="#f8fafc",
-            paper_bgcolor="#ffffff",
-            margin=dict(l=120, r=150, t=80)
+    # Rank parameters by their contribution to the dominant multivariate variability.
+    features = ['leak_rate', 'd 13C/12C  Mean', 'p_no_acid', 'p_gases', 'total_co2',
+                'd 18O/16O  Mean', 'Line', '1  Cycle Int  Samp  44']
+    feature_labels = {
+        'leak_rate': 'Leak rate',
+        'd 13C/12C  Mean': 'd13C/12C mean',
+        'p_no_acid': 'P no acid',
+        'p_gases': 'P gasses',
+        'total_co2': 'Total CO2',
+        'd 18O/16O  Mean': 'd18O/16O mean',
+        'Line': 'Line',
+        '1  Cycle Int  Samp  44': 'Initial sample intensity',
+    }
+    contribution_result = _leading_variability_contributions(df, features)
+    if contribution_result is not None:
+        contributions, component_contributions, captured_variance = contribution_result
+        order = np.argsort(contributions)
+        ordered_contributions = contributions[order]
+        ordered_component_contributions = component_contributions[order]
+        ordered_labels = [feature_labels[features[index]] for index in order]
+        pc1 = ordered_component_contributions[:, 0]
+        pc2 = (
+            ordered_component_contributions[:, 1]
+            if ordered_component_contributions.shape[1] > 1
+            else np.zeros_like(pc1)
         )
-        fig.update_xaxes(showgrid=True, gridcolor="#cbd5e1", gridwidth=1, zeroline=False)
-        fig.update_yaxes(showgrid=True, gridcolor="#cbd5e1", gridwidth=1, zeroline=False)
-        return fig
-
-    # Standardize the data
-    X_scaled = StandardScaler().fit_transform(X)
-
-    # Adjust n_components based on the data
-    n_samples, n_features = X_scaled.shape
-    n_components = min(2, n_samples, n_features)  # Ensure n_components <= min(n_samples, n_features)
-
-    # Apply PCA
-    pca = PCA(n_components=n_components)
-    components = pca.fit_transform(X_scaled)
-
-    # Calculate loadings
-    loadings = pca.components_.T * np.sqrt(pca.explained_variance_)
-
-    # Scatter plot for PCA components
-    pca_customdata = None
-    if n_components == 2:
-        pca_color = color_values.loc[X.index] if color_values is not None else df.loc[X.index, color_param]
-        pca_hover = df.loc[X.index, 'Identifier 2']
-        pca_customdata = _build_customdata_for_index(X.index)
-        fig.add_trace(go.Scatter(
-            x=components[:, 0], y=components[:, 1], mode='markers',
-            marker=dict(color=pca_color, colorscale='Viridis', symbol=marker_symbols, showscale=False),
-            text=pca_hover, hoverinfo='text+x+y'
+        contribution_customdata = np.column_stack(
+            (
+                pc1,
+                pc2,
+                np.full(len(order), captured_variance),
+            )
+        )
+        fig.add_trace(go.Bar(
+            x=ordered_contributions,
+            y=ordered_labels,
+            orientation='h',
+            marker=dict(color='#315f8c', line=dict(color='#244968', width=1)),
+            text=[f"{value:.1f}%" for value in ordered_contributions],
+            textposition='auto',
+            customdata=contribution_customdata,
+            hovertemplate=(
+                '<b>%{y}</b><br>'
+                'Contribution to leading variability: %{x:.1f}%<br>'
+                'Via PC1: %{customdata[0]:.1f}%<br>'
+                'Via PC2: %{customdata[1]:.1f}%<br>'
+                'Variance captured by PC1 + PC2: %{customdata[2]:.1f}%<extra></extra>'
+            ),
         ), row=13, col=2)
 
-        # Add loadings as annotations
-        for i, feature in enumerate(features):
-            fig.add_annotation(
-                x=loadings[i, 0],  # Loading for the first component (x)
-                y=loadings[i, 1],  # Loading for the second component (y)
-                ax=0, ay=0,  # Starting point for the arrow (origin)
-                axref="x", ayref="y",  # Reference the x and y axes for arrow positioning
-                showarrow=True,  # Display the arrow
-                arrowsize=2,  # Set arrow size
-                arrowhead=2,  # Set arrowhead style
-                xanchor="right",  # Anchor the x-axis to the right side
-                yanchor="top",  # Anchor the y-axis to the top side
-                row=13, col=2
+    explained_variance_result = _explained_variance_by_component(df, features)
+    if explained_variance_result is not None:
+        explained_variance, cumulative_variance, complete_row_count = explained_variance_result
+        component_labels = [f"PC{index}" for index in range(1, len(explained_variance) + 1)]
+        scree_customdata = np.column_stack(
+            (
+                cumulative_variance,
+                np.full(len(explained_variance), complete_row_count),
             )
-            fig.add_annotation(
-                x=loadings[i, 0],  # Loading for the first component (x)
-                y=loadings[i, 1],  # Loading for the second component (y)
-                xanchor="center",  # Center the x-axis label
-                yanchor="bottom",  # Bottom-align the y-axis label
-                text=feature,  # The feature name as annotation text
-                yshift=5,  # Adjust the y-position to avoid overlap
-                row=13, col=2
-            )
+        )
+        fig.add_trace(go.Bar(
+            x=component_labels,
+            y=explained_variance,
+            marker=dict(color='#b07a1d', line=dict(color='#7c5715', width=1)),
+            text=[f"{value:.1f}%" for value in explained_variance],
+            textposition='auto',
+            customdata=scree_customdata,
+            hovertemplate=(
+                '<b>%{x}</b><br>'
+                'Explained variance: %{y:.1f}%<br>'
+                'Cumulative variance: %{customdata[0]:.1f}%<br>'
+                'Complete measurements: %{customdata[1]:.0f}<extra></extra>'
+            ),
+        ), row=14, col=1)
+
+    correlation_result = _spearman_correlation_summary(df, features)
+    if correlation_result is not None:
+        correlation_matrix, pair_counts = correlation_result
+        correlation_labels = [
+            'Leak rate',
+            'd13C',
+            'P no acid',
+            'P gasses',
+            'Total CO2',
+            'd18O',
+            'Line',
+            'Initial intensity',
+        ]
+        correlation_axis_labels = [feature_labels[feature] for feature in features]
+        correlation_numeric = (
+            df[features]
+            .apply(pd.to_numeric, errors='coerce')
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+        def _finite_float_or_none(value: Any) -> float | None:
+            numeric_value = pd.to_numeric(value, errors='coerce')
+            if pd.isna(numeric_value) or not np.isfinite(float(numeric_value)):
+                return None
+            return float(numeric_value)
+
+        color_value_list = (
+            list(color_values)
+            if color_values is not None
+            else [None] * len(df.index)
+        )
+        correlation_scatter_preview = {
+            'kind': 'spearman-scatter-preview',
+            'featureLabels': correlation_labels,
+            'axisLabels': correlation_axis_labels,
+            'rowLabels': df.index.astype(str).tolist(),
+            'identifier1': identifier1_series.tolist(),
+            'identifier2': identifier2_series.tolist(),
+            'species': species_series.tolist(),
+            'colorLabel': hover_color_label,
+            'colorValues': [_finite_float_or_none(value) for value in color_value_list],
+            'colorDisplay': hover_color_series.tolist(),
+            'markerSymbols': marker_symbols,
+            'values': [
+                [_finite_float_or_none(value) for value in row]
+                for row in correlation_numeric.to_numpy(dtype=object)
+            ],
+        }
+        correlation_text = np.where(
+            np.isfinite(correlation_matrix),
+            np.vectorize(lambda value: f"{value:.2f}")(np.nan_to_num(correlation_matrix)),
+            '',
+        )
+        fig.add_trace(go.Heatmap(
+            x=correlation_labels,
+            y=correlation_labels,
+            z=correlation_matrix,
+            zmin=-1.0,
+            zmax=1.0,
+            zmid=0.0,
+            colorscale=[
+                [0.0, '#efaa83'],
+                [0.5, '#f8fafc'],
+                [1.0, '#8fb6da'],
+            ],
+            colorbar=dict(title=dict(text='rho'), thickness=12, len=0.78),
+            text=correlation_text,
+            texttemplate='%{text}',
+            textfont=dict(color='#0f172a', size=10),
+            customdata=pair_counts,
+            meta={'correlationScatterPreview': correlation_scatter_preview},
+            hovertemplate=(
+                '<b>%{y} vs %{x}</b><br>'
+                'Spearman rho: %{z:.2f}<br>'
+                'Complete pairs: %{customdata}<extra></extra>'
+            ),
+        ), row=14, col=2)
 
     # # Position the color scale only on the first subplot, adjusting its height to match one row
     # fig.update_traces(marker=dict(colorbar=dict(len=0.2, y=0.2, yanchor="bottom")), selector=dict(row=1, col=1))
@@ -509,11 +713,15 @@ def create_diagnostic_plots(
         (12, 1): ("Line", "P no Acid"),
         (12, 2): ("Line", "P Gasses"),
         (13, 1): ("Line", "Initial Sample Intensity (Cycle 1 m/z 44)"),
-        (13, 2): ("Principal Component 1", "Principal Component 2"),
+        (13, 2): ("Contribution to Leading Variability (%)", "Parameter"),
+        (14, 1): ("Principal Component", "Explained Variance (%)"),
+        (14, 2): ("Parameter", "Parameter"),
     }
     for (row, col), (x_title, y_title) in axis_titles.items():
         fig.update_xaxes(title_text=x_title, row=row, col=col)
         fig.update_yaxes(title_text=y_title, row=row, col=col)
+    fig.update_yaxes(rangemode="tozero", row=14, col=1)
+    fig.update_xaxes(tickangle=-35, row=14, col=2)
 
     unified_hover_template = (
         "Identifier 1: %{customdata[1]}<br>"
@@ -525,7 +733,6 @@ def create_diagnostic_plots(
         "Y: %{y}<extra></extra>"
     )
     base_count = len(df.index)
-    pca_count = len(X.index)
     for trace in fig.data:
         if not isinstance(trace, go.Scatter):
             continue
@@ -536,8 +743,6 @@ def create_diagnostic_plots(
         point_count = len(x_values) if x_values is not None else 0
         if point_count == base_count:
             trace.customdata = base_customdata
-        elif pca_customdata is not None and point_count == pca_count:
-            trace.customdata = pca_customdata
         else:
             continue
         trace.hovertemplate = unified_hover_template
@@ -608,7 +813,7 @@ def create_diagnostic_plots(
     # Update layout with room for the group rail and shared color scale.
     fig.update_layout(
         title_text=None,
-        height=4200,
+        height=4520,
         showlegend=False,
         plot_bgcolor="#f8fafc",
         paper_bgcolor="#ffffff",
@@ -621,33 +826,41 @@ def create_diagnostic_plots(
 
 
 DIAGNOSTIC_GRID_SPECS: tuple[tuple[str, str, int], ...] = (
+    ("Multivariate Overview", "Parameter Contributions to Variability", 26),
+    ("Multivariate Overview", "Explained Variance by Component", 27),
+    ("Multivariate Overview", "Spearman Correlation Matrix", 28),
     ("d13C", "d13C vs Leak Rate", 1),
     ("d13C", "d13C vs P no Acid", 3),
     ("d13C", "d13C vs Total CO2", 5),
     ("d13C", "d13C vs Initial Sample Intensity", 7),
     ("d13C", "d13C vs Diff Signal Intensity", 9),
     ("d13C", "d13C vs Pressure-Adjusted Signal Intensity Diff", 11),
-    ("d13C", "d13C vs Line", 13),
     ("d18O", "d18O vs Leak Rate", 2),
     ("d18O", "d18O vs P no Acid", 4),
     ("d18O", "d18O vs Total CO2", 6),
     ("d18O", "d18O vs Initial Sample Intensity", 8),
     ("d18O", "d18O vs Diff Signal Intensity", 10),
     ("d18O", "d18O vs Pressure-Adjusted Signal Intensity Diff", 12),
-    ("d18O", "d18O vs Line", 14),
     ("Leak Rate", "Leak Rate vs Total CO2", 16),
-    ("Leak Rate", "Leak Rate vs Line", 17),
     ("Leak Rate", "Leak Rate vs Initial Sample Intensity", 19),
     ("Leak Rate", "Leak Rate vs P no Acid", 20),
     ("Leak Rate", "Leak Rate vs P Gasses", 21),
     ("Total CO2", "Total CO2 vs Initial Sample Intensity", 15),
-    ("Total CO2", "Total CO2 vs Line", 18),
-    ("P no Acid", "P no Acid vs Line", 23),
-    ("P Gasses", "P Gasses vs Line", 24),
-    ("Initial Sample Intensity", "Initial Sample Intensity vs Line", 25),
+    ("Line", "d13C vs Line", 13),
+    ("Line", "d18O vs Line", 14),
+    ("Line", "Leak Rate vs Line", 17),
+    ("Line", "Total CO2 vs Line", 18),
+    ("Line", "P no Acid vs Line", 23),
+    ("Line", "P Gasses vs Line", 24),
+    ("Line", "Initial Sample Intensity vs Line", 25),
     ("Isotope Comparison", "d18O vs d13C", 22),
-    ("Multivariate Overview", "PCA: Principal Components", 26),
 )
+
+MULTIVARIATE_PLOT_SUBTITLES: dict[str, str] = {
+    "Parameter Contributions to Variability": "Weighted contribution across PC1 and PC2",
+    "Explained Variance by Component": "Standardized parameters, complete measurements",
+    "Spearman Correlation Matrix": "Pairwise-complete measurements; hover a cell to preview the scatter",
+}
 
 
 def split_diagnostic_plot_grid(fig) -> list[tuple[str, str, Any]]:
@@ -711,10 +924,15 @@ def split_diagnostic_plot_grid(fig) -> list[tuple[str, str, Any]]:
                 }
             )
 
+        subtitle = MULTIVARIATE_PLOT_SUBTITLES.get(title)
+        title_text = f"<b>{title}</b>"
+        if subtitle:
+            title_text += f"<br><span style='font-size:11px;color:#64748b'>{subtitle}</span>"
+
         standalone = go.Figure(data=trace_payloads)
         standalone.update_layout(
             title=dict(
-                text=f"<b>{title}</b>",
+                text=title_text,
                 x=0.5,
                 xanchor="center",
                 font=dict(size=16, color="#172554"),
@@ -727,7 +945,7 @@ def split_diagnostic_plot_grid(fig) -> list[tuple[str, str, Any]]:
             hovermode="closest",
             plot_bgcolor="#f8fafc",
             paper_bgcolor="#ffffff",
-            margin=dict(l=54, r=18, t=54, b=50),
+            margin=dict(l=54, r=18, t=70 if subtitle else 54, b=50),
         )
         grid.append((group, title, standalone))
     return grid

@@ -19,6 +19,11 @@ declare module "plotly.js/lib/core" {
   export default Plotly;
 }
 
+declare module "plotly.js/lib/bar" {
+  const bar: unknown;
+  export default bar;
+}
+
 declare module "plotly.js/lib/box" {
   const box: unknown;
   export default box;
@@ -27,6 +32,11 @@ declare module "plotly.js/lib/box" {
 declare module "plotly.js/lib/calendars" {
   const calendars: unknown;
   export default calendars;
+}
+
+declare module "plotly.js/lib/heatmap" {
+  const heatmap: unknown;
+  export default heatmap;
 }
 
 declare module "plotly.js/lib/scatter" {
