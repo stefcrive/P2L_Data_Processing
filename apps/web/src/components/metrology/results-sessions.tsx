@@ -1,22 +1,23 @@
 "use client";
 
+import { withCalibrationStages } from "@/lib/metrology-envelopes";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useCallback, useMemo, useRef, useState, type ContextType, type FormEvent, type ReactNode } from "react";
 import { ArrowLeft, Building2, FolderOpen, Plus, Search, ShieldCheck, Upload, Download, FlaskConical } from "lucide-react";
 import { useTranslation } from "@/components/layout/language-provider";
 import { FileInput } from "@/components/ui/file-input";
 import { useSessionStore } from "@/store/use-session-store";
-import { METROLOGY_API, isotopeLabel, isotopes, metroRequest, type Method, type ResultsSession, type ResultsSessionDetail, type Run, type SessionAnalysis, type ResidualOverride, type Isotope } from "@/lib/metrology";
+import { METROLOGY_API, isotopeLabel, isotopes, metroRequest, type Method, type ResultsSession, type ResultsSessionDetail, type Run, type SessionAnalysis, type ResidualOverride, type QcFlagCategory, type Isotope } from "@/lib/metrology";
 import { BusyButton, Empty, Field, Inspect, Panel, Status, type WorkspaceProps } from "./shared";
 import { Methods } from "./methods";
 import { LongTermCharts } from "./results-station";
 import { RunReview } from "./runs";
-import { AnchorPair, MethodFacts, SessionMethodSummary, SessionQcSummary } from "./qualification-summary";
-import { CorrectionValidation, SessionUncertainty, SessionProcessing, SessionQcSequence, SessionResiduals, TraceableExport } from "./session-science";
+import { AnchorPair, SessionMethodSummary, SessionQcSummary } from "./qualification-summary";
+import { CorrectionValidation, SessionUncertainty, SessionProcessing, SessionQcSequence, SessionOutlierTable, SessionResiduals, TraceableExport } from "./session-science";
 import { RowReview } from "./row-review";
-import { MetrologyChartWorkspace, MetrologyConsultation, MetrologyProcessingResults, MetrologyChartHeight } from "./consultation-context";
+import { MetrologyChartWorkspace, MetrologyConsultation, MetrologyProcessingResults, MetrologyChartHeight, MetrologyToolsSession } from "./consultation-context";
 
 const DiagnosticsTools=dynamic(()=>import("@/app/(dashboard)/diagnostics/page"),{ssr:false,loading:()=> <p>Loading diagnostics…</p>});
 const CalibrationTools=dynamic(()=>import("@/app/(dashboard)/calibration/page"),{ssr:false,loading:()=> <p>Loading calibration charts…</p>});
@@ -45,7 +46,7 @@ export function ResultsSessions(props:Props) {
     metroRequest<ResultsSessionDetail>(`/results-sessions/${selectedId}`,{signal:controller.signal}).then(setDetail).catch(e=>{if(!controller.signal.aborted)setError(e.message);});
     return ()=>controller.abort();
   },[selectedId,props.state]);
-  if(selectedId) return <div className="metro-stack">{error&&<p className="metro-note error" role="alert">{tr(error)}</p>}{detail?.id===selectedId?<SessionDetail key={detail.id} {...props} detail={detail} sessionNavigation={<button className="metro-btn" onClick={()=>props.navigate("results")}><ArrowLeft size={14}/>{tr("All results sessions")}</button>}/>:<p role="status">{tr("Opening saved results session…")}</p>}</div>;
+  if(selectedId) return <div className="metro-stack">{error&&<div className="metro-note error" role="alert">{tr(error)} <button className="metro-btn" onClick={()=>props.navigate("results")}>{tr("All results sessions")}</button></div>}{detail?.id===selectedId?<SessionDetail key={detail.id} {...props} detail={detail} sessionNavigation={<button className="metro-btn" onClick={()=>props.navigate("results")}><ArrowLeft size={14}/>{tr("All results sessions")}</button>}/>:<p role="status">{tr("Opening saved results session…")}</p>}</div>;
   const filtered=sessions.filter(s=>(origin==="all"||(origin==="observed"?s.calibration_verification==="simulation_assumption":s.calibration_verification!=="simulation_assumption"))&&(!client||s.client===client)&&(!context||s.context===context)&&`${s.name} ${s.client} ${s.project} ${s.method_name}`.toLowerCase().includes(search.toLowerCase()));
   return <div className="metro-stack">
     <div className="station-library-heading"><div><span className="metro-eyebrow">{tr("Local results library")}</span><h2>{tr("Clients, batches and their calibration history")}</h2><p className="metro-muted">{tr("Reopen a session to consult its data, qualification, QC, uncertainty and saved exports.")}</p></div><button className="metro-btn primary" onClick={()=>setCreating(!creating)}><Plus size={15}/>{tr(creating?"Close session form":"New results session")}</button></div>
@@ -92,7 +93,11 @@ function NewSession(props:WorkspaceProps & {onCreated:(id:string)=>void;newConte
 export function SessionDetail({detail, qualificationReview, sessionNavigation, ...props}:Props & {detail:ResultsSessionDetail;qualificationReview?:ReactNode;sessionNavigation?:ReactNode}) {
   const tr=useTranslation();
   const qualificationMode = detail.context === "qualification";
-  const [tab,setTab]=useState("summary");
+  const [tab,setTab]=useState(()=>{try{return sessionStorage.getItem(`metrology-tab:${detail.id}`)||"summary";}catch{return "summary";}});
+  useEffect(()=>{sessionStorage.setItem(`metrology-tab:${detail.id}`,tab);},[detail.id,tab]);
+  const [visitedTools,setVisitedTools]=useState<string[]>([]);
+  const [bridges,setBridges]=useState<Record<string,{session_id:string;row_mapping:Record<string,string>}>>({});
+  const bridgeCache=useRef(new Map<string,{session_id:string;row_mapping:Record<string,string>}>());
   const [runId,setRun]=useState(props.runId||[...detail.runs].filter(r=>r.evaluation?.results.some(row=>row.role==="unknown")).sort((a,b)=>(b.acquired_date??b.created_at).localeCompare(a.acquired_date??a.created_at))[0]?.id||detail.run_ids.at(-1)||"");
   const [group,setGroup]=useState("");
   const [files,setFiles]=useState<File[]>([]);
@@ -106,17 +111,32 @@ export function SessionDetail({detail, qualificationReview, sessionNavigation, .
   const [toolsAttempt,setToolsAttempt]=useState(0);
   const [analysis,setAnalysis]=useState<SessionAnalysis|null>(null);
   const [analysisError,setAnalysisError]=useState("");
-  const [outlierMethod,setOutlierMethod]=useState("sigma");
-  const [threshold,setThreshold]=useState(3);
+  const [outlierMethod,setOutlierMethod]=useState(detail.outlier_screening?.method??"sigma");
+  const [threshold,setThreshold]=useState(detail.outlier_screening?.threshold??3);
+  const [outlierVisibility,setOutlierVisibility]=useState<Record<Isotope,boolean>>(()=>{
+    try{return {...{d13c:true,d18o:true},...JSON.parse(sessionStorage.getItem(`qc-outlier-visibility:${detail.id}`)??"{}")} as Record<Isotope,boolean>;}catch{return {d13c:true,d18o:true};}
+  });
+  const toggleOutlierVisibility=(iso:Isotope,visible:boolean)=>setOutlierVisibility(previous=>{
+    const next={...previous,[iso]:visible};try{sessionStorage.setItem(`qc-outlier-visibility:${detail.id}`,JSON.stringify(next));}catch{}return next;
+  });
+  const [outlierTypes,setOutlierTypes]=useState<Record<QcFlagCategory,boolean>>(()=>{
+    const defaults={statistical:true,range:true,manual:true,failed:true};
+    try{return {...defaults,...JSON.parse(sessionStorage.getItem(`qc-outlier-types:${detail.id}`)??"{}")};}catch{return defaults;}
+  });
+  const toggleOutlierType=(category:QcFlagCategory,visible:boolean)=>setOutlierTypes(previous=>{
+    const next={...previous,[category]:visible};try{sessionStorage.setItem(`qc-outlier-types:${detail.id}`,JSON.stringify(next));}catch{}return next;
+  });
   const [materialId,setMaterialId]=useState(detail.chart_settings?.diagnostic_material_id??detail.method?.config.qc_id??"");
+  const [carbonatePreapplied,setCarbonatePreapplied]=useState(false);
   const [carbonateMaterial,setCarbonateMaterial]=useState<"calcite"|"aragonite">(detail.chart_settings?.carbonate_material??"calcite");
   const [mapping,setMapping]=useState<Record<string,string>>({});
-  const revisionKey=detail.runs.map(r=>`${r.id}:${r.revision}:${r.latest_evaluation_id}`).join("|");
+  const revisionKey=`${detail.method?.id}:${detail.method?.revision}:`+detail.runs.map(r=>`${r.id}:${r.revision}:${r.latest_evaluation_id}`).join("|");
+  const analysisSettingsKey=JSON.stringify([detail.groups,detail.residual_overrides,detail.method?.config,detail.outlier_screening]);
   useEffect(()=>{
     const controller=new AbortController();setAnalysisError("");
-    metroRequest<SessionAnalysis>(`/results-sessions/${detail.id}/analysis?outlier_method=${outlierMethod}&threshold=${threshold}`,{signal:controller.signal}).then(setAnalysis).catch(e=>{if(!controller.signal.aborted)setAnalysisError(e.message);});
+    metroRequest<SessionAnalysis>(`/results-sessions/${detail.id}/analysis`,{signal:controller.signal}).then(setAnalysis).catch(e=>{if(!controller.signal.aborted)setAnalysisError(e.message);});
     return ()=>controller.abort();
-  },[detail.id,revisionKey,outlierMethod,threshold,detail.groups,detail.residual_overrides]);
+  },[detail.id,revisionKey,analysisSettingsKey]);
   const setLegacySession=useSessionStore(s=>s.setSessionId);
   const run=detail.runs.find(r=>r.id===runId)??detail.runs.at(-1);
   useEffect(()=>setGroups(detail.groups),[detail.groups]);
@@ -126,10 +146,18 @@ export function SessionDetail({detail, qualificationReview, sessionNavigation, .
   const toolsActive=["diagnostics","calibration","processing"].includes(tab);
   useEffect(()=>{
     if(!toolsActive||!toolsRun)return;
-    const controller=new AbortController();setTool("");setToolsError("");
-    metroRequest<{session_id:string;row_mapping:Record<string,string>}>(`/results-sessions/${detail.id}/tools/${toolsRun}`,{method:"POST",body:JSON.stringify({actor:props.decision.actor||"Results reader",reason:"Open linked raw data and existing plotting tools for consultation"}),signal:controller.signal}).then(result=>{if(!controller.signal.aborted){setLegacySession(result.session_id);setTool(result.session_id);setMapping(result.row_mapping??{});}}).catch(e=>{if(!controller.signal.aborted)setToolsError(e.message);});
+    const key=`${detail.id}:${revisionKey}:${toolsRun}`;
+    const accept=(result:{session_id:string;row_mapping:Record<string,string>})=>{
+      bridgeCache.current.set(key,result);setLegacySession(result.session_id);setTool(result.session_id);if(toolsRun==="all")setMapping(result.row_mapping??{});
+      setBridges(previous=>({...previous,[toolsRun]:result}));
+      setVisitedTools(previous=>previous.includes(tab)?previous:[...previous,tab]);
+    };
+    const cached=bridgeCache.current.get(key);
+    if(cached){accept(cached);return;}
+    const controller=new AbortController();setToolsError("");
+    metroRequest<{session_id:string;row_mapping:Record<string,string>}>(`/results-sessions/${detail.id}/tools/${toolsRun}`,{method:"POST",body:JSON.stringify({actor:props.decision.actor||"Results reader",reason:"Open linked raw data and existing plotting tools for consultation"}),signal:controller.signal}).then(result=>{if(!controller.signal.aborted)accept(result);}).catch(e=>{if(!controller.signal.aborted)setToolsError(e.message);});
     return ()=>controller.abort();
-  },[toolsActive,toolsRun,detail.id,revisionKey,setLegacySession,props.decision.actor,toolsAttempt]);
+  },[toolsActive,toolsRun,detail.id,revisionKey,setLegacySession,props.decision.actor,toolsAttempt,tab]);
   async function importWorkbooks(event:FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if(!files.length||props.busy||importingRef.current)return;
@@ -137,11 +165,13 @@ export function SessionDetail({detail, qualificationReview, sessionNavigation, .
     setImporting(true);
     let completed=0;
     try {
+      const saved=await props.act(`/results-sessions/${detail.id}/chart-settings`,{carbonate_material:carbonateMaterial,diagnostic_material_id:materialId||null},"PUT");
+      if(!saved)return;
       for(const [index,file] of files.entries()) {
         setImportIndex(index+1);
         const data=new FormData();
         data.append("file",file);
-        data.append("metadata",JSON.stringify({...props.decision,results_session_id:detail.id,sample_group:batch}));
+        data.append("metadata",JSON.stringify({...props.decision,results_session_id:detail.id,sample_group:batch,carbonate_material:carbonateMaterial,carbonate_correction_preapplied:carbonatePreapplied}));
         const result=await props.upload("/runs/import",data) as Run|undefined;
         if(!result)break;
         completed++;
@@ -156,14 +186,46 @@ export function SessionDetail({detail, qualificationReview, sessionNavigation, .
       setImporting(false);
     }
   }
-  const saveOverride=async(material:string,effect:string,isotope:Isotope,settings:ResidualOverride|null)=>{
+  const saveOverride=useCallback(async(material:string,effect:string,isotope:Isotope,settings:ResidualOverride|null)=>{
     const result=await props.act(`/results-sessions/${detail.id}/residual-overrides`,{material_id:material,effect,isotope,settings},"PUT");
-    if(result) setAnalysis(await metroRequest<SessionAnalysis>(`/results-sessions/${detail.id}/analysis?outlier_method=${outlierMethod}&threshold=${threshold}`));
+    if(result) setAnalysis(await metroRequest<SessionAnalysis>(`/results-sessions/${detail.id}/analysis`));
     return result;
-  };
+  },[props.act,detail.id,outlierMethod,threshold]);
+  const saveScreening=useCallback(async()=>{
+    const result=await props.act(`/results-sessions/${detail.id}/outlier-screening`,{method:outlierMethod,threshold},"PUT");
+    if(result)setAnalysis(await metroRequest<SessionAnalysis>(`/results-sessions/${detail.id}/analysis`));
+  },[props.act,detail.id,outlierMethod,threshold]);
+  const processingResults=useMemo(()=>Object.fromEntries((analysis?.rows??[]).filter(row=>(!group||row.role!=="unknown"||row.sample_group===group)&&mapping[row.id]).map(row=>[mapping[row.id],row])),[analysis,group,mapping]);
+  const qcTarget=useMemo(()=>{
+    const material=props.state.materials.find(item=>item.id===detail.method?.config.qc_id);
+    return Object.fromEntries(isotopes.map(iso=>[iso,material?.assigned[iso].value??null])) as Record<Isotope,number|null>;
+  },[props.state.materials,detail.method?.config.qc_id]);
+  const comparison=useMemo(()=>{
+    const values=new Map<string,{before:(number|null)[];after:(number|null)[]}>();
+    for(const row of analysis?.rows??[])if(mapping[row.id]&&(row.role==="qc"||row.role==="anchor")){
+      const before=isotopes.map(iso=>analysis?.diagnostics_before.materials.find(m=>m.material_id===row.material_id)?.isotopes[iso].intensity_dependence.points?.find(p=>p.id===row.id)?.y??null);
+      values.set(mapping[row.id],{before,after:isotopes.map(iso=>row.isotopes?.[iso]?.value??null)});
+    }
+    return (figure:Record<string,unknown>)=>withCalibrationStages(figure,values,{before:tr("Before correction"),after:tr("After correction")});
+  },[analysis,mapping,tr]);
+  const calibrationWorkspace=useMemo<ContextType<typeof MetrologyChartWorkspace>>(()=>analysis?({
+          sequence:interact=><SessionQcSequence analysis={analysis} mapping={mapping} interact={interact} target={qcTarget}/>,
+          plots:(interact,manualControls)=><><CorrectionValidation analysis={analysis}/><SessionResiduals analysis={analysis} materialId={materialId} mapping={mapping} interact={interact} manualControls={manualControls} overrides={detail.residual_overrides??{}} busy={props.busy} saveOverride={saveOverride}/></>,
+          carbonateMaterial,comparison,
+          materialLabels:[...new Set(analysis.rows.filter(row=>row.material_id===materialId).map(row=>row.identifier1||row.label))],
+          outliers:{method:analysis.outliers.method,threshold:analysis.outliers.threshold,rows:[...analysis.outliers.flags,...analysis.qc_review_flags??[]].map(f=>({row:mapping[f.measurement_id],isotope:f.isotope==="d13c"?"d13C":"d18O",category:f.category??"statistical",reasons:f.reasons,hidden:!outlierVisibility[f.isotope]||!outlierTypes[f.category??"statistical"]}))},
+          outlierTable:<SessionOutlierTable analysis={analysis} review={(measurementId,runId)=>{const run=detail.runs.find(r=>r.id===runId);const row=run?.evaluation?.results.find(r=>r.id===measurementId);return run&&row?<RowReview {...props} row={row} run={run}/>:null;}}/>,
+          controls:<div className="metro-stack"><Field label={tr("Outlier method")}><select value={outlierMethod} onChange={e=>{setOutlierMethod(e.target.value as "sigma"|"iqr");setThreshold(e.target.value==="iqr"?1.5:3);}}><option value="sigma">Sigma</option><option value="iqr">IQR</option></select></Field><Field label={tr("Screening threshold")}><input type="number" min={.5} max={10} step={.5} value={threshold} onChange={e=>{const value=Number(e.target.value);if(value>=.5&&value<=10)setThreshold(value);}}/></Field>
+            <button className="metro-btn" disabled={props.busy||(analysis.outliers.method===outlierMethod&&analysis.outliers.threshold===threshold)} onClick={saveScreening}>{tr("Save screening")}</button>
+            <fieldset><legend>{tr("Show outliers in charts")}</legend>{([['statistical','Statistical outliers'],['range','Validity-range flags'],['manual','Manual exclusions'],['failed','Failed analyses']] as const).map(([category,label])=><label key={category} className="metro-check"><input type="checkbox" checked={outlierTypes[category]} onChange={e=>toggleOutlierType(category,e.target.checked)}/>{tr(label)}</label>)}</fieldset>
+            <fieldset><legend>{tr("Isotope")}</legend>{isotopes.map(iso=><label key={iso} className="metro-check"><input type="checkbox" checked={outlierVisibility[iso]} onChange={e=>toggleOutlierVisibility(iso,e.target.checked)}/>{isotopeLabel[iso]} · {analysis.outliers.flags.filter(f=>f.isotope===iso).length}</label>)}</fieldset>
+            <small className="metro-muted">{tr("Visibility only. Saved flags remain excluded from long-term QC statistics.")}</small>
+          </div>,
+          review:labels=><>{[...new Set(labels)].map(label=>{const id=Object.keys(mapping).find(id=>mapping[id]===label);const selectedRun=detail.runs.find(r=>r.measurements.some(m=>m.id===id));const row=selectedRun?.evaluation?.results.find(r=>r.id===id);return row&&selectedRun?<RowReview {...props} key={id} row={row} run={selectedRun}/>:null;})}</>,
+        }):null,[analysis,materialId,mapping,detail.residual_overrides,detail.runs,props.state,props.decision,props.busy,props.act,props.upload,saveOverride,carbonateMaterial,comparison,qcTarget,outlierMethod,threshold,outlierVisibility,outlierTypes,saveScreening,tr]);
   const tabs=qualificationMode
     ? [["summary","Session summary"],["import","Import"],["calibration","Calibration & linearity"],["processing","Processing charts"],["method","Qualification settings"],["validation","Review & approval"],["uncertainty","Uncertainty"],["export","Traceable results export"],["sources","Raw source archive"]]
-    : [["summary","Session summary"],["import","Import"],["method","Method definition"],["calibration","Calibration & linearity"],["diagnostics","Diagnostics"],["processing","Processing charts"],["uncertainty","Uncertainty"],["export","Traceable results export"],["sources","Raw source archive"]];
+    : [["summary","Session summary"],["import","Import"],["calibration","Calibration & linearity"],["diagnostics","Diagnostics"],["processing","Processing charts"],["uncertainty","Uncertainty"],["export","Traceable results export"],["sources","Raw source archive"]];
   return <div className="metro-stack">
     <section className="station-session-cover">{sessionNavigation&&<div className="station-session-navigation">{sessionNavigation}</div>}<div className="station-session-identity"><div className="station-session-heading"><h2>{detail.name}</h2><span className="station-session-client">{detail.client} / {detail.project||tr("Results session")}</span></div>{detail.notes&&<p>{detail.notes}</p>}</div><div className="station-session-method"><small>{tr("Session method")}</small><strong>{detail.method_name}</strong><span>v{detail.method?.version} · {detail.run_ids.length} {tr("workbooks")}</span></div></section>
     {detail.calibration_verification==="simulation_assumption"&&<div className="station-provenance-note"><ShieldCheck size={20}/><div><b>{tr("Real observations · simulated qualification")}</b><p>{tr("Exported reference-scale values are retained without a second normalization. The curve below belongs to the current mock qualification; it does not establish the original historical calibration. Missing masses and original timestamps remain unchanged.")}</p></div></div>}
@@ -171,30 +233,22 @@ export function SessionDetail({detail, qualificationReview, sessionNavigation, .
     <div className="metro-tabs station-tabs" role="tablist" aria-label={tr("Results session workflow")}>{tabs.map(([id,label])=><button key={id} role="tab" aria-selected={tab===id} onClick={()=>setTab(id)}>{tr(label)}</button>)}</div>
     {run&&<div className="station-run-selector">{["import","diagnostics"].includes(tab)&&<Field label={tr("Analytical workbook")}><select value={run.id} onChange={e=>setRun(e.target.value)}>{detail.runs.map(r=><option key={r.id} value={r.id}>{r.label} · {tr(r.status)}</option>)}</select></Field>}<Field label={tr("Sample group")}><select value={group} onChange={e=>setGroup(e.target.value)}><option value="">{tr("All sample groups")}</option>{(options.length?options:["Main batch"]).map(g=><option key={g}>{g}</option>)}</select></Field><span className="metro-muted">{["import","diagnostics"].includes(tab)?tr(run.status):`${detail.run_ids.length} ${tr("workbooks")} / ${tr("Whole session")}`}</span></div>}
     {tab==="validation"&&qualificationReview}
-    {tab==="summary"&&<><div className="metro-grid station-session-summary-grid"><SessionMethodSummary detail={detail} state={props.state}/><SessionQcSummary detail={detail}/></div>{qualificationMode&&<div className="metro-actions"><button className="metro-btn" onClick={()=>setTab("method")}>{tr("Edit qualification method and criteria")}</button></div>}{run?.evaluation?<>
+    {tab==="summary"&&<><div className="metro-grid station-session-summary-grid"><div className="metro-stack station-method-column"><SessionMethodSummary detail={detail} state={props.state}/>{analysis&&<CorrectionValidation analysis={analysis}/>}</div><SessionQcSummary detail={detail}/></div>{qualificationMode&&<div className="metro-actions"><button className="metro-btn" onClick={()=>setTab("method")}>{tr("Edit qualification method and criteria")}</button></div>}{run?.evaluation?<>
 
-      {analysis&&<CorrectionValidation analysis={analysis}/>}
       <AnchorPair method={detail.method?.normalization?detail.method:detail.method&&run.evaluation?.normalization.d13c&&run.evaluation?.normalization.d18o?{...detail.method,normalization:{d13c:run.evaluation.normalization.d13c,d18o:run.evaluation.normalization.d18o}}:detail.method}/>
       {!qualificationMode&&<LongTermCharts state={{...props.state,active_method:detail.method,history:detail.history,runs:props.state.runs.filter(r=>r.method_id===detail.method_id)}} highlightRunIds={detail.run_ids}/>}
     </>:<Empty>{tr("The session is ready. Open Import to upload its Qtegra workbook.")}</Empty>}</>}
-    {tab==="import"&&<><Panel title={tr("Material selection")}><form onSubmit={e=>{e.preventDefault();void props.act(`/results-sessions/${detail.id}/chart-settings`,{carbonate_material:carbonateMaterial,diagnostic_material_id:materialId||null},"PUT");}}><div className="metro-form-grid"><Field label={tr("Carbonate material")}><select value={carbonateMaterial} onChange={e=>setCarbonateMaterial(e.target.value as "calcite"|"aragonite")}><option value="calcite">{tr("Calcite")}</option><option value="aragonite">{tr("Aragonite")}</option></select></Field><Field label={tr("Homogeneous material")}><select value={materialId} onChange={e=>setMaterialId(e.target.value)}>{props.state.materials.filter(m=>detail.method?.config.anchor_ids.includes(m.id)||m.id===detail.method?.config.qc_id).map(m=><option key={m.id} value={m.id}>{m.name}</option>)}</select></Field></div><div className="metro-actions"><BusyButton busy={props.busy}>{tr("Save material selection")}</BusyButton></div></form></Panel><Panel title={tr("Add analytical workbooks")}><form className="metro-stack" onSubmit={importWorkbooks}><div className="station-choice-note"><ShieldCheck size={17}/><p>{tr(detail.input_basis==="already_vpdb"?"Imported values are already normalized with the pinned method. Normalization will not be applied twice.":"Instrument deltas will receive the approved residual correction and dual-point normalization.")}</p></div><div className="metro-form-grid"><Field label={tr("Qtegra results Excel")}><FileInput key={fileInputKey} accept=".xlsx,.xls" multiple required={!files.length} disabled={props.busy||importing} onChange={e=>setFiles(Array.from(e.target.files??[]))}/></Field><Field label={tr("Sample group for the selected workbooks")}><input required disabled={props.busy||importing} value={batch} onChange={e=>setBatch(e.target.value)} placeholder={tr("Core A, reference series or client batch")}/></Field></div><p className="metro-muted">{tr("Select one or more Excel files. Use Ctrl or Shift to select multiple files. All selected workbooks will use the same sample group.")}</p>{files.length>0&&<ul>{files.map((file,index)=><li key={`${index}-${file.name}`}>{file.name}</li>)}</ul>}{importing&&<p role="status">{tr(`Importing workbook ${importIndex} of ${files.length}`)}</p>}<p className="metro-muted">{detail.processing_evidence}</p><div className="metro-actions"><BusyButton busy={props.busy||importing}><Upload size={14}/>{tr("Import, evaluate and store QC")}</BusyButton></div></form></Panel>{run&&<RunReview {...props} key={`${run.id}-${run.latest_evaluation_id}-${run.revision}`} run={run} initialTab="measurements" fixedView/>}</>}
+    {tab==="import"&&<><Panel title={tr("Add analytical workbooks")}><form className="metro-stack" onSubmit={importWorkbooks}><div className="metro-form-grid"><Field label={tr("Carbonate material")}><select value={carbonateMaterial} disabled={importing||props.busy} onChange={e=>{setCarbonateMaterial(e.target.value as "calcite"|"aragonite");setCarbonatePreapplied(false);}}><option value="calcite">{tr("Calcite")}</option><option value="aragonite">{tr("Aragonite")}</option></select></Field><Field label={tr("Homogeneous material")}><select value={materialId} onChange={e=>setMaterialId(e.target.value)}>{props.state.materials.filter(m=>detail.method?.config.anchor_ids.includes(m.id)||m.id===detail.method?.config.qc_id).map(m=><option key={m.id} value={m.id}>{m.name}</option>)}</select></Field></div><div className="metro-actions"><button type="button" className="metro-btn" disabled={props.busy||importing} onClick={()=>void props.act(`/results-sessions/${detail.id}/chart-settings`,{carbonate_material:carbonateMaterial,diagnostic_material_id:materialId||null},"PUT")}>{tr("Save material selection")}</button></div><p className="metro-muted">δ¹⁸O: αcalcite = 1.0087 · αaragonite = 1.0091 · f = {(1.0087/(carbonateMaterial==="aragonite"?1.0091:1.0087)).toFixed(8)}<br/>{tr("Unknown samples only; QC and anchor reference values retain their certified basis.")} {tr(carbonatePreapplied?"Exported carbonate correction retained without a second application.":"Applied after normalization: δout = (δcalcite + 1000) × f − 1000.")}</p>{carbonateMaterial==="aragonite"&&detail.input_basis==="already_vpdb"&&<label className="metro-check"><input type="checkbox" checked={carbonatePreapplied} disabled={importing||props.busy} onChange={e=>setCarbonatePreapplied(e.target.checked)}/>{tr("Aragonite correction already applied in the export")}</label>}<div className="station-choice-note"><ShieldCheck size={17}/><p>{tr(detail.input_basis==="already_vpdb"?"Imported values are already normalized with the pinned method. Normalization will not be applied twice.":"Instrument deltas will receive the approved residual correction and dual-point normalization.")}</p></div><div className="metro-form-grid"><Field label={tr("Qtegra results Excel")}><FileInput key={fileInputKey} accept=".xlsx,.xls" multiple required={!files.length} disabled={props.busy||importing} onChange={e=>setFiles(Array.from(e.target.files??[]))}/></Field><Field label={tr("Sample group for the selected workbooks")}><input required disabled={props.busy||importing} value={batch} onChange={e=>setBatch(e.target.value)} placeholder={tr("Core A, reference series or client batch")}/></Field></div><p className="metro-muted">{tr("Select one or more Excel files. Use Ctrl or Shift to select multiple files. All selected workbooks will use the same sample group.")}</p>{files.length>0&&<ul>{files.map((file,index)=><li key={`${index}-${file.name}`}>{file.name}</li>)}</ul>}{importing&&<p role="status">{tr(`Importing workbook ${importIndex} of ${files.length}`)}</p>}<p className="metro-muted">{detail.processing_evidence}</p><div className="metro-actions"><BusyButton busy={props.busy||importing}><Upload size={14}/>{tr("Import, evaluate and store QC")}</BusyButton></div></form></Panel>{run&&<RunReview {...props} key={`${run.id}-${run.latest_evaluation_id}-${run.revision}`} run={run} initialTab="measurements" fixedView/>}</>}
     {tab==="sources"&&<Panel title={tr("Raw source archive")}><p className="metro-muted">{tr("Original acquisition bytes are stored with SHA-256 hashes. Duplicate and alternative exports remain available but do not add repeated QC observations. Processed reports are excluded.")}</p><div className="metro-table-wrap"><table><thead><tr><th>{tr("Original export")}</th><th>{tr("Import decision")}</th><th>SHA-256</th><th/></tr></thead><tbody>{detail.sources?.map(a=><tr key={a.id}><td>{a.relative_path}<small className="station-cell-subtitle">{(a.size/1024).toFixed(1)} KB</small></td><td>{tr(a.disposition)}</td><td><code title={a.sha256}>{a.sha256.slice(0,14)}…</code></td><td><a className="metro-btn" href={`${METROLOGY_API}/session-sources/${a.id}`}><Download size={14}/>{tr("Download")}</a></td></tr>)}</tbody></table></div></Panel>}
-    {tab==="method"&&(qualificationMode?<Methods {...props} methodId={detail.method_id} sessionScoped/>:<><SessionMethodSummary detail={detail} state={props.state}/><AnchorPair method={detail.method}/><details><summary>{tr("Full qualified method record")}</summary><MethodFacts method={detail.method}/><Inspect value={detail.method}/></details></>)}
+    {tab==="method"&&(qualificationMode?<Methods {...props} methodId={detail.method_id} sessionScoped/>:<><SessionMethodSummary detail={detail} state={props.state}/><AnchorPair method={detail.method}/></>)}
     {analysisError&&<p role="alert" className="metro-note error">{tr(analysisError)}</p>}
     {tab==="uncertainty"&&<SessionUncertainty detail={detail} group={group} analysis={analysis}/>}
-    {toolsActive&&<MetrologyConsultation.Provider value={true}>
-      {toolsError?<div role="alert" className="metro-note error">{tr(toolsError)} <button className="metro-btn" onClick={()=>setToolsAttempt(attempt=>attempt+1)}>{tr("Retry plotting workspace")}</button></div>:!run?<Empty>{tr("Import a workbook to open the plotting tools.")}</Empty>:!toolId?<p role="status">{tr("Preparing original workbook plots. Large sessions may take a few minutes.")}</p>:<div className="station-existing-tools" key={toolId}>
-        {tab==="diagnostics"?<DiagnosticsTools/>:tab==="calibration"&&analysis?<MetrologyChartWorkspace.Provider value={{
-          sequence:interact=><SessionQcSequence analysis={analysis} mapping={mapping} interact={interact}/>,
-          plots:(interact,manualControls)=><><CorrectionValidation analysis={analysis}/><SessionResiduals analysis={analysis} materialId={materialId} mapping={mapping} interact={interact} manualControls={manualControls} overrides={detail.residual_overrides??{}} busy={props.busy} saveOverride={saveOverride}/></>,
-          carbonateMaterial,
-          materialLabels:[...new Set(analysis.rows.filter(row=>row.material_id===materialId).map(row=>row.identifier1||row.label))],
-          outliers:{method:outlierMethod,threshold,rows:analysis.outliers.flags.map(f=>({row:mapping[f.measurement_id],isotope:f.isotope==="d13c"?"d13C":"d18O"}))},
-          controls:<div className="metro-stack"><Field label={tr("Outlier method")}><select value={outlierMethod} onChange={e=>{setOutlierMethod(e.target.value);setThreshold(e.target.value==="iqr"?1.5:3);}}><option value="sigma">Sigma</option><option value="iqr">IQR</option></select></Field><Field label={tr("Screening threshold")}><input type="number" min={.5} max={10} step={.5} value={threshold} onChange={e=>{const value=Number(e.target.value);if(value>=.5&&value<=10)setThreshold(value);}}/></Field><p className="metro-muted">{analysis.outliers.flags.length} {tr("session QC flags")}. {tr("Screening uses the original IRMS sigma/IQR algorithm on final QC values. Flags do not exclude analyses.")}</p><div className="station-outlier-list">{analysis.outliers.flags.map(flag=>{const row=analysis.rows.find(r=>r.id===flag.measurement_id);return <button className="metro-btn" key={`${flag.measurement_id}-${flag.isotope}`} onClick={()=>{setRun(flag.run_id);setTab("import");}}>{row?.label} / {row?.workbook_sequence} / {isotopeLabel[flag.isotope]}</button>;})}</div></div>,
-          review:labels=><>{[...new Set(labels)].map(label=>{const id=Object.keys(mapping).find(id=>mapping[id]===label);const selectedRun=detail.runs.find(r=>r.measurements.some(m=>m.id===id));const row=selectedRun?.evaluation?.results.find(r=>r.id===id);return row&&selectedRun?<RowReview {...props} key={id} row={row} run={selectedRun}/>:null;})}</>,
-        }}><CalibrationTools/></MetrologyChartWorkspace.Provider>:tab==="processing"?<MetrologyChartHeight.Provider value={420}><section className="station-processing-main"><h2>{tr("Original IRMS processing tools / imported observations")}</h2><MetrologyProcessingResults.Provider value={Object.fromEntries((analysis?.rows??[]).filter(row=>(!group||row.role!=="unknown"||row.sample_group===group)&&mapping[row.id]).map(row=>[mapping[row.id],row]))}><ProcessingTools/></MetrologyProcessingResults.Provider></section></MetrologyChartHeight.Provider>:null}
-      </div>}
-      {tab==="processing"&&analysis&&<SessionProcessing analysis={analysis} group={group} mapping={mapping} tableOnly/>}
+    {(toolsActive||visitedTools.length>0)&&<MetrologyConsultation.Provider value={true}>
+      {toolsActive&&(toolsError?<div role="alert" className="metro-note error">{tr(toolsError)} <button className="metro-btn" onClick={()=>setToolsAttempt(attempt=>attempt+1)}>{tr("Retry plotting workspace")}</button></div>:!run?<Empty>{tr("Import a workbook to open the plotting tools.")}</Empty>:!toolId?<p role="status">{tr("Preparing original workbook plots. Large sessions may take a few minutes.")}</p>:null)}
+      {visitedTools.map(toolTab=>{const bridge=bridges[toolTab==="diagnostics"?(run?.id??""):"all"];if(!bridge)return null;return <div className="station-existing-tools" hidden={tab!==toolTab} key={toolTab}><MetrologyToolsSession.Provider value={bridge.session_id}>
+        {toolTab==="diagnostics"?<DiagnosticsTools/>:toolTab==="calibration"&&analysis?<MetrologyChartWorkspace.Provider value={calibrationWorkspace}><CalibrationTools/></MetrologyChartWorkspace.Provider>:toolTab==="processing"?<MetrologyChartHeight.Provider value={340}><section className="station-processing-main"><h2>{tr("Original IRMS processing tools / imported observations")}</h2><MetrologyProcessingResults.Provider value={processingResults}><ProcessingTools/></MetrologyProcessingResults.Provider></section></MetrologyChartHeight.Provider>:null}
+      {toolTab==="processing"&&analysis&&<SessionProcessing analysis={analysis} group={group} mapping={mapping} tableOnly/>}
+      </MetrologyToolsSession.Provider></div>;})}
     </MetrologyConsultation.Provider>}
     {tab==="export"&&<><TraceableExport {...props} detail={detail} group={group}/>
       <details><summary>{tr("Organize sample groups")}</summary><Panel><form onSubmit={async e=>{e.preventDefault();const changed=Object.fromEntries(Object.entries(groups).filter(([id,value])=>value!==detail.groups[id]));if(Object.keys(changed).length)await props.act(`/results-sessions/${detail.id}/groups`,{groups:changed});}}><div className="metro-table-wrap"><table><thead><tr><th>{tr("Sample")}</th><th>{tr("Sample group")}</th><th>{tr("Decision")}</th></tr></thead><tbody>{detail.runs.flatMap(source=>(source.evaluation?.results??[]).filter(r=>r.role==="unknown").map(r=>({...r,locked:source.status==="released"}))).map(r=><tr key={r.id}><td>{r.label}</td><td><input className="metro-control" aria-label={`${tr("Group for")} ${r.label}`} value={groups[r.id]??"Main batch"} disabled={r.locked} onChange={e=>setGroups(p=>({...p,[r.id]:e.target.value}))}/></td><td><Status value={r.issues?.length?"blocked":r.locked?"released":"review"}/></td></tr>)}</tbody></table></div><div className="metro-actions"><BusyButton busy={props.busy}>{tr("Save sample groups")}</BusyButton></div></form></Panel></details>

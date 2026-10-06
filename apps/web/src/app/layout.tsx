@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist_Mono, Manrope, Space_Grotesk } from "next/font/google";
 import "./globals.css";
+import "@/components/ui/scientific-controls.css";
 
 import { BackToTopButton } from "@/components/layout/back-to-top-button";
 import { QueryProvider } from "@/components/layout/query-provider";

@@ -1,4 +1,5 @@
 "use client";
+import { memo } from "react";
 import { useMetrologyConsultation } from "@/components/metrology/consultation-context";
 
 import { useTranslation } from "@/components/layout/language-provider";
@@ -41,7 +42,7 @@ import type {
 } from "@/lib/types";
 import { formatScientificText } from "@/lib/scientific-notation";
 import { cn } from "@/lib/utils";
-import { useSessionStore } from "@/store/use-session-store";
+import { useToolsSession } from "@/components/metrology/consultation-context";
 
 const RANGE_FETCH_DEBOUNCE_MS = 300;
 const LINEARITY_SAVE_DEBOUNCE_MS = 250;
@@ -1733,16 +1734,16 @@ function diagnosticsColorScaleTicks(range: [number, number], count = 6): number[
 function DiagnosticsColorScaleBar({ colorParam, range }: { colorParam: string; range: [number, number] }) {
   const tr = useTranslation();
   const label = diagnosticsColorParameterLabel(colorParam);
-  const ticks = diagnosticsColorScaleTicks(range);
+  const ticks = diagnosticsColorScaleTicks(range, /date/i.test(colorParam ?? "") ? 2 : 3);
   return (
-    <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
+    <div className="scientific-color-strip">
       <div className="mb-1 font-semibold text-stone-900">{tr(formatScientificText(label))}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
         aria-label={tr(`${label} color scale from ${range[0]} to ${range[1]}`)}
       />
-      <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
+      <div className="scientific-color-ticks">
         {ticks.map((tick, index) => (
           <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
             {tr(formatDiagnosticsColorbarValue(tick, colorParam))}
@@ -1891,6 +1892,7 @@ function RangeSliderControl({
   bounds,
   value,
   step = 0.001,
+  date = false,
   precision = 3,
   onChange,
 }: {
@@ -1899,6 +1901,7 @@ function RangeSliderControl({
   value: [number, number] | null;
   step?: number;
   precision?: number;
+  date?: boolean;
   onChange: (nextRange: [number, number]) => void;
 }) {
   const tr = useTranslation();
@@ -1915,6 +1918,7 @@ function RangeSliderControl({
       min={minBound}
       max={maxBound}
       step={step}
+      date={date}
       precision={precision}
       description={tr(bounds ? "Data bounds" : undefined)}
       onChange={onChange}
@@ -1922,12 +1926,12 @@ function RangeSliderControl({
   );
 }
 
-export default function DiagnosticsPage() {
+function DiagnosticsPage() {
   const consultation = useMetrologyConsultation();
   const tr = useTranslation();
-  const sessionId = useSessionStore((state) => state.sessionId);
+  const sessionId = useToolsSession();
   const queryClient = useQueryClient();
-  const [colorParam, setColorParam] = useState("Date");
+  const [colorParam, setColorParam] = useState("1  Cycle Int  Samp  44");
   const [symbolSize, setSymbolSize] = useState(8);
   const [identifierFilter, setIdentifierFilter] = useState<string[]>([]);
   const [d13Range, setD13Range] = useState<[number, number] | null>(null);
@@ -1980,6 +1984,8 @@ export default function DiagnosticsPage() {
   });
   const calibrationWorkspaceQuery = useQuery({
     queryKey: ["calibration-workspace", sessionId],
+    staleTime: consultation ? Infinity : 0,
+    gcTime: 30 * 60 * 1000,
     queryFn: () => api.getCalibrationWorkspace(sessionId!),
     enabled: Boolean(sessionId),
   });
@@ -2778,6 +2784,7 @@ export default function DiagnosticsPage() {
                 </div>
                 <RangeSliderControl
                   label={tr("Color scale interval")}
+                      date={["date","date_ordinal"].includes(String(colorParam).toLowerCase())}
                   bounds={[colorSliderBounds.min, colorSliderBounds.max]}
                   value={effectiveColorScaleRange}
                   step={sliderStep(colorSliderBounds)}
@@ -3079,7 +3086,7 @@ export default function DiagnosticsPage() {
                           {group.items.map((item) => (
                             <div
                               key={item.key}
-                              className="aspect-square min-w-0 overflow-hidden rounded-lg border border-stone-200 bg-white"
+                              className="min-w-0 self-start overflow-hidden rounded-lg border border-stone-200 bg-white"
                             >
                               <PlotlyChart
                                 figure={item.figure}
@@ -3346,3 +3353,5 @@ export default function DiagnosticsPage() {
     </div>
   );
 }
+
+export default memo(DiagnosticsPage);

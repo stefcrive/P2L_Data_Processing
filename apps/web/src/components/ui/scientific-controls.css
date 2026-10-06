@@ -1,0 +1,67 @@
+.control-column.scientific-control-column { container: scientific-controls / inline-size; padding-right: 0; scroll-padding-top: 80px; }
+.scientific-control-column .scientific-controls { min-width: 0; overflow: visible; }
+.control-column.scientific-control-column .scientific-controls .scientific-controls__header { position: sticky; top: 0; z-index: 25; padding: 8px 10px; gap: 4px; background: #fff; }
+.scientific-control-column .scientific-controls .scientific-controls__toolbar { display: flex; align-items: center; flex-wrap: nowrap; gap: 5px; min-width: 0; }
+.scientific-control-column .scientific-controls .scientific-controls__toolbar h3 { flex: 1; font-size: 12px; line-height: 1.3; margin: 0; }
+.scientific-control-column .scientific-controls .scientific-controls__toolbar button { flex-shrink: 0; min-height: 28px; height: 28px; font-size: 11px; padding: 3px 8px; }
+.scientific-control-column .scientific-controls .scientific-controls__toolbar .scientific-controls__help { width: 18px; padding: 0; color: #64748b; }
+.scientific-controls__status { font-size: 11px; color: #925511; }
+.scientific-controls__pending { display: flex; flex-wrap: wrap; gap: 3px 8px; }
+.scientific-control-column .scientific-controls .scientific-controls__body { display: flex; flex-direction: column; gap: 8px; padding: 8px 10px 10px; }
+.scientific-controls .scientific-controls__group { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.scientific-controls__group + .scientific-controls__group { border-top: 1px solid #e2e8f0; padding-top: 6px; }
+.scientific-controls .scientific-controls__group h4 { font-size: 11px; font-weight: 600; line-height: 1.3; color: #475569; margin: 0; }
+.scientific-controls .scientific-controls__grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; align-items: end; }
+.scientific-controls__wide { grid-column: 1 / -1; }
+.scientific-controls__ranges { display: grid; grid-template-columns: minmax(0,1fr); gap: 6px; }
+.scientific-control-column .scientific-controls :is(label,legend,.text-sm,.form-label) { font-size: 11px; line-height: 1.3; }
+.scientific-control-column .scientific-controls label { min-width: 0; }
+.scientific-control-column .scientific-controls label:has(>input[type=checkbox]) { padding: 1px 0; gap: 6px; }
+.scientific-control-column .scientific-controls label > .mb-1 { margin-bottom: 2px; }
+.scientific-control-column .scientific-controls input:not([type=range]):not([type=checkbox]) { width: 100%; min-width: 0; min-height: 30px; height: 30px; font-size: 12px; padding: 3px 6px; border-radius: 4px; }
+.scientific-control-column .scientific-controls button { min-height: 28px; font-size: 11px; padding: 4px 7px; }
+.scientific-controls :is(button,input):focus-visible, .scientific-select:focus-within { outline: 2px solid #2563eb; outline-offset: 2px; }
+.scientific-select { display: grid; grid-template-columns: minmax(0,1fr) 13px; align-items: center; gap: 4px; position: relative; min-width: 0; min-height: 30px; padding: 4px 6px; border: 1px solid #cbd5e1; border-radius: 4px; background: #fff; color: #334155; }
+.scientific-select__value { font-size: 12px; font-weight: 400; line-height: 1.35; overflow-wrap: anywhere; }
+.scientific-select[data-disabled] { opacity: .55; }
+.scientific-controls .scientific-select > select { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 100%; opacity: 0; cursor: pointer; }
+.scientific-control-column .scientific-controls .range-field--compact { min-width: 0; padding: 0; border: 0; background: transparent; border-radius: 0; }
+.scientific-control-column .scientific-controls .range-field--compact .range-field__controls { display: grid; grid-template-columns: minmax(80px,1fr) minmax(38px,.7fr) minmax(80px,1fr); align-items: center; gap: 5px; margin-top: 2px; }
+.scientific-control-column .scientific-controls .range-field--compact .range-field__number { display: block; grid-row: 1; min-width: 0; }
+.scientific-control-column .scientific-controls .range-field--compact .range-field__number:first-child { grid-column: 1; }
+.scientific-control-column .scientific-controls .range-field--compact .range-field__number:last-child { grid-column: 3; }
+.scientific-control-column .scientific-controls .range-field--compact .range-field__number > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.scientific-control-column .scientific-controls .range-field--compact .range-field__number input { font-variant-numeric: tabular-nums; font-family: inherit; font-size: 12px; text-align: right; padding-inline: 4px; }
+.scientific-control-column .scientific-controls .range-field--compact .dual-range { grid-column: 2; grid-row: 1; height: 28px; margin: 0; min-width: 0; }
+.scientific-control-column .scientific-controls .range-field--wide-values .range-field__controls { grid-template-columns: minmax(0,1fr) minmax(0,1fr); }
+.scientific-control-column .scientific-controls .range-field--wide-values .range-field__number:last-child { grid-column: 2; }
+.scientific-control-column .scientific-controls .range-field--wide-values .dual-range { grid-column: 1/-1; grid-row: 2; height: 18px; }
+.scientific-control-column .scientific-controls .range-field--date .range-field__number { display: grid; grid-template-columns: 28px minmax(0,1fr); gap: 4px; align-items: center; grid-column: 1/-1; }
+.scientific-control-column .scientific-controls .range-field--date .range-field__number:first-child { grid-column: 1/-1; }
+.scientific-control-column .scientific-controls .range-field--date .range-field__number > span { position: static; width: auto; height: auto; clip-path: none; font-size: 10px; margin: 0; }
+.scientific-control-column .scientific-controls .range-field--date .range-field__number:last-child { grid-column: 1/-1; grid-row: 2; }
+.scientific-control-column .scientific-controls .range-field--date .range-field__number input { text-align: left; }
+.scientific-control-column .scientific-controls .range-field--date .dual-range { grid-row: 3; }
+.scientific-controls .scientific-color-strip { padding: 0; width: 100%; }
+.scientific-controls .scientific-color-strip > div:first-child { display: none; }
+.scientific-controls .scientific-color-strip > [role=img] { height: 6px; }
+.scientific-controls .scientific-color-ticks { display: flex; justify-content: space-between; gap: 4px; font-size: 10px; line-height: 1.3; margin-top: 2px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.scientific-control-column .scientific-controls .mt-2 { margin-top: 6px; }
+.scientific-controls__checks { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; }
+.scientific-controls__checks > .scientific-check--wide { grid-column: 1/-1; }
+/* Range inputs stay easy to target even when the two values are close. */
+.scientific-control-column .scientific-controls .dual-range__input { height: 28px; }
+.scientific-control-column .scientific-controls .range-field--wide-values .dual-range__input { height: 20px; }
+@container scientific-controls (min-width: 580px) {
+  .scientific-controls .scientific-controls__ranges { grid-template-columns: minmax(0,1fr); }
+  .scientific-control-column .scientific-controls .scientific-controls__ranges > .range-field { grid-column: auto; }
+}
+@media (max-width:1279px) {
+  .control-column.scientific-control-column { position: static; max-height: none; overflow: visible; }
+  .control-column.scientific-control-column .scientific-controls .scientific-controls__header { top: var(--app-header-height); }
+}
+
+@media (min-width:1280px) {
+  .station-existing-tools .workspace-grid.scientific-processing-workspace { grid-template-columns: minmax(300px,320px) 24px minmax(0,1fr); }
+  .control-column-is-collapsed .station-existing-tools .workspace-grid.scientific-processing-workspace { grid-template-columns: 24px minmax(0,1fr); }
+}

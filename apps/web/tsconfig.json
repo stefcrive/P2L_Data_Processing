@@ -33,6 +33,7 @@
     "**/*.tsx",
     ".next-dev/types/**/*.ts",
     ".next-metrology-3200/types/**/*.ts",
+    ".next-metrology-3201/types/**/*.ts",
     ".next-prod/types/**/*.ts",
     ".next-uiqa/types/**/*.ts",
     ".next/types/**/*.ts",

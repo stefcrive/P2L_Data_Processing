@@ -45,7 +45,7 @@ export function RawAnalysisInfoTable({
   if (layout === "vertical") {
     return (
       <section
-        className={cn("flex h-full min-h-0 flex-col overflow-hidden rounded-md border border-slate-200 bg-white", className)}
+        className={cn("raw-analysis-info flex h-full min-h-0 flex-col overflow-hidden rounded-md border border-slate-200 bg-white", className)}
         aria-labelledby="hover-raw-analysis-heading"
       >
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-2 py-1.5">

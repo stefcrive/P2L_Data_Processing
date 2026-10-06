@@ -109,3 +109,32 @@ export function normalizationEnvelope(model: Normalization, coverageFactor: numb
     return { x, value: model.intercept + b * x, uncertainty: variance < -1e-12 ? null : coverageFactor * Math.sqrt(Math.max(0, variance)) };
   }), name, fillcolor);
 }
+
+export type CalibrationStages = {before:(number|null)[];after:(number|null)[]};
+/** Add paired canonical stages in the figure's existing isotope-axis assignment. */
+export function withCalibrationStages(figure:Record<string,unknown>, values:Map<string,CalibrationStages>, labels:{before:string;after:string}) {
+  const traces=(Array.isArray(figure.data)?figure.data:[]) as Record<string,unknown>[];
+  const layout=(figure.layout??{}) as Record<string,unknown>,scene=layout.scene as Record<string,unknown>|undefined;
+  const isotopeAxis=(axis:unknown,fallback:number)=>{
+    const title=(axis as {title?:unknown})?.title;
+    const label=typeof title==="string"?title:String((title as {text?:string})?.text??"");
+    return /18|¹⁸/.test(label)?1:/13|¹³/.test(label)?0:fallback;
+  };
+  const xi=isotopeAxis(scene?.xaxis??layout.xaxis,1),yi=isotopeAxis(scene?.yaxis??layout.yaxis,0),zi=isotopeAxis(scene?.zaxis,-1);
+  const isotopeNames=["δ¹³C","δ¹⁸O"],used=new Set<string>();
+  const additions=traces.flatMap(trace=>{
+    const custom=vector(trace.customdata) as unknown[][]|null, xs=vector(trace.x),zs=vector(trace.z),texts=vector(trace.text);
+    if(!custom||!xs||!String(trace.mode).includes("markers"))return [];
+    const indices=custom.map((point,i)=>{const id=String(point[0]);if(!values.has(id)||used.has(id))return -1;used.add(id);return i;}).filter(i=>i>=0);
+    if(!indices.length)return [];
+    return (["before","after"] as const).map(stage=>({...trace,name:labels[stage],meta:{...(trace.meta as object??{}),correctionStage:stage},legendgroup:stage,showlegend:true,mode:"markers",
+      x:indices.map(i=>values.get(String(custom[i][0]))![stage][xi]),y:indices.map(i=>values.get(String(custom[i][0]))![stage][yi]),
+      ...(zs?{z:indices.map(i=>zi<0?zs[i]:values.get(String(custom[i][0]))![stage][zi])}:{}),
+      customdata:indices.map(i=>custom[i]),text:texts?indices.map(i=>texts[i]):trace.text,
+      // Imported error bars belong to the imported values; retain them on that trace.
+      error_x:undefined,error_y:undefined,error_z:undefined,
+      marker:{size:stage==="before"?8:6,symbol:stage==="before"?"circle-open":"circle",color:stage==="before"?"#94a3b8":"#215ec5"},
+      hovertemplate:`${isotopeNames[xi]}: %{x:.4f} ‰<br>${isotopeNames[yi]}: %{y:.4f} ‰<extra>%{fullData.name}</extra>`}));
+  });
+  return {...figure,data:[...traces,...additions]};
+}

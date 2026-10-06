@@ -1,0 +1,685 @@
+{
+  "schema": "irms.session_state",
+  "schema_version": 1,
+  "application": "IRMS Output Analyzer",
+  "session_id": "5604c5464187420d826dfd3e58f0799c",
+  "session_name": "Natan Pereira / Natan Pereira BTS coral series",
+  "created_at": "2026-10-06T15:11:49.098088+00:00",
+  "updated_at": "2026-10-06T15:11:59.568937+00:00",
+  "source_files": [
+    {
+      "name": "4c0283d537ed__Natan Pereira BTS coral series 1.xlsx",
+      "size": 76676,
+      "md5": "280df434d060837c21f7c7b9ea09685b",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 0,
+        "file_name": "4c0283d537ed__Natan Pereira BTS coral series 1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "cb758247a117__Natan Pereira BTS coral series 10.xlsx",
+      "size": 115909,
+      "md5": "ddf2511a31bfbe9723611dbf4882caba",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 1,
+        "file_name": "cb758247a117__Natan Pereira BTS coral series 10.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "b788d374aa4d__Natan Pereira BTS coral series 12.xlsx",
+      "size": 113488,
+      "md5": "364229222373fdae9f57faadbe56b72f",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 2,
+        "file_name": "b788d374aa4d__Natan Pereira BTS coral series 12.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "42242e113b06__Natan Pereira BTS coral series 13.xlsx",
+      "size": 106572,
+      "md5": "5e6e228fa1d171ce371e95b77d1cbe54",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 3,
+        "file_name": "42242e113b06__Natan Pereira BTS coral series 13.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "c82295ddefec__Natan Pereira BTS coral series 14.1.xlsx",
+      "size": 115544,
+      "md5": "95f51c9f12f40c3620252d8ebacb899c",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 4,
+        "file_name": "c82295ddefec__Natan Pereira BTS coral series 14.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "ad2d4a9f2ce6__Natan Pereira BTS coral series 17.4.xlsx",
+      "size": 111066,
+      "md5": "da762132c6feea07b989f87ddeb44027",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 5,
+        "file_name": "ad2d4a9f2ce6__Natan Pereira BTS coral series 17.4.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "25d42f1b32ab__Natan Pereira BTS coral series 2.xlsx",
+      "size": 94702,
+      "md5": "77f54b43d54afa94d298cbea8b050ad6",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 6,
+        "file_name": "25d42f1b32ab__Natan Pereira BTS coral series 2.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "02845ed929c6__Natan Pereira BTS coral series 3.xlsx",
+      "size": 115893,
+      "md5": "46c0f77f88d5245b0dcf368d9ad04813",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 7,
+        "file_name": "02845ed929c6__Natan Pereira BTS coral series 3.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "b0614000b16d__Natan Pereira BTS coral series 4.1.xlsx",
+      "size": 115934,
+      "md5": "56cbef8625beeb0c42eed8a37e8d2f98",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 8,
+        "file_name": "b0614000b16d__Natan Pereira BTS coral series 4.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "de1d202e39cb__Natan Pereira BTS coral series 5.xlsx",
+      "size": 109433,
+      "md5": "7b36fe5d8b2c068314a43bf63a2d9022",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 9,
+        "file_name": "de1d202e39cb__Natan Pereira BTS coral series 5.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "375e2e180dc6__Natan Pereira BTS coral series 7.xlsx",
+      "size": 116230,
+      "md5": "5d1def4f8270e134b70dcc67077e877c",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 10,
+        "file_name": "375e2e180dc6__Natan Pereira BTS coral series 7.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "ee0a048ed7a4__Natan Pereira BTS coral series 8.1.xlsx",
+      "size": 115962,
+      "md5": "6e4dda9dab895925c17aca8d91131a9b",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 11,
+        "file_name": "ee0a048ed7a4__Natan Pereira BTS coral series 8.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "3f525473c511__Natan Pereira BTS coral series 9.xlsx",
+      "size": 116100,
+      "md5": "727b3e7e1752ece065090b25b4ca5f3e",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 12,
+        "file_name": "3f525473c511__Natan Pereira BTS coral series 9.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "35a2b0e7ba09__SHP2L 25032026.xlsx",
+      "size": 71040,
+      "md5": "9a7f051aaabc654985e2f73423cca63b",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 13,
+        "file_name": "35a2b0e7ba09__SHP2L 25032026.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "d6b24e7268cd__Natan Pereira BTS coral series 15.xlsx",
+      "size": 110597,
+      "md5": "5f2cb71184d4fd9db63dc3e3496e43f4",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 14,
+        "file_name": "d6b24e7268cd__Natan Pereira BTS coral series 15.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "5320cca3aecc__Natan Pereira BTS coral series 16.xlsx",
+      "size": 104051,
+      "md5": "7d5c31c42c9e5270ed7e33b7e80146dd",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 15,
+        "file_name": "5320cca3aecc__Natan Pereira BTS coral series 16.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "c0b7deb51c05__Natan Pereira BTS coral series 6.xlsx",
+      "size": 90650,
+      "md5": "a5d0734e89daa4bad04073dff2db02ec",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 16,
+        "file_name": "c0b7deb51c05__Natan Pereira BTS coral series 6.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "221779fac78b__Natan Pereira BTS coral series 11.xlsx",
+      "size": 89631,
+      "md5": "4a0c73db3ab87af4441b46deea4c80a7",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 17,
+        "file_name": "221779fac78b__Natan Pereira BTS coral series 11.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "f83cab0ad3b9__Natan Pereira BTS coral series 6.3.xlsx",
+      "size": 34078,
+      "md5": "c264ff8922b453fe41b18963a604d02d",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 18,
+        "file_name": "f83cab0ad3b9__Natan Pereira BTS coral series 6.3.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    }
+  ],
+  "session_record_dir": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\5604c5464187420d826dfd3e58f0799c",
+  "relative_session_record_dir": "Session record/5604c5464187420d826dfd3e58f0799c",
+  "files": {
+    "metadata": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\5604c5464187420d826dfd3e58f0799c\\metadata.json",
+    "snapshot": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\5604c5464187420d826dfd3e58f0799c\\snapshot.csv",
+    "cycles_snapshot": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\5604c5464187420d826dfd3e58f0799c\\cycles_snapshot.csv",
+    "event_log": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\5604c5464187420d826dfd3e58f0799c\\events.jsonl",
+    "session_state": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\5604c5464187420d826dfd3e58f0799c\\irms_session_state.json"
+  }
+}

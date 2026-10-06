@@ -18,6 +18,33 @@ from .importer import measurement_identity
 
 
 class ResultsSessions:
+    def save_outlier_screening(self, session_id, command):
+        from .qc_screening import stored_qc_screening
+        with self.repo.connect(write=True) as db:
+            session = self.repo.get(db, "results_sessions", session_id)
+            settings = command.model_dump(exclude={"actor", "reason"})
+            before = session.get("outlier_screening", {"method": "sigma", "threshold": 3.0})
+            session["outlier_screening"] = settings
+            self.repo.update(db, "results_sessions", session_id, session)
+            result = stored_qc_screening(self.repo, db, session)
+            if before != settings:
+                self.repo.audit(db, "qc_screening_settings_saved", session_id, command.actor, command.reason, before, settings)
+            return result
+
+    def results_session_analysis(self, session_id, outlier_method=None, threshold=None):
+        from .qc_screening import stored_qc_screening
+        from .session_analysis import session_analysis
+        detail = self.results_session_detail(session_id)
+        # Explicit query parameters remain a non-persistent preview for existing clients.
+        if outlier_method is not None or threshold is not None:
+            settings = detail.get("outlier_screening", {"method": "sigma", "threshold": 3.0})
+            return session_analysis(detail, outlier_method=outlier_method or settings["method"],
+                                    threshold=threshold if threshold is not None else settings["threshold"])
+        with self.repo.connect(write=True) as db:
+            session = self.repo.get(db, "results_sessions", session_id)
+            outliers = stored_qc_screening(self.repo, db, session, detail["runs"])
+        return session_analysis(detail, outliers=outliers)
+
     def save_chart_settings(self, session_id, command):
         with self.repo.connect(write=True) as db:
             session = self.repo.get(db, "results_sessions", session_id)

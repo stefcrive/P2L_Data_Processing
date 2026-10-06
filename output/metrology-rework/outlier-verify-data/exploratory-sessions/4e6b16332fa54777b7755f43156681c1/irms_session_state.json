@@ -1,0 +1,55 @@
+{
+  "schema": "irms.session_state",
+  "schema_version": 1,
+  "application": "IRMS Output Analyzer",
+  "session_id": "4e6b16332fa54777b7755f43156681c1",
+  "session_name": "Test client / Original export verification",
+  "created_at": "2026-10-06T17:18:57.952199+00:00",
+  "updated_at": "2026-10-06T17:18:58.574183+00:00",
+  "source_files": [
+    {
+      "name": "1de02b6d6a84__SHP2L__-0036(Reevaluated).xls",
+      "size": 198656,
+      "md5": "6d98e63e41647eaf4ff6a28c5877dc0c",
+      "software": "generic",
+      "identity_parsing": {
+        "file_index": 0,
+        "file_name": "1de02b6d6a84__SHP2L__-0036(Reevaluated).xls",
+        "software": "generic",
+        "identifier1": {
+          "source_column": "Identifier 1",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Identifier 2",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Identifier 1",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    }
+  ],
+  "session_record_dir": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\4e6b16332fa54777b7755f43156681c1",
+  "relative_session_record_dir": "Session record/4e6b16332fa54777b7755f43156681c1",
+  "files": {
+    "metadata": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\4e6b16332fa54777b7755f43156681c1\\metadata.json",
+    "snapshot": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\4e6b16332fa54777b7755f43156681c1\\snapshot.csv",
+    "cycles_snapshot": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\4e6b16332fa54777b7755f43156681c1\\cycles_snapshot.csv",
+    "event_log": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\4e6b16332fa54777b7755f43156681c1\\events.jsonl",
+    "session_state": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\4e6b16332fa54777b7755f43156681c1\\irms_session_state.json"
+  }
+}

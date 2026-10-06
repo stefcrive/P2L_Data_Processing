@@ -9,6 +9,7 @@ import { formatScientificText } from "@/lib/scientific-notation";
 export function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
+      data-card=""
       className={cn(
         "rounded-lg border border-slate-200 bg-white shadow-sm",
         className,
@@ -19,7 +20,7 @@ export function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElemen
 }
 
 export function CardHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn("flex flex-col gap-1 border-b border-slate-200 p-4", className)} {...props} />;
+  return <div data-card-header="" className={cn("flex flex-col gap-1 border-b border-slate-200 p-4", className)} {...props} />;
 }
 
 export function CardTitle({ className, children, ...props }: React.HTMLAttributes<HTMLHeadingElement>) {
@@ -29,7 +30,7 @@ export function CardTitle({ className, children, ...props }: React.HTMLAttribute
 
 export function CardDescription({ className, children, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
   const tr = useTranslation();
-  return <p className={cn("text-xs leading-relaxed text-slate-500", className)} {...props}>{tr(typeof children === "string" ? formatScientificText(children) : children)}</p>;
+  return <p data-card-description="" className={cn("text-xs leading-relaxed text-slate-500", className)} {...props}>{tr(typeof children === "string" ? formatScientificText(children) : children)}</p>;
 }
 
 export function CardContent({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {

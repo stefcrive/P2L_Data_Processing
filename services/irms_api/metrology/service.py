@@ -165,10 +165,14 @@ class Service(ResultsSessions):
         digest = self.repo.blob(content)
         with self.repo.connect(write=True) as db:
             session = self.prepare_session_import(db, command)
+            if command.carbonate_correction_preapplied and command.input_basis != "already_vpdb":
+                raise ValueError("Pre-applied carbonate correction requires already normalized VPDB input")
             duplicates = self.repo.list(db, "raw_imports", sha256=digest)
             if duplicates:
                 existing = [r for r in self.repo.list(db, "runs") if r["raw_import_id"] == duplicates[0]["id"]]
                 if existing:
+                    if existing[0].get("carbonate_material", "calcite") != command.carbonate_material or existing[0].get("carbonate_correction_preapplied", False) != command.carbonate_correction_preapplied:
+                        raise ValueError("This workbook is already imported with a different carbonate basis; retain its original processing record")
                     if session:
                         self.attach_session_run(db, session, existing[0], command)
                     return {**existing[0], "duplicate": True}
@@ -204,6 +208,7 @@ class Service(ResultsSessions):
                                    "synthetic": parsed["synthetic"], "simulation": self.repo.demo,"source_kind":parsed.get("source_kind","qtegra_raw"),
                                    "calibration_verification":session.get("calibration_verification","documented") if session else "documented",
                                    "input_basis": command.input_basis, "external_method_id": command.external_method_id,
+                                   "carbonate_material": command.carbonate_material, "carbonate_correction_preapplied": command.carbonate_correction_preapplied,
                                    "processing_evidence": command.processing_evidence, "preapplied_corrections": command.preapplied_corrections,
                                    "latest_evaluation_id": None, "period_key": period_key,
                                    "acquired_date": min(acquisition) if acquisition else None,
@@ -547,6 +552,11 @@ class Service(ResultsSessions):
         runs = {r["id"]: r for r in self.repo.list(db, "runs")}
         period = self.repo.get(db, "periods", period_id) if period_id else None
         owners={run_id:session for session in self.repo.list(db,"results_sessions") for run_id in session["run_ids"]}
+        from .qc_screening import stored_qc_screening
+        session_flags = set()
+        for session in {s["id"]: s for r in observations if (s := owners.get(r["run_id"]))}.values():
+            screening = stored_qc_screening(self.repo, db, session, [runs[rid] for rid in session["run_ids"]])
+            session_flags.update((f["evaluation_id"], f["measurement_id"], f["isotope"]) for f in screening["flags"])
         groups = {}
         for row in observations:
             run = runs[row["run_id"]]
@@ -584,9 +594,10 @@ class Service(ResultsSessions):
             group["isotopes"] = {}
             for iso in ISOTOPES:
                 points = [{"id": r["id"], "value": r["raw"][iso] if use_original else r["isotopes"][iso]["value"], "run_id": r["run_id"],
-                           "at": r["acquired_at"] or r["created_at"], "qc_passed": r["qc_passed"], "issues": r["issues"]}
+                           "at": r["acquired_at"] or r["created_at"], "qc_passed": r["qc_passed"], "issues": r["issues"],
+                           "session_outlier": (r["evaluation_id"], r["measurement_id"], iso) in session_flags}
                           for r in rows if not r["excluded"] and (r["raw"].get(iso) is not None if use_original else iso in r["isotopes"])]
-                group["isotopes"][iso] = control_summary(points, group["material"]["assigned"][iso]["value"], config["precision"][iso])
+                group["isotopes"][iso] = control_summary(points, group["material"]["assigned"][iso]["value"], config["precision"][iso], exclude_outliers=True)
             group["observations"] = rows
             group["run_count"] = len({r["run_id"] for r in rows})
             group["precision_eligible"] = period is not None

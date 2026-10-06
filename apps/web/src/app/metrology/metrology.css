@@ -553,3 +553,73 @@
 .station-residual-table td:last-child { min-width: 44px; }
 .station-effect-tooltip { position: fixed; z-index: 45; width: 700px; padding: 12px; background: #fff; border: 1px solid #b7c7db; border-radius: 8px; pointer-events: none; }
 .station-effect-tooltip h3 { margin: 0; font-size: 13px; }
+
+.station-method-column { align-self:start; }
+.station-method-column .station-isotope-pair { grid-template-columns:1fr; }
+.metro tr.station-qc-failed > * { background:#fff0ec; color:#9b3526; }
+.station-residual-table { font-variant-numeric:tabular-nums; }
+.station-residual-table thead th { text-align:center; padding:5px 8px; }
+.station-residual-table thead th:first-child { text-align:left; }
+.station-residual-table td.station-effect-value { min-width:140px; padding:8px 10px; }
+.station-effect-value strong { font-size:13px; font-weight:600; white-space:nowrap; }
+.station-effect-value strong span { font-weight:400; }
+.station-effect-value small { display:block; font-size:11px; margin-top:2px; white-space:nowrap; }
+.station-residual-table .after { border-right:1px solid #cbd5e1; }
+.station-residual-table .before { border-left:1px solid #dbe3ed; }
+.station-residual-table .effect-relevant { color:#94521b; background:#fff4e7; }
+.station-residual-table .effect-small { color:#27634b; background:#edf7f1; }
+.station-residual-table th[scope=row] { min-width:180px; max-width:310px; }
+.station-residual-table tbody tr[data-active=true] th { background:#edf2f8; }
+.station-residual-table .station-effect-link { font-size:12px; }
+.station-residual-table td:last-child { min-width:38px; width:38px; }
+.station-residual-charts { scroll-margin-top:70px; }
+.station-effect-tooltip { width:min(1060px,calc(100vw - 32px)); max-height:calc(100vh - 100px); overflow:auto; pointer-events:auto; box-shadow:0 12px 40px #1b354b30; }
+.station-effect-tooltip .metro-grid { gap:12px; }
+.station-effect-tooltip .station-panel-toolbar { margin:0; padding-bottom:4px; }
+.station-existing-tools .control-column { container-type:inline-size; }
+.station-existing-tools .control-column [data-card-header] { position:sticky; top:0; z-index:25; background:#fff; padding:8px 10px; }
+.station-existing-tools .control-column [data-card-header] h3 { font-size:13px; }
+.station-existing-tools .control-column [data-card-header] [data-card-description] { display:none; }
+.station-existing-tools .control-column [data-card-header] > .flex { flex-wrap:nowrap; align-items:center; gap:6px; }
+.station-existing-tools .control-column [data-card-header] button { font-size:11px; padding:4px 7px; height:28px; flex-shrink:0; }
+.station-existing-tools .control-column :is(.text-sm,.form-label,.form-section-title,label,legend) { font-size:11px; line-height:1.3; }
+.station-existing-tools .control-column :is(.form-field,.grid,.metro-stack) { gap:6px; }
+.station-existing-tools .control-column :is(.space-y-3,.space-y-4)>:not([hidden])~:not([hidden]) { margin-top:8px; }
+.station-existing-tools .control-column :is(input,select):not([type=checkbox]):not([type=range]) { font-size:12px; padding:3px 6px; width:100%; min-width:0; }
+.station-existing-tools .control-column select { text-overflow:ellipsis; }
+.station-existing-tools .control-column :is(.form-label,.mb-1) { margin-bottom:2px; }
+.station-existing-tools .range-field { border:0; border-radius:0; background:transparent; padding:0; }
+.station-existing-tools .range-field__controls { grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:4px 10px; margin-top:2px; }
+.station-existing-tools .range-field__number:first-child { grid-column:1; grid-row:1; }
+.station-existing-tools .range-field__number:last-child { grid-column:2; grid-row:1; }
+.station-existing-tools .dual-range { grid-column:1 / -1; grid-row:2; height:23px; margin:0; }
+.station-existing-tools .range-field__number input { font-size:12px; text-align:left; font-family:inherit; }
+.station-existing-tools .range-field__number span { font-size:10px; margin-bottom:1px; }
+.station-existing-tools .range-field__description { display:none; }
+.station-existing-tools .control-column .range-field { grid-column:1 / -1; }
+.scientific-color-strip { width:100%; padding:2px 0; font-size:10px; }
+.scientific-color-strip > div:first-child { display:none; }
+.scientific-color-ticks { display:flex; justify-content:space-between; gap:4px; margin-top:2px; font-size:10px; white-space:nowrap; font-variant-numeric:tabular-nums; }
+@container (min-width:350px) { .control-column .grid:has(>label) { grid-template-columns:repeat(2,minmax(0,1fr)); } .control-column .grid>.form-field:has(select), .control-column .grid>div:has(select) { grid-column:1 / -1; } }
+@media(max-width:1279px) { .station-existing-tools .control-column { max-height:none; overflow:visible; position:static; } }
+@media(max-width:760px) { .station-residual-table { min-width:820px; } .analytical-panel-header { flex-wrap:wrap; } }
+
+.station-existing-tools .range-field--date .range-field__number:first-child { grid-column:1 / -1; grid-row:1; }
+.station-existing-tools .range-field--date .range-field__number:last-child { grid-column:1 / -1; grid-row:2; }
+.station-existing-tools .range-field--date .range-field__number { display:grid; grid-template-columns:32px minmax(0,1fr); align-items:center; gap:4px; }
+.station-existing-tools .range-field--date .dual-range { grid-row:3; }
+
+.station-residual-workspace > .metro-table-wrap { max-height:none; }
+
+.station-effect-tooltip .station-panel-toolbar button { margin-left:auto; }
+
+/* One analytical surface across canonical diagnostics and original IRMS plots. */
+.metro-plot {background:#fff;border:1px solid #dce4ed;border-radius:6px;padding:8px;min-width:0;}
+.metro [hidden] {display:none !important;}
+.station-analysis-evidence {margin:12px 0;}
+.station-analysis-evidence .station-validity td {font-variant-numeric:tabular-nums;}
+.station-validity .outside {background:#fff2dc;color:#8a4b00;}
+.station-validity .inside {background:#eff8f2;color:#1d6440;}
+
+.station-outlier-category { border-top: 1px solid #dce5ed; padding: 8px 0; }
+.station-outlier-category > summary { cursor: pointer; font-size: 13px; font-weight: 600; padding-bottom: 6px; }

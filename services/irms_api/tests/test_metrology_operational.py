@@ -64,6 +64,14 @@ class CorrectionVerificationTests(unittest.TestCase):
         self.assertEqual(review['status'],'review_required')
         self.assertTrue(any('historical' in r for r in review['reasons']))
 
+    def test_saved_outliers_are_excluded_per_isotope(self):
+        args=self.fixture()
+        review=correction_review(*args,excluded_outlier_ids={'d13c':{'0'}})
+        self.assertEqual((review['d13c']['paired_n'],review['d13c']['total_qc']), (14,14))
+        self.assertEqual(review['d13c']['excluded_outlier_n'],1)
+        self.assertEqual((review['d18o']['paired_n'],review['d18o']['total_qc']), (15,15))
+        self.assertEqual(review['d18o']['excluded_outlier_n'],0)
+
 
 class LegacyRawImportTests(unittest.TestCase):
     def frame(self):

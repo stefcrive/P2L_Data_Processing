@@ -1,5 +1,8 @@
 "use client";
 
+import { qcOutlierDisplay } from "@/lib/qc-outlier-display";
+import { memo } from "react";
+
 import { useTranslation } from "@/components/layout/language-provider";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, ChevronUp, Database, GripVertical, X } from "lucide-react";
@@ -48,7 +51,7 @@ import type {
 import { cn } from "@/lib/utils";
 import { formatScientificText } from "@/lib/scientific-notation";
 import { MetrologyChartWorkspace, MetrologyChartAppearance, useMetrologyConsultation } from "@/components/metrology/consultation-context";
-import { useSessionStore } from "@/store/use-session-store";
+import { useToolsSession } from "@/components/metrology/consultation-context";
 
 type SelectedTarget = {
   rowLabel: string;
@@ -988,10 +991,10 @@ function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefin
       xanchor: "center",
       font: { size: 14 },
     },
-    margin: { l: 42, r: 12, t: 42, b: 112 },
-    legend: { orientation: "h", yanchor: "top", y: -0.28, x: 0, xanchor: "left", font: { size: 10 } },
+    margin: { l: 42, r: 12, t: 36, b: 48 },
+    legend: { orientation: "h", yanchor: "bottom", y: 1.01, x: 0, xanchor: "left", font: { size: 9 }, itemwidth: 30, tracegroupgap: 0 },
     hovermode: "closest",
-    height: 390,
+    height: 540,
   };
   return ensureFigureUiRevision(
     {
@@ -2009,6 +2012,7 @@ function RangeSliderField({
   min,
   max,
   step = 0.1,
+  date = false,
   precision = 2,
   onChange,
 }: {
@@ -2018,6 +2022,7 @@ function RangeSliderField({
   max: number;
   step?: number;
   precision?: number;
+  date?: boolean;
   onChange: (next: [number, number]) => void;
 }) {
   const tr = useTranslation();
@@ -2033,6 +2038,7 @@ function RangeSliderField({
       min={resolvedMin}
       max={resolvedMax}
       step={step}
+      date={date}
       precision={precision}
       onChange={onChange}
     />
@@ -2212,16 +2218,16 @@ function CalibrationColorScaleBar({
 }) {
   const tr = useTranslation();
   const label = calibrationColorParameterLabel(colorParam);
-  const ticks = calibrationColorScaleTicks(range);
+  const ticks = calibrationColorScaleTicks(range, /date/i.test(colorParam ?? "") ? 2 : 3);
   return (
-    <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
+    <div className="scientific-color-strip">
       <div className="mb-1 font-semibold text-stone-900">{tr(formatScientificText(label))}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
         aria-label={tr(`${label} color scale from ${range[0]} to ${range[1]}`)}
       />
-      <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
+      <div className="scientific-color-ticks">
         {ticks.map((tick, index) => (
           <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
             {tr(formatCalibrationColorScaleValue(tick, colorParam))}
@@ -3009,11 +3015,11 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
   );
 }
 
-export default function CalibrationPage() {
+function CalibrationPage() {
   const station = useContext(MetrologyChartWorkspace);
   const consultation = useMetrologyConsultation();
   const tr = useTranslation();
-  const sessionId = useSessionStore((state) => state.sessionId);
+  const sessionId = useToolsSession();
   const queryClient = useQueryClient();
   const [config, setConfig] = useState<CalibrationConfig | null>(null);
   const [calibrationJob, setCalibrationJob] = useState<JobSnapshot<SessionSnapshot> | null>(null);
@@ -3154,6 +3160,8 @@ export default function CalibrationPage() {
 
   const workspaceQuery = useQuery({
     queryKey: ["calibration-workspace", sessionId],
+    staleTime: consultation ? Infinity : 0,
+    gcTime: 30 * 60 * 1000,
     queryFn: () => api.getCalibrationWorkspace(sessionId!),
     enabled: Boolean(sessionId),
   });
@@ -3376,10 +3384,11 @@ export default function CalibrationPage() {
     enabled: Boolean(sessionId),
     staleTime: 60_000,
   });
-  const calibrationPreviewMasks = useMemo(
-    () => buildCalibrationPreviewMasks(linearityPreviewDataQuery.data, activeDraftConfig),
-    [activeDraftConfig, linearityPreviewDataQuery.data],
-  );
+  const calibrationPreviewMasks = useMemo(() => {
+    const masks=buildCalibrationPreviewMasks(linearityPreviewDataQuery.data, activeDraftConfig);
+    // The station uses persisted final QC flags, never the legacy raw-value filter.
+    return station&&masks?{...masks,baseD13:masks.selectedRows,baseD18:masks.selectedRows,baseCross:masks.selectedRows}:masks;
+  },[activeDraftConfig,linearityPreviewDataQuery.data,Boolean(station)]);
   const activeColorParam = activeDraftConfig?.color_param ?? persistedWorkspace?.config.color_param ?? null;
   const colorCompatiblePreviewWorkspace =
     calibrationPreviewWorkspaceQuery.data &&
@@ -4205,7 +4214,7 @@ export default function CalibrationPage() {
   ].some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
   const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
-  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 980, 450) : null;
+  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 1120, 620) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
     ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
   );
@@ -4568,15 +4577,29 @@ export default function CalibrationPage() {
                 ) : null}
               </div>
 </>);
+  const stationComparison=(figure:Record<string,unknown>|undefined)=>figure?(station?.comparison?.(figure)??figure):figure;
   const stationAppearance = (figure: Record<string, unknown>): Record<string, unknown> => {
     const colorState = calibrationPreviewMasks?.color;
     const data = (Array.isArray(figure.data) ? figure.data : []).map((trace: Record<string, unknown>) => {
       if (!Array.isArray(trace.customdata) || !String(trace.mode ?? "").includes("markers")) return trace;
       const values = trace.customdata.map((point: unknown) => Array.isArray(point) ? colorState?.valuesByRow.get(String(point[0])) ?? null : null);
       const marker = trace.marker as Record<string,unknown> ?? {};
-      const symbols=trace.customdata.map((point:unknown,index:number)=>Array.isArray(point)&&station?.outliers?.rows.some(flag=>flag.row===String(point[0])&&(point[1]==="cross"||flag.isotope===point[1]))?"x":Array.isArray(marker.symbol)?marker.symbol[index]:marker.symbol??"circle");
-      return {...trace, marker: {...marker,symbol:symbols,...(values.some(value=>value!=null)?{color:values,coloraxis:"coloraxis"}:{})}};
+      return qcOutlierDisplay({...trace, marker: {...marker,...(values.some(value=>value!=null)?{color:values,coloraxis:"coloraxis"}:{})}},station?.outliers?.rows??[]);
     });
+    // Scalar legend markers make before/after readable with per-point colors and symbols.
+    const stageLegends=new Map<string,Record<string,unknown>>();
+    for(const trace of data) {
+      const stage=(trace.meta as {correctionStage?:string})?.correctionStage;
+      if(!stage)continue;
+      const group=`correction-${stage}`;
+      trace.legendgroup=group; trace.showlegend=false;
+      if(!String(trace.mode).includes("markers"))continue;
+      const symbols=(trace.marker as {symbol?:unknown})?.symbol;
+      const uniqueSymbols=new Set(Array.isArray(symbols)?symbols:[symbols]);
+      const legendSymbol=uniqueSymbols.size===1?[...uniqueSymbols][0]:stage==="before"?"x-thin":stage==="preview"?"diamond":"circle";
+      if(!stageLegends.has(group))stageLegends.set(group,{type:trace.type??"scatter",mode:"markers",name:trace.name,legendgroup:group,x:[null],y:[null],...(trace.type==="scatter3d"?{z:[null]}:{}),marker:{size:stage==="before"?9:7,symbol:legendSymbol,color:"#475569",opacity:stage==="before"?.72:.94},hoverinfo:"skip",showlegend:true});
+    }
+    data.push(...stageLegends.values());
     const layout = {...(figure.layout as Record<string,unknown> ?? {})};
     layout.title = {...(typeof layout.title==="object"?layout.title as object:{text:layout.title??""}),font:{size:13},x:.02,xanchor:"left"};
     layout.font = {family:"Segoe UI, sans-serif",size:12,color:"#475569"};
@@ -5174,6 +5197,7 @@ export default function CalibrationPage() {
                   <div className="form-field">
                     <RangeSliderField
                       label={tr("Color scale interval")}
+                      date={["date","date_ordinal"].includes(String(activeColorParam).toLowerCase())}
                       value={effectiveColorScaleRange}
                       min={colorSliderBounds.min}
                       max={colorSliderBounds.max}
@@ -5409,7 +5433,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
-                      figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.calibration_3d, "calibration_3d")))}
+                      figure={stationComparison(hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.calibration_3d, "calibration_3d"))))}
                       className={consultation ? "h-[320px] w-full" : "h-[clamp(380px,42vw,620px)] w-full"}
                       fitContainer
                       uiRevision={`calibration:${sessionId}:calibration_3d`}
@@ -5427,7 +5451,7 @@ export default function CalibrationPage() {
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
-                      figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.crossplot, "crossplot")))}
+                      figure={stationComparison(hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.crossplot, "crossplot"))))}
                       className={consultation ? "h-[320px] w-full" : "h-[clamp(380px,42vw,620px)] w-full"}
                       fitContainer
                       uiRevision={`calibration:${sessionId}:crossplot`}
@@ -5585,11 +5609,13 @@ export default function CalibrationPage() {
           )}
         </div>
       </div>
+      {station?.outlierTable}
+
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
           role="tooltip"
-          className="fixed z-[80] max-h-[calc(100vh-20px)] w-[min(980px,calc(100vw-20px))] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
-          style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
+          className="fixed z-[80] flex max-h-[calc(100vh-20px)] w-[min(1120px,calc(100vw-20px))] flex-col overflow-hidden rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px`, height: "min(620px, calc(100vh - 20px))" }}
           onMouseEnter={clearHoverPreviewHideTimer}
           onMouseLeave={scheduleHoverPreviewHide}
         >
@@ -5601,15 +5627,15 @@ export default function CalibrationPage() {
               {tr(hoverPreview.target.isotopeKey)}
             </span>
           </div>
-          <div className="grid min-h-0 gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:items-stretch">
-            <div className="h-[390px] min-w-0">
+          <div className="grid min-h-0 flex-1 gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:items-stretch">
+            <div className="h-full min-w-0">
               <RawAnalysisInfoTable info={hoverDiagnosticsQuery.data?.analysis_info} layout="vertical" />
             </div>
-            <div className="flex min-h-[390px] min-w-0 items-center">
+            <div className="flex h-full min-h-0 min-w-0 items-center">
               {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
                 <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Loading hover preview...")}</div>
               ) : hasHoverDiagnosticsFigureData ? (
-                <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
+                <PlotlyChart figure={hoverDiagnosticsFigure} className="h-full w-full" fitContainer verticallyResizable={false} legendFontSize={9} />
               ) : (
                 <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Cycle-intensity preview unavailable for this point.")}</div>
               )}
@@ -5621,3 +5647,5 @@ export default function CalibrationPage() {
     </div>
   );
 }
+
+export default memo(CalibrationPage);

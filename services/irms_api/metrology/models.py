@@ -266,6 +266,8 @@ class InterventionCommand(Decision):
 
 
 class RunCommand(Decision):
+    carbonate_material: Literal["calcite", "aragonite"] = "calcite"
+    carbonate_correction_preapplied: bool = False
     results_session_id: str | None = None
     sample_group: str = "Main batch"
     method_id: str | None = None
@@ -350,9 +352,14 @@ class ResidualOverride(StrictModel):
 
 class ResidualOverrideCommand(Decision):
     material_id: str
-    effect: Literal["intensity_dependence", "pressure_dependence", "pressure_residual", "mass_dependence", "drift", "memory"]
+    effect: Literal["sample_reference_dependence", "intensity_dependence", "pressure_dependence", "pressure_residual", "mass_dependence", "drift", "memory"]
     isotope: Literal["d13c", "d18o"]
     settings: ResidualOverride | None = None
+
+
+class OutlierScreeningCommand(Decision):
+    method: Literal["sigma", "iqr"] = "sigma"
+    threshold: float = Field(default=3, ge=.5, le=10, allow_inf_nan=False)
 
 
 class SessionChartSettingsCommand(Decision):

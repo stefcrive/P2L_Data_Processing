@@ -1,5 +1,6 @@
 "use client";
 
+import { AnalysisEvidence } from "./analysis-evidence";
 import { useState } from "react";
 import { useTranslation } from "@/components/layout/language-provider";
 import type { Measurement, RunDetail } from "@/lib/metrology";
@@ -19,7 +20,8 @@ export function RowReview({ row, run, ...props }: WorkspaceProps & { row: Measur
   }
   return <div className="station-row-review">
     <div className="metro-actions"><b>{row.label} · {row.source_index}</b><Status value={row.excluded ? "excluded" : row.issues?.length ? "review_required" : "pass"}/></div>
-    {!!row.issues?.length && <ul className="station-issue-list">{row.issues.map(issue => <li key={issue}>{tr(issue)}</li>)}</ul>}
+    <AnalysisEvidence row={row} run={run} method={props.state.methods.find(m=>m.id===run.method_id)}/>
+    {!!row.issues?.length && <details><summary>{tr("Review flags")}</summary><ul className="station-issue-list">{row.issues.map(issue => <li key={issue}>{tr(issue)}</li>)}</ul></details>}
     {!!row.accepted_issues?.length && <p className="station-exception-note">{tr("Accepted exceptions")}: {row.accepted_issues.map(tr).join("; ")}</p>}
     {row.reviews?.map((review, i) => <p className="metro-muted" key={i}>{review.actor} · {review.at.slice(0,16)} · {review.reason}</p>)}
     {!locked && !row.excluded && <form className="metro-stack" onSubmit={event => event.preventDefault()}>

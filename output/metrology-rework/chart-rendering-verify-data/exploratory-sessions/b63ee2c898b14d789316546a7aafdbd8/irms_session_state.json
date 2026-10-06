@@ -1,0 +1,1210 @@
+{
+  "schema": "irms.session_state",
+  "schema_version": 1,
+  "application": "IRMS Output Analyzer",
+  "session_id": "b63ee2c898b14d789316546a7aafdbd8",
+  "session_name": "Igor Venancio / Igor Venanacio MD28-3678 series",
+  "created_at": "2026-10-06T13:31:13.935092+00:00",
+  "updated_at": "2026-10-06T13:31:21.595345+00:00",
+  "source_files": [
+    {
+      "name": "d2c73be9dc13__Igor Venancio MD28-3678 series 13.xlsx",
+      "size": 71118,
+      "md5": "3e036ed1c0b4bc7d23f05bff7a2145e9",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 0,
+        "file_name": "d2c73be9dc13__Igor Venancio MD28-3678 series 13.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "030aab9e5708__Igor Venancio MD28-3678 series 15.xlsx",
+      "size": 67442,
+      "md5": "7e5dac5c9c0b0a6040b862734611125b",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 1,
+        "file_name": "030aab9e5708__Igor Venancio MD28-3678 series 15.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "da17d76e6f89__Igor Venancio MD28-3678 series 16.1.xlsx",
+      "size": 69448,
+      "md5": "b9cd575b7fa5a83b2def7b4dda0e9ea4",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 2,
+        "file_name": "da17d76e6f89__Igor Venancio MD28-3678 series 16.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "263ab18c951a__Igor Venancio MD28-3678 series 17.xlsx",
+      "size": 69851,
+      "md5": "d65c122856e989596c2b6d979c513e13",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 3,
+        "file_name": "263ab18c951a__Igor Venancio MD28-3678 series 17.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "f35201983984__Igor Venancio MD28-3678 series 18.xlsx",
+      "size": 68756,
+      "md5": "28e9c02492a82b49fecba204b9a77f86",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 4,
+        "file_name": "f35201983984__Igor Venancio MD28-3678 series 18.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "04196b9eaaab__Igor Venancio MD28-3678 series 2.xlsx",
+      "size": 67270,
+      "md5": "3d485c8b624b3156998b18f7b62fc4ce",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 5,
+        "file_name": "04196b9eaaab__Igor Venancio MD28-3678 series 2.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "4bf4e276f53c__Igor Venancio MD28-3678 series 21.xlsx",
+      "size": 71641,
+      "md5": "82e787fdf213faf42d6a7e9732f3cd49",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 6,
+        "file_name": "4bf4e276f53c__Igor Venancio MD28-3678 series 21.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "f7ec21476237__Igor Venancio MD28-3678 series 23.xlsx",
+      "size": 70876,
+      "md5": "a2d2a63df758baa11cac58188b3aed61",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 7,
+        "file_name": "f7ec21476237__Igor Venancio MD28-3678 series 23.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "29500df430a0__Igor Venancio MD28-3678 series 24.xlsx",
+      "size": 71326,
+      "md5": "35ae115ba7456e21a900eab656c82152",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 8,
+        "file_name": "29500df430a0__Igor Venancio MD28-3678 series 24.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "2d1bdffaa726__Igor Venancio MD28-3678 series 3.xlsx",
+      "size": 69701,
+      "md5": "0fc8773acdf8ad82227c4987a4a146c2",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 9,
+        "file_name": "2d1bdffaa726__Igor Venancio MD28-3678 series 3.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "aef9c3e20c61__Igor Venancio MD28-3678 series 4.xlsx",
+      "size": 71051,
+      "md5": "f6952f3c4ec2753d45ab0253e739ee3a",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 10,
+        "file_name": "aef9c3e20c61__Igor Venancio MD28-3678 series 4.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "37f4b9693314__Igor Venancio MD28-3678 series 5.xlsx",
+      "size": 66046,
+      "md5": "3a3084be63bca965e9fa9c5f441b10c7",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 11,
+        "file_name": "37f4b9693314__Igor Venancio MD28-3678 series 5.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "1e82af8b7d34__Igor Venancio MD28-3678 series 6.xlsx",
+      "size": 70683,
+      "md5": "e47125674d8ca3207c3c89979e08d6c3",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 12,
+        "file_name": "1e82af8b7d34__Igor Venancio MD28-3678 series 6.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "df9944930626__Igor Venancio MD28-3678 series 7.xlsx",
+      "size": 69891,
+      "md5": "b48302a2538409a31a9f8deec1c9adfd",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 13,
+        "file_name": "df9944930626__Igor Venancio MD28-3678 series 7.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "d68641c79559__Igor Venancio MD28-3678 series 9.5.xlsx",
+      "size": 71164,
+      "md5": "6f405b5305d7b2b130b7976595beaeb4",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 14,
+        "file_name": "d68641c79559__Igor Venancio MD28-3678 series 9.5.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "42c2cb36630b__Igor Venancio MD28-3678 series 10.1.xlsx",
+      "size": 65383,
+      "md5": "bc0a2f36675a34c935b89aa9670a2909",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 15,
+        "file_name": "42c2cb36630b__Igor Venancio MD28-3678 series 10.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "23b5dd0bc57c__Igor Venancio MD28-3678 series 11.1.xlsx",
+      "size": 62568,
+      "md5": "52e4606081b2a9a155719f61c0ba0701",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 16,
+        "file_name": "23b5dd0bc57c__Igor Venancio MD28-3678 series 11.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "0b77d6c4be30__Igor Venancio MD28-3678 series 8.xlsx",
+      "size": 47120,
+      "md5": "e547bd048d43587c5a6257ce44ea705a",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 17,
+        "file_name": "0b77d6c4be30__Igor Venancio MD28-3678 series 8.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "71818da41878__Igor Venancio MD28-3678 series 14.1.xlsx",
+      "size": 49324,
+      "md5": "c6cdbecb3de01637c0fca5ccd5b6f10f",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 18,
+        "file_name": "71818da41878__Igor Venancio MD28-3678 series 14.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "f05b06e17f88__Igor Venancio MD28-3678 series 14.xlsx",
+      "size": 28842,
+      "md5": "5cdba2520fc9ee6310ad9ddbd854a539",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 19,
+        "file_name": "f05b06e17f88__Igor Venancio MD28-3678 series 14.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "4c0f3cc72922__Igor Venancio MD28-3678 series 22.1.xlsx",
+      "size": 49266,
+      "md5": "c74cc62ed82dc307509af77d193f5498",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 20,
+        "file_name": "4c0f3cc72922__Igor Venancio MD28-3678 series 22.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "ad0637e2348b__Igor Venancio MD28-3678 series 1.xlsx",
+      "size": 43815,
+      "md5": "2ffe382addb73f735d5ab84a54ddf8ef",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 21,
+        "file_name": "ad0637e2348b__Igor Venancio MD28-3678 series 1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "9ce964970c4b__Igor Venancio MD28-3678 series 12a.xlsx",
+      "size": 40780,
+      "md5": "a52322ef7dd1d7603dfdb490346c2d24",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 22,
+        "file_name": "9ce964970c4b__Igor Venancio MD28-3678 series 12a.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "71ea584ee517__Igor Venancio MD28-3678 series 12b.1.xlsx",
+      "size": 38323,
+      "md5": "e1c16cf86049985ac3fe0782cf1e2cd2",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 23,
+        "file_name": "71ea584ee517__Igor Venancio MD28-3678 series 12b.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "bf91e4e9bf0f__Igor Venancio MD28-3678 series 8.1.xlsx",
+      "size": 21133,
+      "md5": "8bc7ea36a4fc84989c9f94ecba31c1db",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 24,
+        "file_name": "bf91e4e9bf0f__Igor Venancio MD28-3678 series 8.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "4f2c2849e049__Igor Venancio MD28-3678 series 22.xlsx",
+      "size": 29413,
+      "md5": "0353044d33cdf85d8767b427440e1aba",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 25,
+        "file_name": "4f2c2849e049__Igor Venancio MD28-3678 series 22.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "51e85e98423c__Igor Venancio MD28-3678 series 20.xlsx",
+      "size": 30372,
+      "md5": "ac485a9f90880cd9d8461c5dd58e5c5a",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 26,
+        "file_name": "51e85e98423c__Igor Venancio MD28-3678 series 20.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "83a54d8be93f__Igor Venancio MD28-3678 series 20.1.xlsx",
+      "size": 18052,
+      "md5": "3dcaf760c4c03f91f997a25b3bbb3411",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 27,
+        "file_name": "83a54d8be93f__Igor Venancio MD28-3678 series 20.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "49600ccc18e4__Igor Venancio MD28-3678 series 8.2.xlsx",
+      "size": 19119,
+      "md5": "012a67fa64c0a0baeaf48c901d95d09a",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 28,
+        "file_name": "49600ccc18e4__Igor Venancio MD28-3678 series 8.2.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "0e314b7508a0__Igor Venancio MD28-3678 series 11.xlsx",
+      "size": 17588,
+      "md5": "1c8f400b3e4151869d3253b0795f7d24",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 29,
+        "file_name": "0e314b7508a0__Igor Venancio MD28-3678 series 11.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "63d9484c3a18__Igor Venancio MD28-3678 series 25.xlsx",
+      "size": 14984,
+      "md5": "c98225dd19acee0e5de4271d2431c5e7",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 30,
+        "file_name": "63d9484c3a18__Igor Venancio MD28-3678 series 25.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "b1112b3fcdd4__Igor Venancio MD28-3678 series 10.2.xlsx",
+      "size": 13550,
+      "md5": "074d08cb8774f59899afb1e32a16b2cc",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 31,
+        "file_name": "b1112b3fcdd4__Igor Venancio MD28-3678 series 10.2.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "fed9ccac22bb__Igor Venancio MD28-3678 series 19.xlsx",
+      "size": 10741,
+      "md5": "789a335c71966e34813eeecc35a12adc",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 32,
+        "file_name": "fed9ccac22bb__Igor Venancio MD28-3678 series 19.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    },
+    {
+      "name": "7b5e9166b581__Igor Venancio MD28-3678 series 3.1.xlsx",
+      "size": 9231,
+      "md5": "13f49a16714a8f87fa255c470abd6b85",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 33,
+        "file_name": "7b5e9166b581__Igor Venancio MD28-3678 series 3.1.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    }
+  ],
+  "session_record_dir": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\b63ee2c898b14d789316546a7aafdbd8",
+  "relative_session_record_dir": "Session record/b63ee2c898b14d789316546a7aafdbd8",
+  "files": {
+    "metadata": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\b63ee2c898b14d789316546a7aafdbd8\\metadata.json",
+    "snapshot": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\b63ee2c898b14d789316546a7aafdbd8\\snapshot.csv",
+    "cycles_snapshot": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\b63ee2c898b14d789316546a7aafdbd8\\cycles_snapshot.csv",
+    "event_log": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\b63ee2c898b14d789316546a7aafdbd8\\events.jsonl",
+    "session_state": "C:\\Dev\\IRMSdataprocessing\\.data\\metrology-operational\\exploratory-sessions\\b63ee2c898b14d789316546a7aafdbd8\\irms_session_state.json"
+  }
+}

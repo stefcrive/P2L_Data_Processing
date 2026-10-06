@@ -1,0 +1,387 @@
+{
+  "session_id": "173feb766a8346119dddbe4c0259db33",
+  "session_name": "Test client / Original export verification",
+  "created_at": "2026-10-06T13:06:25.780725+00:00",
+  "updated_at": "2026-10-06T16:50:40.578926+00:00",
+  "source_files": [
+    {
+      "name": "1de02b6d6a84__SHP2L__-0036(Reevaluated).xls",
+      "size": 198656,
+      "md5": "6d98e63e41647eaf4ff6a28c5877dc0c",
+      "software": "generic",
+      "identity_parsing": {
+        "file_index": 0,
+        "file_name": "1de02b6d6a84__SHP2L__-0036(Reevaluated).xls",
+        "software": "generic",
+        "identifier1": {
+          "source_column": "Identifier 1",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Identifier 2",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Identifier 1",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    }
+  ],
+  "errors": [],
+  "calibration": {
+    "config": {
+      "selected_standards": [
+        "SHP2L"
+      ],
+      "linearity": {
+        "apply": false
+      }
+    },
+    "selected_standards": [
+      "SHP2L"
+    ]
+  },
+  "processing": {
+    "config": {
+      "selected_identifier": "All",
+      "x_axis_option": "By Sequence",
+      "color_param": "Date",
+      "z_axis": "1  Cycle Int  Samp  44",
+      "species_name_map": {},
+      "identifier1_name_map": {},
+      "apply_shared_linearity_to_partially_saturated": true,
+      "enable_saturation_correction": false,
+      "saturation_correction_method": "reference_gas_intensity",
+      "saturation_correction_method_d13": "reference_gas_intensity",
+      "saturation_correction_method_d18": "reference_gas_intensity",
+      "signal_range": [
+        -6.00636017439817,
+        34.51832360486175
+      ],
+      "leak_range": [
+        -390.3827389574433,
+        718.0781031958538
+      ],
+      "d13c_range": [
+        -2.1963204902973987,
+        2.4708767816881276
+      ],
+      "d18o_range": [
+        -15.590589956714703,
+        17.39877538717828
+      ],
+      "statistical_outlier_method": "Z-Score",
+      "sigma_level_data": 4.0,
+      "iqr_multiplier_data": 1.5,
+      "overlays": {
+        "show_statistical_outliers": false,
+        "show_range_outliers": false,
+        "show_manual_outliers": false,
+        "show_saturated_collectors": true,
+        "show_saturated_samples": true,
+        "show_failed_samples": true
+      },
+      "manual_linearity_override": {
+        "enabled": false,
+        "use_diff_intensity": false,
+        "quadratic": false,
+        "max_sample_signal": null,
+        "d13_per_10v": 0.0,
+        "d18_per_10v": 0.0,
+        "d13_per_10v2": 0.0,
+        "d18_per_10v2": 0.0
+      },
+      "export": {
+        "include_outliers": false,
+        "selected_ids": [
+          "All"
+        ],
+        "interpolate_outliers": false,
+        "client_name": null,
+        "comment_map": {},
+        "client_output_identifier_source": "identifier1",
+        "client_output_sample_source": "comment",
+        "client_output_species_source": "species",
+        "show_sequence": true
+      }
+    },
+    "ranges_source": "user",
+    "apply_calibration": false
+  },
+  "autosave": {
+    "save_dir": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\173feb766a8346119dddbe4c0259db33",
+    "log_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\173feb766a8346119dddbe4c0259db33\\events.jsonl",
+    "snapshot_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\173feb766a8346119dddbe4c0259db33\\snapshot.csv",
+    "meta_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\173feb766a8346119dddbe4c0259db33\\metadata.json",
+    "session_state_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\outlier-verify-data\\exploratory-sessions\\173feb766a8346119dddbe4c0259db33\\irms_session_state.json",
+    "session_token": "173feb766a8346119dddbe4c0259db33",
+    "initialized_at": "2026-10-06T13:06:25.795829+00:00",
+    "enabled": true,
+    "resumed": false,
+    "last_action": "processing_config_updated",
+    "last_saved_at": "2026-10-06T16:50:40.577926+00:00",
+    "event_count": 5
+  },
+  "edit_state": {
+    "edited_rows": [],
+    "original_delta_values": {},
+    "original_missing_delta_tokens": [],
+    "original_std_values": {},
+    "original_missing_std_tokens": [],
+    "original_identifier1_values": {},
+    "original_identifier2_values": {},
+    "original_species_values": {},
+    "manual_outlier_overrides": {},
+    "restored_delta_tokens": []
+  },
+  "import_parsing": {
+    "files": [
+      {
+        "file_index": 0,
+        "file_name": "1de02b6d6a84__SHP2L__-0036(Reevaluated).xls",
+        "software": "generic",
+        "identifier1": {
+          "source_column": "Identifier 1",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Identifier 2",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Identifier 1",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    ]
+  },
+  "row_count": 151,
+  "cycles_row_count": 151,
+  "metrology_link": {
+    "results_session_id": "a56b8ffa077246ee89b99e9ba68303d7",
+    "run_id": "all",
+    "run_ids": [
+      "1de02b6d6a84481c8675670a4dfd9c2e"
+    ],
+    "method_id": "a2c4be1f0d1a4aeab9085745ab37b7f5",
+    "qualification_id": "b2e979f5477e4562b9d02ae290ff3cb9",
+    "bridge_version": 8,
+    "fingerprint": "23897918a20cf38f95eb0798ab7c966e4a323a7b0f4bd7ee4e2333ca32f8f83c",
+    "row_mapping": {
+      "8e3858ed50c5443a87524771728f617f": "0",
+      "bd0187b12581408285dab839fa2160c1": "1",
+      "89b3fdaa09f94b3f9161764a1f127886": "2",
+      "b37c542b56e7492bbf0ddc764d26b6c2": "3",
+      "19880217343d49e197ada7400fbc7ae6": "4",
+      "8a12eb86b6404bac91ddaa14750c6ed3": "5",
+      "ba4f9c5358bf4d82be1ba7655194d0c1": "6",
+      "3f40dae09676411db68bd9adc6601ab0": "7",
+      "7ce4e3507d3c4140b5f976c20f6bf4e5": "8",
+      "cdec40f118964fac8bcfb61ff0e747ad": "9",
+      "5a01dd46e25f45cd9f6febcc3ec4d9c3": "10",
+      "83caa068e8454014bc22dbcbfff47262": "11",
+      "8be2764d0cda42de89dbfa46d40afc74": "12",
+      "de85ccac03964c53ab1a549ef6fdf871": "13",
+      "92dc8e6f6ed745f380f9c69e424c754e": "14",
+      "75455cfe7c1b4e14967fe5b39f2f0e50": "15",
+      "476060ceb16a45a887f7898052fa20af": "16",
+      "411488ff550d40039fbacb05805a491e": "17",
+      "5146bb07ca344448903a172dbd3312d2": "18",
+      "4f4fe831fce14281a21968a829b24b1b": "19",
+      "e2ba86a9e87d4fe48a7516c4615d1863": "20",
+      "f17256a9ae2f41bda70032f7d2a9d004": "21",
+      "81e488a1b6a44f9da9a30f7ec02e7f8d": "22",
+      "3553cfe36e1f4c738c080a3743141823": "23",
+      "2781ace218964dd39e8d486ad49d6d03": "24",
+      "e5e1fb28e5d340608ee441911abbef24": "25",
+      "9ef8e0fa84994895879b92546400fb24": "26",
+      "ef5fa2014a8e4ce0a7efa0dcaa4bd73c": "27",
+      "06387d8acfdc481c97003110c5685c1c": "28",
+      "4dbda832e6d643459979ff9da02759f6": "29",
+      "5ddef7c199ba4cd7aff3ddfd661bbbf7": "30",
+      "88f254389cc347f2b5f5c3cf11dc0bf7": "31",
+      "e129ca9778fc4658945989954c87557b": "32",
+      "791583a361db4f7cb8a9f63250f207f3": "33",
+      "a3806d7f0a8f4fcc9fac1a7a9e8ced94": "34",
+      "e7fd950e39fb40cba2250d525660c376": "35",
+      "30f38daa6b584e4683d5abfce821ea28": "36",
+      "29466e06de8c403d8e9463c1b5cfe84b": "37",
+      "9b16f87f9b2c4345b3769e5cdb03fa2c": "38",
+      "4718b7ca06af41dd9bcd7b5b8bbe4608": "39",
+      "9a807ed3fe96418f89184c5be649a86f": "40",
+      "4589640512c44034bae779bdc2703409": "41",
+      "d326c36d42ea4c548a35d18f7c6ccb2c": "42",
+      "1fb7afaaf9f44280b7a90701794538a1": "43",
+      "d5c0defb2dc6462e9070cd12df1a4890": "44",
+      "412aa92954f34b22b1ea65e34aeb34b6": "45",
+      "324911d1ae46420daf825e5cae4c85f6": "46",
+      "61453fb6d2f34fc5a1f8d6b6a3235ecb": "47",
+      "72a8cafcbbf04d45bd8ca32d41b33e36": "48",
+      "0cf2075e876841df8966ab18dda1497e": "49",
+      "08b09b20118f4a1389bd6a26832a35b1": "50",
+      "1fa2db5815e84404b11e3dd50eff601d": "51",
+      "f593d8dc7ba14735ac9bc274133b4465": "52",
+      "915b719b4ba54ee1b0cea33efaa12c47": "53",
+      "778986ef4f1347ff8022c722b0714e98": "54",
+      "c146477a7ebc451c89e091c1799b6614": "55",
+      "88a75162208d4a37a0be8513e6cca105": "56",
+      "4263cc37b19042d2a99afbfa7ea70597": "57",
+      "56fb026af5274f55b8c515d8409994c2": "58",
+      "21b3ebd0c1b34d5e90b72c2a74dd3c75": "59",
+      "220997009ce04cbabe7cf3d27c3109ec": "60",
+      "6ab67be1d9c143b7892d1e2519305ddf": "61",
+      "98e61d28cb56461191c7d1438dfdf79b": "62",
+      "781f8ad50d4c4f7fbddb479666b7c742": "63",
+      "128ee8d78cb046f9baf3c103a5c59ce0": "64",
+      "e0212c0cf67748adb643b0e633421a78": "65",
+      "26a30603cfd648388c479dbe791a5f9b": "66",
+      "017339ff5ae746d884c90a297ab16b76": "67",
+      "513e2040b64b456f984ad94aa7332631": "68",
+      "5f50d6ad430046f3b077bfba66f45670": "69",
+      "4dfc8599cebd4f2aab8023ed418f5391": "70",
+      "26fad89f01a740c0af6abb19dc5debf3": "71",
+      "5185b10a694d4c0cadf299ea27768a66": "72",
+      "7b778214db8744ff85a2ba94104d4aa5": "73",
+      "2753617c372c43f886b503686254180c": "74",
+      "f865d42d93a74f43ad8dc7ba8e6a4c4b": "75",
+      "5e2ca37d68dd4d189b0c6704568ffef5": "76",
+      "77fea65943354255b1af4845efa6807b": "77",
+      "0229f766d2a84899a8378efe9dc9809e": "78",
+      "189a2fe661ea4512a7901edc334f52cd": "79",
+      "c7453e8a24584bc685742eb37850b8e1": "80",
+      "3323f53be91b48c4a73fb7c9af1dc1f5": "81",
+      "21f307cb5fcf47d79792500b96c1a097": "82",
+      "7946f2004a1e41e8844c034803f65eba": "83",
+      "f9f9d6e39b774ab4adc80acc6b8d8b67": "84",
+      "f322e608a5724799ba55e556c08c9d67": "85",
+      "11384ba6cf7d41a5b9cedcc6649c8d53": "86",
+      "f1662d3fc55e47b48d8d8613d34ae51f": "87",
+      "1075f16bc45b4838b36121ccef5ba9ed": "88",
+      "04ca025d13d0494e9a6bdc5fdda66df4": "89",
+      "492f63d4b1c641eaac8636aa772aa252": "90",
+      "b36a9a3ca65c4d0f935e8690f85a4527": "91",
+      "cb826d3b43864f82bd7dfcade87a2883": "92",
+      "6fac0d1c1d7b456c85ce88b13dcc19a6": "93",
+      "dbf5b1fd56bf4f3b81acb53cc9e5539e": "94",
+      "da988668af8548e2bd8ac887942f5aa1": "95",
+      "9b99184cfcb24e41aac762911a8fe90b": "96",
+      "67acab72ad3d445ea1f7fc257c1a5873": "97",
+      "3cc938633c1e47ab904bd994e056ba6a": "98",
+      "822eb6e98e7446ccae78a0926f650634": "99",
+      "0ae560e56ced444f88170a092b735340": "100",
+      "909cbeb5a2244f109492e0eddcab68f1": "101",
+      "f71425959d4f40e194476ba6eed5c5d3": "102",
+      "cfcd4fec6f5546e096a07a393328de4c": "103",
+      "c925f46ce92b4455b0325a015945bffb": "104",
+      "05e4be67b2cf4cdb849f6f37b5ab9335": "105",
+      "e1528c7e7a754fa4a9684f1962529436": "106",
+      "ed11cd3f0453412c9c4100ff9b13c49e": "107",
+      "65b29a0a0d46489a93d1c34b8e33889f": "108",
+      "b44dc576c76845cdbbda3be61697ff67": "109",
+      "736eb8872c4a45ca8c807e5884104ebd": "110",
+      "3b5b90c74e8241e493eb588c27794777": "111",
+      "17fabecf05ab4abfafb3020b97d89e1a": "112",
+      "498a9ee1f8ff4147b0165d50ad622cce": "113",
+      "df4a27e1c8f4473caf827d4a04aaf0e1": "114",
+      "9814fb19992e4f04af63625dd077044d": "115",
+      "dc32049efbc84e68a5c4c0db28f773a8": "116",
+      "39e6254dfc354652ac8f771b75b53ac7": "117",
+      "62eef08279944c8385814c29df6a0c90": "118",
+      "ec2184f7cb7e4407bbcbdfca80e2bfac": "119",
+      "afb4dd1b22234bf681e668650b458fcb": "120",
+      "94fda462b2c24098881e95608b8bd212": "121",
+      "f8e5d33baf754082a2971c06f29aaa76": "122",
+      "19867cf1174a434eb42df8a04dc0b3f3": "123",
+      "39b1b9d8950143c1a1571cf2b52e0b38": "124",
+      "1571e7aa1baf4f0f872dbed796dc2a79": "125",
+      "66d5219224594bd394f00591cd1c3cc1": "126",
+      "72f41d84c7a04990920e38815d37ff59": "127",
+      "ad4635f4485d4d019d94434c28900c03": "128",
+      "683079319faa4a0e95acd3733c357156": "129",
+      "7e4b3d597b2e4f92837701dcaafb1bae": "130",
+      "530bc8410d184591a89baf7e73d6ce6d": "131",
+      "da3e328274e940e69c8f676162849bdc": "132",
+      "0e7dd489a0f84db991ccc685219cb663": "133",
+      "379499e953eb4e5f8dc84505d6d5da01": "134",
+      "775673c7ca264ef2a8a89b30a222e9aa": "135",
+      "eb4262a0dda74168940c2b5aaa9b7fca": "136",
+      "26df1840270e4c86bcd32b7e6a775c25": "137",
+      "2f4b765c14c342b9b66fc7342ea9b300": "138",
+      "61ae25e7686841b2bc26d9e0dd3a8305": "139",
+      "9863df8c026f49a38b6fb8a342b72eae": "140",
+      "794f22957c5642e8883bfb813ec7269d": "141",
+      "90cab316abaa4ffc945f3e4d4ab97073": "142",
+      "0cd1e589f7e240faa49e3d0abea016ef": "143",
+      "eb3f08c25df145989914d488d7e389ff": "144",
+      "4767b5da3219424f875fc2fe16f53fbb": "145",
+      "5e65cd06b6ac408097e92e759380331f": "146",
+      "d1f408c6f6474da68da81d4cc236d85b": "147",
+      "12764268796841d2982d072035d1d5d4": "148",
+      "336765177a2f48a7a443a4241469a5cb": "149",
+      "0e24eb60838440b5ab51a473d5fb0a11": "150"
+    }
+  },
+  "metrology_reference_values": [
+    {
+      "Standard": "NBS18",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": -5.014,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS18",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -23.01,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS19",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": 1.95,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS19",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -2.2,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "SHP2L",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": -0.75,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "SHP2L",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -5.72,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    }
+  ]
+}

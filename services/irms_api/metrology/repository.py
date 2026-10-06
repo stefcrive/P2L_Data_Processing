@@ -13,7 +13,7 @@ from . import SOFTWARE_VERSION
 from .models import Material, MethodConfig
 
 TABLES = {"materials", "methods", "qualifications", "tests", "assets", "interventions", "raw_imports", "runs",
-          "measurements", "evaluations", "qc_observations", "exclusions", "periods", "releases", "reports", "results_sessions", "session_exports", "session_sources"}
+          "measurements", "evaluations", "qc_observations", "exclusions", "periods", "releases", "reports", "results_sessions", "session_exports", "session_sources", "qc_screenings"}
 
 
 def now() -> str:
@@ -63,6 +63,7 @@ class Repository:
                 CREATE TABLE IF NOT EXISTS releases(id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE REFERENCES runs(id), evaluation_id TEXT NOT NULL REFERENCES evaluations(id), method_id TEXT NOT NULL REFERENCES methods(id), data TEXT NOT NULL, created_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS results_sessions(id TEXT PRIMARY KEY, method_id TEXT REFERENCES methods(id), data TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS qc_screenings(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES results_sessions(id), fingerprint TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(session_id, fingerprint));
                 CREATE TABLE IF NOT EXISTS session_exports(id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS session_sources(id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL, previous_hash TEXT NOT NULL, hash TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -70,7 +71,7 @@ class Repository:
                 CREATE INDEX IF NOT EXISTS qc_method ON qc_observations(method_id);
                 PRAGMA user_version=1;
             """)
-            for table in ("materials", "raw_imports", "measurements", "evaluations", "qc_observations", "exclusions", "periods", "releases", "reports", "audit", "tests", "assets", "session_exports", "session_sources"):
+            for table in ("materials", "raw_imports", "measurements", "evaluations", "qc_observations", "exclusions", "periods", "releases", "reports", "audit", "tests", "assets", "session_exports", "session_sources", "qc_screenings"):
                 for operation in ("UPDATE", "DELETE"):
                     db.execute(f"CREATE TRIGGER IF NOT EXISTS immutable_{table}_{operation} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, 'Append-only scientific record'); END")
             db.execute("CREATE TRIGGER IF NOT EXISTS frozen_method BEFORE UPDATE OF data ON methods WHEN OLD.status != 'draft' BEGIN SELECT RAISE(ABORT, 'Approved method is frozen'); END")

@@ -15,7 +15,7 @@ from .models import (
     AnnotationCommand, ApproveCommand, Decision, EffectCommand, EvaluateCommand, ExclusionCommand,
     InterventionCommand, MaterialCommand, MethodCommand, PeriodCommand, QualificationCommand,
     ReleaseCommand, RunCommand, TestCommand,
-    ResultsSessionCommand, SessionGroupsCommand, SessionExportCommand, RowReviewCommand, ResidualOverrideCommand, SessionChartSettingsCommand,
+    OutlierScreeningCommand, ResultsSessionCommand, SessionGroupsCommand, SessionExportCommand, RowReviewCommand, ResidualOverrideCommand, SessionChartSettingsCommand,
 )
 from .repository import Repository, encode
 from .reports import build_report
@@ -120,9 +120,13 @@ def exported_results(id_: str, s: Service = Depends(get_service)):
 
 
 @router.get("/results-sessions/{id_}/analysis")
-def session_analysis_view(id_: str, outlier_method: str = "sigma", threshold: float = 3, s: Service = Depends(get_service)):
-    from .session_analysis import session_analysis
-    return invoke(session_analysis, invoke(s.results_session_detail, id_), outlier_method=outlier_method, threshold=threshold)
+def session_analysis_view(id_: str, outlier_method: str | None = None, threshold: float | None = None, s: Service = Depends(get_service)):
+    return invoke(s.results_session_analysis, id_, outlier_method, threshold)
+
+
+@router.put("/results-sessions/{id_}/outlier-screening")
+def session_outlier_screening(id_: str, command: OutlierScreeningCommand, s: Service = Depends(get_service)):
+    return invoke(s.save_outlier_screening, id_, command)
 
 
 @router.post("/runs/{id_}/row-review")
@@ -330,3 +334,15 @@ def get_report(id_: str, format_: Literal["pdf", "json"], s: Service = Depends(g
         report = invoke(s.repo.get, db, "reports", id_)
         digest = report["sha256"] if format_ == "pdf" else report["snapshot_sha256"]
         return download(invoke(s.repo.read_blob, digest), f"irms-{report['kind']}-{id_[:8]}.{format_}", "application/pdf" if format_ == "pdf" else "application/json")
+
+
+@router.get("/runs/{id_}/measurements/{measurement_id}/evidence")
+def measurement_evidence(id_: str, measurement_id: str, s: Service = Depends(get_service)):
+    from .analysis_evidence import analysis_evidence
+    with s.repo.connect() as db:
+        run = invoke(s.repo.get, db, "runs", id_)
+        row = invoke(s.repo.get, db, "measurements", measurement_id)
+        if row["run_id"] != id_:
+            raise HTTPException(404, "Analysis does not belong to this workbook")
+        source = invoke(s.repo.get, db, "raw_imports", run["raw_import_id"])
+        return analysis_evidence(row, source)

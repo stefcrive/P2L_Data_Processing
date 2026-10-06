@@ -75,6 +75,8 @@ export function SessionQcSummary({ detail }: { detail: ResultsSessionDetail }) {
   ];
   return <Panel title={tr("QC standard deviation")}><div className="metro-table-wrap"><table className="station-numeric-table"><thead><tr><th>{tr("Session / carousel")}</th><th>{tr("Isotope")}</th><th>{tr("Imported SD / ‰")}</th><th>{tr("Final SD / ‰")}</th><th>{tr("SD criterion / ‰")}</th></tr></thead><tbody>{populations.flatMap(population => isotopes.map(i => {
     const raw = stats(population.rows.map(r => r[i])), final = stats(population.rows.map(r => r.isotopes?.[i]?.value));
-    return <tr key={`${population.id}-${i}`} className={population.id === "session" ? "station-budget-total" : undefined}><th scope="row">{population.label}</th><td>{isotopeLabel[i]}</td><td>{fmt(raw.sd,4)} <small>n={raw.n}</small></td><td>{fmt(final.sd,4)} <small>n={final.n}</small></td><td>&lt; {fmt(detail.method?.config.qc.external_sd[i],3)}</td></tr>;
+    const limit = detail.method?.config.qc.external_sd[i];
+    const failed = limit != null && final.sd != null && final.sd >= limit;
+    return <tr key={`${population.id}-${i}`} className={`${population.id === "session" ? "station-budget-total" : ""} ${failed ? "station-qc-failed" : ""}`} title={failed ? tr("Final QC SD exceeds the method criterion") : undefined}><th scope="row">{population.label}</th><td>{isotopeLabel[i]}</td><td>{fmt(raw.sd,4)} <small>n={raw.n}</small></td><td>{fmt(final.sd,4)} <small>n={final.n}</small></td><td>&lt; {fmt(detail.method?.config.qc.external_sd[i],3)}</td></tr>;
   }))}</tbody></table></div><p className="metro-muted">{tr("All non-excluded QC aliquots in this session. Missing results reduce n; pooled SD does not replace individual workbook acceptance or historical u_prec.")}</p></Panel>;
 }

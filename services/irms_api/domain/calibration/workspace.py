@@ -1096,13 +1096,20 @@ def build_calibration_workspace(
         outlier_reference_df=outlier_reference_df,
     )
     chart_src = _apply_precision_date_range(clean_stds, config) if clean_stds is not None and not clean_stds.empty else pd.DataFrame(columns=work_df.columns)
+    # Consultation renders all selected observations; stored session flags govern
+    # display visibility. Keep the existing cleaned population for every fit.
+    spatial_src = chart_src
+    if metadata.get("metrology_link"):
+        selected_mask = standards_for_outliers_df["Identifier 1"].astype(str).isin({str(item) for item in selected_standards})
+        spatial_src = _apply_precision_date_range(standards_for_outliers_df.loc[selected_mask], config)
     main_figures: dict[str, dict[str, Any]] = {}
     if include_figures and chart_src is not None and not chart_src.empty:
         calibration_figs = create_calibration_plots(standards_reference, chart_src, selected_standards, config.color_param)
         for key, value in calibration_figs.items():
             main_figures[key] = _figure_json(value)
+    if include_figures and spatial_src is not None and not spatial_src.empty:
         fig_3d, _ = _build_isotope_3d_scatter(
-            chart_src,
+            spatial_src,
             z_col=config.z_axis,
             z_label=config.z_axis,
             color_col=config.color_param,
@@ -1112,7 +1119,7 @@ def build_calibration_workspace(
             isotope_key="cross",
         )
         main_figures["calibration_3d"] = _figure_json(fig_3d)
-        main_figures["crossplot"] = _build_calibration_crossplot(chart_src, config.color_param)
+        main_figures["crossplot"] = _build_calibration_crossplot(spatial_src, config.color_param)
 
     linearity_src = chart_src if chart_src is not None and not chart_src.empty else clean_stds
     linearity_fit_src = _with_standard_linearity_residual_columns(

@@ -24,14 +24,17 @@ def comparison_rows(results, models, run):
     return rows
 
 
-def correction_review(results, models, config, run, qc):
+def correction_review(results, models, config, run, qc, excluded_outlier_ids=None):
     baseline={r["id"]:r for r in comparison_rows(results,models,run)}
+    excluded_outlier_ids=excluded_outlier_ids or {}
     output={}
     for iso in ISOTOPES:
         model=models.get(iso,{})
         correction=model.get("correction")
         points=[]
-        qc_rows=[r for r in results if r["role"]=="qc" and not r["excluded"]]
+        all_qc_rows=[r for r in results if r["role"]=="qc" and not r["excluded"]]
+        excluded_ids=set(excluded_outlier_ids.get(iso,()))
+        qc_rows=[r for r in all_qc_rows if r["id"] not in excluded_ids]
         for r in qc_rows:
             before=baseline[r["id"]].get(iso)
             after=r.get("isotopes",{}).get(iso,{}).get("value")
@@ -72,9 +75,10 @@ def correction_review(results, models, config, run, qc):
             if run.get("calibration_verification")=="simulation_assumption": reasons.append("The linked qualification is simulated; historical calibration transfer is unverified.")
             status="eligible_for_review" if not reasons else ("not_improved" if reduction is not None and reduction<=0 else "review_required")
         output[iso]={"status":status,"before":before,"after":after,"paired_n":len(points),"total_qc":len(qc_rows),
+                     "excluded_outlier_n":len([r for r in all_qc_rows if r["id"] in excluded_ids]),
                      "sd_reduction_fraction":reduction,"reduction_interval95":interval,"points":points,"reasons":reasons,
                      "criteria":criteria.model_dump(),"automatic_approval":False,
-                     "basis":"Same QC aliquots, same VPDB scale and frozen normalization slope; before removes only the station's residual correction.",
+                     "basis":"Same non-outlier QC aliquots, same VPDB scale and frozen normalization slope; before removes only the station's residual correction.",
                      "interval_basis":"2048 paired bootstrap resamples, seed 253. Descriptive support assuming independent QC aliquots; drift/memory require separate review."}
     return output
 
@@ -82,7 +86,7 @@ def correction_review(results, models, config, run, qc):
 def screen_effects(diagnostics, practical):
     for material in diagnostics["materials"]:
         for iso, fits in material["isotopes"].items():
-            for key in ("mass_dependence","intensity_dependence","pressure_dependence","pressure_residual","drift","memory"):
+            for key in ("sample_reference_dependence","mass_dependence","intensity_dependence","pressure_dependence","pressure_residual","drift","memory"):
                 fit=fits[key]
                 interval=fit.get("slope_ci95")
                 resolved=bool(interval and (interval[0]>0 or interval[1]<0))

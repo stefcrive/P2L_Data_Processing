@@ -506,17 +506,15 @@ def build_processing_summary(
     failed_samples = int(category_masks["Failed Sample"].sum())
     partially_failed = int(category_masks["Partially Saturated Collectors"].sum())
     fully_saturated = int(category_masks["Fully Saturated Collectors"].sum())
-    total_outliers = (
-        statistical_outliers
-        + d13c_outliers
-        + d18o_outliers
-        + signal_outliers
-        + leak_outliers
-        + failed_samples
-        + fully_saturated
-    )
+    # Categories overlap. Subtract each acquisition only once, including manual exclusions.
+    exclusion_keys = ["Statistical", "d13C Range", "d18O Range", "Signal Intensity",
+                      "Leak Rate", "Failed Sample", "Fully Saturated Collectors", "Manual Override"]
     if config.partial_saturated_outliers:
-        total_outliers += partially_failed
+        exclusion_keys.append("Partially Saturated Collectors")
+    excluded = pd.Series(False, index=data_without_standards.index, dtype=bool)
+    for key in exclusion_keys:
+        excluded |= category_masks.get(key, pd.Series(False, index=excluded.index, dtype=bool))
+    total_outliers = int(excluded.fillna(False).sum())
     final_analyses = max(total_measurements - total_outliers, 0)
 
     metrics = [
@@ -558,6 +556,7 @@ def build_processing_summary(
             else ""
         )
         metrics.append(ProcessingSummaryMetric(metric=label, value=count, details=details))
+    metrics.append(ProcessingSummaryMetric(metric="Unique Outliers", value=total_outliers, details="Each acquisition counted once"))
     metrics.append(
         ProcessingSummaryMetric(
             metric="Final Analyses",

@@ -39,6 +39,52 @@ class ResultsSessionTests(unittest.TestCase):
         self.assertEqual(self.client.put(endpoint, json={**command,"settings":None}).status_code, 200)
         self.assertNotIn(key, self.service.results_session_detail(session["id"])["residual_overrides"])
 
+    def test_saved_qc_outliers_persist_and_history_is_isotope_specific(self):
+        session = self.create()
+        rows = [fixtures.row(i+1, "SHP2L", v, sample_type="QC Standard")
+                for i, v in enumerate([-.002, -.001, 0, .001, .002, .003, .004, .07])]
+        for row in rows:
+            row["d18O Mean"] = 0
+        run = self.service.import_run("outliers.xlsx", fixtures.workbook(rows), RunCommand(**D, results_session_id=session["id"]))
+        original = self.service.run_detail(run["id"])["evaluation"]
+        endpoint = f"/metrology/results-sessions/{session['id']}"
+        # A session IQR outlier can be inside the frozen +/-3 SD limits.
+        response = self.client.put(endpoint+"/outlier-screening", json={**D, "method":"iqr", "threshold":1.5})
+        self.assertEqual(response.status_code, 200, response.text)
+        screening = response.json()
+        self.assertEqual(len(screening["flags"]), 1)
+        flag = screening["flags"][0]
+        self.assertEqual(flag["isotope"], "d13c")
+        self.assertEqual(flag["evaluation_id"], original["id"])
+        self.assertLess(flag["value"], 3*self.method["config"]["precision"]["d13c"])
+        restarted = Service(Repository(self.repo.root))
+        analysis = restarted.results_session_analysis(session["id"])
+        self.assertEqual(analysis["outliers"]["id"], screening["id"])
+        self.assertEqual(analysis["correction_review"]["d13c"]["paired_n"], 7)
+        self.assertEqual(analysis["correction_review"]["d18o"]["paired_n"], 8)
+        self.assertEqual(restarted.results_session_analysis(session["id"])["outliers"]["id"], screening["id"])
+        detail = restarted.results_session_detail(session["id"])
+        carbon, oxygen = (detail["history"][0]["isotopes"][iso] for iso in ("d13c", "d18o"))
+        self.assertEqual((carbon["total_n"], carbon["n"], oxygen["n"]), (8, 7, 8))
+        self.assertEqual(len(carbon["points"]), 8)
+        self.assertIn("session_qc_outlier", [f["rule"] for f in carbon["flags"]])
+        self.assertAlmostEqual(carbon["sd"], .002160246899469287)
+        self.assertEqual(detail["runs"][0]["evaluation"], original)
+        with self.repo.connect(write=True) as db:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "Append-only"):
+                db.execute("DELETE FROM qc_screenings WHERE id=?", (screening["id"],))
+        # New settings replace the active detection without destroying its provenance.
+        sigma = self.client.put(endpoint+"/outlier-screening", json={**D, "method":"sigma", "threshold":3}).json()
+        self.assertNotEqual(sigma["id"], screening["id"])
+        self.assertEqual(sigma["flags"], [])
+        self.assertEqual(self.service.results_session_detail(session["id"])["history"][0]["isotopes"]["d13c"]["n"], 8)
+        # A new immutable evaluation gets a different cache population.
+        self.service.evaluate_run(run["id"], EvaluateCommand(**D))
+        next_analysis = self.service.results_session_analysis(session["id"])
+        self.assertNotEqual(next_analysis["outliers"]["id"], sigma["id"])
+        for invalid in [{"method":"bad", "threshold":3}, {"method":"sigma", "threshold":0}]:
+            self.assertEqual(self.client.put(endpoint+"/outlier-screening", json={**D, **invalid}).status_code, 422)
+
     def setUp(self):
         self.fixture = fixtures.WorkflowTests("test_seed_has_no_provisional_anchor_certificates")
         self.fixture.setUp()
@@ -84,6 +130,26 @@ class ResultsSessionTests(unittest.TestCase):
             self.service.save_results_session(ResultsSessionCommand(**D,name="Changed",client="Other client",method_id=self.method["id"],processing_evidence="Another model"),session["id"])
         with self.assertRaisesRegex(Conflict,"pinned"):
             self.service.annotate(run["id"],AnnotationCommand(**D,input_basis="instrument_delta"))
+
+    def test_aragonite_import_records_basis_and_scales_full_budget(self):
+        session=self.create()
+        content=fixtures.workbook([fixtures.row(1,"SHP2L",0,sample_type="QC Standard"),fixtures.row(2,"Aragonite sample",1)])
+        run=self.service.import_run("aragonite.xlsx",content,RunCommand(**D,results_session_id=session["id"],carbonate_material="aragonite"))
+        detail=self.service.run_detail(run["id"])
+        self.assertEqual(detail["carbonate_material"],"aragonite")
+        qc,sample=detail["evaluation"]["results"]
+        factor=1.0087/1.0091
+        result=sample["isotopes"]["d18o"]
+        self.assertAlmostEqual(result["value"],(sample["d18o"]+1000)*factor-1000)
+        self.assertEqual(qc["isotopes"]["d18o"]["value"],qc["d18o"])
+        self.assertAlmostEqual(result["u_prec"],self.method["config"]["precision"]["d18o"]*factor)
+        self.assertTrue(result["processing"]["carbonate"]["applied"])
+        self.assertGreater(result["budget"]["expanded_uncertainty"],0)
+        with self.assertRaisesRegex(ValueError,"different carbonate basis"):
+            self.service.import_run("again.xlsx",content,RunCommand(**D,results_session_id=session["id"]))
+        response=self.client.get(f"/metrology/runs/{run['id']}/measurements/{sample['id']}/evidence")
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json()["raw_rows"][0]["values"]["Label"],"Aragonite sample")
 
     def test_client_isolation_and_foreign_groups(self):
         a=self.create(); b=self.create("Client B")
@@ -167,6 +233,18 @@ class ResultsSessionTests(unittest.TestCase):
                 for row in source["measurements"]:
                     self.assertAlmostEqual(frame.loc[int(result["row_mapping"][row["id"]]),"d 13C/12C  Mean"],row["d13c"])
             self.assertEqual(open_plot_bridge(self.service,session["id"],"all",Decision(**D))["session_id"],result["session_id"])
+            # A format upgrade reuses already parsed workbooks and saved plot controls.
+            import hashlib
+            from services.irms_api.metrology.repository import encode
+            meta=legacy.store.load_metadata(result["session_id"])
+            runs=self.service.results_session_detail(session["id"])["runs"]
+            meta["metrology_link"].update(bridge_version=7,fingerprint=hashlib.sha256(encode([(r["id"],r["revision"],r.get("latest_evaluation_id")) for r in runs]).encode()).hexdigest())
+            meta["calibration"]["config"]["color_param"]="Date"
+            legacy.store.write_metadata(result["session_id"],meta)
+            with patch.object(legacy,"_import_session_from_bytes",side_effect=AssertionError("Unchanged workbooks must not be reparsed")):
+                upgraded=open_plot_bridge(self.service,session["id"],"all",Decision(**D))
+            self.assertEqual(upgraded["session_id"],result["session_id"])
+            self.assertEqual(legacy.store.load_metadata(result["session_id"])["calibration"]["config"]["color_param"],"Date")
             self.service.annotate(second["id"],AnnotationCommand(**D,acquisition_complete=True))
             changed=open_plot_bridge(self.service,session["id"],"all",Decision(**D))
             self.assertNotEqual(changed["session_id"],result["session_id"])
@@ -183,7 +261,11 @@ class ResultsSessionTests(unittest.TestCase):
         qc=[r for r in data["rows"] if r["role"]=="qc"]
         expected=identify_outliers_iqr(pd.DataFrame({"value":[r["isotopes"]["d13c"]["value"] for r in qc]}),"value",1.5)
         self.assertEqual({r["measurement_id"] for r in data["outliers"]["flags"] if r["isotope"]=="d13c"},{r["id"] for r,flag in zip(qc,expected) if flag})
-        self.assertEqual(data["correction_review"]["d13c"]["paired_n"],7)
+        self.assertEqual(data["correction_review"]["d13c"]["paired_n"],6)
+        self.assertEqual(data["correction_review"]["d13c"]["excluded_outlier_n"],1)
+        self.assertEqual(data["correction_review"]["d18o"]["paired_n"],6)
+        self.assertEqual(data["qc_statistics"]["d13c"]["final"]["n"],6)
+        self.assertEqual(data["qc_statistics"]["d18o"]["final"]["n"],6)
         self.assertIn("pressure_dependence",data["diagnostics_before"]["materials"][0]["isotopes"]["d13c"])
         self.assertFalse(any(r["excluded"] for r in data["rows"]))
 

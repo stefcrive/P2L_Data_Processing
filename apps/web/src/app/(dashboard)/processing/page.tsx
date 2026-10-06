@@ -1,4 +1,5 @@
 "use client";
+import { orderTraceByX } from "@/lib/plotly-order";
 import { useContext } from "react";
 import { withSessionUncertainty } from "@/lib/metrology-envelopes";
 
@@ -33,6 +34,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { DecimalInput } from "@/components/ui/decimal-input";
+import { ScientificControlPanel, ScientificControlGroup, ScientificSelect } from "@/components/ui/scientific-controls";
 import { DualRangeField } from "@/components/ui/dual-range-field";
 import { PageHeader } from "@/components/ui/page-header";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -55,9 +57,10 @@ import type {
   SpeciesSection,
 } from "@/lib/types";
 import { formatScientificText } from "@/lib/scientific-notation";
+import { uniqueOutlierTables } from "@/lib/outlier-tables";
 import { cn } from "@/lib/utils";
 import { MetrologyProcessingResults, useMetrologyConsultation } from "@/components/metrology/consultation-context";
-import { useSessionStore } from "@/store/use-session-store";
+import { useToolsSession } from "@/components/metrology/consultation-context";
 
 type SelectedTarget = {
   rowLabel: string;
@@ -2232,7 +2235,7 @@ function applyProcessingConfigPreviewToFigure(
     }
     changed = true;
   }
-  return changed ? { ...cloned, data: nextData, layout: nextLayout } : figure;
+  return changed ? { ...cloned, data: config.x_axis_option === "By Identifier 2" ? nextData.map(orderTraceByX) : nextData, layout: nextLayout } : figure;
 }
 
 function formatPrecisionMetric(value?: number | null): string {
@@ -2457,10 +2460,13 @@ function applyDisplayState(
   return { ...cloned, data: displayTraces, layout };
 }
 
+const normalizeProcessingMarkerOpacityCache = new WeakMap<Record<string,unknown>,Record<string,unknown>>();
 function normalizeProcessingMarkerOpacity(figure: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   if (!figure) {
     return figure;
   }
+  const cached=normalizeProcessingMarkerOpacityCache.get(figure);
+  if(cached)return cached;
   const cloned = cloneFigure(figure);
   let changed = false;
   const data = cloned.data.map((trace) => {
@@ -2471,7 +2477,9 @@ function normalizeProcessingMarkerOpacity(figure: Record<string, unknown> | unde
     changed = true;
     return { ...trace, marker: { ...marker, opacity: 1 } };
   });
-  return changed ? { ...cloned, data } : figure;
+  const result = changed ? { ...cloned, data } : figure;
+  normalizeProcessingMarkerOpacityCache.set(figure,result);
+  return result;
 }
 
 function TraceModeControl({
@@ -2488,13 +2496,14 @@ function TraceModeControl({
   const tr = useTranslation();
   const display = normalizeDisplayState(state);
   return (
-    <details className="group relative">
+    <details className="group relative chart-display-menu">
       <summary className="flex h-8 cursor-pointer list-none items-center gap-1.5 rounded-md border border-stone-300 bg-white px-2.5 text-xs font-medium text-stone-700 shadow-sm transition-colors hover:bg-stone-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 [&::-webkit-details-marker]:hidden">
         <SlidersHorizontal aria-hidden="true" className="h-3.5 w-3.5" />{tr("Display")}<ChevronRight aria-hidden="true" className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
       </summary>
       <div
         className="absolute right-0 top-10 z-30 grid min-w-56 gap-0.5 rounded-lg border border-stone-200 bg-white p-2 text-xs shadow-lg"
         role="group"
+        data-chart-display-menu="external"
         aria-label={tr("Chart display options")}
       >
         <label className={cn("flex min-h-8 items-center gap-2 rounded-md px-2 hover:bg-stone-50", hasCalibrated ? "text-stone-700" : "text-stone-400")}>
@@ -3549,35 +3558,20 @@ function computeHoverPreviewPosition(
   clientY: number,
   tooltipWidth = 440,
   tooltipHeight = 340,
-): { left: number; top: number } {
+): { left: number; top: number; width:number; height:number } {
   if (typeof window === "undefined") {
-    return { left: clientX + 220, top: clientY - 24 };
+    return {left:clientX+18,top:clientY+18,width:tooltipWidth,height:tooltipHeight};
   }
-  // Keep the diagnostics card to the right of Plotly's native hover label.
-  const horizontalOffset = 220;
-  const fallbackLeftOffset = 24;
-  const verticalOffset = -24;
-  const edgePadding = 10;
-  const viewportWidth = window.innerWidth;
-  const viewportHeight = window.innerHeight;
-
-  let left = clientX + horizontalOffset;
-  if (left + tooltipWidth > viewportWidth - edgePadding) {
-    left = clientX - tooltipWidth - fallbackLeftOffset;
-  }
-  if (left < edgePadding) {
-    left = edgePadding;
-  }
-
-  let top = clientY + verticalOffset;
-  if (top + tooltipHeight > viewportHeight - edgePadding) {
-    top = viewportHeight - tooltipHeight - edgePadding;
-  }
-  if (top < edgePadding) {
-    top = edgePadding;
-  }
-
-  return { left, top };
+  const gap=18, edge=10, vw=window.innerWidth, vh=window.innerHeight;
+  const width=Math.min(tooltipWidth,vw-edge*2), height=Math.min(tooltipHeight,vh-edge*2);
+  const left=Math.max(edge,Math.min(clientX-width/2,vw-width-edge));
+  if(clientY+gap+height<=vh-edge)return {left,top:clientY+gap,width,height};
+  if(clientY-gap-height>=edge)return {left,top:clientY-gap-height,width,height};
+  if(clientX+gap+width<=vw-edge)return {left:clientX+gap,top:Math.max(edge,Math.min(clientY-height/2,vh-height-edge)),width,height};
+  if(clientX-gap-width>=edge)return {left:clientX-gap-width,top:Math.max(edge,Math.min(clientY-height/2,vh-height-edge)),width,height};
+  // A centered point leaves no room for the full card: use the larger vertical side.
+  const below=vh-clientY-gap-edge, above=clientY-gap-edge;
+  return below>=above ? {left,top:clientY+gap,width,height:below} : {left,top:edge,width,height:above};
 }
 
 function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
@@ -3647,6 +3641,7 @@ function RangeSliderField({
   min,
   max,
   step = 0.1,
+  date = false,
   precision = 2,
   showManualInputs = false,
   onChange,
@@ -3657,6 +3652,7 @@ function RangeSliderField({
   max: number;
   step?: number;
   precision?: number;
+  date?: boolean;
   showManualInputs?: boolean;
   onChange: (next: [number, number]) => void;
 }) {
@@ -3673,6 +3669,8 @@ function RangeSliderField({
       min={resolvedMin}
       max={resolvedMax}
       step={step}
+      date={date}
+      compact
       precision={precision}
       className={showManualInputs ? "bg-white" : undefined}
       onChange={onChange}
@@ -3885,16 +3883,16 @@ function ProcessingColorScaleBar({
 }) {
   const tr = useTranslation();
   const label = previewColorLabel(colorParam ?? "Color");
-  const ticks = processingColorScaleTicks(range);
+  const ticks = processingColorScaleTicks(range, /date/i.test(colorParam ?? "") ? 2 : 3);
   return (
-    <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
+    <div className="scientific-color-strip">
       <div className="mb-1 font-semibold text-stone-900">{tr(formatScientificText(label))}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
         aria-label={tr(`${label} color scale from ${range[0]} to ${range[1]}`)}
       />
-      <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
+      <div className="scientific-color-ticks">
         {ticks.map((tick, index) => (
           <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
             {tr(formatProcessingColorScaleValue(tick, colorParam))}
@@ -3905,10 +3903,13 @@ function ProcessingColorScaleBar({
   );
 }
 
+const hideEmbeddedColorbarsCache = new WeakMap<Record<string,unknown>,Record<string,unknown>>();
 function hideEmbeddedColorbars(figure: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   if (!figure) {
     return figure;
   }
+  const cached=hideEmbeddedColorbarsCache.get(figure);
+  if(cached)return cached;
   const cloned = cloneFigure(figure);
   const data = cloned.data.map((trace) => {
     const marker = trace.marker && typeof trace.marker === "object" ? trace.marker as Record<string, unknown> : null;
@@ -3924,7 +3925,9 @@ function hideEmbeddedColorbars(figure: Record<string, unknown> | undefined): Rec
       layout[key] = { ...(axis as Record<string, unknown>), showscale: false };
     }
   }
-  return { ...cloned, data, layout };
+  const result = { ...cloned, data, layout };
+  hideEmbeddedColorbarsCache.set(figure,result);
+  return result;
 }
 
 function buildDateColorbarTicksForRange(cmin: number, cmax: number, maxTicks = 6): { tickvals: number[]; ticktext: string[] } {
@@ -4255,8 +4258,8 @@ function OutlierTablesPanel({
     setSelectedRowsByTable({});
   }, [tables]);
 
-  const populatedTables = tables.filter((table) => table.rows.length > 0);
-  const totalRowCount = populatedTables.reduce((total, table) => total + table.rows.length, 0);
+  const populatedTables = uniqueOutlierTables(tables).filter((table) => table.rows.length > 0);
+  const totalRowCount = new Set(populatedTables.flatMap(table => table.rows.map(row => extractOutlierRowLabel(row) ?? JSON.stringify(row)))).size;
 
   if (!populatedTables.length) {
     return (
@@ -4288,7 +4291,7 @@ function OutlierTablesPanel({
         <div className="flex shrink-0 items-center gap-1.5">
           {isPreview ? <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Preview")}</span> : null}
           <span className="rounded-md bg-stone-100 px-2 py-1 text-xs font-medium text-stone-600">
-            {totalRowCount}{tr("rows")}</span>
+            {totalRowCount} {tr("unique analyses")}</span>
         </div>
       </summary>
       <div className="space-y-2 border-t border-stone-200 p-3">
@@ -4355,7 +4358,7 @@ function CheckboxField({
 }) {
   const tr = useTranslation();
   return (
-    <label className={cn("flex items-center gap-2 py-1.5 text-sm", disabled ? "cursor-not-allowed opacity-60" : "")}>
+    <label className={cn("flex items-center gap-2 py-1.5 text-sm", (description||label.length>24)&&"scientific-check--wide", disabled ? "cursor-not-allowed opacity-60" : "")}>
       <input
         type="checkbox"
         checked={checked}
@@ -4969,6 +4972,7 @@ function FigureCard({
       </CardHeader>
       <CardContent className="min-w-0 overflow-hidden">
         <PlotlyChart
+          lazy
           figure={figure}
           className={chartClassName ?? "min-h-[340px]"}
           fitContainer={fitContainer}
@@ -4986,11 +4990,11 @@ function FigureCard({
   );
 }
 
-export default function ProcessingPage() {
+function ProcessingPage() {
   const consultation = useMetrologyConsultation();
   const metrologyResults = useContext(MetrologyProcessingResults);
   const tr = useTranslation();
-  const sessionId = useSessionStore((state) => state.sessionId);
+  const sessionId = useToolsSession();
   const queryClient = useQueryClient();
   const [config, setConfig] = useState<ProcessingConfig | null>(null);
   const [activeBackgroundJob, setActiveBackgroundJob] = useState<JobSnapshot<unknown> | null>(null);
@@ -5071,12 +5075,16 @@ export default function ProcessingPage() {
 
   const workspaceQuery = useQuery({
     queryKey: ["processing-workspace", sessionId],
+    staleTime: consultation ? Infinity : 0,
+    gcTime: 30 * 60 * 1000,
     queryFn: ({ signal }) => api.getProcessingWorkspace(sessionId!, [], signal),
     enabled: Boolean(sessionId),
   });
   const speciesSectionQueryState = useQueries({
     queries: openSpeciesSectionList.map((species) => ({
       queryKey: ["processing-species-section", sessionId, species],
+      staleTime: consultation ? Infinity : 0,
+      gcTime: 30 * 60 * 1000,
       queryFn: ({ signal }: { signal: AbortSignal }) => api.getProcessingSpeciesSection(sessionId!, species, signal),
       enabled: Boolean(sessionId),
     })),
@@ -5088,6 +5096,8 @@ export default function ProcessingPage() {
   });
   const calibrationWorkspaceQuery = useQuery({
     queryKey: ["calibration-workspace", sessionId],
+    staleTime: consultation ? Infinity : 0,
+    gcTime: 30 * 60 * 1000,
     queryFn: () => api.getCalibrationWorkspace(sessionId!),
     enabled: Boolean(sessionId),
   });
@@ -5176,7 +5186,7 @@ export default function ProcessingPage() {
       return;
     }
     speciesDefaultsSessionRef.current = sessionId;
-    setOpenSpeciesSections(new Set(workspaceQuery.data.species_sections.map((section) => section.species)));
+    setOpenSpeciesSections(new Set());
   }, [sessionId, workspaceQuery.data]);
 
   useEffect(() => {
@@ -6675,6 +6685,13 @@ export default function ProcessingPage() {
     clearSelectionDraftSpeciesForTargets(targets);
   }
 
+  const previewFigureCache = useMemo(() => Object.assign(new WeakMap<Record<string,unknown>, Record<string,unknown>>(), {masks:new Map<string,ReturnType<typeof buildProcessingPreviewMasks>>()}), [
+    workspace, activeConfig, linearityPreviewDataQuery.data, sharedLinearityConfig, linearityPreviewConfig,
+    linearityPreviewStale, linearityPreviewValues, calibrationWorkspaceQuery.data, selectionDraftEdits,
+    selectionDraftValues, selectionDraftIdentifier1, selectionDraftIdentifier2, selectionDraftSpecies,
+    hideDuplicateSymbologyAndCollapseLegends, metrologyResults, tr,
+  ]);
+
   if (!sessionId) {
     return (
       <Card>
@@ -6736,9 +6753,9 @@ export default function ProcessingPage() {
   );
   const hasSaveableChanges = hasPendingProcessingConfigChanges || hasUnsavedLinearityChanges || hasPendingSelectionDrafts;
   const shouldApplyLinearityPreview = Boolean(linearityPreviewConfig) || hasPendingLinearityChanges || linearityPreviewStale;
-  const processingPreviewMasks = hasPendingProcessingConfigChanges
-    ? buildProcessingPreviewMasks(linearityPreviewDataQuery.data, previewLinearity, activeConfig, workspace.edit_state)
-    : null;
+  if (!previewFigureCache.masks.has("processing")) previewFigureCache.masks.set("processing",hasPendingProcessingConfigChanges
+    ? buildProcessingPreviewMasks(linearityPreviewDataQuery.data, previewLinearity, activeConfig, workspace.edit_state) : null);
+  const processingPreviewMasks = previewFigureCache.masks.get("processing") ?? null;
   const displayedDataOutlierTables = applyPreviewMasksToOutlierTables(
     workspace.outlier_tables,
     processingPreviewMasks,
@@ -6766,6 +6783,9 @@ export default function ProcessingPage() {
     activeConfig.species_name_map,
   );
   const applyPreviewFigure = (figure: Record<string, unknown> | undefined) => {
+    if (!figure) return figure;
+    const cached = previewFigureCache.get(figure);
+    if (cached) return cached;
     const linearityFigure = shouldApplyLinearityPreview
       ? applyLinearityPreviewToFigure(
           figure,
@@ -6784,7 +6804,9 @@ export default function ProcessingPage() {
     const displayed = hideDuplicateSymbologyAndCollapseLegends
       ? draftFigure
       : applyDuplicateHighlightsToFigure(draftFigure, duplicateSampleState.rowLabels);
-    return withSessionUncertainty(displayed, metrologyResults, tr("Final result ± U"));
+    const result = withSessionUncertainty(displayed, metrologyResults, tr("Final result ± U"));
+    if (result) previewFigureCache.set(figure, result);
+    return result;
   };
   const selectedLinearityIntensityCol = previewLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(previewLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
@@ -6839,12 +6861,13 @@ export default function ProcessingPage() {
       return [source.toLocaleUpperCase(), mapped.toLocaleUpperCase()];
     }),
   );
-  const exportPreviewMasks = buildProcessingPreviewMasks(
+  if (!previewFigureCache.masks.has("export")) previewFigureCache.masks.set("export",buildProcessingPreviewMasks(
     linearityPreviewDataQuery.data,
     previewLinearity,
     { ...activeConfig, selected_identifier: "All" },
     workspace.edit_state,
-  );
+  ));
+  const exportPreviewMasks = previewFigureCache.masks.get("export") ?? null;
   const selectedExportIdentifiers = new Set(
     activeConfig.export.selected_ids.map((identifier) => String(identifier).trim()),
   );
@@ -7120,7 +7143,7 @@ export default function ProcessingPage() {
       hasGapBefore: index > 0 && rowIndex - indexes[index - 1] > 1,
     }));
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
-  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 980, 450) : null;
+  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 1240, 560) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
     ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
   );
@@ -7519,38 +7542,30 @@ export default function ProcessingPage() {
         </div>
       ) : null}
 
-      <div className="workspace-grid">
-        <aside className="control-column">
-          <Card>
-            <CardHeader className="gap-3">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <CardTitle>{tr("Processing Controls")}</CardTitle>
-                  <CardDescription>{tr(consultation?"Select the observations and chart parameters.":"Filters, outliers, and shared linearity controls synced with Calibration.")}</CardDescription>
-                </div>
-                <Button onClick={applyConfig} disabled={busy || !hasSaveableChanges} size="sm">
-                  {tr(busy ? "Saving..." : "Save changes")}
-                </Button>
-              </div>
-              {hasPendingProcessingConfigChanges || hasUnsavedLinearityChanges || hasPendingSelectionDrafts ? (
-                <div className="flex flex-wrap gap-2">
+      <div className="workspace-grid scientific-processing-workspace">
+        <aside className="control-column scientific-control-column">
+          <ScientificControlPanel title={tr("Processing Controls")}
+            help={tr(consultation?"Select the observations and chart parameters.":"Filters, outliers, and shared linearity controls synced with Calibration.")}
+            action={<Button onClick={applyConfig} disabled={busy || !hasSaveableChanges} size="sm" title={tr("Save changes")} aria-label={tr(busy ? "Saving..." : "Save changes")}>{tr(busy ? "Saving..." : "Save")}</Button>}
+            status={hasPendingProcessingConfigChanges || hasUnsavedLinearityChanges || hasPendingSelectionDrafts ? (
+                <div className="scientific-controls__pending">
                   {hasPendingProcessingConfigChanges ? (
-                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Preview active")}</span>
+                    <span>{tr("Preview active")}</span>
                   ) : null}
                   {hasUnsavedLinearityChanges ? (
-                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Unsaved linearity")}</span>
+                    <span>{tr("Unsaved linearity")}</span>
                   ) : null}
                   {hasPendingSelectionDrafts ? (
-                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Unsaved selection edits")}</span>
+                    <span>{tr("Unsaved selection edits")}</span>
                   ) : null}
                 </div>
-              ) : null}
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
-                <label className="text-sm">
+              ) : null}>
+              <ScientificControlGroup title={tr("Display settings")}>
+              <div className="scientific-controls__grid">
+
+                <label className={cn("text-sm",activeConfig.selected_identifier.length>18&&"scientific-controls__wide")}>
                   <span className="mb-1 block font-medium text-stone-700">{tr("Identifier scope")}</span>
-                  <select
+                  <ScientificSelect
                     value={activeConfig.selected_identifier}
                     onChange={(event) => updateConfig("selected_identifier", event.target.value)}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
@@ -7560,22 +7575,40 @@ export default function ProcessingPage() {
                         {tr(option)}
                       </option>
                     ))}
-                  </select>
+                  </ScientificSelect>
                 </label>
                 <label className="text-sm">
                   <span className="mb-1 block font-medium text-stone-700">{tr("X axis")}</span>
-                  <select
+                  <ScientificSelect
                     value={activeConfig.x_axis_option}
                     onChange={(event) => updateConfig("x_axis_option", event.target.value as ProcessingConfig["x_axis_option"])}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
                     <option value="By Identifier 2">{tr("By Identifier 2")}</option>
                     <option value="By Sequence">{tr("By Sequence")}</option>
-                  </select>
+                  </ScientificSelect>
                 </label>
+                {Boolean(workspace.overview_figures.processing_3d?.data?.length) && <label className="text-sm scientific-controls__wide">
+                  <span className="mb-1 block font-medium text-stone-700">{tr("3D Z axis")}</span>
+                  <ScientificSelect
+                    value={activeConfig.z_axis}
+                    onChange={(event) => updateConfig("z_axis", event.target.value)}
+                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                  >
+                    {workspace.available_values.z_axis_options.map((option) => (
+                      <option key={option} value={option}>
+                        {tr(option)}
+                      </option>
+                    ))}
+                  </ScientificSelect>
+                </label>}
+              </div>
+
+              </ScientificControlGroup>
+              <ScientificControlGroup title={tr("Color scale")}>
                 <div className="text-sm">
-                  <span className="mb-1 block font-medium text-stone-700">{tr("Color parameter")}</span>
-                  <select
+                  <ScientificSelect
+                    aria-label={tr("Color parameter")}
                     value={activeConfig.color_param}
                     onChange={(event) => updateConfig("color_param", event.target.value)}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
@@ -7587,7 +7620,7 @@ export default function ProcessingPage() {
                         {tr(previewColorLabel(option))}
                       </option>
                     ))}
-                  </select>
+                  </ScientificSelect>
                   {colorScaleBounds ? (
                     <div className="mt-2">
                       <ProcessingColorScaleBar colorParam={activeConfig?.color_param} range={effectiveColorScaleRange} />
@@ -7596,6 +7629,7 @@ export default function ProcessingPage() {
                   <div className="mt-2">
                     <RangeSliderField
                       label={tr("Color scale interval")}
+                      date={["date","date_ordinal"].includes(String(activeConfig?.color_param).toLowerCase())}
                       value={effectiveColorScaleRange}
                       min={colorSliderBounds.min}
                       max={colorSliderBounds.max}
@@ -7605,25 +7639,9 @@ export default function ProcessingPage() {
                     />
                   </div>
                 </div>
-                <label className="text-sm">
-                  <span className="mb-1 block font-medium text-stone-700">{tr("3D Z axis")}</span>
-                  <select
-                    value={activeConfig.z_axis}
-                    onChange={(event) => updateConfig("z_axis", event.target.value)}
-                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                  >
-                    {workspace.available_values.z_axis_options.map((option) => (
-                      <option key={option} value={option}>
-                        {tr(option)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-800">{tr("Range filters")}</div>
-                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
+              </ScientificControlGroup>
+              <ScientificControlGroup title={tr("Range filters")}>
+                <div className="scientific-controls__ranges">
                   <RangeSliderField
                     label={tr("Signal range")}
                     value={activeConfig.signal_range}
@@ -7665,18 +7683,20 @@ export default function ProcessingPage() {
                     onChange={(nextRange) => updateConfig("d18o_range", nextRange)}
                   />
                 </div>
+              </ScientificControlGroup>
+              <ScientificControlGroup title={tr("Outlier detection")}>
                 <label className="text-sm">
                   <span className="mb-1 block text-stone-700">{tr("Statistical outlier method")}</span>
-                  <select
+                  <ScientificSelect
                     value={activeConfig.statistical_outlier_method}
                     onChange={(event) => updateConfig("statistical_outlier_method", event.target.value as ProcessingConfig["statistical_outlier_method"])}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
                     <option value="Z-Score">{tr("Z-Score")}</option>
                     <option value="IQR">{tr("IQR")}</option>
-                  </select>
+                  </ScientificSelect>
                 </label>
-                <div className="grid gap-3 sm:grid-cols-2">
+                <div className="scientific-controls__grid">
                   <label className="text-sm">
                     <span className="mb-1 block text-stone-700">{tr("Sigma level")}</span>
                     <input
@@ -7698,10 +7718,10 @@ export default function ProcessingPage() {
                     />
                   </label>
                 </div>
-              </div>
+              </ScientificControlGroup>
 
-              <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-800">{tr("Show on chart")}</div>
+              <ScientificControlGroup title={tr("Show on chart")}>
+                <div className="scientific-controls__checks">
                 <CheckboxField
                   checked={hideDuplicateSymbologyAndCollapseLegends}
                   label={tr("Hide duplicate symbols and collapse legends")}
@@ -7719,16 +7739,16 @@ export default function ProcessingPage() {
                 />
                 <CheckboxField checked={activeConfig.overlays.show_saturated_samples} label={tr("Fully saturated samples")} onChange={(checked) => updateOverlay("show_saturated_samples", checked)} />
                 <CheckboxField checked={activeConfig.overlays.show_failed_samples} label={tr("Failed samples")} onChange={(checked) => updateOverlay("show_failed_samples", checked)} />
+                </div>
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() => void resetManualOutliers()}
                   disabled={busy || manualOverrideCount === 0}
                 >{tr("Reset manual outliers")}</Button>
-              </div>
+              </ScientificControlGroup>
 
-              <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-800">{tr("Saturation correction")}</div>
+              <ScientificControlGroup title={tr("Saturation correction")}>
                 <CheckboxField
                   checked={Boolean(activeConfig.enable_saturation_correction)}
                   label={tr("Enable saturation correction")}
@@ -7736,10 +7756,10 @@ export default function ProcessingPage() {
                   onChange={(checked) => updateConfig("enable_saturation_correction", checked)}
                 />
                 {activeConfig.enable_saturation_correction ? (
-                  <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="scientific-controls__grid">
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">{tr("δ¹³C default method")}</span>
-                      <select
+                      <ScientificSelect
                         value={activeConfig.saturation_correction_method_d13 ?? activeConfig.saturation_correction_method}
                         onChange={(event) => updateSaturationMethod("d13C", event.target.value as SaturationCorrectionMethod)}
                         className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
@@ -7749,11 +7769,11 @@ export default function ProcessingPage() {
                             {tr(option.label)}
                           </option>
                         ))}
-                      </select>
+                      </ScientificSelect>
                     </label>
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">{tr("δ¹⁸O default method")}</span>
-                      <select
+                      <ScientificSelect
                         value={activeConfig.saturation_correction_method_d18 ?? activeConfig.saturation_correction_method}
                         onChange={(event) => updateSaturationMethod("d18O", event.target.value as SaturationCorrectionMethod)}
                         className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
@@ -7763,11 +7783,11 @@ export default function ProcessingPage() {
                             {tr(option.label)}
                           </option>
                         ))}
-                      </select>
+                      </ScientificSelect>
                     </label>
                   </div>
                 ) : null}
-              </div>
+              </ScientificControlGroup>
 
               {!consultation && <>
               <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
@@ -7806,7 +7826,7 @@ export default function ProcessingPage() {
                     ) : null}
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">{tr("Linearity basis")}</span>
-                      <select
+                      <ScientificSelect
                         value={selectedLinearityIntensityCol}
                         onChange={(event) => updateSharedLinearityIntensityCol(event.target.value)}
                         title={tr(getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))}
@@ -7817,11 +7837,11 @@ export default function ProcessingPage() {
                             {tr(getLinearityIntensityOptionLabel(option))}
                           </option>
                         ))}
-                      </select>
+                      </ScientificSelect>
                     </label>
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">{tr("Linearity cycle intensity")}</span>
-                      <select
+                      <ScientificSelect
                         value={selectedLinearityCycleIntensityAggregation}
                         onChange={(event) => updateSharedLinearity("cycle_intensity_aggregation", event.target.value)}
                         title={tr("Choose which cycle intensity is used when building the selected linearity basis for each analysis.")}
@@ -7832,7 +7852,7 @@ export default function ProcessingPage() {
                             {tr(option.label)}
                           </option>
                         ))}
-                      </select>
+                      </ScientificSelect>
                     </label>
                     <Tooltip label={tr(getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))} align="start">
                       <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Basis formula")}</span>
@@ -7858,7 +7878,7 @@ export default function ProcessingPage() {
                         />
                       </label>
                     ) : null}
-                    <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="scientific-controls__grid">
                       <div className="border-t border-stone-200 pt-2 text-sm">
                         <div className="text-xs font-medium text-stone-500">{tr("δ¹³C fitted coefficients")}</div>
                         <div className="mt-1 space-y-1 font-semibold text-stone-900">
@@ -7890,7 +7910,7 @@ export default function ProcessingPage() {
                         </div>
                       </div>
                     </div>
-                    <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="scientific-controls__grid">
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">
                               {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
@@ -7913,7 +7933,7 @@ export default function ProcessingPage() {
                       </label>
                     </div>
                     {showSecondaryCoefficientOffset ? (
-                      <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="scientific-controls__grid">
                         <label className="text-sm">
                           <span className="mb-1 block text-stone-700">
                                 {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
@@ -7941,7 +7961,7 @@ export default function ProcessingPage() {
                     <div className="grid gap-4 sm:grid-cols-2">
                       <div className="space-y-3">
                         <span className="text-sm font-medium text-stone-800">{tr("Line 1 offset")}</span>
-                        <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="scientific-controls__grid">
                           <label className="text-sm">
                             <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
                             <input
@@ -7972,7 +7992,7 @@ export default function ProcessingPage() {
                       </div>
                       <div className="space-y-3">
                         <span className="text-sm font-medium text-stone-800">{tr("Line 2 offset")}</span>
-                        <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="scientific-controls__grid">
                           <label className="text-sm">
                             <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
                             <input
@@ -8050,8 +8070,7 @@ export default function ProcessingPage() {
                 </Button>
                 <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>{tr("Reset all edits")}</Button>
               </div>
-            </CardContent>
-          </Card>
+          </ScientificControlPanel>
 
         </aside>
 
@@ -9227,6 +9246,7 @@ export default function ProcessingPage() {
                               </div>
                               <div className="w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
+                                  lazy
                                   figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d13c))), d13State)}
                                   className="h-[380px] w-full"
                                   fitContainer
@@ -9255,6 +9275,7 @@ export default function ProcessingPage() {
                               </div>
                               <div className="w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
+                                  lazy
                                   figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d18o))), d18State)}
                                   className="h-[380px] w-full"
                                   fitContainer
@@ -9291,9 +9312,13 @@ export default function ProcessingPage() {
       </div>
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          role="tooltip"
-          className="fixed z-[80] max-h-[calc(100vh-20px)] w-[min(980px,calc(100vw-20px))] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
-          style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
+          role="dialog"
+          aria-label={tr("Sample preview")}
+          className="sample-hover-preview fixed z-[80] overflow-y-auto rounded-lg border border-stone-300 bg-white p-3 shadow-2xl"
+          tabIndex={0}
+          onClick={event=>{if (!(event.target as HTMLElement).closest("button,input,summary,a,.modebar")) {setTargets([hoverPreview.target]);setHoverPreview(null);}}}
+          onKeyDown={event=>{if(event.key==="Enter"&&event.target===event.currentTarget){setTargets([hoverPreview.target]);setHoverPreview(null);}}}
+          style={{left:hoverPreviewPosition.left,top:hoverPreviewPosition.top,width:hoverPreviewPosition.width,maxHeight:hoverPreviewPosition.height}}
           onMouseEnter={clearHoverPreviewHideTimer}
           onMouseLeave={scheduleHoverPreviewHide}
         >
@@ -9301,19 +9326,17 @@ export default function ProcessingPage() {
             <span className="font-medium text-stone-800">
               {tr(hoverPreview.target.identifier1 || "Sample")} | {tr(hoverPreview.target.identifier2 || "N/A")}
             </span>
-            <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
-              {tr(hoverPreview.target.isotopeKey)}
-            </span>
+            <button type="button" className="text-blue-700 underline" onClick={()=>{setTargets([hoverPreview.target]);setHoverPreview(null);}}>{tr("Open sample editor")}</button>
           </div>
-          <div className="grid min-h-0 gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:items-stretch">
-            <div className="h-[390px] min-w-0">
+          <div className="grid min-h-0 gap-3 md:grid-cols-[minmax(260px,340px)_minmax(0,1fr)] md:items-stretch">
+            <div className="h-[480px] min-w-0">
               <RawAnalysisInfoTable info={hoverAnalysisInfo} layout="vertical" />
             </div>
-            <div className="flex min-h-[390px] min-w-0 items-center">
+            <div className="flex min-h-[480px] min-w-0 items-center">
               {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
                 <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Loading hover preview...")}</div>
               ) : hasHoverDiagnosticsFigureData ? (
-                <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
+                <PlotlyChart figure={hoverDiagnosticsFigure} initialHeight={480} legendFontSize={10} className="w-full" />
               ) : (
                 <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Cycle-intensity preview unavailable for this point.")}</div>
               )}
@@ -9328,3 +9351,5 @@ export default function ProcessingPage() {
 
 
 
+
+export default memo(ProcessingPage);

@@ -55,3 +55,10 @@ test('reused processing figures show canonical results and U without changing im
   assert.deepEqual(cross.x,[-4]); assert.deepEqual(cross.y,[-2]); assert.deepEqual(cross.z,[6]);
   assert.deepEqual(cross.error_x.array,[.12]); assert.deepEqual(cross.error_y.array,[.12]);
 });
+
+test('calibration before/after retains oxygen X, carbon Y, and numeric Z in binary figures',()=>{
+ const encoded={dtype:'f8',bdata:Buffer.from(new Float64Array([4]).buffer).toString('base64')};
+ const input={data:[{mode:'markers',type:'scatter3d',name:'Imported',x:encoded,y:encoded,z:encoded,customdata:[['a','cross']]}],layout:{scene:{xaxis:{title:{text:'δ¹⁸O'}},yaxis:{title:{text:'δ¹³C'}},zaxis:{title:{text:'I44 / V'}}}}};
+ const output=compiled.exports.withCalibrationStages(input,new Map([['a',{before:[1,-5],after:[2,-6]}]]),{before:'Before',after:'After'});
+ assert.equal(output.data[0],input.data[0]);assert.deepEqual(output.data[1].x,[-5]);assert.deepEqual(output.data[1].y,[1]);assert.deepEqual(output.data[2].x,[-6]);assert.deepEqual(output.data[2].z,[4]);assert.equal(output.layout,input.layout);
+});

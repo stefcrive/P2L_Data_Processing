@@ -4,7 +4,8 @@ import { useTranslation } from "@/components/layout/language-provider";
 import { useMetrologyConsultation, MetrologyChartAppearance, MetrologyChartHeight } from "@/components/metrology/consultation-context";
 import { useLanguage } from "@/components/layout/language-provider";
 import dynamic from "next/dynamic";
-import { ChevronDown, ChevronUp, GripHorizontal } from "lucide-react";
+import { createPortal } from "react-dom";
+import { GripHorizontal, HelpCircle, SlidersHorizontal, ChevronDown } from "lucide-react";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -15,6 +16,7 @@ import {
   useState,
 } from "react";
 
+import { alignedIsotopeAxes } from "@/lib/plotly-order";
 import { cn } from "@/lib/utils";
 import { formatPlotlyDisplayText } from "@/lib/scientific-notation";
 
@@ -54,6 +56,9 @@ export type PlotlyChartProps = {
   minHeight?: number;
   maxHeight?: number;
   deferRenderMs?: number;
+  lazy?: boolean;
+  initialHeight?: number;
+  legendFontSize?: number;
   uiRevision?: string;
   onPointClick?: (points: PlotlyPoint[]) => void;
   onSelection?: (points: PlotlyPoint[]) => void;
@@ -76,9 +81,15 @@ function titleText(value: unknown): string {
   return "";
 }
 
+function panelTitle(value: unknown): string {
+  return titleText(value).split(/<br\s*\/?>(?:\s*)/i)[0].replace(/<[^>]*>/g, "").replace(/&amp;/g, "&").replace(/&nbsp;/g, " ");
+}
+
 type PlotlyGraphDiv = HTMLDivElement & {
+  on?: (name:string,handler:(event:unknown)=>void)=>void;
+  removeListener?: (name:string,handler:(event:unknown)=>void)=>void;
   _fullLayout?: {
-    meta?: { equalStandardScale?: boolean };
+    meta?: { equalStandardScale?: boolean; standardMeanOffset?: number };
     yaxis?: { dtick?: unknown; range?: unknown };
     yaxis2?: { dtick?: unknown; overlaying?: unknown; range?: unknown; tickmode?: unknown; title?: unknown };
   };
@@ -130,7 +141,7 @@ function syncStandardAxisScale(
   }
 
   const primarySpan = Math.abs(primaryRange[1] - primaryRange[0]);
-  const standardCenter = (standardRange[0] + standardRange[1]) / 2;
+  const standardCenter = (primaryRange[0] + primaryRange[1]) / 2 + (graphDiv._fullLayout?.meta?.standardMeanOffset ?? ((standardRange[0] + standardRange[1] - primaryRange[0] - primaryRange[1]) / 2));
   const reversed = primaryRange[1] < primaryRange[0];
   const targetRange: [number, number] = reversed
     ? [standardCenter + primarySpan / 2, standardCenter - primarySpan / 2]
@@ -141,14 +152,15 @@ function syncStandardAxisScale(
     return;
   }
 
+  setProgrammaticRelayout?.(true);
   void import("@/lib/plotly-core").then(({ default: plotlyModule }) => {
+    if (!graphDiv.isConnected) { setProgrammaticRelayout?.(false); return; }
     const Plotly = plotlyModule as unknown as PlotlyRelayoutApi;
-    setProgrammaticRelayout?.(true);
     void Plotly
       .relayout(graphDiv, {
         "yaxis2.tickmode": "linear",
         "yaxis2.dtick": primaryTickInterval,
-        // Keep the standards centered, but give both axes the same units-per-pixel.
+        // Both means occupy the same pixel; isotope units per pixel remain equal.
         "yaxis2.range": targetRange,
       })
       .finally(() => setProgrammaticRelayout?.(false));
@@ -283,13 +295,13 @@ function compactFigureColorbars(
       return traceValue;
     }
     const trace = { ...(traceValue as Record<string, unknown>) };
-    if (trace.colorbar && typeof trace.colorbar === "object") {
+    if (trace.showscale !== false && trace.colorbar && typeof trace.colorbar === "object") {
       trace.colorbar = compactColorbar(trace.colorbar);
       hasColorbar = true;
     }
     if (trace.marker && typeof trace.marker === "object") {
       const marker = { ...(trace.marker as Record<string, unknown>) };
-      if (marker.colorbar && typeof marker.colorbar === "object") {
+      if (marker.showscale !== false && marker.colorbar && typeof marker.colorbar === "object") {
         marker.colorbar = compactColorbar(marker.colorbar);
         hasColorbar = true;
       }
@@ -459,12 +471,15 @@ export function PlotlyChart({
   figure: sourceFigure,
   className,
   fitContainer = false,
-  collapsibleLegend = false,
+  collapsibleLegend = true,
   legendCollapsed = false,
-  verticallyResizable = false,
+  verticallyResizable = true,
   minHeight = 280,
   maxHeight = 960,
   deferRenderMs = 0,
+  lazy = false,
+  initialHeight,
+  legendFontSize = 11,
   uiRevision,
   onPointClick,
   onSelection,
@@ -472,22 +487,38 @@ export function PlotlyChart({
   onHoverEnd,
 }: PlotlyChartProps) {
   const tr = useTranslation();
+  const [headerHost,setHeaderHost] = useState<HTMLElement|null>(null);
+  const [panelHelp,setPanelHelp] = useState("");
+  const [legendHost,setLegendHost] = useState<HTMLElement|null>(null);
+  const [isNearViewport,setIsNearViewport] = useState(!lazy);
   const metrologyConsultation = useMetrologyConsultation();
   const appearance = useContext(MetrologyChartAppearance);
   const stationHeight = useContext(MetrologyChartHeight);
   const figure = useMemo(() => sourceFigure && appearance ? appearance(sourceFigure) : sourceFigure, [sourceFigure, appearance]);
   const { language } = useLanguage();
-  const [renderRevision, setRenderRevision] = useState(0);
+  const plotConfig = useMemo(() => ({responsive:true,displaylogo:false,displayModeBar:"hover" as const,locale:language === "pt" ? "pt-BR" : "en-US"}), [language]);
   const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
-  const [isLegendExpanded, setIsLegendExpanded] = useState(true);
+  const [isLegendExpanded, setIsLegendExpanded] = useState(!legendCollapsed);
+  useEffect(()=>setIsLegendExpanded(!legendCollapsed),[legendCollapsed]);
   const [chartHeight, setChartHeight] = useState<number | null>(null);
   const [isResizing, setIsResizing] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const plotContainerRef = useRef<HTMLDivElement>(null);
   const graphDivRef = useRef<PlotlyGraphDiv | null>(null);
+  const liveInteractions = useRef<Record<string,(event:unknown)=>void>>({});
+  const interactionListeners = useMemo(()=>Object.fromEntries(["plotly_hover","plotly_unhover","plotly_click","plotly_selected","plotly_relayout"].map(name=>[name,(event:unknown)=>liveInteractions.current[name]?.(event)])),[]);
+  function bindInteractions(graphDiv:PlotlyGraphDiv|undefined) {
+    if(!graphDiv?.on)return;
+    // react-plotly retains its handler registry after Strict Mode purges the graph.
+    // Reattach our own listeners without asking Plotly to redraw the figure.
+    for(const [name,handler] of Object.entries(interactionListeners)) {
+      graphDiv.removeListener?.(name,handler);
+      graphDiv.on(name,handler);
+    }
+  }
   const initialHeightRef = useRef<number | null>(null);
   const resizeDragRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null);
-  const didRefreshAfterInitializeRef = useRef(false);
+
   const pointerInteractionTokenRef = useRef(0);
   const consumedPointerInteractionTokenRef = useRef(0);
   const isSynchronizingStandardAxisRef = useRef(false);
@@ -499,9 +530,6 @@ export function PlotlyChart({
       return false;
     }
     const layout = figure.layout && typeof figure.layout === "object" ? (figure.layout as Record<string, unknown>) : {};
-    if (layout.showlegend === false) {
-      return false;
-    }
     const traces = Array.isArray(figure.data) ? figure.data : [];
     return traces.some((traceValue) => {
       if (!traceValue || typeof traceValue !== "object") {
@@ -511,8 +539,17 @@ export function PlotlyChart({
       return trace.showlegend !== false && typeof trace.name === "string" && trace.name.trim().length > 0;
     });
   }, [collapsibleLegend, figure]);
-  const isLegendVisible = isLegendExpanded && !legendCollapsed;
+  const isLegendVisible = isLegendExpanded;
   const shouldFillContainer = fitContainer || verticallyResizable || hasCollapsibleLegend;
+  useEffect(()=>{
+    const card=containerRef.current?.closest("[data-card]");
+    const header=card?.querySelector<HTMLElement>("[data-card-header]")??null;
+    setHeaderHost(header);
+    setLegendHost(header?.querySelector<HTMLElement>('[data-chart-display-menu="external"]') ?? null);
+    setPanelHelp([titleText((figure?.layout as Record<string,unknown>)?.title).replace(/<[^>]*>/g," "),header?.querySelector("[data-card-description]")?.textContent,...(Array.isArray(figure?.data)?figure.data.map((t: {name?:string})=>t.name):[])].filter(Boolean).join(" · "));
+    if(header) header.classList.add("analytical-panel-header");
+    return ()=>header?.classList.remove("analytical-panel-header");
+  },[figure, isDeferredReady, isNearViewport]);
   const preparedFigure = useMemo(() => {
     if (!figure || Object.keys(figure).length === 0) {
       return null;
@@ -525,17 +562,45 @@ export function PlotlyChart({
     if (secondaryAxis && titleText(secondaryAxis.title).startsWith("Standard ")) {
       layout.meta = { ...(typeof layout.meta === "object" && layout.meta ? layout.meta : {}), equalStandardScale: true };
     }
-    if (metrologyConsultation) {
-      layout.height = Math.round(270 * stationHeight / 280);
-      layout.font = { ...(layout.font as object ?? {}), family: "Segoe UI, sans-serif", size: 11, color: "#475569" };
-      layout.paper_bgcolor = "transparent";
-      layout.plot_bgcolor = "transparent";
-      layout.margin = { l: 54, r: secondaryAxis ? 56 : 24, t: 64, b: 45, ...(layout.margin as object ?? {}) };
-      for (const key of Object.keys(layout).filter(k => /^[xy]axis\d*$/.test(k))) {
-        layout[key] = { ...(layout[key] as object), gridcolor: "#e8edf1", automargin: true };
+    // Presentation only: never modify data, axis ranges, scales or assignments.
+    layout.height = stationHeight === 280 ? 340 : stationHeight;
+    layout.title = {text:""};
+    layout.font = { ...(layout.font as object ?? {}), family: "Segoe UI, sans-serif", size: 11, color: "#475569" };
+    layout.paper_bgcolor = "#ffffff";
+    layout.plot_bgcolor = "#ffffff";
+    layout.margin = { ...(layout.margin as object ?? {}), l: 54, r: secondaryAxis ? 58 : 18, t: isLegendVisible ? 28 : 8, b: 42, pad: 0, autoexpand: true };
+    layout.legend = { ...(layout.legend as object ?? {}), orientation:"h", x:0, xanchor:"left", y:1.01, yanchor:"bottom", font:{size:legendFontSize}, itemsizing:"constant", tracegroupgap:0, borderwidth:0, entrywidth:undefined, entrywidthmode:"pixels" };
+    for (const key of Object.keys(layout).filter(k => /^[xy]axis\d*$/.test(k))) {
+      const axis=layout[key] as Record<string,unknown>;
+      layout[key] = { ...axis, gridcolor: "#e8edf1", automargin: true, title: typeof axis.title === "string" ? {text:axis.title,standoff:6} : {...(axis.title as object??{}),standoff:6} };
+    }
+    for(const key of Object.keys(layout).filter(k=>/^scene\d*$/.test(k))) {
+      const scene={...(layout[key] as Record<string,unknown>)};
+      if(key==="scene" && !layout.scene2) {
+        // A single 3D viewport includes its own tick/title space. Reclaim the
+        // old bottom legend reservation without changing data ranges or saved views.
+        scene.domain={x:[0,1],y:[0,1]};
+        if(!scene.camera) scene.camera={eye:{x:1.65,y:1.65,z:1.65}};
+        layout.margin={...(layout.margin as object),l:10,r:10,b:12};
       }
+      for(const axisKey of ["xaxis","yaxis","zaxis"]) {
+        const axis={...(scene[axisKey] as Record<string,unknown>??{})};
+        axis.tickfont={...(axis.tickfont as object??{}),size:10};
+        axis.title=typeof axis.title==="string"?{text:axis.title,font:{size:10}}:{...(axis.title as object??{}),font:{size:10}};
+        axis.gridcolor="#e8edf1";
+        scene[axisKey]=axis;
+      }
+      layout[key]=scene;
     }
     applyD18AxisInversion(layout);
+    if ((layout.meta as {equalStandardScale?:boolean})?.equalStandardScale) {
+      const alignment = alignedIsotopeAxes(figureData as Record<string,unknown>[], (layout.yaxis as {autorange?:unknown})?.autorange === "reversed");
+      if (alignment) {
+        layout.meta = {...(layout.meta as object), standardMeanOffset:alignment.offset};
+        layout.yaxis = {...(layout.yaxis as object), range:alignment.primary, autorange:false};
+        layout.yaxis2 = {...(layout.yaxis2 as object), range:alignment.secondary, autorange:false};
+      }
+    }
     const hoverLabel = layout.hoverlabel && typeof layout.hoverlabel === "object" ? { ...(layout.hoverlabel as Record<string, unknown>) } : {};
     hoverLabel.namelength = -1;
     layout.hoverlabel = hoverLabel;
@@ -564,13 +629,13 @@ export function PlotlyChart({
     }
     applyPersistedViewport(layout, uiRevision ? persistedViewports.get(uiRevision) : undefined);
     return {
-      data: formatPlotlyDisplayText(compacted.data, text => tr(metrologyConsultation ? text.replace(/VSMOW/g, "VPDB") : text)) as never[],
+      data: formatPlotlyDisplayText(compacted.data.map(value=>{if(!value || typeof value!=="object")return value; const trace=value as Record<string,unknown>; const name=trace.name; return {...trace,name:typeof name==="string"?name.replace(/^(Duplicat(?:e|ed) samples|Amostras duplicadas)$/i, "Duplicates").replace(/^(Final result ± U|Resultado final ± U)$/, "Final ± U").replace(/^(Before correction|Antes da correção)$/, "Before").replace(/^(After correction|Após a correção)$/, "After").replace(/^(Manual preview|Prévia manual)$/, "Preview"):name};}), text => tr(metrologyConsultation ? text.replace(/VSMOW/g, "VPDB") : text)) as never[],
       layout: formatPlotlyDisplayText(layout, text => tr(metrologyConsultation ? text.replace(/VSMOW/g, "VPDB") : text)) as never,
       useResizeHandler: true,
       fillContainerHeight: shouldFillContainer,
       hasExplicitHeight,
     };
-  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, tr, uiRevision, metrologyConsultation, stationHeight]);
+  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, tr, uiRevision, metrologyConsultation, stationHeight, legendFontSize]);
 
   useEffect(() => {
     if ((!verticallyResizable && !(metrologyConsultation && stationHeight !== 280 && fitContainer)) || chartHeight !== null) {
@@ -581,13 +646,13 @@ export function PlotlyChart({
       return;
     }
     const measuredHeight = Math.round(container.getBoundingClientRect().height);
-    const requestedHeight = metrologyConsultation
-      ? verticallyResizable ? stationHeight : measuredHeight * stationHeight / 280
-      : measuredHeight;
-    const initialHeight = Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, requestedHeight));
-    initialHeightRef.current = initialHeight;
-    setChartHeight(initialHeight);
-  }, [chartHeight, isDeferredReady, normalizedMaxHeight, normalizedMinHeight, preparedFigure, verticallyResizable, fitContainer, metrologyConsultation, stationHeight]);
+    const requestedHeight = initialHeight ?? (metrologyConsultation
+      ? (stationHeight === 280 ? 340 : stationHeight)
+      : 340);
+    const startingHeight = Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, requestedHeight));
+    initialHeightRef.current = startingHeight;
+    setChartHeight(startingHeight);
+  }, [chartHeight, isDeferredReady, normalizedMaxHeight, normalizedMinHeight, preparedFigure, verticallyResizable, fitContainer, metrologyConsultation, stationHeight, initialHeight]);
 
   useEffect(() => {
     if (!shouldDeferRender) {
@@ -599,7 +664,7 @@ export function PlotlyChart({
       setIsDeferredReady(true);
     }, deferRenderMs);
     return () => window.clearTimeout(timer);
-  }, [deferRenderMs, figure, shouldDeferRender]);
+  }, [deferRenderMs, shouldDeferRender]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -617,6 +682,7 @@ export function PlotlyChart({
         return;
       }
       const { width, height } = entry.contentRect;
+      if(width<=0||height<=0)return;
       if (Math.abs(width - lastWidth) < 0.5 && Math.abs(height - lastHeight) < 0.5) {
         return;
       }
@@ -629,7 +695,7 @@ export function PlotlyChart({
       resizeFrame = window.requestAnimationFrame(() => {
         resizeFrame = null;
         const graphDiv = graphDivRef.current;
-        if (!graphDiv?.isConnected) {
+        if (!graphDiv?.isConnected || graphDiv.getBoundingClientRect().width === 0) {
           return;
         }
         void import("@/lib/plotly-core").then(({ default: plotlyModule }) => {
@@ -649,7 +715,7 @@ export function PlotlyChart({
         window.cancelAnimationFrame(resizeFrame);
       }
     };
-  }, [isDeferredReady, preparedFigure]);
+  }, [isDeferredReady, isNearViewport, preparedFigure]);
 
   useEffect(() => {
     if (!hasCollapsibleLegend || !isDeferredReady) {
@@ -657,7 +723,7 @@ export function PlotlyChart({
     }
     const resizeFrame = window.requestAnimationFrame(() => {
       const graphDiv = graphDivRef.current;
-      if (!graphDiv?.isConnected) {
+      if (!graphDiv?.isConnected || graphDiv.getBoundingClientRect().width === 0) {
         return;
       }
       void import("@/lib/plotly-core").then(({ default: plotlyModule }) => {
@@ -668,25 +734,33 @@ export function PlotlyChart({
       });
     });
     return () => window.cancelAnimationFrame(resizeFrame);
-  }, [hasCollapsibleLegend, isDeferredReady, isLegendVisible]);
+  }, [hasCollapsibleLegend, isDeferredReady, isNearViewport, isLegendVisible]);
+
+  useEffect(() => {
+    if (isNearViewport || !lazy) return;
+    const element = containerRef.current;
+    if (!element || typeof IntersectionObserver === "undefined") { setIsNearViewport(true); return; }
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) { setIsNearViewport(true); observer.disconnect(); }
+    }, {rootMargin:"240px"});
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [isNearViewport, lazy]);
 
   function refreshAfterInitialize(_figure?: unknown, graphDiv?: PlotlyGraphDiv) {
     graphDivRef.current = graphDiv ?? null;
+    bindInteractions(graphDiv);
     syncStandardAxisScale(graphDiv, (active) => {
       isSynchronizingStandardAxisRef.current = active;
-    });
-    if (didRefreshAfterInitializeRef.current) {
-      return;
-    }
-    didRefreshAfterInitializeRef.current = true;
-    window.requestAnimationFrame(() => {
-      setRenderRevision((current) => current + 1);
     });
   }
 
   function persistViewportUpdate(update: Record<string, unknown> | undefined) {
     if (!uiRevision || !update || isSynchronizingStandardAxisRef.current) {
       return;
+    }
+    if (Object.keys(update).some(key => key.startsWith("yaxis."))) {
+      syncStandardAxisScale(graphDivRef.current ?? undefined, active => {isSynchronizingStandardAxisRef.current = active;});
     }
     const current = persistedViewports.get(uiRevision) ?? {};
     const next = mergeViewportRelayout(current, update);
@@ -764,13 +838,15 @@ export function PlotlyChart({
   if (!preparedFigure) {
     return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">{tr("No chart data yet.")}</div>;
   }
-  if (!isDeferredReady) {
+  if (!isDeferredReady || !isNearViewport) {
     return (
       <div
         className={cn(
           "flex min-w-0 items-center justify-center rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500",
           className,
         )}
+        ref={containerRef}
+        style={{minHeight:initialHeight ?? 340}}
         aria-busy="true"
       >{tr("Preparing chart...")}</div>
     );
@@ -804,68 +880,45 @@ export function PlotlyChart({
           onUnhover: () => onHoverEnd?.(),
         }
       : {};
+  liveInteractions.current = {
+    plotly_hover:event=>hoverHandlers.onHover?.(event as Parameters<NonNullable<typeof hoverHandlers.onHover>>[0]),
+    plotly_unhover:()=>onHoverEnd?.(),
+    plotly_click:event=>{if(onPointClick&&consumePointerInteraction())onPointClick((event as {points?:PlotlyPoint[]})?.points??[]);},
+    plotly_selected:event=>{if(onSelection&&consumePointerInteraction())onSelection((event as {points?:PlotlyPoint[]})?.points??[]);},
+    plotly_relayout:event=>persistViewportUpdate(event as Record<string,unknown>),
+  };
+  const legendControl = <label className="chart-legend-control"><input type="checkbox" checked={!isLegendVisible} onChange={event=>setIsLegendExpanded(!event.target.checked)}/>{tr("Hide legend")}</label>;
   return (
     <div
       ref={containerRef}
-      className={cn("flex min-w-0 w-full flex-col overflow-hidden", className)}
+      className={cn("analytical-chart flex min-w-0 w-full flex-col overflow-hidden", className)}
       style={chartHeight == null ? undefined : { height: `${chartHeight}px` }}
     >
-      {hasCollapsibleLegend && isLegendVisible ? (
-        <div className="flex shrink-0 justify-end border-b border-slate-100 bg-slate-50/70 px-2 py-1.5">
-          <button
-            type="button"
-            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-slate-600 transition-colors hover:bg-white hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1"
-            aria-expanded={isLegendVisible}
-            onClick={() => setIsLegendExpanded((current) => !current)}
-          >
-            <ChevronUp className="h-3.5 w-3.5" />{tr("Hide legend")}</button>
-        </div>
-      ) : null}
+      {headerHost ? createPortal(<div className="analytical-chart-actions">{panelHelp&&<button type="button" className="analytical-help" title={panelHelp} aria-label={panelHelp}><HelpCircle size={14}/></button>}{!legendHost&&hasCollapsibleLegend&&<details className="chart-display-menu"><summary><SlidersHorizontal size={14}/>{tr("Display")}<ChevronDown size={13}/></summary><div data-chart-display-menu>{legendControl}</div></details>}</div>,headerHost) : <div className="analytical-chart-header"><h3 title={panelHelp}>{tr(panelTitle((figure?.layout as Record<string,unknown>)?.title))}</h3>{hasCollapsibleLegend&&<details className="chart-display-menu"><summary><SlidersHorizontal size={14}/>{tr("Display")}<ChevronDown size={13}/></summary><div data-chart-display-menu>{legendControl}</div></details>}</div>}
+      {legendHost&&hasCollapsibleLegend ? createPortal(legendControl,legendHost) : null}
       <div
         ref={plotContainerRef}
         className={cn("relative min-h-0 w-full", shouldUseContainerHeight ? "flex-1" : "")}
         onPointerDownCapture={registerPointerInteraction}
       >
-        {hasCollapsibleLegend && !isLegendVisible && !legendCollapsed ? (
-          <button
-            type="button"
-            className="absolute right-2 top-10 z-20 inline-flex h-7 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2 text-xs font-medium text-slate-700 shadow-sm transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1"
-            aria-expanded={false}
-            onClick={() => setIsLegendExpanded(true)}
-          >
-            <ChevronDown className="h-3.5 w-3.5" />{tr("Show legend")}</button>
-        ) : null}
         <Plot
           data={preparedFigure.data}
           layout={preparedFigure.layout}
-          config={{ responsive: true, locale: language === "pt" ? "pt-BR" : "en-US" }}
-          revision={renderRevision}
+          config={plotConfig}
           onInitialized={refreshAfterInitialize}
           onUpdate={(_figure: unknown, graphDiv: PlotlyGraphDiv) => {
             graphDivRef.current = graphDiv;
-            syncStandardAxisScale(graphDiv, (active) => {
+            bindInteractions(graphDiv);
+            if (!isSynchronizingStandardAxisRef.current) syncStandardAxisScale(graphDiv, (active) => {
               isSynchronizingStandardAxisRef.current = active;
             })
           }}
-          onRelayout={persistViewportUpdate}
           useResizeHandler={preparedFigure.useResizeHandler}
           className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}
           // Plotly resets its inner SVG to 100% while resizing. Keep a concrete
           // height on fixed-size charts so an auto-height parent cannot collapse.
           style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%", height: (preparedFigure.layout as { height?: number }).height ?? normalizedMinHeight }}
-          onClick={(event: { points?: PlotlyPoint[] }) => {
-            if (!onPointClick || !consumePointerInteraction()) {
-              return;
-            }
-            onPointClick(event.points ?? []);
-          }}
-          onSelected={(event: { points?: PlotlyPoint[] } | undefined) => {
-            if (!onSelection || !consumePointerInteraction()) {
-              return;
-            }
-            onSelection(event?.points ?? []);
-          }}
-          {...hoverHandlers}
+
         />
       </div>
       {verticallyResizable ? (
@@ -879,7 +932,7 @@ export function PlotlyChart({
           tabIndex={0}
           title={tr("Drag to resize chart height. Use the up and down arrow keys for precise changes.")}
           className={cn(
-            "group flex h-3 shrink-0 touch-none cursor-ns-resize items-center justify-center border-t border-slate-200 bg-slate-50 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-400",
+            "analytical-resize group flex h-2 shrink-0 touch-none cursor-ns-resize items-center justify-center border-t border-slate-200 bg-slate-50 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-400",
             isResizing && "bg-slate-100 text-blue-700",
           )}
           onPointerDown={beginVerticalResize}

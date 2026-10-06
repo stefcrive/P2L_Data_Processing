@@ -21,20 +21,29 @@ def open_plot_bridge(service, session_id, scope, command):
         if not run_ids or any(r not in session["run_ids"] and r != qualification_run for r in run_ids):
             raise ValueError("Choose an imported session or its applied qualification")
         runs = [service.repo.get(db, "runs", rid) for rid in run_ids]
-        fingerprint = hashlib.sha256(encode([(r["id"], r["revision"], r.get("latest_evaluation_id")) for r in runs]).encode()).hexdigest()
+        method = service.repo.get(db, "methods", session["method_id"])
+        fingerprint = hashlib.sha256(encode({"runs": [(r["id"], r["revision"], r.get("latest_evaluation_id")) for r in runs], "method": method}).encode()).hexdigest()
         bridge = session.get("bridges", {}).get(scope)
+        reuse_parsed = False
         if bridge and legacy.store.session_exists(bridge):
             link = legacy.store.load_metadata(bridge).get("metrology_link", {})
-            if link.get("bridge_version") == 7 and link.get("fingerprint") == fingerprint:
+            if link.get("bridge_version") == 8 and link.get("fingerprint") == fingerprint:
                 return {"session_id": bridge, "run_id": scope, "row_mapping": link.get("row_mapping", {})}
+            # Upgrade an unchanged, frozen v7 consultation from its parsed cache.
+            # Scientific revisions still create a fresh bridge below.
+            old_fingerprint = hashlib.sha256(encode([(r["id"], r["revision"], r.get("latest_evaluation_id")) for r in runs]).encode()).hexdigest()
+            reuse_parsed = (link.get("bridge_version") == 7 and link.get("fingerprint") == old_fingerprint
+                            and link.get("method_id") == method["id"] and method["status"] != "draft")
         uploads, sources = [], {}
         for run in runs:
             raw = service.repo.get(db, "raw_imports", run["raw_import_id"])
             filename = f"{run['id'][:12]}__{raw['filename']}"
-            uploads.append((filename, service.repo.read_blob(raw["sha256"])))
+            if not reuse_parsed:
+                uploads.append((filename, service.repo.read_blob(raw["sha256"])))
             sources[filename] = service.repo.list(db, "measurements", run_id=run["id"])
-        result = legacy._import_session_from_bytes(uploads)
-        bridge = result.session.session_id
+        if not reuse_parsed:
+            result = legacy._import_session_from_bytes(uploads)
+            bridge = result.session.session_id
         frame = legacy.store.load_frame(bridge)
         for column in ("Identifier 1", "Identifier 2", "Species"):
             frame[column] = frame[column].astype(object) if column in frame else ""
@@ -67,13 +76,15 @@ def open_plot_bridge(service, session_id, scope, command):
                 # and use the authoritative exported analysis values in result plots.
                 for field, column in (("d13c", "d 13C/12C  Mean"), ("d18o", "d 18O/16O  Mean"),
                                       ("d13c_sd", "d 13C/12C  Std Dev"), ("d18o_sd", "d 18O/16O  Std Dev"),
-                                      ("i44_v", "1  Cycle Int  Samp  44")):
+                                      ("i44_v", "1  Cycle Int  Samp  44"),
+                                      ("reference_i44_v", "1  Cycle Int  Ref  44"),
+                                      ("sample_reference_difference_v", "1  Cycle Int  Diff Samp-Ref  44")):
                     frame.loc[index, "IRMS cycle summary: " + column] = row.get(column)
                     frame.loc[index, column] = original.get(field)
         metadata = legacy.store.load_metadata(bridge)
         metadata["session_name"] = f"{session['client']} / {session['name']}"
         metadata["metrology_link"] = {"results_session_id": session_id, "run_id": scope, "run_ids": run_ids,
-            "method_id": session["method_id"], "qualification_id": session["qualification_id"], "bridge_version": 7,
+            "method_id": session["method_id"], "qualification_id": session["qualification_id"], "bridge_version": 8,
             "fingerprint": fingerprint, "row_mapping": mapping}
         method = service.repo.get(db, "methods", session["method_id"])
         materials = service.material_map(db, method)
@@ -83,11 +94,13 @@ def open_plot_bridge(service, session_id, scope, command):
         if not selected and method["config"]["qc_id"]:
             material = materials[method["config"]["qc_id"]]
             selected = list(dict.fromkeys(name for name in [material["name"], *material["aliases"]] if name in identifiers))
-        metadata["calibration"] = {"config": {"selected_standards": selected, "linearity": {"apply": False}}, "selected_standards": selected}
+        if not reuse_parsed:
+            metadata["calibration"] = {"config": {"selected_standards": selected, "linearity": {"apply": False}}, "selected_standards": selected}
         metadata["metrology_reference_values"] = [{"Standard": m["name"], "Isotopic_Value_Type": token,
             "Value": m["assigned"][iso]["value"], "Source": f"Session method v{method['version']}; {m['assigned'][iso]['scale']}; {m['lot']}"}
             for m in materials.values() for iso, token in (("d13c", ISOTYPE_D13C), ("d18o", ISOTYPE_D18O)) if m["assigned"][iso]["value"] is not None]
-        legacy._set_processing_apply_calibration(metadata, False)
+        if not reuse_parsed:
+            legacy._set_processing_apply_calibration(metadata, False)
         legacy._persist_session_update(bridge, action="metrology_consultation_linked", metadata=metadata, df=frame)
         session.setdefault("bridges", {})[scope] = bridge
         service.repo.update(db, "results_sessions", session_id, session)

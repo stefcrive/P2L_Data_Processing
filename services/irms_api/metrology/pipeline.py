@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import numpy as np
 
+from ..domain.calibration.core import CARBONATE_ACID_FRACTIONATION_FACTORS, convert_d18o_carbonate_material
 from .models import ISOTOPES, Material, MethodConfig
 from .science import anchor_model, budget, corrected_normalize, regression, summary
 from .correction_review import comparison_rows, correction_review, screen_effects
@@ -43,6 +44,7 @@ def pair_fit(rows: list[dict], x: str, y: str) -> dict:
 
 def diagnostics(rows: list[dict]) -> dict:
     groups = defaultdict(list)
+    by_sequence = {r["sequence"]: r for r in rows}
     for r in rows:
         if r.get("excluded") or r["role"] not in ("anchor", "qc"):
             continue
@@ -75,7 +77,7 @@ def diagnostics(rows: list[dict]) -> dict:
             mean = summary([p[iso] for p in qc if p[iso] is not None])["mean"]
             memory_rows = []
             for point in qc:
-                previous = next((r for r in rows if r["sequence"] == point["sequence"] - 1), None)
+                previous = by_sequence.get(point["sequence"] - 1)
                 if previous and not previous.get("excluded") and previous.get(iso) is not None and point.get(iso) is not None:
                     memory_rows.append({"id": point["id"], "contrast": previous[iso] - mean, "response": point[iso]})
             memory = pair_fit(memory_rows, "contrast", "response") if len(memory_rows) >= 6 else {"status": "insufficient_evidence", "n": len(memory_rows)}
@@ -94,6 +96,7 @@ def diagnostics(rows: list[dict]) -> dict:
                 "mass_dependence": pair_fit(points, "mass_ug", iso), "intensity_dependence": intensity,
                 "pressure_residual": pair_fit(residual_rows, "pressure_mismatch_v", "residual"),
                 "pressure_dependence": pair_fit(points, "pressure_mismatch_v", iso),
+                "sample_reference_dependence": pair_fit(points, "sample_reference_difference_v", iso),
                 "drift": pair_fit(qc, "sequence", iso), "memory": memory,
             }
         result["materials"].append(item)
@@ -216,13 +219,15 @@ def evaluate(run: dict, method: dict, materials: dict, measurements: list[dict],
             bounds = config.ranges.get(iso)
             if bounds is None or not bounds.low <= norm["value"] <= bounds.high:
                 result["issues"].append(f"{iso} outside validated isotope range or range unset")
+            factor = norm.get("processing", {}).get("carbonate", {}).get("factor", 1.)
             precision = config.precision.get(iso)
+            precision = precision * factor if precision is not None else None
             if precision is not None:
                 try:
                     components = [
                         {"name": "precision", "u": precision, "covers": ["routine_precision", "qtegra_linearity", "reaction", "transfer", "instrument_stability"], "rationale": config.precision_evidence},
                         {"name": "normalization", "u": norm["u_norm"], "covers": ["assigned_values", "anchor_means"], "rationale": "Propagated from both assigned values and measured anchor means"},
-                        *[item.model_dump() for item in config.additional_components[iso]],
+                        *[{**item.model_dump(), "u": item.u * factor} for item in config.additional_components[iso]],
                     ]
                     if correction:
                         components.append({"name": "secondary_correction", "u": norm["correction"]["u"],
@@ -302,6 +307,14 @@ def evaluate(run: dict, method: dict, materials: dict, measurements: list[dict],
 def process_value(result, isotope, model, run, *, monte_carlo=False):
     """Evaluate the documented processing chain once, including imported stages."""
     value = result[isotope]
+    imported_value = value
+    mineral = run.get("carbonate_material", "calcite") if result.get("role") == "unknown" else "calcite"
+    carbonate_applied = isotope == "d18o" and mineral != "calcite"
+    retained_carbonate = carbonate_applied and run.get("carbonate_correction_preapplied", False)
+    if retained_carbonate:
+        if run.get("input_basis") != "already_vpdb":
+            raise ValueError("Pre-applied carbonate correction requires already normalized VPDB input")
+        value = convert_d18o_carbonate_material(value, source_material=mineral, target_material="calcite")
     external = run.get("input_basis") == "already_vpdb"
     correction = model.get("correction")
     supplied_x = (value - model["intercept"]) / model["slope"] if external else value
@@ -321,4 +334,29 @@ def process_value(result, isotope, model, run, *, monte_carlo=False):
                            "correction_source": "Qtegra: documented matching coefficient" if preapplied else ("IRMS Metrology" if correction else "None"),
                            "correction_applied": bool(correction and not preapplied),
                            "evidence": run.get("processing_evidence", "")}
+    if isotope == "d18o" and result.get("role") == "unknown":
+        factor = CARBONATE_ACID_FRACTIONATION_FACTORS["calcite"] / CARBONATE_ACID_FRACTIONATION_FACTORS[mineral]
+        before_carbonate = norm["value"]
+        norm["value"] = convert_d18o_carbonate_material(before_carbonate, source_material="calcite", target_material=mineral)
+        if retained_carbonate and external and (not correction or preapplied):
+            norm["value"] = imported_value
+        norm["u_norm"] *= factor
+        norm["jacobian"] = [v * factor for v in norm["jacobian"]]
+        if "correction" in norm:
+            norm["correction"]["u"] *= factor
+            norm["correction"]["coefficient_sensitivity"] *= factor
+            norm["u_normalization_and_correction"] *= factor
+        if "monte_carlo" in norm:
+            mc = norm["monte_carlo"]
+            mc["mean"] = convert_d18o_carbonate_material(mc["mean"], source_material="calcite", target_material=mineral)
+            mc["u"] *= factor
+            mc["interval95"] = [convert_d18o_carbonate_material(v, source_material="calcite", target_material=mineral) for v in mc["interval95"]]
+        norm["processing"].update(input_value=imported_value, carbonate={
+            "material": mineral, "source_material": mineral if retained_carbonate else "calcite",
+            "alpha_calcite": CARBONATE_ACID_FRACTIONATION_FACTORS["calcite"],
+            "alpha_material": CARBONATE_ACID_FRACTIONATION_FACTORS[mineral],
+            "factor": factor, "applied": carbonate_applied and not retained_carbonate,
+            "preapplied": retained_carbonate, "before": before_carbonate, "after": norm["value"],
+            "formula": "delta_material = (delta_calcite + 1000) * alpha_calcite / alpha_material - 1000",
+            "factor_basis": "Fixed factors from the original IRMS carbonate conversion",})
     return norm
