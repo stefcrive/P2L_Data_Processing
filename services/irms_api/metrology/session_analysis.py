@@ -8,6 +8,8 @@ from .correction_review import comparison_rows, correction_review, screen_effect
 from .models import ISOTOPES, MethodConfig
 from .pipeline import diagnostics
 from .science import summary
+from .importer import measurement_identity
+from .residual_preview import residual_previews
 
 
 def session_analysis(detail, *, outlier_method="sigma", threshold=3.0):
@@ -19,7 +21,7 @@ def session_analysis(detail, *, outlier_method="sigma", threshold=3.0):
     for run in detail["runs"]:
         evaluation = run.get("evaluation")
         source = evaluation["results"] if evaluation else run["measurements"]
-        source = [{**r, "run_id": run["id"], "run_label": run["label"],
+        source = [{**r, **measurement_identity(r, run.get("source_kind", "qtegra_raw")), "run_id": run["id"], "run_label": run["label"],
                    "workbook_sequence": r["sequence"], "sequence": offset + r["sequence"],
                    "sample_group": detail["groups"].get(r["id"], "Main batch"),
                    "evaluation_id": evaluation["id"] if evaluation else None} for r in source]
@@ -51,8 +53,10 @@ def session_analysis(detail, *, outlier_method="sigma", threshold=3.0):
     practical = config.correction_validation.practical_effect
     final_by_id = {r["id"]: r for r in after}
     paired_before = [{**r, **{iso: r.get(iso) if final_by_id.get(r["id"], {}).get(iso) is not None else None for iso in ISOTOPES}} for r in before]
+    final_diagnostics = screen_effects(diagnostics(after), practical)
     return {"rows": rows, "diagnostics_before": screen_effects(diagnostics(paired_before), practical),
-            "diagnostics_after": screen_effects(diagnostics(after), practical), "correction_review": review,
+            "diagnostics_after": final_diagnostics, "correction_review": review,
+            "residual_previews": residual_previews(final_diagnostics, detail.get("residual_overrides", {})),
             "outliers": {"method": outlier_method, "threshold": threshold, "basis": "Final session QC, separate material populations; flags do not exclude observations", "flags": flags},
             "workbooks": len(detail["runs"]), "paired_results": len(paired_ids),
             "qc_statistics": {iso: {"imported": summary([r[iso] for r in rows if r.get("role") == "qc" and not r.get("excluded") and r.get(iso) is not None]),

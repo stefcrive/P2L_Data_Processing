@@ -8,6 +8,15 @@ const compiled = { exports: {} };
 new Function('require', 'module', 'exports', outputText)(require, compiled, compiled.exports);
 const { uncertaintyEnvelope, normalizationEnvelope, withSessionUncertainty } = compiled.exports;
 
+test('binary Plotly vectors receive canonical uncertainty and excluded rows break envelopes', () => {
+  const x = new Float64Array([1,2,3]);
+  const rows = Object.fromEntries(['a','b','c'].map((id,i)=>[id,{run_id:'r',excluded:i===1,isotopes:{d13c:{value:i,budget:{expanded_uncertainty:.1}}}}]));
+  const updated = withSessionUncertainty({data:[{type:'scatter',x:{dtype:'f8',bdata:Buffer.from(x.buffer).toString('base64')},y:new Float64Array([10,11,12]),customdata:[['a','d13C'],['b','d13C'],['c','d13C']]}]},rows,'Final');
+  assert.deepEqual(updated.data.at(-1).x,[1,2,3]);
+  assert.deepEqual(updated.data.at(-1).y,[0,null,2]);
+  assert.equal(updated.data[1].x.filter(v=>v===null).length,2);
+});
+
 test('pointwise intervals retain missing budgets and workbook boundaries', () => {
   const traces = uncertaintyEnvelope([
     { x:1,value:2,uncertainty:.1,segment:'a' },

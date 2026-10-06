@@ -1,4 +1,5 @@
 "use client";
+import { useMetrologyConsultation } from "@/components/metrology/consultation-context";
 
 import { useTranslation } from "@/components/layout/language-provider";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -1922,6 +1923,7 @@ function RangeSliderControl({
 }
 
 export default function DiagnosticsPage() {
+  const consultation = useMetrologyConsultation();
   const tr = useTranslation();
   const sessionId = useSessionStore((state) => state.sessionId);
   const queryClient = useQueryClient();
@@ -2791,6 +2793,7 @@ export default function DiagnosticsPage() {
                 />
               </div>
 
+              {!consultation && <>
               <div className="space-y-4">
                 <div className="form-section-title">{tr("Value Ranges")}</div>
                 <RangeSliderControl
@@ -2811,8 +2814,10 @@ export default function DiagnosticsPage() {
                 />
               </div>
 
+              </>}
             </CardContent>
           </Card>
+          {!consultation && <>
           <Card>
             <CardHeader>
               <CardTitle>{tr("Linearity (Shared with Processing and Calibration)")}</CardTitle>
@@ -3047,6 +3052,7 @@ export default function DiagnosticsPage() {
               )}
             </CardContent>
           </Card>
+          </>}
         </aside>
 
         <ControlColumnToggle />

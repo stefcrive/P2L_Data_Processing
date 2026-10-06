@@ -47,7 +47,7 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { formatScientificText } from "@/lib/scientific-notation";
-import { MetrologyChartWorkspace, useMetrologyConsultation } from "@/components/metrology/consultation-context";
+import { MetrologyChartWorkspace, MetrologyChartAppearance, useMetrologyConsultation } from "@/components/metrology/consultation-context";
 import { useSessionStore } from "@/store/use-session-store";
 
 type SelectedTarget = {
@@ -3352,7 +3352,8 @@ export default function CalibrationPage() {
   }, [officialValuesOrder]);
 
   const persistedWorkspace = workspaceQuery.data as CalibrationWorkspace | undefined;
-  const activeDraftConfig = config ?? persistedWorkspace?.config ?? null;
+  const baseDraftConfig = config ?? persistedWorkspace?.config ?? null;
+  const activeDraftConfig = useMemo(() => baseDraftConfig && station ? {...baseDraftConfig,selected_standards:station.materialLabels?.length?station.materialLabels:baseDraftConfig.selected_standards,carbonate_material:(station.carbonateMaterial??"calcite") as CalibrationConfig["carbonate_material"],calibration_type:(station.outliers?.method==="iqr"?"IQR":"Z-Score") as CalibrationConfig["calibration_type"],sigma_level:station.outliers?.threshold??3,iqr_multiplier:station.outliers?.threshold??1.5} : baseDraftConfig, [baseDraftConfig,station?.carbonateMaterial,station?.materialLabels?.join("|"),station?.outliers?.method,station?.outliers?.threshold]);
   const activeDraftConfigSignature = activeDraftConfig ? JSON.stringify(activeDraftConfig) : "";
   const persistedConfigSignature = persistedWorkspace?.config ? JSON.stringify(persistedWorkspace.config) : "";
   const hasDraftConfigChanges = Boolean(
@@ -4330,6 +4331,260 @@ export default function CalibrationPage() {
     };
   })();
 
+  const manualLinearityControls = (<>              <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-medium text-stone-800">{tr("Manual linearity control")}</div>
+                  <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">{tr("Basis: ")}{tr(selectedLinearityBasisLabel)}</span>
+                </div>
+                <CheckboxField
+                  checked={activeConfig.linearity.apply}
+                  label={tr("Enable linearity correction")}
+                  description={tr("Uses the same basis, fits, and offsets as Processing.")}
+                  onChange={(checked) => updateLinearity("apply", checked)}
+                />
+                {!isTwoTermLinearityBasis ? (
+                  <CheckboxField
+                    checked={Boolean(activeConfig.linearity.quadratic)}
+                    label={tr("Use quadratic linearity relationship")}
+                    description={tr("Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I.")}
+                    onChange={(checked) => updateLinearity("quadratic", checked)}
+                  />
+                ) : null}
+                <label className="text-sm">
+                  <span className="mb-1 block text-stone-700">{tr("Linearity basis")}</span>
+                  <select
+                    value={selectedLinearityIntensityCol}
+                    onChange={(event) => updateLinearityIntensityCol(event.target.value)}
+                    title={tr(getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))}
+                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                  >
+                    {LINEARITY_INTENSITY_OPTIONS.map((option) => (
+                      <option key={option} value={option} title={tr(getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation))}>
+                        {tr(getLinearityIntensityOptionLabel(option))}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-sm">
+                  <span className="mb-1 block text-stone-700">{tr("Linearity cycle intensity")}</span>
+                  <select
+                    value={selectedLinearityCycleIntensityAggregation}
+                    onChange={(event) => updateLinearity("cycle_intensity_aggregation", event.target.value)}
+                    title={tr("Choose which cycle intensity is used when building the selected linearity basis for each analysis.")}
+                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
+                  >
+                    {LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {tr(option.label)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <Tooltip label={tr(getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))} align="start">
+                  <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Basis formula")}</span>
+                </Tooltip>
+                {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">{tr("Max sample intensity")}</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.1"
+                      value={activeConfig.linearity.max_sample_intensity ?? ""}
+                      onChange={(event) => {
+                        const rawValue = event.target.value.trim();
+                        if (rawValue === "") {
+                          updateLinearity("max_sample_intensity", null);
+                          return;
+                        }
+                        const parsed = Number(rawValue);
+                        updateLinearity("max_sample_intensity", Number.isFinite(parsed) ? parsed : null);
+                      }}
+                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                ) : null}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="border-t border-stone-200 pt-2 text-sm">
+                    <div className="text-xs font-medium text-stone-500">{tr("δ¹³C fitted coefficients")}</div>
+                    <div className="mt-1 space-y-1 font-semibold text-stone-900">
+                      <div>
+                        <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                        {tr(formatFirstNonZeroDigits(d13FitSlope))}
+                      </div>
+                      {showSecondaryCoefficientOffset ? (
+                        <div>
+                          <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                          {tr(formatFirstNonZeroDigits(d13FitQuad))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="border-t border-stone-200 pt-2 text-sm">
+                    <div className="text-xs font-medium text-stone-500">{tr("δ¹⁸O fitted coefficients")}</div>
+                    <div className="mt-1 space-y-1 font-semibold text-stone-900">
+                      <div>
+                        <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                        {tr(formatFirstNonZeroDigits(d18FitSlope))}
+                      </div>
+                      {showSecondaryCoefficientOffset ? (
+                        <div>
+                          <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                          {tr(formatFirstNonZeroDigits(d18FitQuad))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">
+                      {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
+                    </span>
+                    <DecimalInput
+                      value={activeConfig.linearity.manual_d13_per_10v ?? 0}
+                      onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "primary", value)}
+                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="mb-1 block text-stone-700">
+                      {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
+                    </span>
+                    <DecimalInput
+                      value={activeConfig.linearity.manual_d18_per_10v ?? 0}
+                      onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "primary", value)}
+                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                    />
+                  </label>
+                </div>
+                {showSecondaryCoefficientOffset ? (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">
+                        {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
+                      </span>
+                      <DecimalInput
+                        value={activeConfig.linearity.manual_d13_per_10v2 ?? 0}
+                        onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "secondary", value)}
+                        className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                      />
+                    </label>
+                    <label className="text-sm">
+                      <span className="mb-1 block text-stone-700">
+                        {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
+                      </span>
+                      <DecimalInput
+                        value={activeConfig.linearity.manual_d18_per_10v2 ?? 0}
+                        onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "secondary", value)}
+                        className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                      />
+                    </label>
+                  </div>
+                ) : null}
+                <div className="text-xs text-stone-500">{tr("Coefficient offset active:")}{tr(coefficientOffsetEnabled ? "Yes" : "No")}
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-3">
+                    <span className="text-sm font-medium text-stone-800">{tr("Line 1 offset")}</span>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={linearityOffsetDrafts.line_1_offset_d13}
+                          onFocus={() => setLinearityOffsetEditing("line_1_offset_d13")}
+                          onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d13", event.target.value)}
+                          onBlur={() => commitLinearityOffsetDraft("line_1_offset_d13")}
+                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d13")}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={linearityOffsetDrafts.line_1_offset_d18}
+                          onFocus={() => setLinearityOffsetEditing("line_1_offset_d18")}
+                          onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d18", event.target.value)}
+                          onBlur={() => commitLinearityOffsetDraft("line_1_offset_d18")}
+                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d18")}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <span className="text-sm font-medium text-stone-800">{tr("Line 2 offset")}</span>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={linearityOffsetDrafts.line_2_offset_d13}
+                          onFocus={() => setLinearityOffsetEditing("line_2_offset_d13")}
+                          onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d13", event.target.value)}
+                          onBlur={() => commitLinearityOffsetDraft("line_2_offset_d13")}
+                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d13")}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                      <label className="text-sm">
+                        <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={linearityOffsetDrafts.line_2_offset_d18}
+                          onFocus={() => setLinearityOffsetEditing("line_2_offset_d18")}
+                          onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d18", event.target.value)}
+                          onBlur={() => commitLinearityOffsetDraft("line_2_offset_d18")}
+                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d18")}
+                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                        />
+                      </label>
+                    </div>
+                  </div>
+                </div>
+                {activeConfig.linearity.apply ? (
+                  <div className="space-y-1 border-t border-stone-200 pt-2">
+                    <Tooltip label={tr("Precision after applying the shared linearity correction to each selected standard.")} align="start">
+                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Corrected precision")}</span>
+                    </Tooltip>
+                    {standardPrecisionRows.length ? (
+                      standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
+                        <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
+                          <span className="font-medium text-stone-800">{tr(summary.standard)}</span>
+                          <span>{tr("δ¹³C: ")}{tr(formatMetricWithUnit(summary.d13_linearity_corrected_precision))}</span>
+                          <span>{tr("δ¹⁸O: ")}{tr(formatMetricWithUnit(summary.d18_linearity_corrected_precision))}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-xs text-stone-500">{tr("No selected standards available for precision.")}</div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+</>);
+  const stationAppearance = (figure: Record<string, unknown>): Record<string, unknown> => {
+    const colorState = calibrationPreviewMasks?.color;
+    const data = (Array.isArray(figure.data) ? figure.data : []).map((trace: Record<string, unknown>) => {
+      if (!Array.isArray(trace.customdata) || !String(trace.mode ?? "").includes("markers")) return trace;
+      const values = trace.customdata.map((point: unknown) => Array.isArray(point) ? colorState?.valuesByRow.get(String(point[0])) ?? null : null);
+      const marker = trace.marker as Record<string,unknown> ?? {};
+      const symbols=trace.customdata.map((point:unknown,index:number)=>Array.isArray(point)&&station?.outliers?.rows.some(flag=>flag.row===String(point[0])&&(point[1]==="cross"||flag.isotope===point[1]))?"x":Array.isArray(marker.symbol)?marker.symbol[index]:marker.symbol??"circle");
+      return {...trace, marker: {...marker,symbol:symbols,...(values.some(value=>value!=null)?{color:values,coloraxis:"coloraxis"}:{})}};
+    });
+    const layout = {...(figure.layout as Record<string,unknown> ?? {})};
+    layout.title = {...(typeof layout.title==="object"?layout.title as object:{text:layout.title??""}),font:{size:13},x:.02,xanchor:"left"};
+    layout.font = {family:"Segoe UI, sans-serif",size:12,color:"#475569"};
+    layout.coloraxis = {...(layout.coloraxis as object ?? {}), ...colorAxisLayout(colorState ?? null), cmin:effectiveColorScaleRange[0], cmax:effectiveColorScaleRange[1], showscale:false};
+    const scene = layout.scene as Record<string,unknown> | undefined;
+    if (scene) layout.scene = {...scene, bgcolor:"transparent", ...Object.fromEntries(["xaxis","yaxis","zaxis"].map(key=>[key,{...(scene[key] as object??{}),gridcolor:"#e8edf1",zerolinecolor:"#a7b6bf",showbackground:false}]))};
+    return {...figure, data, layout};
+  };
   return (
     <div className="space-y-5">
       {!station && <PageHeader
@@ -4836,17 +5091,18 @@ export default function CalibrationPage() {
         </div>
       ) : null}
 
+      <MetrologyChartAppearance.Provider value={station ? stationAppearance : null}>
       {station?.sequence(stationInteractions)}
       <div className="workspace-grid">
         <aside className="control-column">
-          {station?.controls}
-          <details open={!station}><summary className="station-chart-settings">{tr("Chart display settings")}</summary>
+          <details open><summary className="station-chart-settings">{tr("Chart display settings")}</summary>
           <Card>
             <CardHeader>
               <CardTitle>{tr("Calibration Controls")}</CardTitle>
-              <CardDescription>{tr("Configure standards, visualization, linearity, outlier detection, and precision date range settings.")}</CardDescription>
+              <CardDescription>{tr("Adjust chart colors, axes and outlier detection.")}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
+              {!station && <>
               <MultiSelectDropdown
                 label={tr("Selected standards")}
                 options={displayedWorkspace.available_values.standards}
@@ -4876,11 +5132,13 @@ export default function CalibrationPage() {
                 </select>
               </label>
 
+              </>}
               <div className="grid gap-4">
                 <div className="form-field">
                   <span className="form-label">{tr("Color parameter")}</span>
                   <select
                     value={activeConfig.color_param}
+                    aria-label={tr("Color parameter")}
                     onChange={(event) => updateConfig("color_param", event.target.value)}
                     className="form-control"
                   >
@@ -4933,243 +5191,9 @@ export default function CalibrationPage() {
                 )}
               </div>
 
-              <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="text-sm font-medium text-stone-800">{tr("Linearity (shared with processing)")}</div>
-                  <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">{tr("Basis: ")}{tr(selectedLinearityBasisLabel)}</span>
-                </div>
-                <CheckboxField
-                  checked={activeConfig.linearity.apply}
-                  label={tr("Enable linearity correction")}
-                  description={tr("Uses the same basis, fits, and offsets as Processing.")}
-                  onChange={(checked) => updateLinearity("apply", checked)}
-                />
-                {!isTwoTermLinearityBasis ? (
-                  <CheckboxField
-                    checked={Boolean(activeConfig.linearity.quadratic)}
-                    label={tr("Use quadratic linearity relationship")}
-                    description={tr("Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I.")}
-                    onChange={(checked) => updateLinearity("quadratic", checked)}
-                  />
-                ) : null}
-                <label className="text-sm">
-                  <span className="mb-1 block text-stone-700">{tr("Linearity basis")}</span>
-                  <select
-                    value={selectedLinearityIntensityCol}
-                    onChange={(event) => updateLinearityIntensityCol(event.target.value)}
-                    title={tr(getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))}
-                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                  >
-                    {LINEARITY_INTENSITY_OPTIONS.map((option) => (
-                      <option key={option} value={option} title={tr(getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation))}>
-                        {tr(getLinearityIntensityOptionLabel(option))}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="text-sm">
-                  <span className="mb-1 block text-stone-700">{tr("Linearity cycle intensity")}</span>
-                  <select
-                    value={selectedLinearityCycleIntensityAggregation}
-                    onChange={(event) => updateLinearity("cycle_intensity_aggregation", event.target.value)}
-                    title={tr("Choose which cycle intensity is used when building the selected linearity basis for each analysis.")}
-                    className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                  >
-                    {LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {tr(option.label)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <Tooltip label={tr(getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))} align="start">
-                  <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Basis formula")}</span>
-                </Tooltip>
-                {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">{tr("Max sample intensity")}</span>
-                    <input
-                      type="number"
-                      min={0}
-                      step="0.1"
-                      value={activeConfig.linearity.max_sample_intensity ?? ""}
-                      onChange={(event) => {
-                        const rawValue = event.target.value.trim();
-                        if (rawValue === "") {
-                          updateLinearity("max_sample_intensity", null);
-                          return;
-                        }
-                        const parsed = Number(rawValue);
-                        updateLinearity("max_sample_intensity", Number.isFinite(parsed) ? parsed : null);
-                      }}
-                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
-                ) : null}
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="border-t border-stone-200 pt-2 text-sm">
-                    <div className="text-xs font-medium text-stone-500">{tr("δ¹³C fitted coefficients")}</div>
-                    <div className="mt-1 space-y-1 font-semibold text-stone-900">
-                      <div>
-                        <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
-                        {tr(formatFirstNonZeroDigits(d13FitSlope))}
-                      </div>
-                      {showSecondaryCoefficientOffset ? (
-                        <div>
-                          <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
-                          {tr(formatFirstNonZeroDigits(d13FitQuad))}
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                  <div className="border-t border-stone-200 pt-2 text-sm">
-                    <div className="text-xs font-medium text-stone-500">{tr("δ¹⁸O fitted coefficients")}</div>
-                    <div className="mt-1 space-y-1 font-semibold text-stone-900">
-                      <div>
-                        <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
-                        {tr(formatFirstNonZeroDigits(d18FitSlope))}
-                      </div>
-                      {showSecondaryCoefficientOffset ? (
-                        <div>
-                          <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
-                          {tr(formatFirstNonZeroDigits(d18FitQuad))}
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">
-                      {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
-                    </span>
-                    <DecimalInput
-                      value={activeConfig.linearity.manual_d13_per_10v ?? 0}
-                      onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "primary", value)}
-                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
-                  <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">
-                      {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
-                    </span>
-                    <DecimalInput
-                      value={activeConfig.linearity.manual_d18_per_10v ?? 0}
-                      onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "primary", value)}
-                      className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                    />
-                  </label>
-                </div>
-                {showSecondaryCoefficientOffset ? (
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">
-                        {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
-                      </span>
-                      <DecimalInput
-                        value={activeConfig.linearity.manual_d13_per_10v2 ?? 0}
-                        onValueChange={(value) => updateLinearityCoefficientOffset("d13C", "secondary", value)}
-                        className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                      />
-                    </label>
-                    <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">
-                        {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
-                      </span>
-                      <DecimalInput
-                        value={activeConfig.linearity.manual_d18_per_10v2 ?? 0}
-                        onValueChange={(value) => updateLinearityCoefficientOffset("d18O", "secondary", value)}
-                        className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                      />
-                    </label>
-                  </div>
-                ) : null}
-                <div className="text-xs text-stone-500">{tr("Coefficient offset active:")}{tr(coefficientOffsetEnabled ? "Yes" : "No")}
-                </div>
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <div className="space-y-3">
-                    <span className="text-sm font-medium text-stone-800">{tr("Line 1 offset")}</span>
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          value={linearityOffsetDrafts.line_1_offset_d13}
-                          onFocus={() => setLinearityOffsetEditing("line_1_offset_d13")}
-                          onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d13", event.target.value)}
-                          onBlur={() => commitLinearityOffsetDraft("line_1_offset_d13")}
-                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d13")}
-                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                        />
-                      </label>
-                      <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          value={linearityOffsetDrafts.line_1_offset_d18}
-                          onFocus={() => setLinearityOffsetEditing("line_1_offset_d18")}
-                          onChange={(event) => handleLinearityOffsetDraftChange("line_1_offset_d18", event.target.value)}
-                          onBlur={() => commitLinearityOffsetDraft("line_1_offset_d18")}
-                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_1_offset_d18")}
-                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                        />
-                      </label>
-                    </div>
-                  </div>
-                  <div className="space-y-3">
-                    <span className="text-sm font-medium text-stone-800">{tr("Line 2 offset")}</span>
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          value={linearityOffsetDrafts.line_2_offset_d13}
-                          onFocus={() => setLinearityOffsetEditing("line_2_offset_d13")}
-                          onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d13", event.target.value)}
-                          onBlur={() => commitLinearityOffsetDraft("line_2_offset_d13")}
-                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d13")}
-                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                        />
-                      </label>
-                      <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          value={linearityOffsetDrafts.line_2_offset_d18}
-                          onFocus={() => setLinearityOffsetEditing("line_2_offset_d18")}
-                          onChange={(event) => handleLinearityOffsetDraftChange("line_2_offset_d18", event.target.value)}
-                          onBlur={() => commitLinearityOffsetDraft("line_2_offset_d18")}
-                          onKeyDown={(event) => handleLinearityOffsetKeyDown(event, "line_2_offset_d18")}
-                          className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                        />
-                      </label>
-                    </div>
-                  </div>
-                </div>
-                {activeConfig.linearity.apply ? (
-                  <div className="space-y-1 border-t border-stone-200 pt-2">
-                    <Tooltip label={tr("Precision after applying the shared linearity correction to each selected standard.")} align="start">
-                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Corrected precision")}</span>
-                    </Tooltip>
-                    {standardPrecisionRows.length ? (
-                      standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
-                        <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
-                          <span className="font-medium text-stone-800">{tr(summary.standard)}</span>
-                          <span>{tr("δ¹³C: ")}{tr(formatMetricWithUnit(summary.d13_linearity_corrected_precision))}</span>
-                          <span>{tr("δ¹⁸O: ")}{tr(formatMetricWithUnit(summary.d18_linearity_corrected_precision))}</span>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="text-xs text-stone-500">{tr("No selected standards available for precision.")}</div>
-                    )}
-                  </div>
-                ) : null}
-              </div>
+              {!station && manualLinearityControls}
 
+              {station ? station.controls : <>
               <div className="space-y-3 border-t border-stone-200 pt-4">
                 <Tooltip label={tr("Set how calibration outliers are identified before precision is calculated.")} align="start">
                   <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Outlier settings")}</span>
@@ -5229,6 +5253,8 @@ export default function CalibrationPage() {
                 </label>
               </div>
 
+              </>}
+              {!station && <>
               <div className="space-y-3 border-t border-stone-200 pt-4">
                 <Tooltip label={tr("Limit the measurement dates included in the precision calculation.")} align="start">
                   <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Precision date range")}</span>
@@ -5311,6 +5337,7 @@ export default function CalibrationPage() {
               <div className="text-xs text-stone-500">{tr("Select exactly one or two standards to run calibration.")}</div>
               {runError ? <div className="text-xs text-red-600">{tr("Calibration error: ")}{tr(runError)}</div> : null}
               {resetError ? <div className="text-xs text-red-600">{tr("Reset error: ")}{tr(resetError)}</div> : null}
+              </>}
             </CardContent>
           </Card>
           </details>
@@ -5319,7 +5346,7 @@ export default function CalibrationPage() {
         <ControlColumnToggle />
 
         <div className="space-y-6">
-          {station?.plots(stationInteractions)}
+          {station?.plots(stationInteractions, manualLinearityControls)}
           {!station && (precisionSummaries.length ? (
             <div className="grid gap-3">
               {precisionSummaries.map((summary) => (
@@ -5590,6 +5617,7 @@ export default function CalibrationPage() {
           </div>
         </div>
       ) : null}
+      </MetrologyChartAppearance.Provider>
     </div>
   );
 }

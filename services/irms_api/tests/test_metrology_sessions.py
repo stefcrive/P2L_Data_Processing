@@ -18,6 +18,27 @@ D = fixtures.DECISION
 
 
 class ResultsSessionTests(unittest.TestCase):
+    def test_residual_overrides_are_audited_previews_and_can_be_restored(self):
+        session = self.create()
+        run, _ = self.import_batch(session)
+        detail = self.service.results_session_detail(session["id"])
+        original = detail["runs"][0]["evaluation"]
+        material = self.method["config"]["qc_id"]
+        endpoint = f"/metrology/results-sessions/{session['id']}/residual-overrides"
+        command = {**D, "material_id": material, "effect": "drift", "isotope": "d13c",
+                   "settings": {"enabled": True, "slope": .002, "center": 2}}
+        response = self.client.put(endpoint, json=command)
+        self.assertEqual(response.status_code, 200, response.text)
+        analysis = self.client.get(f"/metrology/results-sessions/{session['id']}/analysis").json()
+        key = f"{material}:drift:d13c"
+        self.assertIn(key, analysis["residual_previews"])
+        persisted = Service(Repository(self.repo.root)).results_session_detail(session["id"])
+        self.assertEqual(persisted["residual_overrides"][key]["slope"], .002)
+        self.assertEqual(persisted["runs"][0]["evaluation"], original)
+        self.assertEqual(self.client.put(endpoint, json={**command,"material_id":"foreign"}).status_code, 422)
+        self.assertEqual(self.client.put(endpoint, json={**command,"settings":None}).status_code, 200)
+        self.assertNotIn(key, self.service.results_session_detail(session["id"])["residual_overrides"])
+
     def setUp(self):
         self.fixture = fixtures.WorkflowTests("test_seed_has_no_provisional_anchor_certificates")
         self.fixture.setUp()

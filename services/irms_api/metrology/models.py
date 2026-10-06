@@ -338,6 +338,28 @@ class SessionGroupsCommand(Decision):
     groups: dict[str, str]
 
 
+class ResidualOverride(StrictModel):
+    enabled: bool = False
+    algorithm: Literal["linear", "quadratic"] = "linear"
+    slope: float | None = None
+    quadratic: float | None = None
+    center: float | None = None
+    offset: float = 0
+    practical_threshold: float = Field(default=.01, gt=0)
+
+
+class ResidualOverrideCommand(Decision):
+    material_id: str
+    effect: Literal["intensity_dependence", "pressure_dependence", "pressure_residual", "mass_dependence", "drift", "memory"]
+    isotope: Literal["d13c", "d18o"]
+    settings: ResidualOverride | None = None
+
+
+class SessionChartSettingsCommand(Decision):
+    carbonate_material: Literal["calcite", "aragonite"] = "calcite"
+    diagnostic_material_id: str | None = None
+
+
 class SessionExportCommand(Decision):
     format: Literal["csv", "json", "zip", "pdf", "xlsx"] = "zip"
     group: str | None = None

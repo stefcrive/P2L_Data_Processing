@@ -1,7 +1,7 @@
 "use client";
 
 import { useTranslation } from "@/components/layout/language-provider";
-import { useMetrologyConsultation } from "@/components/metrology/consultation-context";
+import { useMetrologyConsultation, MetrologyChartAppearance, MetrologyChartHeight } from "@/components/metrology/consultation-context";
 import { useLanguage } from "@/components/layout/language-provider";
 import dynamic from "next/dynamic";
 import { ChevronDown, ChevronUp, GripHorizontal } from "lucide-react";
@@ -9,6 +9,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   useEffect,
+  useContext,
   useMemo,
   useRef,
   useState,
@@ -455,7 +456,7 @@ function mergeViewportRelayout(current: Record<string, unknown>, update: Record<
 }
 
 export function PlotlyChart({
-  figure,
+  figure: sourceFigure,
   className,
   fitContainer = false,
   collapsibleLegend = false,
@@ -472,6 +473,9 @@ export function PlotlyChart({
 }: PlotlyChartProps) {
   const tr = useTranslation();
   const metrologyConsultation = useMetrologyConsultation();
+  const appearance = useContext(MetrologyChartAppearance);
+  const stationHeight = useContext(MetrologyChartHeight);
+  const figure = useMemo(() => sourceFigure && appearance ? appearance(sourceFigure) : sourceFigure, [sourceFigure, appearance]);
   const { language } = useLanguage();
   const [renderRevision, setRenderRevision] = useState(0);
   const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
@@ -522,11 +526,11 @@ export function PlotlyChart({
       layout.meta = { ...(typeof layout.meta === "object" && layout.meta ? layout.meta : {}), equalStandardScale: true };
     }
     if (metrologyConsultation) {
-      layout.height = 270;
+      layout.height = Math.round(270 * stationHeight / 280);
       layout.font = { ...(layout.font as object ?? {}), family: "Segoe UI, sans-serif", size: 11, color: "#475569" };
       layout.paper_bgcolor = "transparent";
       layout.plot_bgcolor = "transparent";
-      layout.margin = { ...(layout.margin as object ?? {}), l: 54, r: secondaryAxis ? 56 : 24, t: 48, b: 45 };
+      layout.margin = { l: 54, r: secondaryAxis ? 56 : 24, t: 64, b: 45, ...(layout.margin as object ?? {}) };
       for (const key of Object.keys(layout).filter(k => /^[xy]axis\d*$/.test(k))) {
         layout[key] = { ...(layout[key] as object), gridcolor: "#e8edf1", automargin: true };
       }
@@ -566,10 +570,10 @@ export function PlotlyChart({
       fillContainerHeight: shouldFillContainer,
       hasExplicitHeight,
     };
-  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, tr, uiRevision, metrologyConsultation]);
+  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, tr, uiRevision, metrologyConsultation, stationHeight]);
 
   useEffect(() => {
-    if (!verticallyResizable || chartHeight !== null) {
+    if ((!verticallyResizable && !(metrologyConsultation && stationHeight !== 280 && fitContainer)) || chartHeight !== null) {
       return;
     }
     const container = containerRef.current;
@@ -577,10 +581,13 @@ export function PlotlyChart({
       return;
     }
     const measuredHeight = Math.round(container.getBoundingClientRect().height);
-    const initialHeight = Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, metrologyConsultation ? 280 : measuredHeight));
+    const requestedHeight = metrologyConsultation
+      ? verticallyResizable ? stationHeight : measuredHeight * stationHeight / 280
+      : measuredHeight;
+    const initialHeight = Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, requestedHeight));
     initialHeightRef.current = initialHeight;
     setChartHeight(initialHeight);
-  }, [chartHeight, isDeferredReady, normalizedMaxHeight, normalizedMinHeight, preparedFigure, verticallyResizable]);
+  }, [chartHeight, isDeferredReady, normalizedMaxHeight, normalizedMinHeight, preparedFigure, verticallyResizable, fitContainer, metrologyConsultation, stationHeight]);
 
   useEffect(() => {
     if (!shouldDeferRender) {

@@ -14,9 +14,38 @@ from .reports import build_session_dossier
 
 from .models import Decision
 from .repository import encode
+from .importer import measurement_identity
 
 
 class ResultsSessions:
+    def save_chart_settings(self, session_id, command):
+        with self.repo.connect(write=True) as db:
+            session = self.repo.get(db, "results_sessions", session_id)
+            before = session.get("chart_settings", {})
+            if command.diagnostic_material_id and command.diagnostic_material_id not in self.material_map(db, self.repo.get(db, "methods", session["method_id"])):
+                raise ValueError("Choose a material belonging to the session method")
+            session["chart_settings"] = command.model_dump(exclude={"actor", "reason"})
+            self.repo.update(db, "results_sessions", session_id, session)
+            self.repo.audit(db, "session_chart_settings_saved", session_id, command.actor, command.reason, before, session["chart_settings"])
+            return session
+
+    def save_residual_override(self, session_id, command):
+        with self.repo.connect(write=True) as db:
+            session = self.repo.get(db, "results_sessions", session_id)
+            if command.material_id not in self.material_map(db, self.repo.get(db, "methods", session["method_id"])):
+                raise ValueError("Choose a material belonging to the session method")
+            key = f"{command.material_id}:{command.effect}:{command.isotope}"
+            overrides = session.setdefault("residual_overrides", {})
+            before = overrides.get(key)
+            if command.settings is None:
+                overrides.pop(key, None)
+            else:
+                overrides[key] = command.settings.model_dump()
+            self.repo.update(db, "results_sessions", session_id, session)
+            self.repo.audit(db, "residual_preview_override_saved", session_id, command.actor, command.reason,
+                            {"key": key, "settings": before}, {"key": key, "settings": overrides.get(key), "scope": "review_preview"})
+            return session
+
     def save_results_session(self, command, session_id=None):
         if command.calibration_verification=="simulation_assumption" and not self.repo.demo:
             raise ValueError("Simulated qualification assumptions require a separate demonstration workspace")
@@ -164,6 +193,7 @@ class ResultsSessions:
                       "accepted_exceptions":"; ".join(row.get("accepted_issues", [])),
                       "data_origin":"synthetic" if run.get("synthetic") else "observed","source_kind":run.get("source_kind","qtegra_raw"),
                       "calibration_verification":run.get("calibration_verification","documented"),"sample_identifier":row.get("comment","")}
+                item.update(measurement_identity(row, run.get("source_kind", "qtegra_raw")))
                 item.update(d13c_internal_sd=row.get("d13c_sd"), d18o_internal_sd=row.get("d18o_sd"))
                 for iso in ("d13c","d18o"):
                     value=row["isotopes"].get(iso,{})
@@ -172,6 +202,7 @@ class ResultsSessions:
                         "raw":row[iso],"value":value.get("value"),"u_prec":value.get("u_prec"),"u_norm":value.get("u_norm"),
                         "u_corr":value.get("u_corr"),"u_combined":budget.get("u_combined"),"U":budget.get("expanded_uncertainty"),"k":budget.get("k")}.items()})
                 rows.append(item)
+        rows.sort(key=lambda row: (row["identifier1"], row["identifier2"], row["species"], row.get("acquired_at") or "", str(row["analysis"])))
         if not rows:
             raise ValueError("No evaluated unknown samples in this session/group")
         buffer=io.StringIO(newline="")
@@ -218,6 +249,8 @@ class ResultsSessions:
             client_frame = _build_client_output_frame(source_frame, identifier_source=command.identifier_source,
                 sample_source=command.sample_source, species_source="raw_label")
             client_frame = client_frame.drop(columns=[c for c in client_frame if c.startswith("__") or c == "Species"])
+            for field, title in (("identifier1", "Identifier 1"), ("identifier2", "Identifier 2"), ("species", "Species")):
+                client_frame[title] = [r[field] for r in rows]
             for iso in ("d13c", "d18o"):
                 client_frame[f"{iso} expanded uncertainty / per mille"] = [r[f"{iso}_U"] for r in rows]
                 client_frame[f"{iso} coverage factor k"] = [r[f"{iso}_k"] for r in rows]

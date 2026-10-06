@@ -1,0 +1,277 @@
+[
+  {
+    "name": "uncertainty-1440",
+    "plots": [
+      {
+        "height": 220,
+        "title": "Contribuições de incerteza padrão"
+      },
+      {
+        "height": 220,
+        "title": "Contribuições de incerteza padrão"
+      }
+    ],
+    "scroll": 1425,
+    "viewport": 1440
+  },
+  {
+    "name": "uncertainty-1920",
+    "plots": [
+      {
+        "height": 220,
+        "title": "Contribuições de incerteza padrão"
+      },
+      {
+        "height": 220,
+        "title": "Contribuições de incerteza padrão"
+      }
+    ],
+    "scroll": 1905,
+    "viewport": 1920
+  },
+  {
+    "processing_rows": 817,
+    "axes": [
+      {
+        "dtick": 20,
+        "dtick2": 20,
+        "errors": 3,
+        "primary": [
+          -77.60179709024712,
+          16.68700996803082
+        ],
+        "rows": 817,
+        "secondary": [
+          -56.20696859266428,
+          38.08183846561366
+        ]
+      },
+      {
+        "dtick": 100,
+        "dtick2": 100,
+        "errors": 3,
+        "primary": [
+          -325.5157393077742,
+          50.2317293376352
+        ],
+        "rows": 817,
+        "secondary": [
+          -186.56137147434688,
+          189.18609717106253
+        ]
+      }
+    ]
+  },
+  {
+    "name": "processing-1920",
+    "plots": [
+      {
+        "height": 270,
+        "title": "δ¹³C · Resultados da sessão e incerteza expandida"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Resultados da sessão e incerteza expandida"
+      }
+    ],
+    "scroll": 1905,
+    "viewport": 1920
+  },
+  {
+    "name": "processing-1440",
+    "plots": [
+      {
+        "height": 270,
+        "title": "δ¹³C · Resultados da sessão e incerteza expandida"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Resultados da sessão e incerteza expandida"
+      }
+    ],
+    "scroll": 1425,
+    "viewport": 1440
+  },
+  {
+    "name": "calibration-1440",
+    "plots": [
+      {
+        "height": 270,
+        "title": "δ¹³C · Sequência de CQ da sessão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Sequência de CQ da sessão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Linearidade residual de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Linearidade residual de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Linearidade do ajuste de pressão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Linearidade do ajuste de pressão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Desajuste de pressão após remover a tendência de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Desajuste de pressão após remover a tendência de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Deriva do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Deriva do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Triagem de memória do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Triagem de memória do CQ"
+      },
+      {
+        "height": 270,
+        "title": "Intensidade do sinal versus diferença do ajuste de pressão"
+      },
+      {
+        "height": 320,
+        "title": "Gráfico de calibração em 3D (eixo Z: 1  Cycle Int  Samp  44)"
+      },
+      {
+        "height": 320,
+        "title": "δ¹³C vs δ¹⁸O"
+      }
+    ],
+    "scroll": 1425,
+    "viewport": 1440
+  },
+  {
+    "name": "calibration-1920",
+    "plots": [
+      {
+        "height": 270,
+        "title": "δ¹³C · Sequência de CQ da sessão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Sequência de CQ da sessão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Linearidade residual de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Linearidade residual de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Linearidade do ajuste de pressão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Linearidade do ajuste de pressão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Desajuste de pressão após remover a tendência de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Desajuste de pressão após remover a tendência de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Deriva do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Deriva do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Triagem de memória do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Triagem de memória do CQ"
+      },
+      {
+        "height": 270,
+        "title": "Intensidade do sinal versus diferença do ajuste de pressão"
+      },
+      {
+        "height": 320,
+        "title": "Gráfico de calibração em 3D (eixo Z: 1  Cycle Int  Samp  44)"
+      },
+      {
+        "height": 320,
+        "title": "δ¹³C vs δ¹⁸O"
+      }
+    ],
+    "scroll": 1905,
+    "viewport": 1920
+  },
+  {
+    "name": "import-review-1920",
+    "plots": [],
+    "scroll": 1905,
+    "viewport": 1920
+  },
+  {
+    "name": "export-1920",
+    "plots": [],
+    "scroll": 1920,
+    "viewport": 1920
+  },
+  {
+    "name": "export-narrow",
+    "plots": [],
+    "scroll": 375,
+    "viewport": 390
+  },
+  {
+    "name": "uncertainty-narrow",
+    "plots": [
+      {
+        "height": 220,
+        "title": "Contribuições de incerteza padrão"
+      },
+      {
+        "height": 220,
+        "title": "Contribuições de incerteza padrão"
+      }
+    ],
+    "scroll": 375,
+    "viewport": 390
+  },
+  {
+    "name": "processing-narrow",
+    "plots": [
+      {
+        "height": 270,
+        "title": "δ¹³C · Resultados da sessão e incerteza expandida"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Resultados da sessão e incerteza expandida"
+      }
+    ],
+    "scroll": 375,
+    "viewport": 390
+  }
+]

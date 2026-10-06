@@ -7,6 +7,7 @@ import math
 import pandas as pd
 
 from .repository import encode
+from .importer import measurement_identity
 
 
 def open_plot_bridge(service, session_id, scope, command):
@@ -24,7 +25,7 @@ def open_plot_bridge(service, session_id, scope, command):
         bridge = session.get("bridges", {}).get(scope)
         if bridge and legacy.store.session_exists(bridge):
             link = legacy.store.load_metadata(bridge).get("metrology_link", {})
-            if link.get("bridge_version") == 6 and link.get("fingerprint") == fingerprint:
+            if link.get("bridge_version") == 7 and link.get("fingerprint") == fingerprint:
                 return {"session_id": bridge, "run_id": scope, "row_mapping": link.get("row_mapping", {})}
         uploads, sources = [], {}
         for run in runs:
@@ -35,6 +36,8 @@ def open_plot_bridge(service, session_id, scope, command):
         result = legacy._import_session_from_bytes(uploads)
         bridge = result.session.session_id
         frame = legacy.store.load_frame(bridge)
+        for column in ("Identifier 1", "Identifier 2", "Species"):
+            frame[column] = frame[column].astype(object) if column in frame else ""
         frame["Metrology consultation"] = True
         mapping = {}
         def finite(value):
@@ -56,6 +59,10 @@ def open_plot_bridge(service, session_id, scope, command):
             if len(matches) == 1 and matches[0]["id"] not in mapping:
                 original = matches[0]
                 mapping[original["id"]] = str(index)
+                source_run = next(r for r in runs if r["id"] == original["run_id"])
+                identity = measurement_identity(original, source_run.get("source_kind", "qtegra_raw"))
+                for field, column in (("identifier1", "Identifier 1"), ("identifier2", "Identifier 2"), ("species", "Species")):
+                    frame.loc[index, column] = identity[field]
                 # Keep original cycle-derived summaries available for consultation,
                 # and use the authoritative exported analysis values in result plots.
                 for field, column in (("d13c", "d 13C/12C  Mean"), ("d18o", "d 18O/16O  Mean"),
@@ -66,7 +73,7 @@ def open_plot_bridge(service, session_id, scope, command):
         metadata = legacy.store.load_metadata(bridge)
         metadata["session_name"] = f"{session['client']} / {session['name']}"
         metadata["metrology_link"] = {"results_session_id": session_id, "run_id": scope, "run_ids": run_ids,
-            "method_id": session["method_id"], "qualification_id": session["qualification_id"], "bridge_version": 6,
+            "method_id": session["method_id"], "qualification_id": session["qualification_id"], "bridge_version": 7,
             "fingerprint": fingerprint, "row_mapping": mapping}
         method = service.repo.get(db, "methods", session["method_id"])
         materials = service.material_map(db, method)

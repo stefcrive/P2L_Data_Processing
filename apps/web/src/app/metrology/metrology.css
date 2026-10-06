@@ -476,3 +476,80 @@
 @media (max-width: 760px) {
   .metro-shell .station-isotope-pair, .metro-shell .station-budget-toolbar { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Keep session context close together so the scientific tabs lead the workspace. */
+.station-compact-header .station-workspace-context {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 16px;
+  margin-bottom: 6px;
+}
+.station-compact-header .station-demo-strip,
+.metro .station-compact-header .station-review-bar { margin: 0; }
+.station-compact-header .station-review-bar[open] { flex-basis: 100%; }
+.station-compact-header .station-review-bar .metro-review-context { margin-top: 6px; }
+.station-qualification-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+}
+.station-qualification-controls .station-panel-toolbar { margin: 0; align-items: center; }
+.station-qualification-controls .metro-field { display: flex; flex-direction: row; align-items: center; gap: 8px; }
+.station-qualification-controls select { max-width: 100%; }
+.metro .station-qualification-controls > details { margin: 0; padding: 0; border: 0; }
+.station-qualification-controls > details[open] { flex-basis: 100%; }
+.station-qualification-controls > details[open] > .metro-panel { margin-top: 6px; }
+.station-compact-header .station-session-cover {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 12px;
+  padding: 6px 10px;
+}
+.station-compact-header .station-session-cover:has(.station-session-navigation) {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+.station-session-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; }
+.metro .station-compact-header .station-session-cover h2 { margin: 0; }
+.station-session-client { color: #64748b; font-size: 11px; overflow-wrap: anywhere; }
+.station-compact-header .station-session-cover p { margin: 2px 0 0; }
+.station-compact-header .station-session-method { max-width: 280px; }
+.station-compact-header .station-session-method small,
+.station-compact-header .station-session-method strong { display: inline; margin: 0; }
+.station-compact-header .station-session-method small { margin-right: 6px; }
+.station-compact-header .station-session-method strong { overflow-wrap: anywhere; }
+.station-compact-header .station-provenance-note { padding: 4px 8px; align-items: baseline; }
+.station-compact-header .station-provenance-note svg { align-self: center; width: 16px; height: 16px; }
+.station-compact-header .station-provenance-note p { display: inline; margin: 0 0 0 8px; }
+.station-compact-header .station-lineage { padding: 4px 0; gap: 4px 16px; }
+@media (max-width: 1050px) {
+  .station-compact-header .station-session-cover:has(.station-session-navigation) { grid-template-columns: minmax(0, 1fr) auto; }
+  .station-compact-header .station-session-navigation { grid-column: 1 / -1; }
+}
+@media (max-width: 760px) {
+  .station-qualification-controls .station-panel-toolbar { width: 100%; }
+  .station-qualification-controls .metro-field { flex: 1; flex-direction: column; align-items: stretch; min-width: 0; }
+  .station-compact-header .station-session-cover,
+  .station-compact-header .station-session-cover:has(.station-session-navigation) { grid-template-columns: minmax(0, 1fr); }
+  .station-compact-header .station-session-method { max-width: none; }
+}
+.station-validation-verdict { color: #334155; font-size: 13px; }
+.station-residual-table th[scope=row] { font-weight: 500; white-space: normal; }
+.station-residual-table tr[data-active=true] { background: #eef4fc; }
+.station-effect-link { border: 0; background: transparent; padding: 4px 0; color: inherit; text-align: left; cursor: pointer; font: inherit; }
+.station-effect-link:focus-visible, .station-gear:focus-visible { outline: 2px solid #215ec5; outline-offset: 3px; }
+.station-gear { min-width: 34px; min-height: 34px; justify-content: center; }
+.station-manual-controls { padding: 14px 0; }
+.station-manual-controls form { min-width: 0; }
+.station-manual-controls .metro-form-grid { margin: 12px 0; }
+.station-preview-result { display: block; margin-top: 6px; color: #174c8e; }
+.station-residual-charts { padding-top: 8px; border-top: 1px solid #dce4ed; }
+.station-original-linearity { margin-top: 16px; }
+.station-processing-main > h2 { margin-bottom: 16px; font-size: 18px; }
+.station-results-table { margin-top: 24px; }
+.station-results-table td { vertical-align: top; }
+.station-residual-table td { min-width: 180px; }
+.station-residual-table td:last-child { min-width: 44px; }
+.station-effect-tooltip { position: fixed; z-index: 45; width: 700px; padding: 12px; background: #fff; border: 1px solid #b7c7db; border-radius: 8px; pointer-events: none; }
+.station-effect-tooltip h3 { margin: 0; font-size: 13px; }

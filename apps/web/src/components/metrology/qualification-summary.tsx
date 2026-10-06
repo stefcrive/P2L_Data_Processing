@@ -69,8 +69,12 @@ export function SessionQcSummary({ detail }: { detail: ResultsSessionDetail }) {
     const mean = v.length ? v.reduce((s,x) => s+x,0)/v.length : 0;
     return { n: v.length, sd: v.length > 1 ? Math.sqrt(v.reduce((s,x) => s+(x-mean)**2,0)/(v.length-1)) : null };
   };
-  return <Panel title={tr("Session QC SD")}><div className="metro-table-wrap"><table className="station-numeric-table"><thead><tr><th>{tr("Session only")}</th><th>{tr("QC count")}</th><th>{tr("Imported SD / ‰")}</th><th>{tr("Final SD / ‰")}</th><th>{tr("SD criterion / ‰")}</th></tr></thead><tbody>{isotopes.map(i => {
-    const raw = stats(rows.map(r => r[i])), final = stats(rows.map(r => r.isotopes?.[i]?.value));
-    return <tr key={i}><td>{isotopeLabel[i]}</td><td>{rows.length}</td><td>{fmt(raw.sd,4)} <small>(n={raw.n})</small></td><td>{fmt(final.sd,4)} <small>(n={final.n})</small></td><td>&lt; {fmt(detail.method?.config.qc.external_sd[i],3)}</td></tr>;
-  })}</tbody></table></div><p className="metro-muted">{tr("All non-excluded QC aliquots in this session. Missing results reduce n; pooled SD does not replace individual workbook acceptance or historical u_prec.")}</p></Panel>;
+  const populations = [
+    { id: "session", label: tr("Global session QC"), rows },
+    ...detail.runs.map(run => ({ id: run.id, label: run.label, rows: (run.evaluation?.results ?? []).filter(row => row.role === "qc" && !row.excluded) })),
+  ];
+  return <Panel title={tr("QC standard deviation")}><div className="metro-table-wrap"><table className="station-numeric-table"><thead><tr><th>{tr("Session / carousel")}</th><th>{tr("Isotope")}</th><th>{tr("Imported SD / ‰")}</th><th>{tr("Final SD / ‰")}</th><th>{tr("SD criterion / ‰")}</th></tr></thead><tbody>{populations.flatMap(population => isotopes.map(i => {
+    const raw = stats(population.rows.map(r => r[i])), final = stats(population.rows.map(r => r.isotopes?.[i]?.value));
+    return <tr key={`${population.id}-${i}`} className={population.id === "session" ? "station-budget-total" : undefined}><th scope="row">{population.label}</th><td>{isotopeLabel[i]}</td><td>{fmt(raw.sd,4)} <small>n={raw.n}</small></td><td>{fmt(final.sd,4)} <small>n={final.n}</small></td><td>&lt; {fmt(detail.method?.config.qc.external_sd[i],3)}</td></tr>;
+  }))}</tbody></table></div><p className="metro-muted">{tr("All non-excluded QC aliquots in this session. Missing results reduce n; pooled SD does not replace individual workbook acceptance or historical u_prec.")}</p></Panel>;
 }

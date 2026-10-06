@@ -1,0 +1,260 @@
+{
+  "session_id": "fc6556376adc40b1ab12439e932d5c66",
+  "session_name": "Test client / UI verification",
+  "created_at": "2026-10-06T13:04:53.811652+00:00",
+  "updated_at": "2026-10-06T13:04:53.923291+00:00",
+  "source_files": [
+    {
+      "name": "e5dcd702787c__ui-identities.xlsx",
+      "size": 6446,
+      "md5": "e23de71bcdecd4a323eba4642f79240a",
+      "software": "generic",
+      "identity_parsing": {
+        "file_index": 0,
+        "file_name": "e5dcd702787c__ui-identities.xlsx",
+        "software": "generic",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    }
+  ],
+  "errors": [],
+  "calibration": {
+    "config": {
+      "selected_standards": [
+        "SHP2L"
+      ],
+      "linearity": {
+        "apply": false
+      }
+    },
+    "selected_standards": [
+      "SHP2L"
+    ]
+  },
+  "processing": {
+    "config": {
+      "selected_identifier": "All",
+      "x_axis_option": "By Sequence",
+      "color_param": "Date",
+      "z_axis": "1  Cycle Int  Samp  44",
+      "species_name_map": {},
+      "identifier1_name_map": {},
+      "apply_shared_linearity_to_partially_saturated": true,
+      "enable_saturation_correction": false,
+      "saturation_correction_method": "reference_gas_intensity",
+      "saturation_correction_method_d13": "reference_gas_intensity",
+      "saturation_correction_method_d18": "reference_gas_intensity",
+      "signal_range": [
+        0.0,
+        50.0
+      ],
+      "leak_range": [
+        0.0,
+        1000.0
+      ],
+      "d13c_range": [
+        -0.1356326369239947,
+        -0.022700696409338673
+      ],
+      "d18o_range": [
+        -0.1356326369239947,
+        -0.022700696409338673
+      ],
+      "statistical_outlier_method": "Z-Score",
+      "sigma_level_data": 4.0,
+      "iqr_multiplier_data": 1.5,
+      "overlays": {
+        "show_statistical_outliers": false,
+        "show_range_outliers": false,
+        "show_manual_outliers": false,
+        "show_saturated_collectors": true,
+        "show_saturated_samples": true,
+        "show_failed_samples": true
+      },
+      "manual_linearity_override": {
+        "enabled": false,
+        "use_diff_intensity": false,
+        "quadratic": false,
+        "max_sample_signal": null,
+        "d13_per_10v": 0.0,
+        "d18_per_10v": 0.0,
+        "d13_per_10v2": 0.0,
+        "d18_per_10v2": 0.0
+      },
+      "export": {
+        "include_outliers": false,
+        "selected_ids": [
+          "All"
+        ],
+        "interpolate_outliers": false,
+        "client_name": null,
+        "comment_map": {},
+        "client_output_identifier_source": "identifier1",
+        "client_output_sample_source": "comment",
+        "client_output_species_source": "species",
+        "show_sequence": true
+      }
+    },
+    "ranges_source": "four_sigma_import",
+    "apply_calibration": false
+  },
+  "autosave": {
+    "save_dir": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\fc6556376adc40b1ab12439e932d5c66",
+    "log_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\fc6556376adc40b1ab12439e932d5c66\\events.jsonl",
+    "snapshot_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\fc6556376adc40b1ab12439e932d5c66\\snapshot.csv",
+    "meta_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\fc6556376adc40b1ab12439e932d5c66\\metadata.json",
+    "session_state_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\fc6556376adc40b1ab12439e932d5c66\\irms_session_state.json",
+    "session_token": "fc6556376adc40b1ab12439e932d5c66",
+    "initialized_at": "2026-10-06T13:04:53.828166+00:00",
+    "enabled": true,
+    "resumed": false,
+    "last_action": "metrology_consultation_linked",
+    "last_saved_at": "2026-10-06T13:04:53.903709+00:00",
+    "event_count": 2
+  },
+  "edit_state": {
+    "edited_rows": [],
+    "original_delta_values": {},
+    "original_missing_delta_tokens": [],
+    "original_std_values": {},
+    "original_missing_std_tokens": [],
+    "original_identifier1_values": {},
+    "original_identifier2_values": {},
+    "original_species_values": {},
+    "manual_outlier_overrides": {},
+    "restored_delta_tokens": []
+  },
+  "import_parsing": {
+    "files": [
+      {
+        "file_index": 0,
+        "file_name": "e5dcd702787c__ui-identities.xlsx",
+        "software": "generic",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    ]
+  },
+  "row_count": 24,
+  "cycles_row_count": 24,
+  "metrology_link": {
+    "results_session_id": "6ffd73b4ac3c492482df79b959466b05",
+    "run_id": "all",
+    "run_ids": [
+      "e5dcd702787c4d83ac32a727df803c9e"
+    ],
+    "method_id": "a2c4be1f0d1a4aeab9085745ab37b7f5",
+    "qualification_id": "b2e979f5477e4562b9d02ae290ff3cb9",
+    "bridge_version": 7,
+    "fingerprint": "d0d6e62f1949e763a2ed23f1c8d85b15b0172267d24b07bffeac39e466041b60",
+    "row_mapping": {
+      "be56448afb49427bb039e9ac2f42799a": "0",
+      "56a35af8aa984048a55aaabd8a422ac7": "1",
+      "28bdbfa809e645f9b6f5c6aaeab7bf6d": "2",
+      "8b288d873e7b40bd9bea06729d811825": "3",
+      "6d43baaebd1c4d81bc89d20e15306b21": "4",
+      "041266c1f20843d59cfefddd7c53fe40": "5",
+      "3a1b2ac5d522489b936861960cf55aa8": "6",
+      "7ba22730cfad45e798b9f90308185944": "7",
+      "d2bc5155a7c843b0bc8f5945aba8d47c": "8",
+      "ca8fa1f654ab49caa5bcd6e4bd9b2b3a": "9",
+      "ad5fb6978d8a46eea90f0a9b61e41785": "10",
+      "59fc9ad2a20548adb7f1785978c6843d": "11",
+      "3eb410209a6045e58a4a853f68df9472": "12",
+      "5eff5e75771749fe9e1b21d3ce9fbe9f": "13",
+      "4fe8c2f83282497cb69d0b84c3128e9e": "14",
+      "114145889fcf4c649d704760daeceb4d": "15",
+      "b97b66d62a3b4274a009be023bc729c0": "16",
+      "62ad65debeea443888a37d3d5bd0cccd": "17",
+      "d4bb2d06a858460c8d6ee4bfe9e04b75": "18",
+      "21b1fe250cf04e3da1cfa07e46cd45a2": "19",
+      "bceae7a7ad2947c89e494313439ee552": "20",
+      "54c2e6febef7415ebfbd15aac12fd996": "21",
+      "63937adf5a66430780eabfa62ef0d409": "22",
+      "29166b8bd9d647cfadddf79ab36c024e": "23"
+    }
+  },
+  "metrology_reference_values": [
+    {
+      "Standard": "NBS18",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": -5.014,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS18",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -23.01,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS19",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": 1.95,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS19",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -2.2,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "SHP2L",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": -0.75,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "SHP2L",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -5.72,
+      "Source": "Session method v4; VPDB; DEMO-2026-01"
+    }
+  ]
+}

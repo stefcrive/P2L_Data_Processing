@@ -3,6 +3,28 @@ import type { Normalization, SessionRow, Isotope } from "./metrology";
 export type EnvelopePoint = { x: number | string | null; value: number | null | undefined; uncertainty: number | null | undefined; segment?: string };
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 
+/** Plotly 6 serializes numeric vectors as dtype/base64 objects. */
+function vector(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (ArrayBuffer.isView(value)) return Array.from(value as unknown as ArrayLike<number>);
+  if (!value || typeof value !== "object") return null;
+  const encoded = value as {dtype?:string;bdata?:string};
+  if (!encoded.dtype || !encoded.bdata) return null;
+  try {
+    const binary = atob(encoded.bdata);
+    const view = new DataView(Uint8Array.from(binary, c=>c.charCodeAt(0)).buffer);
+    const readers: Record<string,[number,(offset:number)=>number]> = {
+      f8:[8,i=>view.getFloat64(i,true)], f4:[4,i=>view.getFloat32(i,true)],
+      i4:[4,i=>view.getInt32(i,true)], u4:[4,i=>view.getUint32(i,true)],
+      i2:[2,i=>view.getInt16(i,true)], u2:[2,i=>view.getUint16(i,true)],
+      i1:[1,i=>view.getInt8(i)], u1:[1,i=>view.getUint8(i)],
+    };
+    const reader=readers[encoded.dtype];
+    if (!reader || view.byteLength%reader[0]) return null;
+    return Array.from({length:view.byteLength/reader[0]},(_,i)=>reader[1](i*reader[0]));
+  } catch { return null; }
+}
+
 /** Pointwise intervals, separated at workbook boundaries and missing budgets. */
 export function uncertaintyEnvelope(points: EnvelopePoint[], name: string, fillcolor: string, yaxis = "y") {
   const x: (number | string | null)[] = [], y: (number | null)[] = [];
@@ -35,7 +57,8 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
   if (data.some(trace => (trace.meta as Record<string, unknown>)?.sessionUncertainty)) return figure;
   const seen = new Set<string>(), overlays: Record<string, unknown>[] = [];
   for (const trace of data) {
-    if (!Array.isArray(trace.customdata) || !Array.isArray(trace.x) || !Array.isArray(trace.y)) continue;
+    const traceX=vector(trace.x), traceY=vector(trace.y), traceZ=vector(trace.z);
+    if (!Array.isArray(trace.customdata) || !traceX || !traceY) continue;
     const custom = trace.customdata as unknown[][];
     const token = custom.find(point => Array.isArray(point) && point[1])?.[1];
     if (!["d13C", "d18O", "cross"].includes(String(token))) continue;
@@ -43,27 +66,27 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
     const cross = token === "cross", three = trace.type === "scatter3d";
     const indices = custom.flatMap((point, index) => {
       const id = String(point?.[0] ?? ""), row = rows[id], key = `${token}:${id}`;
-      if (!row || row.excluded || seen.has(key)) return [];
+      if (!row || seen.has(key)) return [];
       seen.add(key); return [index];
     });
     if (!indices.length) continue;
     const selected = indices.map(i => rows[String(custom[i][0])]);
     const usable = (row: SessionRow, isotope: Isotope) => {
       const result = row.isotopes?.[isotope];
-      return result?.budget && finite(result.budget.expanded_uncertainty) && finite(result.value) ? result : undefined;
+      return !row.excluded && result?.budget && finite(result.budget.expanded_uncertainty) && finite(result.value) ? result : undefined;
     };
-    const x = indices.map((i, n) => cross ? usable(selected[n], "d18o")?.value ?? null : (trace.x as (number | string)[])[i]);
+    const x = indices.map((i, n) => cross ? usable(selected[n], "d18o")?.value ?? null : traceX[i] as number|string);
     const y = selected.map(row => usable(row, iso)?.value ?? null);
     const u = selected.map(row => usable(row, iso)?.budget?.expanded_uncertainty ?? null);
     const shade = iso === "d13c" ? "rgba(33,94,197,0.18)" : "rgba(22,125,135,0.18)";
     const yaxis = String(trace.yaxis ?? "y");
-    if (!cross) overlays.push(...uncertaintyEnvelope(selected.map((row, i) => ({ x:x[i], value:y[i], uncertainty:u[i], segment:row.run_id })), label, shade, yaxis).map(t => ({...t, showlegend:false})));
+    if (!cross && !three) overlays.push(...uncertaintyEnvelope(selected.map((row, i) => ({ x:x[i], value:y[i], uncertainty:u[i], segment:row.run_id })), label, shade, yaxis).map(t => ({...t, xaxis:trace.xaxis, showlegend:false})));
     overlays.push({ type: three ? "scatter3d" : "scatter", mode:"markers", name:label,
-      x, y, ...(three ? {z:indices.map(i => (trace.z as unknown[])?.[i])} : {xaxis:trace.xaxis, yaxis}),
+      x, y, ...(three ? {z:indices.map(i => traceZ?.[i]), scene:trace.scene} : {xaxis:trace.xaxis, yaxis}),
       marker:{size:three?4:6,color:iso==="d13c"?"#215ec5":"#167d87"},
       error_y:{type:"data",array:u,visible:true,thickness:1,width:2},
       ...(cross ? {error_x:{type:"data",array:selected.map(row=>usable(row,"d18o")?.budget?.expanded_uncertainty??null),visible:true,thickness:1,width:2}} : {}),
-      customdata:indices.map(i=>custom[i]), text:selected.map(row=>`${row.label} ${row.comment}`),
+      customdata:indices.map(i=>custom[i]), text:selected.map(row=>`${row.identifier1??row.label} · ${row.identifier2??row.comment} · ${row.species??""}`),
       hovertemplate:"%{text}<br>%{y:.3f} ‰<extra>%{fullData.name}</extra>",
       legendgroup:"session-uncertainty",showlegend:!overlays.some(t=>(t.meta as Record<string,unknown>)?.sessionUncertainty),meta:{sessionUncertainty:true},
     });

@@ -7477,7 +7477,7 @@ export default function ProcessingPage() {
       <PageHeader
         eyebrow={tr("Analysis pipeline")}
         title={tr("Processing")}
-        description={tr(consultation ? "Explore this acquisition. Use Results & export for corrected values, uncertainty and release." : "Filter, edit, validate, and export the processed measurement set.")}
+        description={tr(consultation ? "Imported observations with final results and expanded uncertainty. Review individual results in the table below." : "Filter, edit, validate, and export the processed measurement set.")}
         actions={
           <>
             <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">{tr("Edited rows: ")}{workspace.edit_state.edited_rows.length}</span>
@@ -7526,7 +7526,7 @@ export default function ProcessingPage() {
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <CardTitle>{tr("Processing Controls")}</CardTitle>
-                  <CardDescription>{tr("Filters, outliers, and shared linearity controls synced with Calibration.")}</CardDescription>
+                  <CardDescription>{tr(consultation?"Select the observations and chart parameters.":"Filters, outliers, and shared linearity controls synced with Calibration.")}</CardDescription>
                 </div>
                 <Button onClick={applyConfig} disabled={busy || !hasSaveableChanges} size="sm">
                   {tr(busy ? "Saving..." : "Save changes")}
@@ -7769,6 +7769,7 @@ export default function ProcessingPage() {
                 ) : null}
               </div>
 
+              {!consultation && <>
               <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-sm font-medium text-stone-800">{tr("Linearity (shared with calibration)")}</div>
@@ -8025,6 +8026,7 @@ export default function ProcessingPage() {
                 )}
               </div>
 
+              </>}
               <div className="flex flex-wrap gap-2">
                 <Button
                   variant="outline"

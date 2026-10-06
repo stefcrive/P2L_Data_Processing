@@ -1,0 +1,95 @@
+[
+  {
+    "name": "qualification-carousel-1440",
+    "plots": [
+      {
+        "height": 270,
+        "title": "δ¹³C · Sequência de CQ da sessão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Sequência de CQ da sessão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Linearidade residual de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Linearidade residual de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Linearidade do ajuste de pressão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Linearidade do ajuste de pressão"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Desajuste de pressão após remover a tendência de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Desajuste de pressão após remover a tendência de intensidade"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Dependência da massa"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Dependência da massa"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Deriva do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Deriva do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹³C · Triagem de memória do CQ"
+      },
+      {
+        "height": 270,
+        "title": "δ¹⁸O · Triagem de memória do CQ"
+      },
+      {
+        "height": 270,
+        "title": "Intensidade do sinal versus diferença do ajuste de pressão"
+      },
+      {
+        "height": 320,
+        "title": "Gráfico de calibração em 3D (eixo Z: 1  Cycle Int  Samp  44)"
+      },
+      {
+        "height": 320,
+        "title": "δ¹³C vs δ¹⁸O"
+      }
+    ],
+    "scroll": 1425,
+    "viewport": 1440
+  },
+  {
+    "name": "empty-processing-1440",
+    "plots": [],
+    "scroll": 1440,
+    "viewport": 1440
+  },
+  {
+    "name": "empty-export-1440",
+    "plots": [],
+    "scroll": 1440,
+    "viewport": 1440
+  },
+  {
+    "name": "empty-export-narrow",
+    "plots": [],
+    "scroll": 375,
+    "viewport": 390
+  }
+]

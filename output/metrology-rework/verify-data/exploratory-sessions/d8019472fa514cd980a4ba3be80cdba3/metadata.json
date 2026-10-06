@@ -1,0 +1,262 @@
+{
+  "session_id": "d8019472fa514cd980a4ba3be80cdba3",
+  "session_name": "DEMO Carbonate laboratory / DEMO released \u00b7 2026-04-08",
+  "created_at": "2026-10-06T13:00:45.699333+00:00",
+  "updated_at": "2026-10-06T13:00:45.923042+00:00",
+  "source_files": [
+    {
+      "name": "b04a581003bc__routine-2026-04-08.xlsx",
+      "size": 34689,
+      "md5": "39b1be9d1d5a11b12ff44dddd4717552",
+      "software": "qtegra",
+      "identity_parsing": {
+        "file_index": 0,
+        "file_name": "b04a581003bc__routine-2026-04-08.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    }
+  ],
+  "errors": [],
+  "calibration": {
+    "config": {
+      "selected_standards": [
+        "SHP2L"
+      ],
+      "linearity": {
+        "apply": false
+      }
+    },
+    "selected_standards": [
+      "SHP2L"
+    ]
+  },
+  "processing": {
+    "config": {
+      "selected_identifier": "All",
+      "x_axis_option": "By Sequence",
+      "color_param": "Date",
+      "z_axis": "1  Cycle Int  Samp  44",
+      "species_name_map": {},
+      "identifier1_name_map": {},
+      "apply_shared_linearity_to_partially_saturated": true,
+      "enable_saturation_correction": false,
+      "saturation_correction_method": "reference_gas_intensity",
+      "saturation_correction_method_d13": "reference_gas_intensity",
+      "saturation_correction_method_d18": "reference_gas_intensity",
+      "signal_range": [
+        4.587670627062256,
+        7.445875167122978
+      ],
+      "leak_range": [
+        0.0,
+        1000.0
+      ],
+      "d13c_range": [
+        -5.875419340986282,
+        3.703194253044978
+      ],
+      "d18o_range": [
+        -28.517568628924387,
+        6.344931483279863
+      ],
+      "statistical_outlier_method": "Z-Score",
+      "sigma_level_data": 4.0,
+      "iqr_multiplier_data": 1.5,
+      "overlays": {
+        "show_statistical_outliers": false,
+        "show_range_outliers": false,
+        "show_manual_outliers": false,
+        "show_saturated_collectors": true,
+        "show_saturated_samples": true,
+        "show_failed_samples": true
+      },
+      "manual_linearity_override": {
+        "enabled": false,
+        "use_diff_intensity": false,
+        "quadratic": false,
+        "max_sample_signal": null,
+        "d13_per_10v": 0.0,
+        "d18_per_10v": 0.0,
+        "d13_per_10v2": 0.0,
+        "d18_per_10v2": 0.0
+      },
+      "export": {
+        "include_outliers": false,
+        "selected_ids": [
+          "All"
+        ],
+        "interpolate_outliers": false,
+        "client_name": null,
+        "comment_map": {},
+        "client_output_identifier_source": "identifier1",
+        "client_output_sample_source": "comment",
+        "client_output_species_source": "species",
+        "show_sequence": true
+      }
+    },
+    "ranges_source": "four_sigma_import",
+    "apply_calibration": false
+  },
+  "autosave": {
+    "save_dir": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\d8019472fa514cd980a4ba3be80cdba3",
+    "log_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\d8019472fa514cd980a4ba3be80cdba3\\events.jsonl",
+    "snapshot_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\d8019472fa514cd980a4ba3be80cdba3\\snapshot.csv",
+    "meta_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\d8019472fa514cd980a4ba3be80cdba3\\metadata.json",
+    "session_state_path": "C:\\Dev\\IRMSdataprocessing\\output\\metrology-rework\\verify-data\\exploratory-sessions\\d8019472fa514cd980a4ba3be80cdba3\\irms_session_state.json",
+    "session_token": "d8019472fa514cd980a4ba3be80cdba3",
+    "initialized_at": "2026-10-06T13:00:45.714991+00:00",
+    "enabled": true,
+    "resumed": false,
+    "last_action": "metrology_consultation_linked",
+    "last_saved_at": "2026-10-06T13:00:45.894886+00:00",
+    "event_count": 2
+  },
+  "edit_state": {
+    "edited_rows": [],
+    "original_delta_values": {},
+    "original_missing_delta_tokens": [],
+    "original_std_values": {},
+    "original_missing_std_tokens": [],
+    "original_identifier1_values": {},
+    "original_identifier2_values": {},
+    "original_species_values": {},
+    "manual_outlier_overrides": {},
+    "restored_delta_tokens": []
+  },
+  "import_parsing": {
+    "files": [
+      {
+        "file_index": 0,
+        "file_name": "b04a581003bc__routine-2026-04-08.xlsx",
+        "software": "qtegra",
+        "identifier1": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "identifier2": {
+          "source_column": "Comment",
+          "mode": "direct",
+          "delimiter": " - ",
+          "part_index": 0,
+          "regex_pattern": "",
+          "regex_group": 1
+        },
+        "species": {
+          "source_column": "Label",
+          "mode": "split",
+          "delimiter": " - ",
+          "part_index": 1,
+          "regex_pattern": "",
+          "regex_group": 1
+        }
+      }
+    ]
+  },
+  "row_count": 26,
+  "cycles_row_count": 234,
+  "metrology_link": {
+    "results_session_id": "08959db209354782a9a247fdc4a2786d",
+    "run_id": "all",
+    "run_ids": [
+      "b04a581003bc4f68ae32ae46531cbe9f"
+    ],
+    "method_id": "27993606742f495bb81c8d428d402dd4",
+    "qualification_id": "d2b5324d6f224750953d085eec3ffdd6",
+    "bridge_version": 7,
+    "fingerprint": "1e24c04d3da33d3dd744154692fb57b89d9c9bcc22d20a4a3c6167ff53c8d4ea",
+    "row_mapping": {
+      "6203c75308b74e169287bb9da94d2e65": "0",
+      "6161dadca5f44d0c85b243f532b104bd": "1",
+      "bb5a1d6a03b849018826dd0d517c1d59": "2",
+      "1bcd3fac1ff0457cb9c39a749394a65b": "3",
+      "33e6cd36372f40c5810c6ece5197a03d": "4",
+      "b56c3e54c0cd4e27ab184c53142cb9b0": "5",
+      "330f60bb89ce4d6d86c23952f575c3b7": "6",
+      "8f728e00daf44fa094f6bcaab5b15dd6": "7",
+      "4c85c2c962ac49099d1dad818ef486de": "8",
+      "125e6372ebbc42dca42c7304a77327af": "9",
+      "9b50169e4df444fba038ed1c932c5563": "10",
+      "80effc412195453c9ca73bff996ca0ff": "11",
+      "2a7287145bb64fa9bd41c7bbc12bbc16": "12",
+      "3eb79d5bb8b0495a97c51b667c0a563b": "13",
+      "71fe8a68c2c348eeb77751cd51ffd71a": "14",
+      "259b00418859499aa184590a52ed7b0f": "15",
+      "16f5c1af23a047a98aa03d0e129290c0": "16",
+      "3ffc4626bf4347b7b58ae80bad7e5c54": "17",
+      "09fa0f8614cb47a3ad619ece8b77eebb": "18",
+      "c48573489fc740a7b1d287c39a4e8661": "19",
+      "046af597b473465299495c78d8b6700d": "20",
+      "dbf5a11e6c5b4eeaa311fc56c1ae9f81": "21",
+      "bc742bb1855a48f2b9b06ae590a91f0b": "22",
+      "884cf8d6a664479eabc3e936fd160c99": "23",
+      "b03ca269e548407cba0899f499cfaa9f": "24",
+      "f78a4ad314fd4ab49a42198c05a4c880": "25"
+    }
+  },
+  "metrology_reference_values": [
+    {
+      "Standard": "NBS18",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": -5.014,
+      "Source": "Session method v1; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS18",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -23.01,
+      "Source": "Session method v1; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS19",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": 1.95,
+      "Source": "Session method v1; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "NBS19",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -2.2,
+      "Source": "Session method v1; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "SHP2L",
+      "Isotopic_Value_Type": "VPDB(13C)",
+      "Value": -0.75,
+      "Source": "Session method v1; VPDB; DEMO-2026-01"
+    },
+    {
+      "Standard": "SHP2L",
+      "Isotopic_Value_Type": "VSMOW(18O)",
+      "Value": -5.72,
+      "Source": "Session method v1; VPDB; DEMO-2026-01"
+    }
+  ]
+}

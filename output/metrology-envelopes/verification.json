@@ -1,0 +1,121 @@
+[
+  {
+    "name": "uncertainty-1440",
+    "plots": [
+      {
+        "height": 340,
+        "title": "δ¹³C · Session results with expanded uncertainty"
+      },
+      {
+        "height": 340,
+        "title": "δ¹⁸O · Session results with expanded uncertainty"
+      },
+      {
+        "height": 220,
+        "title": "Standard uncertainty contributions"
+      },
+      {
+        "height": 220,
+        "title": "Standard uncertainty contributions"
+      }
+    ],
+    "scroll": 1425,
+    "viewport": 1440
+  },
+  {
+    "name": "uncertainty-1920",
+    "plots": [
+      {
+        "height": 340,
+        "title": "δ¹³C · Session results with expanded uncertainty"
+      },
+      {
+        "height": 340,
+        "title": "δ¹⁸O · Session results with expanded uncertainty"
+      },
+      {
+        "height": 220,
+        "title": "Standard uncertainty contributions"
+      },
+      {
+        "height": 220,
+        "title": "Standard uncertainty contributions"
+      }
+    ],
+    "scroll": 1905,
+    "viewport": 1920
+  },
+  {
+    "name": "uncertainty-narrow",
+    "plots": [
+      {
+        "height": 340,
+        "title": "δ¹³C · Session results with expanded uncertainty"
+      },
+      {
+        "height": 340,
+        "title": "δ¹⁸O · Session results with expanded uncertainty"
+      },
+      {
+        "height": 220,
+        "title": "Standard uncertainty contributions"
+      },
+      {
+        "height": 220,
+        "title": "Standard uncertainty contributions"
+      }
+    ],
+    "scroll": 375,
+    "viewport": 390
+  },
+  {
+    "routine_calibration": "loaded"
+  },
+  {
+    "processing_figures": [
+      {
+        "band": 2,
+        "final": 0,
+        "title": "δ¹³C · Session results with expanded uncertainty"
+      },
+      {
+        "band": 2,
+        "final": 0,
+        "title": "δ¹⁸O · Session results with expanded uncertainty"
+      },
+      {
+        "band": 0,
+        "final": 1,
+        "title": "Processing 3D Chart"
+      },
+      {
+        "band": 0,
+        "final": 1,
+        "title": "δ¹³C vs δ¹⁸O"
+      },
+      {
+        "band": 1,
+        "final": 1,
+        "title": "δ¹³C Summary"
+      },
+      {
+        "band": 1,
+        "final": 1,
+        "title": "δ¹⁸O Summary"
+      },
+      {
+        "band": 1,
+        "final": 1,
+        "title": "BTS - δ¹³C for Species: nan"
+      },
+      {
+        "band": 1,
+        "final": 1,
+        "title": "BTS - δ¹⁸O for Species: nan"
+      }
+    ]
+  },
+  {
+    "qualification_calibration_processing": "loaded"
+  }
+]

@@ -15,6 +15,22 @@ from .models import SAMPLE_TYPES
 from .science import summary
 
 
+def measurement_identity(record: dict, source_kind: str = "qtegra_raw") -> dict:
+    """Use the original importer rules, including for older stored acquisitions."""
+    from ..domain.import_session import _suggest_import_parsing_config, _apply_import_parsing_config
+    keys = ("identifier1", "identifier2", "species")
+    if all(key in record for key in keys):
+        return {key: record[key] for key in keys}
+    raw = record.get("raw_rows") or []
+    values = raw[0]["values"] if raw else ({"Identifier 1": record.get("label"), "Identifier 2": record.get("comment")}
+        if source_kind == "isodat_raw" else {"Label": record.get("label"), "Comment": record.get("comment")})
+    frame = pd.DataFrame([values])
+    software = "isodat" if source_kind == "isodat_raw" else "qtegra" if "Label" in frame else "generic"
+    config = _suggest_import_parsing_config(frame, file_index=0, file_name="acquisition", software=software)
+    parsed = _apply_import_parsing_config(frame, config).iloc[0]
+    return {key: scalar(parsed[column]) or "" for key, column in zip(keys, ("Identifier 1", "Identifier 2", "Species"))}
+
+
 def scalar(value):
     if value is None or pd.isna(value):
         return None
@@ -192,6 +208,7 @@ def parse_workbook(content: bytes, filename: str) -> dict:
             record["mass_source"] = "Comment: explicit MASS=<value> <unit>"
         replicate = re.search(r"(?:^|;)\s*REP\s*=\s*(\d+)\s*(?:;|$)", record["comment"], re.I)
         record["replicate"] = int(replicate.group(1)) if replicate else None
+        record.update(measurement_identity(record))
         records.append(record)
     if not records:
         raise ValueError("No analyses found")
@@ -256,6 +273,7 @@ def parse_legacy_export(frame, sheet, sheets):
         rec["sample_reference_difference_v"]=rec["i44_v"]-rec["reference_i44_v"] if rec["i44_v"] is not None and rec["reference_i44_v"] is not None else None
         pressure=re.search(r"Total CO2\s*:\s*([+-]?[\d.]+)",str(data.get("Information") or ""))
         rec["co2_pressure_ubar"]=float(pressure.group(1)) if pressure else None
+        rec.update(measurement_identity(rec, "isodat_raw"))
         records.append(rec)
     if not records:
         raise ValueError("No original acquisition rows found")

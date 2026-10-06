@@ -15,7 +15,7 @@ from .models import (
     AnnotationCommand, ApproveCommand, Decision, EffectCommand, EvaluateCommand, ExclusionCommand,
     InterventionCommand, MaterialCommand, MethodCommand, PeriodCommand, QualificationCommand,
     ReleaseCommand, RunCommand, TestCommand,
-    ResultsSessionCommand, SessionGroupsCommand, SessionExportCommand, RowReviewCommand,
+    ResultsSessionCommand, SessionGroupsCommand, SessionExportCommand, RowReviewCommand, ResidualOverrideCommand, SessionChartSettingsCommand,
 )
 from .repository import Repository, encode
 from .reports import build_report
@@ -94,6 +94,16 @@ def results_session(id_: str, s: Service = Depends(get_service)):
 @router.post("/results-sessions/{id_}/groups")
 def results_groups(id_: str, command: SessionGroupsCommand, s: Service = Depends(get_service)):
     return invoke(s.save_session_groups,id_,command)
+
+
+@router.put("/results-sessions/{id_}/chart-settings")
+def session_chart_settings(id_: str, command: SessionChartSettingsCommand, s: Service = Depends(get_service)):
+    return invoke(s.save_chart_settings, id_, command)
+
+
+@router.put("/results-sessions/{id_}/residual-overrides")
+def residual_override(id_: str, command: ResidualOverrideCommand, s: Service = Depends(get_service)):
+    return invoke(s.save_residual_override, id_, command)
 
 
 @router.post("/results-sessions/{id_}/exports")
