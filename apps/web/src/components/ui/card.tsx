@@ -1,3 +1,6 @@
+"use client";
+
+import { useTranslation } from "@/components/layout/language-provider";
 import * as React from "react";
 
 import { cn } from "@/lib/utils";
@@ -20,11 +23,13 @@ export function CardHeader({ className, ...props }: React.HTMLAttributes<HTMLDiv
 }
 
 export function CardTitle({ className, children, ...props }: React.HTMLAttributes<HTMLHeadingElement>) {
-  return <h3 className={cn("font-display text-base font-semibold leading-tight tracking-normal text-slate-950", className)} {...props}>{typeof children === "string" ? formatScientificText(children) : children}</h3>;
+  const tr = useTranslation();
+  return <h3 className={cn("font-display text-base font-semibold leading-tight tracking-normal text-slate-950", className)} {...props}>{tr(typeof children === "string" ? formatScientificText(children) : children)}</h3>;
 }
 
 export function CardDescription({ className, children, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
-  return <p className={cn("text-xs leading-relaxed text-slate-500", className)} {...props}>{typeof children === "string" ? formatScientificText(children) : children}</p>;
+  const tr = useTranslation();
+  return <p className={cn("text-xs leading-relaxed text-slate-500", className)} {...props}>{tr(typeof children === "string" ? formatScientificText(children) : children)}</p>;
 }
 
 export function CardContent({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {

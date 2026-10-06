@@ -1,8 +1,9 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
@@ -24,12 +25,25 @@ import { MultiSelectDropdown } from "@/components/ui/multi-select-dropdown";
 import { PageHeader } from "@/components/ui/page-header";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
-import type { CalibrationConfig, CalibrationPrecisionSummary, CycleDiagnosticsPayload, EditAction } from "@/lib/types";
+import { buildDiagnosticStatisticsPreview } from "@/lib/diagnostic-statistics-preview";
+import {
+  applyLinearityPreviewToDiagnosticsFigure,
+  buildLinearityPreviewValues,
+} from "@/lib/linearity-preview";
+import type {
+  CalibrationConfig,
+  CalibrationPrecisionSummary,
+  CalibrationWorkspace,
+  CycleDiagnosticsPayload,
+  EditAction,
+  ProcessingLinearityPreviewData,
+} from "@/lib/types";
 import { formatScientificText } from "@/lib/scientific-notation";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/use-session-store";
 
 const RANGE_FETCH_DEBOUNCE_MS = 300;
+const LINEARITY_SAVE_DEBOUNCE_MS = 250;
 const HOVER_PREVIEW_SHOW_DELAY_MS = 500;
 const CORRELATION_PREVIEW_SHOW_DELAY_MS = 240;
 const SELECTION_EDITOR_CHART_DEFER_MS = 350;
@@ -822,8 +836,9 @@ function decodeBinaryVector(dtype: string, bdata: string): number[] | null {
 }
 
 function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> }) {
+  const tr = useTranslation();
   if (!rows.length) {
-    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">No cycle rows returned for this point.</div>;
+    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("No cycle rows returned for this point.")}</div>;
   }
 
   const statusRows: Array<Record<string, unknown>> = rows.map((row) => {
@@ -894,11 +909,11 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">First valid cycle</span>
-        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">Last valid cycle</span>
-        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
-        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
-        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">Sample gas escape</span>
+        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">{tr("First valid cycle")}</span>
+        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">{tr("Last valid cycle")}</span>
+        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">{tr("Successful cycle")}</span>
+        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">{tr("Saturated cycle")}</span>
+        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">{tr("Sample gas escape")}</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -906,7 +921,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             <tr>
               {columns.map((column) => (
                 <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                  {formatScientificText(column)}
+                  {tr(formatScientificText(column))}
                 </th>
               ))}
             </tr>
@@ -957,7 +972,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
                             : "text-stone-700",
                         )}
                       >
-                        {formatScientificText(formatCell(cellValue, column))}
+                        {tr(formatScientificText(formatCell(cellValue, column)))}
                       </td>
                     );
                   })}
@@ -966,7 +981,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             })}
           </tbody>
         </table>
-        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">Showing first 25 of {rows.length} rows.</div> : null}
+        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">{tr("Showing first 25 of ")}{rows.length}{tr(" rows.")}</div> : null}
       </div>
     </div>
   );
@@ -1069,6 +1084,7 @@ function DiagnosticsPanel({
   loading: boolean;
   onPickDeltaValue?: (value: number, stdev?: number | null) => void;
 }) {
+  const tr = useTranslation();
   const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
   const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
   const cycleMean = diagnostics?.cycle_mean ?? {};
@@ -1158,11 +1174,11 @@ function DiagnosticsPanel({
   return (
     <Card className="border-stone-300">
       <CardHeader>
-        <CardTitle className="text-base">{title}</CardTitle>
-        <CardDescription>Cycle-level intensity and exclusion diagnostics for the active sample.</CardDescription>
+        <CardTitle className="text-base">{tr(title)}</CardTitle>
+        <CardDescription>{tr("Cycle-level intensity and exclusion diagnostics for the active sample.")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {loading ? <div className="text-sm text-stone-500">Loading cycle diagnostics...</div> : null}
+        {loading ? <div className="text-sm text-stone-500">{tr("Loading cycle diagnostics...")}</div> : null}
 
         {diagnostics ? (
           <>
@@ -1178,7 +1194,7 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help text-stone-400" : "text-stone-900",
                     )}
                   >
-                    {displayValue}
+                    {tr(displayValue)}
                   </span>
                 );
                 return (
@@ -1198,10 +1214,10 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
                     )}
                   >
-                    <div className="text-xs uppercase tracking-normal text-stone-500">{formatScientificText(item.label)}</div>
+                    <div className="text-xs uppercase tracking-normal text-stone-500">{tr(formatScientificText(item.label))}</div>
                     <div className="mt-1 text-lg font-semibold">
                       {blockedByLinearityCycleCount ? (
-                        <Tooltip label="not enough cycles for linearity calculation" align="start">
+                        <Tooltip label={tr("not enough cycles for linearity calculation")} align="start">
                           {valueElement}
                         </Tooltip>
                       ) : (
@@ -1209,18 +1225,18 @@ function DiagnosticsPanel({
                       )}
                     </div>
                     {item.stdev != null ? (
-                      <div className="mt-1 text-xs text-stone-500">Std dev: {formatDeltaValue(item.stdev)}</div>
+                      <div className="mt-1 text-xs text-stone-500">{tr("Std dev: ")}{tr(formatDeltaValue(item.stdev))}</div>
                     ) : null}
                   </button>
                 );
               })}
               <div className="rounded-lg border border-stone-200 p-3">
-                <div className="text-xs uppercase tracking-normal text-stone-500">Method</div>
-                <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">{tr("Method")}</div>
+                <div className="mt-1 text-sm font-medium text-stone-900">{tr(asString(cycleMean.method) || "N/A")}</div>
               </div>
             </div>
 
-            {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
+            {reason ? <div className="text-sm text-stone-500">{tr("Diagnostics note: ")}{tr(reason)}</div> : null}
 
             <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
               <PlotlyChart
@@ -1238,7 +1254,7 @@ function DiagnosticsPanel({
               <>
                 <div className="flex flex-wrap items-end gap-4">
                   <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label="Chart color axis" />
+                    <SaturationAxisHelpTooltip label={tr("Chart color axis")} />
                     <select
                       value={saturationColorAxis}
                       onChange={(event) => setSaturationColorAxis(event.target.value as SaturationColorAxisKey)}
@@ -1246,13 +1262,13 @@ function DiagnosticsPanel({
                     >
                       {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
-                          {option.label}
+                          {tr(option.label)}
                         </option>
                       ))}
                     </select>
                   </label>
                   <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label="Chart y axis" />
+                    <SaturationAxisHelpTooltip label={tr("Chart y axis")} />
                     <select
                       value={saturationYAxis}
                       onChange={(event) => setSaturationYAxis(event.target.value as SaturationAxisKey)}
@@ -1260,7 +1276,7 @@ function DiagnosticsPanel({
                     >
                       {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
-                          {option.label}
+                          {tr(option.label)}
                         </option>
                       ))}
                     </select>
@@ -1272,8 +1288,8 @@ function DiagnosticsPanel({
                       <SaturationFigureCard
                         key={item.key}
                         chartKey={item.key}
-                        title={item.title}
-                        description={item.description}
+                        title={tr(item.title)}
+                        description={tr(item.description)}
                         figure={item.figure}
                         colorAxis={saturationColorAxis}
                         yAxis={saturationYAxis}
@@ -1291,7 +1307,7 @@ function DiagnosticsPanel({
             ) : null}
           </>
         ) : loading ? null : (
-          <div className="text-sm text-stone-500">Cycle diagnostics appear here once a point is selected.</div>
+          <div className="text-sm text-stone-500">{tr("Cycle diagnostics appear here once a point is selected.")}</div>
         )}
       </CardContent>
     </Card>
@@ -1714,20 +1730,21 @@ function diagnosticsColorScaleTicks(range: [number, number], count = 6): number[
 }
 
 function DiagnosticsColorScaleBar({ colorParam, range }: { colorParam: string; range: [number, number] }) {
+  const tr = useTranslation();
   const label = diagnosticsColorParameterLabel(colorParam);
   const ticks = diagnosticsColorScaleTicks(range);
   return (
     <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
-      <div className="mb-1 font-semibold text-stone-900">{formatScientificText(label)}</div>
+      <div className="mb-1 font-semibold text-stone-900">{tr(formatScientificText(label))}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
-        aria-label={`${label} color scale from ${range[0]} to ${range[1]}`}
+        aria-label={tr(`${label} color scale from ${range[0]} to ${range[1]}`)}
       />
       <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
         {ticks.map((tick, index) => (
           <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
-            {formatDiagnosticsColorbarValue(tick, colorParam)}
+            {tr(formatDiagnosticsColorbarValue(tick, colorParam))}
           </span>
         ))}
       </div>
@@ -1883,6 +1900,7 @@ function RangeSliderControl({
   precision?: number;
   onChange: (nextRange: [number, number]) => void;
 }) {
+  const tr = useTranslation();
   const fallbackBounds: [number, number] = bounds ?? value ?? [0, 1];
   const minBound = Math.min(fallbackBounds[0], fallbackBounds[1], value?.[0] ?? fallbackBounds[0], value?.[1] ?? fallbackBounds[1]);
   const maxBound = Math.max(fallbackBounds[0], fallbackBounds[1], value?.[0] ?? fallbackBounds[0], value?.[1] ?? fallbackBounds[1]);
@@ -1891,19 +1909,20 @@ function RangeSliderControl({
 
   return (
     <DualRangeField
-      label={label}
+      label={tr(label)}
       value={[low, high]}
       min={minBound}
       max={maxBound}
       step={step}
       precision={precision}
-      description={bounds ? "Data bounds" : undefined}
+      description={tr(bounds ? "Data bounds" : undefined)}
       onChange={onChange}
     />
   );
 }
 
 export default function DiagnosticsPage() {
+  const tr = useTranslation();
   const sessionId = useSessionStore((state) => state.sessionId);
   const queryClient = useQueryClient();
   const [colorParam, setColorParam] = useState("Date");
@@ -1925,6 +1944,7 @@ export default function DiagnosticsPage() {
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const hoverPreviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewShowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const linearitySaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
   const hoverPreviewPointerInsideRef = useRef(false);
   const hoverPreviewTarget = hoverPreview?.kind === "cycle" ? hoverPreview.target : null;
@@ -1961,17 +1981,42 @@ export default function DiagnosticsPage() {
     queryFn: () => api.getCalibrationWorkspace(sessionId!),
     enabled: Boolean(sessionId),
   });
+  const linearityPreviewDataQuery = useQuery({
+    queryKey: ["processing-linearity-preview-data", sessionId],
+    queryFn: () => api.getProcessingLinearityPreviewData(sessionId!),
+    enabled: Boolean(sessionId),
+    staleTime: 60_000,
+  });
   const saveSharedLinearityMutation = useMutation({
     mutationFn: (nextLinearity: CalibrationConfig["linearity"]) =>
       api.setCalibrationLinearity(
         sessionId!,
         nextLinearity,
         calibrationWorkspaceQuery.data?.config?.selected_standards ?? [],
-      ),
-    onSuccess: async (workspace) => {
-      queryClient.setQueryData(["calibration-workspace", sessionId], workspace);
-      setSharedLinearityConfig(workspace.config.linearity);
-      await queryClient.invalidateQueries({ queryKey: ["diagnostics", sessionId] });
+        { summaryOnly: true },
+    ),
+    onSuccess: (workspace, submittedLinearity) => {
+      queryClient.setQueryData<CalibrationWorkspace | undefined>(["calibration-workspace", sessionId], (current) =>
+        current
+          ? {
+              ...current,
+              config: workspace.config,
+              available_values: workspace.available_values,
+              precision_summaries: workspace.precision_summaries,
+              selected_standard_official_values: workspace.selected_standard_official_values,
+              linearity_fits: workspace.linearity_fits,
+            }
+          : workspace,
+      );
+      queryClient.setQueryData<ProcessingLinearityPreviewData | undefined>(
+        ["processing-linearity-preview-data", sessionId],
+        (current) => (current ? { ...current, fits: workspace.linearity_fits } : current),
+      );
+      setSharedLinearityConfig((current) =>
+        current && !linearityConfigEquals(current, submittedLinearity) ? current : workspace.config.linearity,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["diagnostics", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
     },
   });
   const selectionRowLabel = selectionTarget?.rowLabel ?? null;
@@ -2055,17 +2100,33 @@ export default function DiagnosticsPage() {
     colorScaleRange ?? [colorSliderBounds.min, colorSliderBounds.max],
     colorSliderBounds,
   );
+  const activeLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config?.linearity ?? null;
+  const linearityPreviewValues = useMemo(
+    () => buildLinearityPreviewValues(linearityPreviewDataQuery.data, activeLinearity),
+    [activeLinearity, linearityPreviewDataQuery.data],
+  );
+  const diagnosticStatisticsPreview = useMemo(
+    () => buildDiagnosticStatisticsPreview(diagnosticGridItems, linearityPreviewValues),
+    [diagnosticGridItems, linearityPreviewValues],
+  );
   const displayedDiagnosticGridItems = useMemo(
     () =>
       diagnosticGridItems.map((item) => ({
         ...item,
         figure: applySymbolSizeToFigure(
-          applyColorScaleRangeToFigure(item.figure, effectiveColorScaleRange, `diagnostics:grid:${item.key}`),
+          applyColorScaleRangeToFigure(
+            applyLinearityPreviewToDiagnosticsFigure(
+              diagnosticStatisticsPreview.get(item.key) ?? item.figure,
+              linearityPreviewValues,
+            ),
+            effectiveColorScaleRange,
+            `diagnostics:grid:${item.key}`,
+          ),
           symbolSize,
           `diagnostics:grid:${item.key}`,
         ),
       })),
-    [diagnosticGridItems, effectiveColorScaleRange, symbolSize],
+    [diagnosticGridItems, diagnosticStatisticsPreview, effectiveColorScaleRange, linearityPreviewValues, symbolSize],
   );
   const diagnosticGridGroups = useMemo(() => {
     const groups: Array<{ name: string; items: typeof displayedDiagnosticGridItems }> = [];
@@ -2079,7 +2140,6 @@ export default function DiagnosticsPage() {
     }
     return groups;
   }, [displayedDiagnosticGridItems]);
-  const activeLinearity = sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config?.linearity ?? null;
   const selectedLinearityIntensityCol = activeLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(activeLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
       ? activeLinearity.intensity_col
@@ -2186,8 +2246,13 @@ export default function DiagnosticsPage() {
   }, [availableColorParams, colorParam]);
 
   useEffect(() => {
-    if (calibrationWorkspaceQuery.data?.config?.linearity) {
-      setSharedLinearityConfig(calibrationWorkspaceQuery.data.config.linearity);
+    setSharedLinearityConfig(null);
+  }, [sessionId]);
+
+  useEffect(() => {
+    const incomingLinearity = calibrationWorkspaceQuery.data?.config?.linearity;
+    if (incomingLinearity) {
+      setSharedLinearityConfig((current) => current ?? incomingLinearity);
     }
   }, [calibrationWorkspaceQuery.data]);
 
@@ -2203,7 +2268,17 @@ export default function DiagnosticsPage() {
     if (linearityConfigEquals(sharedLinearityConfig, calibrationWorkspaceQuery.data.config.linearity)) {
       return;
     }
-    saveSharedLinearityMutation.mutate(sharedLinearityConfig);
+    const pendingLinearity = sharedLinearityConfig;
+    linearitySaveTimerRef.current = setTimeout(() => {
+      linearitySaveTimerRef.current = null;
+      saveSharedLinearityMutation.mutate(pendingLinearity);
+    }, LINEARITY_SAVE_DEBOUNCE_MS);
+    return () => {
+      if (linearitySaveTimerRef.current) {
+        clearTimeout(linearitySaveTimerRef.current);
+        linearitySaveTimerRef.current = null;
+      }
+    };
   }, [
     calibrationWorkspaceQuery.data,
     saveSharedLinearityMutation,
@@ -2403,30 +2478,32 @@ export default function DiagnosticsPage() {
     term: LinearityCoefficientTerm,
     value: number,
   ) {
-    setSharedLinearityConfig((current) => {
-      if (!current) {
-        return current;
-      }
-      const next = { ...current };
-      if (term === "primary" && isotopeKey === "d13C") {
-        next.manual_d13_per_10v = value;
-      } else if (term === "primary") {
-        next.manual_d18_per_10v = value;
-      } else if (isotopeKey === "d13C") {
-        next.manual_d13_per_10v2 = value;
-      } else {
-        next.manual_d18_per_10v2 = value;
-      }
-      const activeOffsets = [
-        Number(next.manual_d13_per_10v ?? 0),
-        Number(next.manual_d18_per_10v ?? 0),
-        ...(next.quadratic || selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44
-          ? [Number(next.manual_d13_per_10v2 ?? 0), Number(next.manual_d18_per_10v2 ?? 0)]
-          : []),
-      ];
-      const hasOffset = activeOffsets.some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
-      next.manual_override_enabled = hasOffset;
-      return next;
+    startTransition(() => {
+      setSharedLinearityConfig((current) => {
+        if (!current) {
+          return current;
+        }
+        const next = { ...current };
+        if (term === "primary" && isotopeKey === "d13C") {
+          next.manual_d13_per_10v = value;
+        } else if (term === "primary") {
+          next.manual_d18_per_10v = value;
+        } else if (isotopeKey === "d13C") {
+          next.manual_d13_per_10v2 = value;
+        } else {
+          next.manual_d18_per_10v2 = value;
+        }
+        const activeOffsets = [
+          Number(next.manual_d13_per_10v ?? 0),
+          Number(next.manual_d18_per_10v ?? 0),
+          ...(next.quadratic || selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44
+            ? [Number(next.manual_d13_per_10v2 ?? 0), Number(next.manual_d18_per_10v2 ?? 0)]
+            : []),
+        ];
+        const hasOffset = activeOffsets.some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
+        next.manual_override_enabled = hasOffset;
+        return next;
+      });
     });
   }
 
@@ -2642,8 +2719,8 @@ export default function DiagnosticsPage() {
     return (
       <Card>
         <CardHeader>
-          <CardTitle>No Active Session</CardTitle>
-          <CardDescription>Import data first to unlock diagnostics.</CardDescription>
+          <CardTitle>{tr("No Active Session")}</CardTitle>
+          <CardDescription>{tr("Import data first to unlock diagnostics.")}</CardDescription>
         </CardHeader>
       </Card>
     );
@@ -2652,28 +2729,28 @@ export default function DiagnosticsPage() {
   return (
     <div className="space-y-5">
       <PageHeader
-        eyebrow="Measurement review"
-        title="Diagnostics"
-        description="Filter measurements, inspect cycle behavior, and investigate anomalies."
-        actions={<span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-[10px] text-slate-600">Rows {Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}</span>}
+        eyebrow={tr("Measurement review")}
+        title={tr("Diagnostics")}
+        description={tr("Filter measurements, inspect cycle behavior, and investigate anomalies.")}
+        actions={<span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-[10px] text-slate-600">{tr("Rows ")}{Number(summary.row_count_after ?? 0)} / {Number(summary.row_count_before ?? 0)}</span>}
       />
       <div className="workspace-grid">
         <aside className="control-column">
           <Card>
             <CardHeader>
-              <CardTitle>Diagnostics Controls</CardTitle>
-              <CardDescription>Configure filters and visual encoding for the diagnostics charts.</CardDescription>
+              <CardTitle>{tr("Diagnostics Controls")}</CardTitle>
+              <CardDescription>{tr("Configure filters and visual encoding for the diagnostics charts.")}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="space-y-3">
-                <div className="form-section-title">Parameter Selection</div>
+                <div className="form-section-title">{tr("Parameter Selection")}</div>
                 <div className="grid gap-3">
                   <div className="form-field min-w-0">
-                    <span className="form-label">Color parameter</span>
+                    <span className="form-label">{tr("Color parameter")}</span>
                     <select value={colorParam} onChange={(event) => setColorParam(event.target.value)} className="form-control">
                       {(availableColorParams.length ? availableColorParams : [colorParam]).map((option) => (
                         <option key={option} value={option}>
-                          {diagnosticsColorParameterLabel(option)}
+                          {tr(diagnosticsColorParameterLabel(option))}
                         </option>
                       ))}
                     </select>
@@ -2684,7 +2761,7 @@ export default function DiagnosticsPage() {
                     ) : null}
                   </div>
                   <label className="form-field max-w-28">
-                    <span className="form-label">Symbol size</span>
+                    <span className="form-label">{tr("Symbol size")}</span>
                     <input
                       type="number"
                       min={2}
@@ -2693,12 +2770,12 @@ export default function DiagnosticsPage() {
                       value={symbolSize}
                       onChange={(event) => setSymbolSize(clampNumber(Number(event.target.value) || 2, 2, 30))}
                       className="form-control"
-                      aria-label="Symbol size for chart dots"
+                      aria-label={tr("Symbol size for chart dots")}
                     />
                   </label>
                 </div>
                 <RangeSliderControl
-                  label="Color scale interval"
+                  label={tr("Color scale interval")}
                   bounds={[colorSliderBounds.min, colorSliderBounds.max]}
                   value={effectiveColorScaleRange}
                   step={sliderStep(colorSliderBounds)}
@@ -2706,18 +2783,18 @@ export default function DiagnosticsPage() {
                   onChange={(nextRange) => setColorScaleRange(nextRange)}
                 />
                 <MultiSelectDropdown
-                  label="Filter by Identifier 1"
+                  label={tr("Filter by Identifier 1")}
                   options={availableIdentifiers}
                   selected={identifierFilter}
                   onChange={setIdentifierFilter}
-                  placeholder="All identifiers"
+                  placeholder={tr("All identifiers")}
                 />
               </div>
 
               <div className="space-y-4">
-                <div className="form-section-title">Value Ranges</div>
+                <div className="form-section-title">{tr("Value Ranges")}</div>
                 <RangeSliderControl
-                  label="δ¹³C/¹²C Mean"
+                  label={tr("δ¹³C/¹²C Mean")}
                   bounds={d13Bounds}
                   value={d13Range}
                   step={0.001}
@@ -2725,7 +2802,7 @@ export default function DiagnosticsPage() {
                   onChange={(nextRange) => setD13Range(nextRange)}
                 />
                 <RangeSliderControl
-                  label="δ¹⁸O/¹⁶O Mean"
+                  label={tr("δ¹⁸O/¹⁶O Mean")}
                   bounds={d18Bounds}
                   value={d18Range}
                   step={0.001}
@@ -2738,13 +2815,13 @@ export default function DiagnosticsPage() {
           </Card>
           <Card>
             <CardHeader>
-              <CardTitle>Linearity (Shared with Processing and Calibration)</CardTitle>
-              <CardDescription>Edits here update the same shared calibration linearity configuration.</CardDescription>
+              <CardTitle>{tr("Linearity (Shared with Processing and Calibration)")}</CardTitle>
+              <CardDescription>{tr("Edits here update the same shared calibration linearity configuration.")}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
-                {saveSharedLinearityMutation.isPending ? <span className="text-xs text-stone-500">Saving...</span> : null}
+                <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">{tr("Basis: ")}{tr(selectedLinearityBasisLabel)}</span>
+                {saveSharedLinearityMutation.isPending ? <span className="text-xs text-stone-500">{tr("Saving...")}</span> : null}
               </div>
               {activeLinearity ? (
                 <>
@@ -2755,7 +2832,7 @@ export default function DiagnosticsPage() {
                       checked={activeLinearity.apply}
                       onChange={(event) => updateSharedLinearity("apply", event.target.checked)}
                     />
-                    <span>Enable linearity correction</span>
+                    <span>{tr("Enable linearity correction")}</span>
                   </label>
                   {!isTwoTermLinearityBasis ? (
                     <label className="flex items-start gap-2 text-sm text-stone-700">
@@ -2765,47 +2842,45 @@ export default function DiagnosticsPage() {
                         checked={Boolean(activeLinearity.quadratic)}
                         onChange={(event) => updateSharedLinearity("quadratic", event.target.checked)}
                       />
-                      <span>Use quadratic linearity relationship</span>
+                      <span>{tr("Use quadratic linearity relationship")}</span>
                     </label>
                   ) : null}
                   <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">Linearity basis</span>
+                    <span className="mb-1 block text-stone-700">{tr("Linearity basis")}</span>
                       <select
                         value={selectedLinearityIntensityCol}
                         onChange={(event) => updateSharedLinearityIntensityCol(event.target.value)}
-                        title={getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
+                        title={tr(getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))}
                         className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                       >
                         {LINEARITY_INTENSITY_OPTIONS.map((option) => (
-                          <option key={option} value={option} title={getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation)}>
-                            {getLinearityIntensityOptionLabel(option)}
+                          <option key={option} value={option} title={tr(getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation))}>
+                            {tr(getLinearityIntensityOptionLabel(option))}
                           </option>
                         ))}
                       </select>
                     </label>
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">Linearity cycle intensity</span>
+                      <span className="mb-1 block text-stone-700">{tr("Linearity cycle intensity")}</span>
                       <select
                         value={selectedLinearityCycleIntensityAggregation}
                         onChange={(event) => updateSharedLinearity("cycle_intensity_aggregation", event.target.value)}
-                        title="Choose which cycle intensity is used when building the selected linearity basis for each analysis."
+                        title={tr("Choose which cycle intensity is used when building the selected linearity basis for each analysis.")}
                         className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                       >
                         {LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.map((option) => (
                           <option key={option.value} value={option.value}>
-                            {option.label}
+                            {tr(option.label)}
                           </option>
                         ))}
                       </select>
                     </label>
-                    <Tooltip label={getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)} align="start">
-                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">
-                        Basis formula
-                      </span>
+                    <Tooltip label={tr(getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))} align="start">
+                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Basis formula")}</span>
                     </Tooltip>
                   {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">Max sample intensity</span>
+                      <span className="mb-1 block text-stone-700">{tr("Max sample intensity")}</span>
                       <input
                         type="number"
                         step="0.1"
@@ -2826,31 +2901,31 @@ export default function DiagnosticsPage() {
                   ) : null}
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="border-t border-stone-200 pt-2 text-sm">
-                      <div className="text-xs font-medium text-stone-500">δ¹³C fitted coefficients</div>
+                      <div className="text-xs font-medium text-stone-500">{tr("δ¹³C fitted coefficients")}</div>
                       <div className="mt-1 space-y-1 font-semibold text-stone-900">
                         <div>
-                          <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
-                          {formatFirstNonZeroDigits(d13FitSlope)}
+                          <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                          {tr(formatFirstNonZeroDigits(d13FitSlope))}
                         </div>
                         {showSecondaryCoefficientOffset ? (
                           <div>
-                            <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
-                            {formatFirstNonZeroDigits(d13FitQuad)}
+                            <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                            {tr(formatFirstNonZeroDigits(d13FitQuad))}
                           </div>
                         ) : null}
                       </div>
                     </div>
                     <div className="border-t border-stone-200 pt-2 text-sm">
-                      <div className="text-xs font-medium text-stone-500">δ¹⁸O fitted coefficients</div>
+                      <div className="text-xs font-medium text-stone-500">{tr("δ¹⁸O fitted coefficients")}</div>
                       <div className="mt-1 space-y-1 font-semibold text-stone-900">
                         <div>
-                          <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
-                          {formatFirstNonZeroDigits(d18FitSlope)}
+                          <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                          {tr(formatFirstNonZeroDigits(d18FitSlope))}
                         </div>
                         {showSecondaryCoefficientOffset ? (
                           <div>
-                            <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
-                            {formatFirstNonZeroDigits(d18FitQuad)}
+                            <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                            {tr(formatFirstNonZeroDigits(d18FitQuad))}
                           </div>
                         ) : null}
                       </div>
@@ -2859,7 +2934,7 @@ export default function DiagnosticsPage() {
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">
-                        {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
+                        {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
                       </span>
                       <DecimalInput
                         value={activeLinearity.manual_d13_per_10v ?? 0}
@@ -2869,7 +2944,7 @@ export default function DiagnosticsPage() {
                     </label>
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">
-                        {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
+                        {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
                       </span>
                       <DecimalInput
                         value={activeLinearity.manual_d18_per_10v ?? 0}
@@ -2882,7 +2957,7 @@ export default function DiagnosticsPage() {
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">
-                          {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                          {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
                         </span>
                         <DecimalInput
                           value={activeLinearity.manual_d13_per_10v2 ?? 0}
@@ -2892,7 +2967,7 @@ export default function DiagnosticsPage() {
                       </label>
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">
-                          {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                          {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
                         </span>
                         <DecimalInput
                           value={activeLinearity.manual_d18_per_10v2 ?? 0}
@@ -2902,15 +2977,14 @@ export default function DiagnosticsPage() {
                       </label>
                     </div>
                   ) : null}
-                  <div className="text-xs text-stone-500">
-                    Coefficient offset active: {coefficientOffsetEnabled ? "Yes" : "No"}
+                  <div className="text-xs text-stone-500">{tr("Coefficient offset active:")}{tr(coefficientOffsetEnabled ? "Yes" : "No")}
                   </div>
                   <div className="grid gap-4 sm:grid-cols-2">
                     <div className="space-y-3">
-                      <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
+                      <span className="text-sm font-medium text-stone-800">{tr("Line 1 offset")}</span>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">δ¹³C</span>
+                          <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
                           <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_1_offset_d13")}
                             onValueChange={(value) => updateSharedLinearity("line_1_offset_d13", value)}
@@ -2918,7 +2992,7 @@ export default function DiagnosticsPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">δ¹⁸O</span>
+                          <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
                           <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_1_offset_d18")}
                             onValueChange={(value) => updateSharedLinearity("line_1_offset_d18", value)}
@@ -2928,10 +3002,10 @@ export default function DiagnosticsPage() {
                       </div>
                     </div>
                     <div className="space-y-3">
-                      <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
+                      <span className="text-sm font-medium text-stone-800">{tr("Line 2 offset")}</span>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">δ¹³C</span>
+                          <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
                           <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_2_offset_d13")}
                             onValueChange={(value) => updateSharedLinearity("line_2_offset_d13", value)}
@@ -2939,7 +3013,7 @@ export default function DiagnosticsPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">δ¹⁸O</span>
+                          <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
                           <DecimalInput
                             value={readLinearityOffsetValue(activeLinearity, "line_2_offset_d18")}
                             onValueChange={(value) => updateSharedLinearity("line_2_offset_d18", value)}
@@ -2951,27 +3025,25 @@ export default function DiagnosticsPage() {
                   </div>
                   {activeLinearity.apply ? (
                     <div className="space-y-1 border-t border-stone-200 pt-2">
-                      <Tooltip label="Precision after applying the shared linearity correction to each selected standard." align="start">
-                        <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">Corrected precision</span>
+                      <Tooltip label={tr("Precision after applying the shared linearity correction to each selected standard.")} align="start">
+                        <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Corrected precision")}</span>
                       </Tooltip>
                       {standardPrecisionRows.length ? (
                         standardPrecisionRows.map((item: CalibrationPrecisionSummary) => (
                           <div key={item.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
-                            <span className="font-medium text-stone-800">{item.standard}</span>
-                            <span>δ¹³C: {formatPrecisionMetric(item.d13_linearity_corrected_precision)}</span>
-                            <span>δ¹⁸O: {formatPrecisionMetric(item.d18_linearity_corrected_precision)}</span>
+                            <span className="font-medium text-stone-800">{tr(item.standard)}</span>
+                            <span>{tr("δ¹³C: ")}{tr(formatPrecisionMetric(item.d13_linearity_corrected_precision))}</span>
+                            <span>{tr("δ¹⁸O: ")}{tr(formatPrecisionMetric(item.d18_linearity_corrected_precision))}</span>
                           </div>
                         ))
                       ) : (
-                        <div className="text-xs text-stone-500">No selected standards available for precision.</div>
+                        <div className="text-xs text-stone-500">{tr("No selected standards available for precision.")}</div>
                       )}
                     </div>
                   ) : null}
                 </>
               ) : (
-                <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">
-                  Load calibration workspace to edit shared linearity parameters.
-                </div>
+                <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">{tr("Load calibration workspace to edit shared linearity parameters.")}</div>
               )}
             </CardContent>
           </Card>
@@ -2980,7 +3052,7 @@ export default function DiagnosticsPage() {
         <ControlColumnToggle />
 
         <div className="space-y-6">
-          {error && <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">{String(error)}</div>}
+          {error && <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">{tr(String(error))}</div>}
           <Card>
             <CardContent className="space-y-3 p-3">
               {diagnosticGridGroups.length ? (
@@ -2991,10 +3063,10 @@ export default function DiagnosticsPage() {
                       <section key={group.name} aria-labelledby={headingId} className="space-y-3">
                         <div className="flex items-baseline justify-between gap-3 border-b border-stone-200 pb-2">
                           <h2 id={headingId} className="text-base font-semibold text-stone-900">
-                            {group.name}
+                            {tr(group.name)}
                           </h2>
                           <span className="text-xs tabular-nums text-stone-500">
-                            {group.items.length} {group.items.length === 1 ? "plot" : "plots"}
+                            {group.items.length} {tr(group.items.length === 1 ? "plot" : "plots")}
                           </span>
                         </div>
                         <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
@@ -3020,7 +3092,7 @@ export default function DiagnosticsPage() {
                   })}
                 </div>
               ) : (
-                <div className="p-3 text-sm text-stone-500">No diagnostic charts.</div>
+                <div className="p-3 text-sm text-stone-500">{tr("No diagnostic charts.")}</div>
               )}
             </CardContent>
           </Card>
@@ -3035,23 +3107,21 @@ export default function DiagnosticsPage() {
           >
             <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
               <div>
-                <div className="text-base font-semibold text-stone-900">Selection Editor</div>
-                <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
+                <div className="text-base font-semibold text-stone-900">{tr("Selection Editor")}</div>
+                <div className="text-sm text-stone-500">{tr("Sample editing and cycle diagnostics.")}</div>
               </div>
               <Button variant="outline" size="sm" onPointerDown={closeSelectionEditor} onClick={closeSelectionEditor}>
-                <X className="h-4 w-4" />
-                Close
-              </Button>
+                <X className="h-4 w-4" />{tr("Close")}</Button>
             </div>
 
             <div className="min-h-0 space-y-4 overflow-y-auto p-4">
               {selectionTarget ? (
                 <>
                   <div className="rounded-lg border border-stone-200 bg-stone-50/60 p-4">
-                    <div className="text-sm font-semibold text-stone-700">Active sample</div>
+                    <div className="text-sm font-semibold text-stone-700">{tr("Active sample")}</div>
                     <div className="mt-1 text-lg font-semibold text-stone-900">
-                      {(selectionTarget.identifier1 || "No Identifier 1").trim()} | {(selectionTarget.identifier2 || "No Identifier 2").trim()} |{" "}
-                      {selectionTarget.rowLabel}
+                      {tr((selectionTarget.identifier1 || "No Identifier 1").trim())} | {tr((selectionTarget.identifier2 || "No Identifier 2").trim())} |{tr(" ")}
+                      {tr(selectionTarget.rowLabel)}
                     </div>
                     {activeTargetInlineDisplayItems.length ? (
                       <div className="mt-4 grid gap-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
@@ -3070,10 +3140,10 @@ export default function DiagnosticsPage() {
                             )}
                           >
                             <div className="text-[11px] font-semibold uppercase tracking-normal text-stone-500">
-                              {formatScientificText(item.label)}
-                              {item.unit ? ` (${item.unit})` : ""}
+                              {tr(formatScientificText(item.label))}
+                              {tr(item.unit ? ` (${item.unit})` : "")}
                             </div>
-                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{formatScientificText(item.value)}</div>
+                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{tr(formatScientificText(item.value))}</div>
                           </div>
                         ))}
                       </div>
@@ -3096,35 +3166,35 @@ export default function DiagnosticsPage() {
                               : "min-w-[92px] rounded-lg px-4 py-2 text-sm font-semibold text-stone-700 hover:bg-stone-100"
                           }
                         >
-                          {formatScientificText(isotopeKey)}
+                          {tr(formatScientificText(isotopeKey))}
                         </button>
                       );
                     })}
                   </div>
 
                   <div className="space-y-2">
-                    <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">Details</div>
+                    <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">{tr("Details")}</div>
                     <div className="grid gap-3 md:grid-cols-2">
                       <div className="rounded-lg border border-stone-200 bg-stone-50/50 p-4">
-                        <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">{formatScientificText(selectionEditorTab)}</div>
+                        <div className="text-xs font-semibold uppercase tracking-normal text-stone-600">{tr(formatScientificText(selectionEditorTab))}</div>
                         <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
-                          <div className="text-stone-500">Current</div>
-                          <div className="text-right font-medium text-stone-900">{formatDeltaValue(activeSelectionCurrentValue)}</div>
-                          <div className="text-stone-500">Cycle mean</div>
-                          <div className="text-right font-medium text-stone-900">{formatDeltaValue(activeSelectionCycleMeanValue)}</div>
-                          <div className="text-stone-500">First valid cycle</div>
-                          <div className="text-right font-medium text-stone-900">{formatDeltaValue(activeSelectionFirstValidCycleValue)}</div>
-                          <div className="text-stone-500">Status</div>
-                          <div className="text-right font-medium text-stone-900">{activeSelectionStatus}</div>
+                          <div className="text-stone-500">{tr("Current")}</div>
+                          <div className="text-right font-medium text-stone-900">{tr(formatDeltaValue(activeSelectionCurrentValue))}</div>
+                          <div className="text-stone-500">{tr("Cycle mean")}</div>
+                          <div className="text-right font-medium text-stone-900">{tr(formatDeltaValue(activeSelectionCycleMeanValue))}</div>
+                          <div className="text-stone-500">{tr("First valid cycle")}</div>
+                          <div className="text-right font-medium text-stone-900">{tr(formatDeltaValue(activeSelectionFirstValidCycleValue))}</div>
+                          <div className="text-stone-500">{tr("Status")}</div>
+                          <div className="text-right font-medium text-stone-900">{tr(activeSelectionStatus)}</div>
                         </div>
-                        <div className="mt-3 text-xs text-stone-500">Method: {activeSelectionMethod}</div>
+                        <div className="mt-3 text-xs text-stone-500">{tr("Method: ")}{tr(activeSelectionMethod)}</div>
                       </div>
                     </div>
                   </div>
 
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">Set value ({formatScientificText(selectionEditorTab)})</span>
+                      <span className="mb-1 block text-stone-700">{tr("Set value (")}{tr(formatScientificText(selectionEditorTab))})</span>
                       <input
                         type="number"
                         step="0.001"
@@ -3137,7 +3207,7 @@ export default function DiagnosticsPage() {
                       />
                     </label>
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">Offset ({formatScientificText(selectionEditorTab)})</span>
+                      <span className="mb-1 block text-stone-700">{tr("Offset (")}{tr(formatScientificText(selectionEditorTab))})</span>
                       <input
                         type="number"
                         step="0.001"
@@ -3151,24 +3221,15 @@ export default function DiagnosticsPage() {
                   </div>
 
                   <div className="flex flex-wrap gap-2">
-                    <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>
-                      Set {formatScientificText(selectionEditorTab)}
+                    <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>{tr("Set")}{tr(formatScientificText(selectionEditorTab))}
                     </Button>
-                    <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>
-                      Offset {formatScientificText(selectionEditorTab)}
+                    <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>{tr("Offset")}{tr(formatScientificText(selectionEditorTab))}
                     </Button>
-                    <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
-                      Interpolate {formatScientificText(selectionEditorTab)}
+                    <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>{tr("Interpolate")}{tr(formatScientificText(selectionEditorTab))}
                     </Button>
-                    <Button variant="outline" onClick={resetSelected} disabled={busy}>
-                      Reset selected
-                    </Button>
-                    <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
-                      Force outlier
-                    </Button>
-                    <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
-                      Force keep
-                    </Button>
+                    <Button variant="outline" onClick={resetSelected} disabled={busy}>{tr("Reset selected")}</Button>
+                    <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>{tr("Force outlier")}</Button>
+                    <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>{tr("Force keep")}</Button>
                     <Button
                       variant="outline"
                       onClick={() => {
@@ -3176,13 +3237,11 @@ export default function DiagnosticsPage() {
                         setSelectionEditorOpen(false);
                       }}
                       disabled={busy}
-                    >
-                      Clear
-                    </Button>
+                    >{tr("Clear")}</Button>
                   </div>
 
                   <DiagnosticsPanel
-                    title={`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`}
+                    title={tr(`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`)}
                     diagnostics={activeSelectionDiagnostics}
                     loading={activeSelectionLoading}
                     onPickDeltaValue={(value, stdev = null) => {
@@ -3192,9 +3251,7 @@ export default function DiagnosticsPage() {
                   />
                 </>
               ) : (
-                <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                  No active selection.
-                </div>
+                <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("No active selection.")}</div>
               )}
             </div>
           </div>
@@ -3218,15 +3275,13 @@ export default function DiagnosticsPage() {
               <div className="mb-2 flex items-start justify-between gap-4 border-b border-stone-200 pb-2">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold text-stone-900">
-                    {hoverPreview.yLabel} vs {hoverPreview.xLabel}
+                    {tr(hoverPreview.yLabel)}{tr(" vs ")}{tr(hoverPreview.xLabel)}
                   </p>
-                  <p className="mt-0.5 text-[11px] text-stone-500">
-                    Point-level relationship for complete measurement pairs
-                  </p>
+                  <p className="mt-0.5 text-[11px] text-stone-500">{tr("Point-level relationship for complete measurement pairs")}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-3 font-mono text-[11px] tabular-nums text-stone-700">
-                  <span>rho {hoverPreview.rho == null ? "N/A" : hoverPreview.rho.toFixed(2)}</span>
-                  <span>n {hoverPreview.pairCount}</span>
+                  <span>{tr("rho ")}{tr(hoverPreview.rho == null ? "N/A" : hoverPreview.rho.toFixed(2))}</span>
+                  <span>{tr("n ")}{hoverPreview.pairCount}</span>
                 </div>
               </div>
               <div className="h-[330px] min-w-0 overflow-hidden">
@@ -3237,21 +3292,24 @@ export default function DiagnosticsPage() {
                   uiRevision={`correlation-preview:${hoverPreview.xLabel}:${hoverPreview.yLabel}`}
                 />
               </div>
-              <p className="mt-1 border-t border-stone-100 pt-2 text-[11px] text-stone-500">
-                Colored by {hoverPreview.colorLabel}. Hover a point for sample details.
-              </p>
+              <p className="mt-1 border-t border-stone-100 pt-2 text-[11px] text-stone-500">{tr("Colored by")}{tr(hoverPreview.colorLabel)}{tr(". Hover a point for sample details.")}</p>
             </div>
           ) : (
             <>
               <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
                 <span className="font-medium text-stone-800">
-                  {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
+                  {tr(hoverPreview.target.identifier1 || "Sample")} | {tr(hoverPreview.target.identifier2 || "N/A")}
                 </span>
                 <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
-                  {hoverPreview.target.isotopeKey}
+                  {tr(hoverPreview.target.isotopeKey)}
                 </span>
               </div>
-              <div className="grid min-h-0 gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:items-stretch">
+              <div className={cn(
+                "grid min-h-0 gap-3 md:items-stretch",
+                hoverPreviewPosition.tableSide === "left"
+                  ? "md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)]"
+                  : "md:grid-cols-[minmax(0,1fr)_minmax(240px,320px)]",
+              )}>
                 <div
                   className={cn(
                     "h-[390px] min-w-0",
@@ -3267,13 +3325,11 @@ export default function DiagnosticsPage() {
                   )}
                 >
                   {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
-                    <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
+                    <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Loading hover preview...")}</div>
                   ) : hasHoverDiagnosticsFigureData ? (
                     <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
                   ) : (
-                    <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                      Cycle-intensity preview unavailable for this point.
-                    </div>
+                    <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Cycle-intensity preview unavailable for this point.")}</div>
                   )}
                 </div>
               </div>

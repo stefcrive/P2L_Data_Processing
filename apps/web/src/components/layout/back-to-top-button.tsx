@@ -1,9 +1,11 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { ArrowUp } from "lucide-react";
 import { useEffect, useState } from "react";
 
 export function BackToTopButton() {
+  const tr = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
 
   useEffect(() => {
@@ -19,7 +21,7 @@ export function BackToTopButton() {
   return (
     <button
       type="button"
-      aria-label="Back to top"
+      aria-label={tr("Back to top")}
       onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
       className={`fixed bottom-4 right-4 z-50 flex h-9 w-9 items-center justify-center rounded-lg border border-stone-300 bg-white/90 text-sm text-stone-700 shadow transition hover:bg-stone-100 ${
         isVisible ? "opacity-100" : "pointer-events-none opacity-0"

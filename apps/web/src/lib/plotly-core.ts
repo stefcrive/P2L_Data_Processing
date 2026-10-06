@@ -5,12 +5,13 @@ import calendars from "plotly.js/lib/calendars";
 import heatmap from "plotly.js/lib/heatmap";
 import scatter from "plotly.js/lib/scatter";
 import scatter3d from "plotly.js/lib/scatter3d";
+import portuguese from "plotly.js/lib/locales/pt-br";
 
 const registeredPlotly = Plotly as typeof Plotly & { __irmsRegistrationVersion?: string };
-const registrationVersion = "scatter-scatter3d-bar-box-heatmap-calendars-v1";
+const registrationVersion = "scatter-scatter3d-bar-box-heatmap-calendars-pt-br-v2";
 
 if (registeredPlotly.__irmsRegistrationVersion !== registrationVersion) {
-  registeredPlotly.register([scatter, scatter3d, bar, box, heatmap, calendars]);
+  registeredPlotly.register([scatter, scatter3d, bar, box, heatmap, calendars, portuguese]);
   registeredPlotly.__irmsRegistrationVersion = registrationVersion;
 }
 

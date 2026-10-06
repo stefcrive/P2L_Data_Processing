@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useLanguage } from "@/components/layout/language-provider";
 
 import {
   ChatMessage,
@@ -22,6 +23,7 @@ async function parseError(response: Response): Promise<string> {
 }
 
 export function useScientificChat(sessionId: string | null) {
+  const { language } = useLanguage();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [attachments, setAttachments] = useState<File[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -58,18 +60,19 @@ export function useScientificChat(sessionId: string | null) {
     abortRef.current = controller;
     try {
       const history = messages.slice(-12).map((message) => ({ role: message.role, content: message.content.slice(0, 4_000) }));
+      const requestMessage = `${content}\n\n${language === "pt" ? "Responda em português brasileiro." : "Respond in English."}`;
       let body: BodyInit;
       let headers: HeadersInit | undefined;
       if (attachments.length) {
         const form = new FormData();
-        form.append("message", content);
+        form.append("message", requestMessage);
         form.append("history", JSON.stringify(history));
         if (sessionId) form.append("current_session_id", sessionId);
         attachments.forEach((file) => form.append("files", file, file.name));
         body = form;
       } else {
         headers = { "Content-Type": "application/json" };
-        body = JSON.stringify({ message: content, history, current_session_id: sessionId });
+        body = JSON.stringify({ message: requestMessage, history, current_session_id: sessionId });
       }
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -92,7 +95,7 @@ export function useScientificChat(sessionId: string | null) {
       abortRef.current = null;
       setIsLoading(false);
     }
-  }, [attachments, isLoading, messages, sessionId]);
+  }, [attachments, isLoading, language, messages, sessionId]);
 
   const addAttachments = useCallback((selected: File[]) => {
     const excelFiles = selected.filter((file) => /\.(xls|xlsx)$/i.test(file.name));

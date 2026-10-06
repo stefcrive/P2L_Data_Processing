@@ -209,7 +209,10 @@ def _build_standard_point_customdata(df: pd.DataFrame, isotope_key: str) -> np.n
     if customdata is None:
         return None
     customdata = customdata.copy()
-    customdata[:, 0] = ""
+    # Metrology consultation needs immutable row identity for uncertainty overlays.
+    # Scientific edits to these projection sessions are blocked by the API.
+    if "Metrology consultation" not in df or not df["Metrology consultation"].fillna(False).all():
+        customdata[:, 0] = ""
     return customdata
 
 

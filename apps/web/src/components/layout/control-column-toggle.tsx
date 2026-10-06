@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { useEffect, useState } from "react";
 
@@ -11,6 +12,7 @@ function applyCollapsedState(collapsed: boolean) {
 }
 
 export function ControlColumnToggle() {
+  const tr = useTranslation();
   const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
@@ -36,9 +38,9 @@ export function ControlColumnToggle() {
         type="button"
         className="control-column-toggle__button"
         onClick={toggleControls}
-        aria-label={label}
+        aria-label={tr(label)}
         aria-pressed={collapsed}
-        title={label}
+        title={tr(label)}
       >
         {collapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
       </button>

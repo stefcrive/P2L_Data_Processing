@@ -1,5 +1,8 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
+import { useMetrologyConsultation } from "@/components/metrology/consultation-context";
+import { useLanguage } from "@/components/layout/language-provider";
 import dynamic from "next/dynamic";
 import { ChevronDown, ChevronUp, GripHorizontal } from "lucide-react";
 import {
@@ -74,6 +77,7 @@ function titleText(value: unknown): string {
 
 type PlotlyGraphDiv = HTMLDivElement & {
   _fullLayout?: {
+    meta?: { equalStandardScale?: boolean };
     yaxis?: { dtick?: unknown; range?: unknown };
     yaxis2?: { dtick?: unknown; overlaying?: unknown; range?: unknown; tickmode?: unknown; title?: unknown };
   };
@@ -109,7 +113,7 @@ function syncStandardAxisScale(
     !primaryAxis ||
     !standardAxis ||
     standardAxis.overlaying !== "y" ||
-    !titleText(standardAxis.title).startsWith("Standard ")
+    !(graphDiv._fullLayout?.meta?.equalStandardScale || titleText(standardAxis.title).startsWith("Standard "))
   ) {
     return;
   }
@@ -466,6 +470,9 @@ export function PlotlyChart({
   onPointHover,
   onHoverEnd,
 }: PlotlyChartProps) {
+  const tr = useTranslation();
+  const metrologyConsultation = useMetrologyConsultation();
+  const { language } = useLanguage();
   const [renderRevision, setRenderRevision] = useState(0);
   const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
   const [isLegendExpanded, setIsLegendExpanded] = useState(true);
@@ -481,7 +488,7 @@ export function PlotlyChart({
   const consumedPointerInteractionTokenRef = useRef(0);
   const isSynchronizingStandardAxisRef = useRef(false);
   const shouldDeferRender = deferRenderMs > 0;
-  const normalizedMinHeight = Math.max(200, minHeight);
+  const normalizedMinHeight = Math.max(200, metrologyConsultation ? Math.min(240,minHeight) : minHeight);
   const normalizedMaxHeight = Math.max(normalizedMinHeight, maxHeight);
   const hasCollapsibleLegend = useMemo(() => {
     if (!collapsibleLegend || !figure) {
@@ -509,6 +516,21 @@ export function PlotlyChart({
     const figureData = Array.isArray(figure.data) ? figure.data : [];
     const layout = typeof figure.layout === "object" && figure.layout ? { ...(figure.layout as Record<string, unknown>) } : {};
     const compacted = compactFigureColorbars(figureData, layout);
+    // Record the axis role before translating any display text (e.g. Standard → Padrão).
+    const secondaryAxis = layout.yaxis2 as { title?: unknown } | undefined;
+    if (secondaryAxis && titleText(secondaryAxis.title).startsWith("Standard ")) {
+      layout.meta = { ...(typeof layout.meta === "object" && layout.meta ? layout.meta : {}), equalStandardScale: true };
+    }
+    if (metrologyConsultation) {
+      layout.height = 270;
+      layout.font = { ...(layout.font as object ?? {}), family: "Segoe UI, sans-serif", size: 11, color: "#475569" };
+      layout.paper_bgcolor = "transparent";
+      layout.plot_bgcolor = "transparent";
+      layout.margin = { ...(layout.margin as object ?? {}), l: 54, r: secondaryAxis ? 56 : 24, t: 48, b: 45 };
+      for (const key of Object.keys(layout).filter(k => /^[xy]axis\d*$/.test(k))) {
+        layout[key] = { ...(layout[key] as object), gridcolor: "#e8edf1", automargin: true };
+      }
+    }
     applyD18AxisInversion(layout);
     const hoverLabel = layout.hoverlabel && typeof layout.hoverlabel === "object" ? { ...(layout.hoverlabel as Record<string, unknown>) } : {};
     hoverLabel.namelength = -1;
@@ -538,13 +560,13 @@ export function PlotlyChart({
     }
     applyPersistedViewport(layout, uiRevision ? persistedViewports.get(uiRevision) : undefined);
     return {
-      data: formatPlotlyDisplayText(compacted.data) as never[],
-      layout: formatPlotlyDisplayText(layout) as never,
+      data: formatPlotlyDisplayText(compacted.data, text => tr(metrologyConsultation ? text.replace(/VSMOW/g, "VPDB") : text)) as never[],
+      layout: formatPlotlyDisplayText(layout, text => tr(metrologyConsultation ? text.replace(/VSMOW/g, "VPDB") : text)) as never,
       useResizeHandler: true,
       fillContainerHeight: shouldFillContainer,
       hasExplicitHeight,
     };
-  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, uiRevision]);
+  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, tr, uiRevision, metrologyConsultation]);
 
   useEffect(() => {
     if (!verticallyResizable || chartHeight !== null) {
@@ -555,7 +577,7 @@ export function PlotlyChart({
       return;
     }
     const measuredHeight = Math.round(container.getBoundingClientRect().height);
-    const initialHeight = Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, measuredHeight));
+    const initialHeight = Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, metrologyConsultation ? 280 : measuredHeight));
     initialHeightRef.current = initialHeight;
     setChartHeight(initialHeight);
   }, [chartHeight, isDeferredReady, normalizedMaxHeight, normalizedMinHeight, preparedFigure, verticallyResizable]);
@@ -733,7 +755,7 @@ export function PlotlyChart({
   }
 
   if (!preparedFigure) {
-    return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">No chart data yet.</div>;
+    return <div className="rounded-lg border border-dashed border-stone-300 p-6 text-sm text-stone-500">{tr("No chart data yet.")}</div>;
   }
   if (!isDeferredReady) {
     return (
@@ -743,9 +765,7 @@ export function PlotlyChart({
           className,
         )}
         aria-busy="true"
-      >
-        Preparing chart...
-      </div>
+      >{tr("Preparing chart...")}</div>
     );
   }
   const shouldUseContainerHeight = preparedFigure.fillContainerHeight;
@@ -791,9 +811,7 @@ export function PlotlyChart({
             aria-expanded={isLegendVisible}
             onClick={() => setIsLegendExpanded((current) => !current)}
           >
-            <ChevronUp className="h-3.5 w-3.5" />
-            Hide legend
-          </button>
+            <ChevronUp className="h-3.5 w-3.5" />{tr("Hide legend")}</button>
         </div>
       ) : null}
       <div
@@ -808,14 +826,12 @@ export function PlotlyChart({
             aria-expanded={false}
             onClick={() => setIsLegendExpanded(true)}
           >
-            <ChevronDown className="h-3.5 w-3.5" />
-            Show legend
-          </button>
+            <ChevronDown className="h-3.5 w-3.5" />{tr("Show legend")}</button>
         ) : null}
         <Plot
           data={preparedFigure.data}
           layout={preparedFigure.layout}
-          config={{ responsive: true }}
+          config={{ responsive: true, locale: language === "pt" ? "pt-BR" : "en-US" }}
           revision={renderRevision}
           onInitialized={refreshAfterInitialize}
           onUpdate={(_figure: unknown, graphDiv: PlotlyGraphDiv) => {
@@ -827,7 +843,9 @@ export function PlotlyChart({
           onRelayout={persistViewportUpdate}
           useResizeHandler={preparedFigure.useResizeHandler}
           className={cn("w-full max-w-full", shouldUseContainerHeight ? "h-full" : "")}
-          style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%" }}
+          // Plotly resets its inner SVG to 100% while resizing. Keep a concrete
+          // height on fixed-size charts so an auto-height parent cannot collapse.
+          style={shouldUseContainerHeight ? { width: "100%", height: "100%" } : { width: "100%", height: (preparedFigure.layout as { height?: number }).height ?? normalizedMinHeight }}
           onClick={(event: { points?: PlotlyPoint[] }) => {
             if (!onPointClick || !consumePointerInteraction()) {
               return;
@@ -846,13 +864,13 @@ export function PlotlyChart({
       {verticallyResizable ? (
         <div
           role="separator"
-          aria-label="Resize chart height"
+          aria-label={tr("Resize chart height")}
           aria-orientation="horizontal"
           aria-valuemin={normalizedMinHeight}
           aria-valuemax={normalizedMaxHeight}
           aria-valuenow={chartHeight ?? undefined}
           tabIndex={0}
-          title="Drag to resize chart height. Use the up and down arrow keys for precise changes."
+          title={tr("Drag to resize chart height. Use the up and down arrow keys for precise changes.")}
           className={cn(
             "group flex h-3 shrink-0 touch-none cursor-ns-resize items-center justify-center border-t border-slate-200 bg-slate-50 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-400",
             isResizing && "bg-slate-100 text-blue-700",

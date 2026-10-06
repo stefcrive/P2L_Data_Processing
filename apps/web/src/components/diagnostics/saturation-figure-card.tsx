@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { useMemo, useState } from "react";
 import { AlertTriangle, Info } from "lucide-react";
 
@@ -299,6 +300,7 @@ export function SaturationSharedColorbar({
   colorAxis: SaturationAxisKey;
   orientation?: "horizontal" | "vertical";
 }) {
+  const tr = useTranslation();
   const range = useMemo(() => {
     const values = figures.flatMap((figure) => valuesForFigureAxis(figure, colorAxis)).filter((value) => Number.isFinite(value));
     if (!values.length) {
@@ -310,11 +312,11 @@ export function SaturationSharedColorbar({
   if (orientation === "vertical") {
     return (
       <div className="flex min-h-[260px] flex-col items-center justify-center gap-2 text-xs">
-        <div className="text-center text-stone-600">{axisLabel(colorAxis)} scale</div>
+        <div className="text-center text-stone-600">{tr(axisLabel(colorAxis))}{tr(" scale")}</div>
         <div className="flex items-center gap-2">
           <div className="flex h-44 w-2 flex-col justify-between text-[10px] tabular-nums text-stone-500">
-            <span>{range ? formatRangeValue(range.max) : "N/A"}</span>
-            <span>{range ? formatRangeValue(range.min) : "N/A"}</span>
+            <span>{tr(range ? formatRangeValue(range.max) : "N/A")}</span>
+            <span>{tr(range ? formatRangeValue(range.min) : "N/A")}</span>
           </div>
           <div className="h-44 w-2 rounded-full border border-stone-300 bg-[linear-gradient(0deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]" />
         </div>
@@ -323,27 +325,28 @@ export function SaturationSharedColorbar({
   }
   return (
     <div className="w-full max-w-[280px] min-w-[180px] text-xs">
-      <div className="mb-1 text-stone-600">{formatScientificText(axisLabel(colorAxis))} scale</div>
+      <div className="mb-1 text-stone-600">{tr(formatScientificText(axisLabel(colorAxis)))}{tr(" scale")}</div>
       <div className="h-2 rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]" />
       <div className="mt-0.5 flex justify-between gap-3 text-[10px] tabular-nums text-stone-500">
-        <span>{range ? formatRangeValue(range.min) : "N/A"}</span>
-        <span>{range ? formatRangeValue(range.max) : "N/A"}</span>
+        <span>{tr(range ? formatRangeValue(range.min) : "N/A")}</span>
+        <span>{tr(range ? formatRangeValue(range.max) : "N/A")}</span>
       </div>
     </div>
   );
 }
 
 export function SaturationAxisHelpTooltip({ label }: { label: string }) {
+  const tr = useTranslation();
   return (
     <span className="mb-1 flex items-center gap-1.5 text-stone-700">
-      <span>{formatScientificText(label)}</span>
-      <Tooltip label={SATURATION_AXIS_HELP_TEXT} align="start" contentClassName="w-96">
+      <span>{tr(formatScientificText(label))}</span>
+      <Tooltip label={tr(SATURATION_AXIS_HELP_TEXT)} align="start" contentClassName="w-96">
         <span
           tabIndex={0}
           className="inline-flex h-5 w-5 items-center justify-center rounded-md text-stone-500 hover:bg-stone-100 hover:text-stone-700 focus:outline-none focus:ring-2 focus:ring-stone-300"
         >
           <Info className="h-3.5 w-3.5" />
-          <span className="sr-only">{formatScientificText(label)} parameter help</span>
+          <span className="sr-only">{tr(formatScientificText(label))}{tr(" parameter help")}</span>
         </span>
       </Tooltip>
     </span>
@@ -362,6 +365,7 @@ export function SaturationFigureCard({
   verticallyResizable = false,
   deferRenderMs = 0,
 }: SaturationFigureCardProps) {
+  const tr = useTranslation();
   const [swapped, setSwapped] = useState(false);
   const displayedFigure = useMemo(() => prepareFigure(figure, colorAxis, yAxis, swapped), [colorAxis, figure, swapped, yAxis]);
   const swappedMessage = `X is set to ${axisLabel(colorAxis)}; fit and prediction traces are hidden in this view.`;
@@ -374,9 +378,9 @@ export function SaturationFigureCard({
           variant="outline"
           size="sm"
           onClick={() => setSwapped((current) => !current)}
-          title="Swap the valid-cycle dots' x axis with the variable currently used for color."
+          title={tr("Swap the valid-cycle dots' x axis with the variable currently used for color.")}
         >
-          {swapped ? "Original axes" : "Swap x/color"}
+          {tr(swapped ? "Original axes" : "Swap x/color")}
         </Button>
       </div>
       <PlotlyChart
@@ -391,19 +395,19 @@ export function SaturationFigureCard({
       />
       <div className="flex min-w-0 items-center gap-2 px-1 pt-2">
         {description ? (
-          <Tooltip label={description} align="start" contentClassName="w-96">
+          <Tooltip label={tr(description)} align="start" contentClassName="w-96">
             <button type="button" className="truncate text-left text-sm font-medium text-stone-700 underline decoration-stone-300 underline-offset-4">
-              {formatScientificText(title)}
+              {tr(formatScientificText(title))}
             </button>
           </Tooltip>
         ) : (
-          <div className="truncate text-sm font-medium text-stone-700">{formatScientificText(title)}</div>
+          <div className="truncate text-sm font-medium text-stone-700">{tr(formatScientificText(title))}</div>
         )}
         {swapped ? (
-          <Tooltip label={swappedMessage} align="end" contentClassName="w-80">
+          <Tooltip label={tr(swappedMessage)} align="end" contentClassName="w-80">
             <button type="button" className="inline-flex h-7 w-7 items-center justify-center rounded-md text-amber-700 hover:bg-amber-50">
               <AlertTriangle className="h-4 w-4" />
-              <span className="sr-only">{swappedMessage}</span>
+              <span className="sr-only">{tr(swappedMessage)}</span>
             </button>
           </Tooltip>
         ) : null}

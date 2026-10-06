@@ -1,4 +1,29 @@
-# IRMS Output Analyzer
+# IRMS Metrology Station
+
+Start `start_metrology_app.bat` to open the metrological overview, normally on port
+3200. `start_metrology_demo.bat` opens the populated synthetic demonstration. Each
+has its own local database and file archive, under `.data/metrology` or
+`.data/metrology-demo`.
+
+`start_metrology_operational.bat` opens the laboratory simulation populated with
+raw U1539, MD28-3678 and BTS coral exports, five mock qualifications and historical
+QC. It uses `.data/metrology-operational`. Processed reports are excluded. See
+[the operational dataset and correction verification](docs/metrology-operational.md).
+
+The overview shows qualification status, the validated method, acceptance criteria
+and QC history. Results Station organizes work by client, project and session.
+Create a session, define its method and Qtegra processing provenance, then import
+the workbook. Reopen it to inspect its applied qualification, dual-anchor curves,
+QC, uncertainty and stored exports. The original IRMS diagnostics, calibration and
+processing controls are reused inside each session.
+
+See [the implementation blueprint](docs/metrology-blueprint.md) and
+[the metrology operator workflow](docs/metrology-workflow.md) for qualification,
+reference-material setup, QC, uncertainty, release controls and current scope.
+
+The shared EN/PT selector switches the station between English
+and Brazilian Portuguese. See [language support](docs/localization.md) for behavior
+and translation maintenance.
 
 The repository now contains two parallel application surfaces:
 

@@ -1,9 +1,13 @@
+"use client";
+
+import { useTranslation } from "@/components/layout/language-provider";
 import * as React from "react";
 
 import { cn } from "@/lib/utils";
 import { formatScientificText } from "@/lib/scientific-notation";
 
 export function Badge({ className, children, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  const tr = useTranslation();
   return (
     <div
       className={cn(
@@ -12,7 +16,7 @@ export function Badge({ className, children, ...props }: React.HTMLAttributes<HT
       )}
       {...props}
     >
-      {typeof children === "string" ? formatScientificText(children) : children}
+      {tr(typeof children === "string" ? formatScientificText(children) : children)}
     </div>
   );
 }

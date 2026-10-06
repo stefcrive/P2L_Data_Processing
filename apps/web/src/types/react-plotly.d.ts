@@ -48,3 +48,8 @@ declare module "plotly.js/lib/scatter3d" {
   const scatter3d: unknown;
   export default scatter3d;
 }
+
+declare module "plotly.js/lib/locales/pt-br" {
+  const locale: unknown;
+  export default locale;
+}

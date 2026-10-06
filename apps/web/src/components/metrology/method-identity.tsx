@@ -1,0 +1,21 @@
+"use client";
+
+import { Building2, FlaskConical, Thermometer } from "lucide-react";
+import { useTranslation } from "@/components/layout/language-provider";
+import type { MethodConfig } from "@/lib/metrology";
+import { Field, Num } from "./shared";
+
+export function MethodIdentity({config:c,patch,locked}:{config:MethodConfig;patch:<K extends keyof MethodConfig>(key:K,value:MethodConfig[K])=>void;locked:boolean}) {
+  const tr=useTranslation();
+  const groups=[
+    {title:"Method identity",icon:Building2,items:[["Method name",c.name],["Laboratory",c.laboratory],["Intended use",c.intended_use]]},
+    {title:"Instrument setup",icon:FlaskConical,items:[["Instrument",c.instrument],["Configuration",c.configuration],["TuneBook / Qtegra",c.tunebook],["Acquisition timezone",c.acquisition_timezone]]},
+    {title:"Preparation and acquisition",icon:Thermometer,items:[["Reaction temperature",c.reaction_temperature_c==null?"":`${c.reaction_temperature_c} °C`],["Acid and preparation",c.preparation],["Acquisition",c.acquisition]]},
+  ];
+  if(locked)return <div className="station-method-facts">{groups.map(({title,icon:Icon,items})=><section key={title}><h3><Icon size={17}/>{tr(title)}</h3><dl>{items.map(([label,value])=><div key={label}><dt>{tr(label)}</dt><dd>{value||tr("Not recorded")}</dd></div>)}</dl></section>)}</div>;
+  return <div className="station-method-editor">
+    <section className="station-form-section"><div className="station-form-heading"><Building2 size={19}/><div><h3>{tr("Method identity")}</h3><p>{tr("Give the session a recognizable analytical method and purpose.")}</p></div></div><div className="metro-form-grid"><Field label={tr("Method name")}><input value={c.name} onChange={e=>patch("name",e.target.value)} required placeholder={tr("Carbonate δ¹³C / δ¹⁸O · VPDB")}/></Field><Field label={tr("Laboratory")}><input value={c.laboratory} onChange={e=>patch("laboratory",e.target.value)} placeholder={tr("Laboratory or analytical facility")}/></Field><Field label={tr("Intended use")} wide><input value={c.intended_use} onChange={e=>patch("intended_use",e.target.value)} placeholder={tr("Sample type and purpose of the measurement")}/></Field></div></section>
+    <section className="station-form-section"><div className="station-form-heading"><FlaskConical size={19}/><div><h3>{tr("Instrument setup")}</h3><p>{tr("Record the configuration used for this qualification and its analytical sessions.")}</p></div></div><div className="metro-form-grid"><Field label={tr("Instrument")}><input list="station-instruments" value={c.instrument} onChange={e=>patch("instrument",e.target.value)}/><datalist id="station-instruments"><option>Kiel IV + MAT253 Plus + Dual Inlet</option></datalist></Field><Field label={tr("Configuration reference")}><input value={c.configuration} onChange={e=>patch("configuration",e.target.value)} placeholder={tr("Configuration name or instrument record")}/></Field><Field label={tr("TuneBook / Qtegra setup")}><input value={c.tunebook} onChange={e=>patch("tunebook",e.target.value)} placeholder={tr("TuneBook name and revision")}/></Field><Field label={tr("Acquisition timezone")}><input list="station-timezones" value={c.acquisition_timezone??"America/Sao_Paulo"} onChange={e=>patch("acquisition_timezone",e.target.value)}/><datalist id="station-timezones"><option>America/Sao_Paulo</option><option>UTC</option></datalist></Field></div></section>
+    <section className="station-form-section"><div className="station-form-heading"><Thermometer size={19}/><div><h3>{tr("Preparation and acquisition")}</h3><p>{tr("Keep preparation conditions alongside the instrument settings they qualify.")}</p></div></div><div className="station-preparation-grid"><Field label={tr("Reaction temperature")}><Num unit="°C" value={c.reaction_temperature_c} onChange={n=>patch("reaction_temperature_c",n)}/></Field><Field label={tr("Acid and preparation conditions")}><textarea rows={3} value={c.preparation} onChange={e=>patch("preparation",e.target.value)} placeholder={tr("Acid, digestion protocol and preparation conditions")}/></Field><Field label={tr("Acquisition configuration")}><textarea rows={3} value={c.acquisition} onChange={e=>patch("acquisition",e.target.value)} placeholder={tr("Cycles, integration time and acquisition settings")}/></Field></div></section>
+  </div>;
+}

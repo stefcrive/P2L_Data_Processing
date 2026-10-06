@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { ChevronDown } from "lucide-react";
 import { useMemo } from "react";
 
@@ -22,6 +23,7 @@ export function MultiSelectDropdown({
   placeholder = "Select values",
   maxHeightClassName = "max-h-56",
 }: MultiSelectDropdownProps) {
+  const tr = useTranslation();
   const selectedSet = useMemo(() => new Set(selected), [selected]);
   const selectedCount = selected.length;
   const summaryLabel = selectedCount ? `${selectedCount} selected` : placeholder;
@@ -33,22 +35,18 @@ export function MultiSelectDropdown({
 
   return (
     <div className="form-field">
-      <span className="form-label">{formatScientificText(label)}</span>
+      <span className="form-label">{tr(formatScientificText(label))}</span>
       <details className="group relative">
         <summary className="form-control list-none cursor-pointer">
           <div className="flex items-center justify-between gap-3">
-            <span className="truncate">{summaryLabel}</span>
+            <span className="truncate">{tr(summaryLabel)}</span>
             <ChevronDown className="h-4 w-4 shrink-0 text-stone-500 transition-transform group-open:rotate-180" aria-hidden="true" />
           </div>
         </summary>
         <div className="absolute z-20 mt-2 w-full rounded-lg border border-stone-200 bg-white p-3 shadow-lg">
           <div className="mb-2 flex items-center justify-between gap-2 border-b border-stone-200 pb-2 text-xs">
-            <button type="button" className="text-stone-700 hover:text-stone-900" onClick={() => onChange(options)}>
-              Select all
-            </button>
-            <button type="button" className="text-stone-700 hover:text-stone-900" onClick={() => onChange([])}>
-              Clear
-            </button>
+            <button type="button" className="text-stone-700 hover:text-stone-900" onClick={() => onChange(options)}>{tr("Select all")}</button>
+            <button type="button" className="text-stone-700 hover:text-stone-900" onClick={() => onChange([])}>{tr("Clear")}</button>
           </div>
           <div className={`space-y-1.5 overflow-y-auto pr-1 ${maxHeightClassName}`}>
             {options.length ? (
@@ -60,11 +58,11 @@ export function MultiSelectDropdown({
                     onChange={(event) => toggleOption(option, event.target.checked)}
                     className="mt-0.5 h-4 w-4 accent-stone-900"
                   />
-                  <span className="truncate text-sm text-stone-700">{formatScientificText(option)}</span>
+                  <span className="truncate text-sm text-stone-700">{tr(formatScientificText(option))}</span>
                 </label>
               ))
             ) : (
-              <div className="px-1 py-2 text-xs text-stone-500">No options available.</div>
+              <div className="px-1 py-2 text-xs text-stone-500">{tr("No options available.")}</div>
             )}
           </div>
         </div>

@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { useEffect, useMemo, useState } from "react";
 
 import { cn } from "@/lib/utils";
@@ -35,6 +36,7 @@ export function DualRangeField({
   className?: string;
   onChange: (next: [number, number]) => void;
 }) {
+  const tr = useTranslation();
   const resolvedMin = Math.min(min, max);
   const resolvedMax = Math.max(min, max);
   const low = clamp(Math.min(value[0], value[1]), resolvedMin, resolvedMax);
@@ -73,11 +75,11 @@ export function DualRangeField({
 
   return (
     <fieldset className={cn("range-field", className)}>
-      <legend className="range-field__label">{formatScientificText(label)}</legend>
-      {description ? <p className="range-field__description">{formatScientificText(description)}</p> : null}
+      <legend className="range-field__label">{tr(formatScientificText(label))}</legend>
+      {description ? <p className="range-field__description">{tr(formatScientificText(description))}</p> : null}
       <div className="range-field__controls">
         <label className="range-field__number">
-          <span>Low</span>
+          <span>{tr("Low")}</span>
           <input
             type="number"
             min={resolvedMin}
@@ -89,11 +91,11 @@ export function DualRangeField({
             onKeyDown={(event) => {
               if (event.key === "Enter") event.currentTarget.blur();
             }}
-            aria-label={`${label} lower limit`}
+            aria-label={tr(`${label} lower limit`)}
           />
         </label>
 
-        <div className="dual-range" aria-label={`${label} range`}>
+        <div className="dual-range" aria-label={tr(`${label} range`)}>
           <div className="dual-range__rail" />
           <div className="dual-range__selection" style={trackStyle} />
           <input
@@ -104,7 +106,7 @@ export function DualRangeField({
             step={step}
             value={low}
             onInput={(event) => onChange([Math.min(Number(event.currentTarget.value), high), high])}
-            aria-label={`${label} lower handle`}
+            aria-label={tr(`${label} lower handle`)}
           />
           <input
             className="dual-range__input"
@@ -114,12 +116,12 @@ export function DualRangeField({
             step={step}
             value={high}
             onInput={(event) => onChange([low, Math.max(Number(event.currentTarget.value), low)])}
-            aria-label={`${label} upper handle`}
+            aria-label={tr(`${label} upper handle`)}
           />
         </div>
 
         <label className="range-field__number">
-          <span>High</span>
+          <span>{tr("High")}</span>
           <input
             type="number"
             min={low}
@@ -131,13 +133,13 @@ export function DualRangeField({
             onKeyDown={(event) => {
               if (event.key === "Enter") event.currentTarget.blur();
             }}
-            aria-label={`${label} upper limit`}
+            aria-label={tr(`${label} upper limit`)}
           />
         </label>
       </div>
       <div className="range-field__bounds" aria-hidden="true">
-        <span>{resolvedMin.toFixed(precision)}</span>
-        <span>{resolvedMax.toFixed(precision)}</span>
+        <span>{tr(resolvedMin.toFixed(precision))}</span>
+        <span>{tr(resolvedMax.toFixed(precision))}</span>
       </div>
     </fieldset>
   );

@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Ban, Database, RotateCcw, Save, X } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -11,6 +12,7 @@ import { resolveSessionName } from "@/lib/session-label";
 import { useSessionStore } from "@/store/use-session-store";
 
 export function SessionHeader() {
+  const tr = useTranslation();
   const sessionId = useSessionStore((state) => state.sessionId);
   const setSessionId = useSessionStore((state) => state.setSessionId);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -60,34 +62,32 @@ export function SessionHeader() {
       <div className="mx-auto flex min-h-10 max-w-[1680px] items-center gap-2 px-3 sm:px-4 lg:px-6">
         <span className={`h-2 w-2 shrink-0 rounded-full ${sessionId ? "bg-emerald-500" : "bg-slate-300"}`} aria-hidden="true" />
         <div className="min-w-0 flex-1 sm:flex sm:items-baseline sm:gap-2">
-          <span className="block truncate text-xs font-semibold text-slate-800">{displayName}</span>
-          <span className="hidden truncate font-mono text-[10px] text-slate-500 sm:block">{sessionSummary}</span>
+          <span className="block truncate text-xs font-semibold text-slate-800">{tr(displayName)}</span>
+          <span className="hidden truncate font-mono text-[10px] text-slate-500 sm:block">{tr(sessionSummary)}</span>
         </div>
         {displaySessionId ? (
-          <Tooltip label={`Session ID: ${displaySessionId}`} align="end">
+          <Tooltip label={tr(`Session ID: ${displaySessionId}`)} align="end">
             <button type="button" className="hidden h-7 items-center gap-1 rounded-md px-2 font-mono text-[10px] text-slate-500 hover:bg-slate-200/70 sm:inline-flex">
-              <Database className="h-3.5 w-3.5" aria-hidden="true" />
-              ID
-            </button>
+              <Database className="h-3.5 w-3.5" aria-hidden="true" />{tr("ID")}</button>
           </Tooltip>
         ) : null}
         <div className="flex items-center gap-1">
           <IconButton
-            label={saveMutation.isPending ? "Saving session" : "Save session"}
+            label={tr(saveMutation.isPending ? "Saving session" : "Save session")}
             onClick={() => saveMutation.mutate()}
             disabled={!sessionId || saveMutation.isPending}
           >
             <Save className="h-3.5 w-3.5" />
           </IconButton>
           <IconButton
-            label={closeMutation.isPending ? "Closing session" : "Close session"}
+            label={tr(closeMutation.isPending ? "Closing session" : "Close session")}
             onClick={() => closeMutation.mutate()}
             disabled={!sessionId || closeMutation.isPending}
           >
             <X className="h-3.5 w-3.5" />
           </IconButton>
           <IconButton
-            label={discardMutation.isPending ? "Discarding changes" : confirmDiscard ? "Confirm discard" : "Discard changes"}
+            label={tr(discardMutation.isPending ? "Discarding changes" : confirmDiscard ? "Confirm discard" : "Discard changes")}
             variant={confirmDiscard ? "default" : "outline"}
             onClick={() => {
               if (!confirmDiscard) {
@@ -101,12 +101,12 @@ export function SessionHeader() {
             <Ban className="h-3.5 w-3.5" />
           </IconButton>
           {confirmDiscard ? (
-            <IconButton label="Cancel discard" variant="secondary" onClick={() => setConfirmDiscard(false)} disabled={discardMutation.isPending}>
+            <IconButton label={tr("Cancel discard")} variant="secondary" onClick={() => setConfirmDiscard(false)} disabled={discardMutation.isPending}>
               <RotateCcw className="h-3.5 w-3.5" />
             </IconButton>
           ) : null}
         </div>
-        {actionError ? <span className="sr-only" role="alert">{String(actionError)}</span> : null}
+        {actionError ? <span className="sr-only" role="alert">{tr(String(actionError))}</span> : null}
       </div>
     </div>
   );

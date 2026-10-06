@@ -4,10 +4,11 @@ import "./globals.css";
 
 import { BackToTopButton } from "@/components/layout/back-to-top-button";
 import { QueryProvider } from "@/components/layout/query-provider";
+import { LanguageProvider } from "@/components/layout/language-provider";
 
 export const metadata: Metadata = {
-  title: "IRMS Results Station",
-  description: "Workspace for processing and reviewing IRMS results",
+  title: "IRMS Metrology Station",
+  description: "Metrological qualification, client sessions and traceable IRMS results",
 };
 
 const sans = Manrope({
@@ -32,8 +33,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className={`${sans.variable} ${display.variable} ${mono.variable}`}>
-        <QueryProvider>{children}</QueryProvider>
-        <BackToTopButton />
+        <LanguageProvider>
+          <QueryProvider>{children}</QueryProvider>
+          <BackToTopButton />
+        </LanguageProvider>
       </body>
     </html>
   );

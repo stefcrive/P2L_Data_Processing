@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "test:i18n": "node --test tests/i18n.test.cjs",
     "lint": "next lint"
   },
   "dependencies": {

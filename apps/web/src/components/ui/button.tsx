@@ -1,4 +1,7 @@
+"use client";
+
 import * as React from "react";
+import { useTranslation } from "@/components/layout/language-provider";
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 
@@ -36,8 +39,9 @@ export interface ButtonProps
 
 const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
   ({ className, variant, size, asChild = false, children, ...props }, ref) => {
+    const tr = useTranslation();
     const Comp = asChild ? Slot : "button";
-    return <Comp className={cn(buttonVariants({ variant, size, className }))} ref={ref} {...props}>{typeof children === "string" ? formatScientificText(children) : children}</Comp>;
+    return <Comp className={cn(buttonVariants({ variant, size, className }))} ref={ref} {...props}>{typeof children === "string" ? formatScientificText(tr(children)) : children}</Comp>;
   },
 );
 Button.displayName = "Button";

@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { cn } from "@/lib/utils";
 import { formatScientificText } from "@/lib/scientific-notation";
 
@@ -35,8 +36,9 @@ function isSignalIntensityColumnLabel(label: string): boolean {
 }
 
 export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> }) {
+  const tr = useTranslation();
   if (!rows.length) {
-    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">No cycle rows returned for this point.</div>;
+    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("No cycle rows returned for this point.")}</div>;
   }
 
   const statusRows: Array<Record<string, unknown>> = rows.map((row) => {
@@ -107,11 +109,11 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">First valid cycle</span>
-        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">Last valid cycle</span>
-        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
-        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
-        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">Sample gas escape</span>
+        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">{tr("First valid cycle")}</span>
+        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">{tr("Last valid cycle")}</span>
+        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">{tr("Successful cycle")}</span>
+        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">{tr("Saturated cycle")}</span>
+        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">{tr("Sample gas escape")}</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -119,7 +121,7 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
             <tr>
               {columns.map((column) => (
                 <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                  {formatScientificText(column)}
+                  {tr(formatScientificText(column))}
                 </th>
               ))}
             </tr>
@@ -170,7 +172,7 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
                             : "text-stone-700",
                         )}
                       >
-                        {formatCell(cellValue, column)}
+                        {tr(formatCell(cellValue, column))}
                       </td>
                     );
                   })}
@@ -179,7 +181,7 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
             })}
           </tbody>
         </table>
-        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">Showing first 25 of {rows.length} rows.</div> : null}
+        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">{tr("Showing first 25 of ")}{rows.length}{tr(" rows.")}</div> : null}
       </div>
     </div>
   );

@@ -86,21 +86,21 @@ const PLOTLY_DISPLAY_KEYS = new Set([
 
 const PLOTLY_DATA_KEYS = new Set(["customdata", "ids", "meta", "x", "y", "z"]);
 
-function formatPlotlyValue(value: unknown, key = ""): unknown {
+function formatPlotlyValue(value: unknown, key = "", translateText: (text: string) => string = text => text): unknown {
   if (PLOTLY_DATA_KEYS.has(key)) {
     return value;
   }
   if (typeof value === "string") {
-    return PLOTLY_DISPLAY_KEYS.has(key) ? formatScientificText(value) : value;
+    return PLOTLY_DISPLAY_KEYS.has(key) ? formatScientificText(translateText(value)) : value;
   }
   if (Array.isArray(value)) {
     if (!value.some((item) => typeof item === "string" || (item && typeof item === "object"))) {
       return value;
     }
     if (PLOTLY_DISPLAY_KEYS.has(key)) {
-      return value.map((item) => (typeof item === "string" ? formatScientificText(item) : formatPlotlyValue(item, key)));
+      return value.map((item) => (typeof item === "string" ? formatScientificText(translateText(item)) : formatPlotlyValue(item, key, translateText)));
     }
-    return value.map((item) => formatPlotlyValue(item));
+    return value.map((item) => formatPlotlyValue(item, "", translateText));
   }
   if (!value || typeof value !== "object") {
     return value;
@@ -109,14 +109,14 @@ function formatPlotlyValue(value: unknown, key = ""): unknown {
   const next: Record<string, unknown> = {};
   for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
     if (childKey === "title" && typeof childValue === "string") {
-      next[childKey] = formatScientificText(childValue);
+      next[childKey] = formatScientificText(translateText(childValue));
     } else {
-      next[childKey] = formatPlotlyValue(childValue, childKey);
+      next[childKey] = formatPlotlyValue(childValue, childKey, translateText);
     }
   }
   return next;
 }
 
-export function formatPlotlyDisplayText<T>(value: T): T {
-  return formatPlotlyValue(value) as T;
+export function formatPlotlyDisplayText<T>(value: T, translateText?: (text: string) => string): T {
+  return formatPlotlyValue(value, "", translateText) as T;
 }

@@ -1,5 +1,8 @@
 "use client";
+import { useContext } from "react";
+import { withSessionUncertainty } from "@/lib/metrology-envelopes";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Check, ChevronRight, Copy, Download, RotateCcw, SearchCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
 import {
@@ -34,6 +37,7 @@ import { DualRangeField } from "@/components/ui/dual-range-field";
 import { PageHeader } from "@/components/ui/page-header";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api, type JobSnapshot } from "@/lib/api";
+import { buildLinearityPreviewValues, type LinearityPreviewValues } from "@/lib/linearity-preview";
 import type {
   CalibrationConfig,
   CalibrationPrecisionSummary,
@@ -52,6 +56,7 @@ import type {
 } from "@/lib/types";
 import { formatScientificText } from "@/lib/scientific-notation";
 import { cn } from "@/lib/utils";
+import { MetrologyProcessingResults, useMetrologyConsultation } from "@/components/metrology/consultation-context";
 import { useSessionStore } from "@/store/use-session-store";
 
 type SelectedTarget = {
@@ -878,200 +883,12 @@ function finiteNumber(value: unknown): number | null {
   return null;
 }
 
-function lineOffsetForPreview(linearity: CalibrationConfig["linearity"], isotopeKey: IsotopeKey, line: number | null | undefined): number {
-  if (line !== 1 && line !== 2) {
-    return 0;
-  }
-  if (isotopeKey === "d13C") {
-    return line === 1 ? finiteNumber(linearity.line_1_offset_d13) ?? 0 : finiteNumber(linearity.line_2_offset_d13) ?? 0;
-  }
-  return line === 1 ? finiteNumber(linearity.line_1_offset_d18) ?? 0 : finiteNumber(linearity.line_2_offset_d18) ?? 0;
-}
-
-function linearityPrimaryOffsetScale(intensityCol: string | null | undefined): number {
-  return intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44 || intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 ? 1 : 10;
-}
-
-function linearitySecondaryOffsetScale(intensityCol: string | null | undefined): number {
-  if (
-    intensityCol === LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44 ||
-    intensityCol === LINEARITY_INTENSITY_RELATIVE_MISMATCH44 ||
-    intensityCol === LINEARITY_INTENSITY_TWO_TERM44
-  ) {
-    return 1;
-  }
-  return 100;
-}
-
-function applyManualLinearityOffsetsForPreview(
-  fits: Record<string, unknown> | undefined,
-  linearity: CalibrationConfig["linearity"],
-): Record<string, unknown> {
-  const adjusted: Record<string, unknown> = {
-    ...(fits ?? {}),
-    d13C: { ...(((fits ?? {}).d13C as Record<string, unknown> | undefined) ?? {}) },
-    d18O: { ...(((fits ?? {}).d18O as Record<string, unknown> | undefined) ?? {}) },
-  };
-  if (!linearity.manual_override_enabled) {
-    return adjusted;
-  }
-  const basisCol = String(adjusted.intensity_col ?? linearity.intensity_col ?? "");
-  const configByIsotope: Record<IsotopeKey, { linear: number; quadratic: number }> = {
-    d13C: {
-      linear: finiteNumber(linearity.manual_d13_per_10v) ?? 0,
-      quadratic: finiteNumber(linearity.manual_d13_per_10v2) ?? 0,
-    },
-    d18O: {
-      linear: finiteNumber(linearity.manual_d18_per_10v) ?? 0,
-      quadratic: finiteNumber(linearity.manual_d18_per_10v2) ?? 0,
-    },
-  };
-  for (const isotopeKey of ISOTOPE_KEYS) {
-    const fit = { ...((adjusted[isotopeKey] as Record<string, unknown> | undefined) ?? {}) };
-    const xRef = finiteNumber(fit.x_ref) ?? 0;
-    const baseIntercept = finiteNumber(fit.intercept);
-    let interceptShift = 0;
-    if (String(fit.model ?? "") === "two_term") {
-      const slopeOffsetRaw = configByIsotope[isotopeKey].linear;
-      const secondaryOffsetRaw = configByIsotope[isotopeKey].quadratic;
-      if (Number.isFinite(slopeOffsetRaw) && Math.abs(slopeOffsetRaw) > 1e-15) {
-        const slopeOffset = slopeOffsetRaw / linearityPrimaryOffsetScale(LINEARITY_INTENSITY_TWO_TERM44);
-        fit.slope = (finiteNumber(fit.slope) ?? 0) + slopeOffset;
-        interceptShift += slopeOffset * xRef;
-      }
-      if (Number.isFinite(secondaryOffsetRaw) && Math.abs(secondaryOffsetRaw) > 1e-15) {
-        const secondaryOffset = secondaryOffsetRaw / linearitySecondaryOffsetScale(LINEARITY_INTENSITY_TWO_TERM44);
-        fit.quad = (finiteNumber(fit.quad) ?? 0) + secondaryOffset;
-        const secondaryRef = finiteNumber(fit.secondary_x_ref);
-        if (secondaryRef != null) {
-          interceptShift += secondaryOffset * secondaryRef;
-        }
-      }
-      if (baseIntercept != null && Math.abs(interceptShift) > 1e-15) {
-        fit.intercept = baseIntercept - interceptShift;
-      }
-      adjusted[isotopeKey] = fit;
-      continue;
-    }
-
-    const slopeOffsetRaw = configByIsotope[isotopeKey].linear;
-    if (Number.isFinite(slopeOffsetRaw) && Math.abs(slopeOffsetRaw) > 1e-15) {
-      const slopeOffset = slopeOffsetRaw / linearityPrimaryOffsetScale(basisCol);
-      fit.slope = (finiteNumber(fit.slope) ?? 0) + slopeOffset;
-      if (baseIntercept != null) {
-        fit.intercept = baseIntercept - slopeOffset * xRef;
-      }
-    }
-    if (linearity.quadratic) {
-      const quadOffsetRaw = configByIsotope[isotopeKey].quadratic;
-      if (Number.isFinite(quadOffsetRaw) && Math.abs(quadOffsetRaw) > 1e-15) {
-        const quadOffset = quadOffsetRaw / linearitySecondaryOffsetScale(basisCol);
-        fit.quad = (finiteNumber(fit.quad) ?? 0) + quadOffset;
-        const currentIntercept = finiteNumber(fit.intercept);
-        if (currentIntercept != null) {
-          fit.intercept = currentIntercept - quadOffset * xRef ** 2;
-        }
-        fit.degree = Math.max(Number(fit.degree ?? 1), 2);
-      }
-    }
-    adjusted[isotopeKey] = fit;
-  }
-  return adjusted;
-}
-
-function linearityFitDegree(fit: Record<string, unknown>): number {
-  const degree = finiteNumber(fit.degree);
-  if (degree != null && degree >= 2) {
-    return 2;
-  }
-  if (fit.quadratic === true) {
-    return 2;
-  }
-  const quad = finiteNumber(fit.quad);
-  return quad != null && Math.abs(quad) > 1e-15 ? 2 : 1;
-}
-
-function linearityCorrectionDeltaForPreview(
-  fit: Record<string, unknown>,
-  intensity: number | null,
-  secondaryIntensity?: number | null,
-): number | null {
-  const slope = finiteNumber(fit.slope);
-  const xRef = finiteNumber(fit.x_ref);
-  if (slope == null || xRef == null || intensity == null) {
-    return null;
-  }
-  if (String(fit.model ?? "") === "two_term") {
-    const secondaryRef = finiteNumber(fit.secondary_x_ref);
-    const secondarySlope = finiteNumber(fit.quad);
-    if (secondaryRef == null || secondarySlope == null || secondaryIntensity == null) {
-      return null;
-    }
-    return slope * (intensity - xRef) + secondarySlope * (secondaryIntensity - secondaryRef);
-  }
-  let delta = slope * (intensity - xRef);
-  const quad = finiteNumber(fit.quad);
-  if (linearityFitDegree(fit) >= 2 && quad != null) {
-    delta += quad * (intensity ** 2 - xRef ** 2);
-  }
-  return Number.isFinite(delta) ? delta : null;
-}
-
 function buildPreviewRowMap(data: ProcessingLinearityPreviewData | undefined): Map<string, ProcessingLinearityPreviewData["rows"][number]> {
   const map = new Map<string, ProcessingLinearityPreviewData["rows"][number]>();
   for (const row of data?.rows ?? []) {
     map.set(String(row.row_label), row);
   }
   return map;
-}
-
-function previewValueForRow(
-  row: ProcessingLinearityPreviewData["rows"][number] | undefined,
-  isotopeKey: IsotopeKey,
-  linearity: CalibrationConfig["linearity"],
-  previewData: ProcessingLinearityPreviewData,
-  effectiveFits: Record<string, unknown>,
-  valueSpace: "raw" | "calibrated",
-): number | null {
-  if (!row) {
-    return null;
-  }
-  const baseRaw = isotopeKey === "d13C" ? finiteNumber(row.d13_raw) : finiteNumber(row.d18_raw);
-  if (baseRaw == null) {
-    return null;
-  }
-  const adjustedRaw = baseRaw + lineOffsetForPreview(linearity, isotopeKey, finiteNumber(row.line));
-  let rawValue = adjustedRaw;
-  const fit = (effectiveFits[isotopeKey] as Record<string, unknown> | undefined) ?? {};
-  if (linearity.apply) {
-    const intensityCol =
-      String(
-        (String(fit.model ?? "") === "two_term"
-          ? fit.primary_col
-          : effectiveFits[isotopeKey === "d13C" ? "d13_intensity_col" : "d18_intensity_col"]) ??
-          previewData.intensity_col ??
-          linearity.intensity_col ??
-          "",
-      ).trim();
-    const fallbackIntensityCol = String(previewData.intensity_col ?? linearity.intensity_col ?? "").trim();
-    const primaryIntensity = finiteNumber(row.intensities[intensityCol]) ?? finiteNumber(row.intensities[fallbackIntensityCol]);
-    const secondaryCol = String(fit.secondary_col ?? LINEARITY_INTENSITY_SYMMETRIC_MISMATCH44);
-    const secondaryIntensity = finiteNumber(row.intensities[secondaryCol]);
-    const delta = linearityCorrectionDeltaForPreview(fit, primaryIntensity, secondaryIntensity);
-    if (delta != null) {
-      rawValue = adjustedRaw - delta;
-    }
-  }
-  if (valueSpace === "raw") {
-    return Number.isFinite(rawValue) ? rawValue : null;
-  }
-  const coeff = (previewData.coefficients?.[isotopeKey] as Record<string, unknown> | undefined) ?? {};
-  const slope = finiteNumber(coeff.slope);
-  const intercept = finiteNumber(coeff.intercept);
-  if (slope != null && intercept != null) {
-    return slope * rawValue + intercept;
-  }
-  return isotopeKey === "d13C" ? finiteNumber(row.d13_calibrated) : finiteNumber(row.d18_calibrated);
 }
 
 function customDataRowLabel(value: unknown): string {
@@ -1603,18 +1420,19 @@ function applyLinearityPreviewToFigure(
   previewData: ProcessingLinearityPreviewData | undefined,
   linearity: CalibrationConfig["linearity"] | null | undefined,
   processingConfig: ProcessingConfig | null | undefined,
+  previewValues?: LinearityPreviewValues,
 ): Record<string, unknown> | undefined {
   if (!figure || !previewData || !linearity || !processingConfig) {
     return figure;
   }
-  const cloned = cloneFigure(figure);
+  const figureData = Array.isArray(figure.data) ? (figure.data as Array<Record<string, unknown>>) : [];
   const rowMap = buildPreviewRowMap(previewData);
-  if (!rowMap.size || !Array.isArray(cloned.data)) {
+  if (!rowMap.size || !figureData.length) {
     return figure;
   }
-  const effectiveFits = applyManualLinearityOffsetsForPreview(previewData.fits, linearity);
+  const resolvedPreviewValues = previewValues ?? buildLinearityPreviewValues(previewData, linearity);
   let changed = false;
-  const nextData = cloned.data.map((trace) => {
+  const nextData = figureData.map((trace) => {
     const customdata = coerceVector(trace.customdata);
     if (!customdata?.length) {
       return trace;
@@ -1640,8 +1458,9 @@ function applyLinearityPreviewToFigure(
       }
       const isotope = customDataIsotope(customdata[index]);
       if (isotope === "cross") {
-        const d18 = previewValueForRow(row, "d18O", linearity, previewData, effectiveFits, "raw");
-        const d13 = previewValueForRow(row, "d13C", linearity, previewData, effectiveFits, "raw");
+        const previewRow = resolvedPreviewValues.get(rowLabel);
+        const d18 = previewRow?.d18O.raw ?? null;
+        const d13 = previewRow?.d13C.raw ?? null;
         const patchedX = patchVectorValue(nextX, index, d18);
         const patchedY = patchVectorValue(nextY, index, d13);
         nextX = patchedX.values;
@@ -1659,7 +1478,7 @@ function applyLinearityPreviewToFigure(
         continue;
       }
       if (isotope === "d13C" || isotope === "d18O") {
-        const value = previewValueForRow(row, isotope, linearity, previewData, effectiveFits, valueSpace);
+        const value = resolvedPreviewValues.get(rowLabel)?.[isotope][valueSpace] ?? null;
         const patchedY = patchVectorValue(nextY, index, value);
         nextY = patchedY.values;
         traceChanged = traceChanged || patchedY.changed;
@@ -1680,7 +1499,7 @@ function applyLinearityPreviewToFigure(
     }
     return nextTrace;
   });
-  return changed ? { ...cloned, data: nextData } : figure;
+  return changed ? { ...figure, data: nextData } : figure;
 }
 
 function applySelectionDraftPreviewToFigure(
@@ -2055,7 +1874,7 @@ function buildProcessingPreviewMasks(
   if (!previewData || !linearity || !config) {
     return null;
   }
-  const effectiveFits = applyManualLinearityOffsetsForPreview(previewData.fits, linearity);
+  const previewValues = buildLinearityPreviewValues(previewData, linearity);
   const editedRows = new Set((editState?.edited_rows ?? []).map((row) => String(row)));
   const overrides = (editState?.manual_outlier_overrides ?? {}) as Record<string, boolean>;
   const rows: ProcessingPreviewRowState[] = previewData.rows.map((row) => {
@@ -2067,8 +1886,8 @@ function buildProcessingPreviewMasks(
       identifier1: normalizeSpeciesLabel(config.identifier1_name_map?.[sourceIdentifier1] ?? sourceIdentifier1),
       identifier2: String(row.identifier2 ?? "").trim(),
       species: normalizeSpeciesLabel(config.species_name_map?.[sourceSpecies] ?? sourceSpecies),
-      d13: previewValueForRow(row, "d13C", linearity, previewData, effectiveFits, "raw"),
-      d18: previewValueForRow(row, "d18O", linearity, previewData, effectiveFits, "raw"),
+      d13: previewValues.get(rowLabel)?.d13C.raw ?? null,
+      d18: previewValues.get(rowLabel)?.d18O.raw ?? null,
       signal: finiteNumber(row.signal),
       leakRate: finiteNumber(row.leak_rate),
       status: String(row.collector_status ?? "").trim(),
@@ -2666,18 +2485,17 @@ function TraceModeControl({
   hasStandards: boolean;
   onChange: (patch: Partial<ChartDisplayState>) => void;
 }) {
+  const tr = useTranslation();
   const display = normalizeDisplayState(state);
   return (
     <details className="group relative">
       <summary className="flex h-8 cursor-pointer list-none items-center gap-1.5 rounded-md border border-stone-300 bg-white px-2.5 text-xs font-medium text-stone-700 shadow-sm transition-colors hover:bg-stone-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 [&::-webkit-details-marker]:hidden">
-        <SlidersHorizontal aria-hidden="true" className="h-3.5 w-3.5" />
-        Display
-        <ChevronRight aria-hidden="true" className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+        <SlidersHorizontal aria-hidden="true" className="h-3.5 w-3.5" />{tr("Display")}<ChevronRight aria-hidden="true" className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
       </summary>
       <div
         className="absolute right-0 top-10 z-30 grid min-w-56 gap-0.5 rounded-lg border border-stone-200 bg-white p-2 text-xs shadow-lg"
         role="group"
-        aria-label="Chart display options"
+        aria-label={tr("Chart display options")}
       >
         <label className={cn("flex min-h-8 items-center gap-2 rounded-md px-2 hover:bg-stone-50", hasCalibrated ? "text-stone-700" : "text-stone-400")}>
           <input
@@ -2686,9 +2504,7 @@ function TraceModeControl({
             disabled={!hasCalibrated}
             onChange={(event) => onChange({ hideCalibrated: event.target.checked })}
             className="h-3.5 w-3.5 accent-blue-600"
-          />
-          Hide calibrated
-        </label>
+          />{tr("Hide calibrated")}</label>
         <label className={cn("flex min-h-8 items-center gap-2 rounded-md px-2 hover:bg-stone-50", hasStandards ? "text-stone-700" : "text-stone-400")}>
           <input
             type="checkbox"
@@ -2696,29 +2512,23 @@ function TraceModeControl({
             disabled={!hasStandards}
             onChange={(event) => onChange({ overlayStandards: event.target.checked })}
             className="h-3.5 w-3.5 accent-blue-600"
-          />
-          Overlay standards
-        </label>
+          />{tr("Overlay standards")}</label>
         <label className="flex min-h-8 items-center gap-2 rounded-md px-2 text-stone-700 hover:bg-stone-50">
           <input
             type="checkbox"
             checked={display.hideSymbols}
             onChange={(event) => onChange({ hideSymbols: event.target.checked })}
             className="h-3.5 w-3.5 accent-blue-600"
-          />
-          Hide symbols
-        </label>
+          />{tr("Hide symbols")}</label>
         <label className="flex min-h-8 items-center gap-2 rounded-md px-2 text-stone-700 hover:bg-stone-50">
           <input
             type="checkbox"
             checked={display.runningAverage}
             onChange={(event) => onChange({ runningAverage: event.target.checked })}
             className="h-3.5 w-3.5 accent-blue-600"
-          />
-          Running average
-        </label>
+          />{tr("Running average")}</label>
         <label className="mt-1 flex items-center justify-between gap-3 border-t border-stone-100 px-2 pt-2 font-medium text-stone-700">
-          <span>Period</span>
+          <span>{tr("Period")}</span>
           <input
             type="number"
             min={2}
@@ -3637,8 +3447,9 @@ function DataTable({
   selectedRowLabels?: string[];
   onSelectedRowLabelsChange?: (next: string[]) => void;
 }) {
+  const tr = useTranslation();
   if (!rows.length) {
-    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{emptyLabel}</div>;
+    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr(emptyLabel)}</div>;
   }
   const selectable = typeof onSelectedRowLabelsChange === "function";
   const selectedSet = new Set(selectedRowLabels);
@@ -3679,10 +3490,10 @@ function DataTable({
       <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
         <thead className="bg-stone-50">
           <tr>
-            {selectable ? <th className="w-12 px-3 py-2 font-medium text-stone-700">Sel</th> : null}
+            {selectable ? <th className="w-12 px-3 py-2 font-medium text-stone-700">{tr("Sel")}</th> : null}
             {columns.map((column) => (
               <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                {formatScientificText(column)}
+                {tr(formatScientificText(column))}
               </th>
             ))}
           </tr>
@@ -3697,7 +3508,7 @@ function DataTable({
                   <td className="px-3 py-2 text-stone-600">
                     <input
                       type="checkbox"
-                      aria-label={rowLabel ? `Select row ${rowLabel}` : `Select row ${rowIndex + 1}`}
+                      aria-label={tr(rowLabel ? `Select row ${rowLabel}` : `Select row ${rowIndex + 1}`)}
                       checked={rowLabel != null ? selectedSet.has(rowLabel) : false}
                       disabled={!canSelectRow}
                       onChange={(event) => {
@@ -3711,7 +3522,7 @@ function DataTable({
                 ) : null}
               {columns.map((column) => (
                 <td key={column} className="px-3 py-2 text-stone-600">
-                  {formatScientificText(formatValue(row[column], column))}
+                  {tr(formatScientificText(formatValue(row[column], column)))}
                 </td>
               ))}
             </tr>
@@ -3719,7 +3530,7 @@ function DataTable({
           })}
         </tbody>
       </table>
-      {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">Showing first 25 of {rows.length} rows.</div> : null}
+      {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">{tr("Showing first 25 of ")}{rows.length}{tr(" rows.")}</div> : null}
     </div>
   );
 }
@@ -3849,6 +3660,7 @@ function RangeSliderField({
   showManualInputs?: boolean;
   onChange: (next: [number, number]) => void;
 }) {
+  const tr = useTranslation();
   const resolvedMin = Math.min(min, max);
   const resolvedMax = Math.max(min, max);
   const low = clampNumber(Math.min(value[0], value[1]), resolvedMin, resolvedMax);
@@ -3856,7 +3668,7 @@ function RangeSliderField({
 
   return (
     <DualRangeField
-      label={label}
+      label={tr(label)}
       value={[low, high]}
       min={resolvedMin}
       max={resolvedMax}
@@ -4071,20 +3883,21 @@ function ProcessingColorScaleBar({
   colorParam: string | null | undefined;
   range: [number, number];
 }) {
+  const tr = useTranslation();
   const label = previewColorLabel(colorParam ?? "Color");
   const ticks = processingColorScaleTicks(range);
   return (
     <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
-      <div className="mb-1 font-semibold text-stone-900">{formatScientificText(label)}</div>
+      <div className="mb-1 font-semibold text-stone-900">{tr(formatScientificText(label))}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
-        aria-label={`${label} color scale from ${range[0]} to ${range[1]}`}
+        aria-label={tr(`${label} color scale from ${range[0]} to ${range[1]}`)}
       />
       <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
         {ticks.map((tick, index) => (
           <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
-            {formatProcessingColorScaleValue(tick, colorParam)}
+            {tr(formatProcessingColorScaleValue(tick, colorParam))}
           </span>
         ))}
       </div>
@@ -4271,8 +4084,9 @@ function applyColorScaleRangeToFigure(
 }
 
 function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> }) {
+  const tr = useTranslation();
   if (!rows.length) {
-    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">No cycle rows returned for this point.</div>;
+    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("No cycle rows returned for this point.")}</div>;
   }
 
   const statusRows: Array<Record<string, unknown>> = rows.map((row) => {
@@ -4343,11 +4157,11 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">First valid cycle</span>
-        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">Last valid cycle</span>
-        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
-        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
-        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">Sample gas escape</span>
+        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">{tr("First valid cycle")}</span>
+        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">{tr("Last valid cycle")}</span>
+        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">{tr("Successful cycle")}</span>
+        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">{tr("Saturated cycle")}</span>
+        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">{tr("Sample gas escape")}</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -4355,7 +4169,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             <tr>
               {columns.map((column) => (
                 <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                  {formatScientificText(column)}
+                  {tr(formatScientificText(column))}
                 </th>
               ))}
             </tr>
@@ -4406,7 +4220,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
                             : "text-stone-700",
                         )}
                       >
-                        {formatScientificText(formatCell(cellValue, column))}
+                        {tr(formatScientificText(formatCell(cellValue, column)))}
                       </td>
                     );
                   })}
@@ -4415,7 +4229,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             })}
           </tbody>
         </table>
-        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">Showing first 25 of {rows.length} rows.</div> : null}
+        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">{tr("Showing first 25 of ")}{rows.length}{tr(" rows.")}</div> : null}
       </div>
     </div>
   );
@@ -4434,6 +4248,7 @@ function OutlierTablesPanel({
   defaultOpen?: boolean;
   isPreview?: boolean;
 }) {
+  const tr = useTranslation();
   const [selectedRowsByTable, setSelectedRowsByTable] = useState<Record<string, string[]>>({});
 
   useEffect(() => {
@@ -4447,12 +4262,12 @@ function OutlierTablesPanel({
     return (
       <div className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-white px-4 py-3 shadow-sm">
         <div className="min-w-0">
-          <div className="text-sm font-semibold text-stone-900">{title}</div>
-          <div className="text-xs text-stone-500">No outliers found for this scope.</div>
+          <div className="text-sm font-semibold text-stone-900">{tr(title)}</div>
+          <div className="text-xs text-stone-500">{tr("No outliers found for this scope.")}</div>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
-          {isPreview ? <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">Preview</span> : null}
-          <span className="rounded-md bg-stone-100 px-2 py-1 text-xs font-medium text-stone-600">0 rows</span>
+          {isPreview ? <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Preview")}</span> : null}
+          <span className="rounded-md bg-stone-100 px-2 py-1 text-xs font-medium text-stone-600">{tr("0 rows")}</span>
         </div>
       </div>
     );
@@ -4464,17 +4279,16 @@ function OutlierTablesPanel({
         <div className="flex min-w-0 items-center gap-2">
           <ChevronRight className="h-4 w-4 shrink-0 text-blue-600 transition-transform group-open:rotate-90" aria-hidden="true" />
           <div>
-            <div className="text-sm font-semibold text-stone-900">{title}</div>
+            <div className="text-sm font-semibold text-stone-900">{tr(title)}</div>
             <div className="text-xs text-stone-500">
-              {isPreview ? "Live preview from unsaved processing controls." : "Outlier categories and review actions."}
+              {tr(isPreview ? "Live preview from unsaved processing controls." : "Outlier categories and review actions.")}
             </div>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
-          {isPreview ? <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">Preview</span> : null}
+          {isPreview ? <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Preview")}</span> : null}
           <span className="rounded-md bg-stone-100 px-2 py-1 text-xs font-medium text-stone-600">
-            {totalRowCount} rows
-          </span>
+            {totalRowCount}{tr("rows")}</span>
         </div>
       </summary>
       <div className="space-y-2 border-t border-stone-200 p-3">
@@ -4486,12 +4300,12 @@ function OutlierTablesPanel({
               <details open key={tableKey} className="group/table rounded-lg border border-stone-200 bg-white px-3 py-2.5">
                 <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-medium text-stone-800">
                   <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-400 transition-transform group-open/table:rotate-90" aria-hidden="true" />
-                  <span>{formatScientificText(table.title ?? table.name)} ({table.rows.length})</span>
+                  <span>{tr(formatScientificText(table.title ?? table.name))} ({table.rows.length})</span>
                 </summary>
                 <div className="mt-3">
                   <DataTable
                     rows={table.rows}
-                    emptyLabel="No rows in this outlier category."
+                    emptyLabel={tr("No rows in this outlier category.")}
                     selectedRowLabels={failedSampleTable ? selectedRowLabels : undefined}
                     onSelectedRowLabelsChange={
                       failedSampleTable
@@ -4505,7 +4319,7 @@ function OutlierTablesPanel({
                   />
                   {renderTableControls ? (
                     <div className="mt-3">
-                      {renderTableControls(table, { selectedRowLabels: failedSampleTable ? selectedRowLabels : [] })}
+                      {tr(renderTableControls(table, { selectedRowLabels: failedSampleTable ? selectedRowLabels : [] }))}
                     </div>
                   ) : null}
                 </div>
@@ -4539,6 +4353,7 @@ function CheckboxField({
   onChange: (checked: boolean) => void;
   disabled?: boolean;
 }) {
+  const tr = useTranslation();
   return (
     <label className={cn("flex items-center gap-2 py-1.5 text-sm", disabled ? "cursor-not-allowed opacity-60" : "")}>
       <input
@@ -4548,10 +4363,10 @@ function CheckboxField({
         onChange={(event) => onChange(event.target.checked)}
         className="h-4 w-4"
       />
-      <span className="font-medium text-stone-800">{formatScientificText(label)}</span>
+      <span className="font-medium text-stone-800">{tr(formatScientificText(label))}</span>
       {description ? (
-        <Tooltip label={description}>
-          <span tabIndex={0} aria-label={`More information about ${label}`} className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">
+        <Tooltip label={tr(description)}>
+          <span tabIndex={0} aria-label={tr(`More information about ${label}`)} className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">
             ?
           </span>
         </Tooltip>
@@ -4561,6 +4376,8 @@ function CheckboxField({
 }
 
 function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }) {
+  const tr = useTranslation();
+  const consultation = useMetrologyConsultation();
   if (!workspace.summary.metrics.length) {
     return null;
   }
@@ -4573,34 +4390,32 @@ function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }
   ];
 
   return (
-    <section className="overflow-hidden rounded-lg border border-stone-200 bg-white shadow-sm" aria-labelledby="processing-summary-title">
+    <section className={`overflow-hidden rounded-lg border border-stone-200 bg-white shadow-sm ${consultation ? "station-processing-summary" : ""}`} aria-labelledby="processing-summary-title">
       <div className="flex flex-col gap-2 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-center gap-3">
           <div>
-            <h2 id="processing-summary-title" className="text-sm font-semibold text-stone-900">
-              Processing summary
-            </h2>
-            <div className="text-xs text-stone-500">Metrics for the current processing configuration.</div>
+            <h2 id="processing-summary-title" className="text-sm font-semibold text-stone-900">{tr("Processing summary")}</h2>
+            <div className="text-xs text-stone-500">{tr("Metrics for the current processing configuration.")}</div>
           </div>
         </div>
-        <div className="flex flex-wrap gap-1.5 text-xs text-stone-600">
+        {!consultation&&<div className="flex flex-wrap gap-1.5 text-xs text-stone-600">
           {summaryBadges.map((badge) => (
             <span key={badge.label} className="rounded-md bg-stone-100 px-2 py-1">
-              {badge.label} <strong className="font-semibold text-stone-800">{String(badge.value)}</strong>
+              {tr(badge.label)} <strong className="font-semibold text-stone-800">{tr(String(badge.value))}</strong>
             </span>
           ))}
-        </div>
+        </div>}
       </div>
       <div className="border-t border-stone-200">
         <div className="grid divide-y divide-stone-200 sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-4">
           {workspace.summary.metrics.map((metric) => (
             <div key={metric.metric} className="min-w-0 px-3 py-2.5">
-              <div className="truncate text-[10px] font-semibold uppercase tracking-wide text-stone-500" title={metric.metric}>
-                {metric.metric}
+              <div className="truncate text-[10px] font-semibold uppercase tracking-wide text-stone-500" title={tr(metric.metric)}>
+                {tr(metric.metric)}
               </div>
-              <div className="mt-0.5 text-lg font-semibold leading-tight text-stone-900">{String(metric.value)}</div>
-              <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-stone-500" title={metric.details}>
-                {metric.details}
+              <div className="mt-0.5 text-lg font-semibold leading-tight text-stone-900">{tr(String(metric.value))}</div>
+              <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-stone-500" title={tr(metric.details)}>
+                {tr(metric.details)}
               </div>
             </div>
           ))}
@@ -4627,6 +4442,7 @@ function DiagnosticsPanel({
   showCycleEvidence?: boolean;
   legendCollapsed?: boolean;
 }) {
+  const tr = useTranslation();
   const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
   const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
   const cycleMean = diagnostics?.cycle_mean ?? {};
@@ -4801,45 +4617,43 @@ function DiagnosticsPanel({
       <CardHeader className="px-3 py-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="min-w-0">
-            <CardTitle className="truncate text-sm">{title}</CardTitle>
-            <CardDescription>Cycle intensity, precision, and correction evidence.</CardDescription>
+            <CardTitle className="truncate text-sm">{tr(title)}</CardTitle>
+            <CardDescription>{tr("Cycle intensity, precision, and correction evidence.")}</CardDescription>
           </div>
           {diagnostics ? (
             <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-stone-600">
-              <span className="rounded-md bg-stone-100 px-2 py-1">{validCycleCount ?? 0} valid cycles</span>
-              {usesSignalProxy ? <span className="rounded-md bg-blue-50 px-2 py-1 text-blue-700">Internal signal proxy</span> : null}
+              <span className="rounded-md bg-stone-100 px-2 py-1">{validCycleCount ?? 0}{tr(" valid cycles")}</span>
+              {usesSignalProxy ? <span className="rounded-md bg-blue-50 px-2 py-1 text-blue-700">{tr("Internal signal proxy")}</span> : null}
             </div>
           ) : null}
         </div>
       </CardHeader>
       <CardContent className="space-y-3 p-3">
-        {loading ? <div className="text-sm text-stone-500">Loading cycle diagnostics...</div> : null}
+        {loading ? <div className="text-sm text-stone-500">{tr("Loading cycle diagnostics...")}</div> : null}
 
         {diagnostics ? (
           <>
             <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-stone-50/60 sm:grid-cols-3 sm:divide-x sm:divide-stone-200">
               <div className="px-3 py-2.5">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">Valid-cycle mean</div>
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr("Valid-cycle mean")}</div>
                 <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
-                  {validMeanCardValue == null ? "N/A" : formatDeltaValue(validMeanCardValue)}
+                  {tr(validMeanCardValue == null ? "N/A" : formatDeltaValue(validMeanCardValue))}
                 </div>
               </div>
               <div className="border-t border-stone-200 px-3 py-2.5 sm:border-t-0">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">Valid-cycle spread</div>
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr("Valid-cycle spread")}</div>
                 <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
-                  {validStdDev == null ? "N/A" : formatDeltaValue(validStdDev)}
+                  {tr(validStdDev == null ? "N/A" : formatDeltaValue(validStdDev))}
                 </div>
               </div>
               <div className="border-t border-stone-200 px-3 py-2.5 sm:border-t-0">
                 <div className="flex items-center justify-between gap-2">
                   <Tooltip
-                    label="Fitted isotope-signal movement across the observed mean m/z 44 intensity range, divided by the instrument's internal standard deviation. Below 1× σ is low, 1–2× σ is a watch, and 2× σ or more is high."
+                    label={tr("Fitted isotope-signal movement across the observed mean m/z 44 intensity range, divided by the instrument's internal standard deviation. Below 1× σ is low, 1–2× σ is a watch, and 2× σ or more is high.")}
                     align="start"
                     contentClassName="w-80"
                   >
-                    <span tabIndex={0} className="text-[10px] font-semibold uppercase tracking-wide text-stone-500 underline decoration-dotted underline-offset-2">
-                      Intensity-linearity drift
-                    </span>
+                    <span tabIndex={0} className="text-[10px] font-semibold uppercase tracking-wide text-stone-500 underline decoration-dotted underline-offset-2">{tr("Intensity-linearity drift")}</span>
                   </Tooltip>
                   {linearitySeverity && linearitySeverity !== "unavailable" ? (
                     <span
@@ -4852,17 +4666,17 @@ function DiagnosticsPanel({
                             : "bg-emerald-100 text-emerald-700",
                       )}
                     >
-                      {linearitySeverity}
+                      {tr(linearitySeverity)}
                     </span>
                   ) : null}
                 </div>
                 <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
-                  {linearityIssueIndex == null ? "N/A" : `${linearityIssueIndex.toFixed(2)}× σ`}
+                  {tr(linearityIssueIndex == null ? "N/A" : `${linearityIssueIndex.toFixed(2)}× σ`)}
                 </div>
                 <div className="mt-0.5 text-[11px] text-stone-500">
-                  {linearitySlopePer10v == null || linearityRSquared == null
+                  {tr(linearitySlopePer10v == null || linearityRSquared == null
                     ? "Needs at least three varying valid cycles."
-                    : `${linearitySlopePer10v >= 0 ? "+" : ""}${linearitySlopePer10v.toFixed(3)}‰ / 10 V · R² ${linearityRSquared.toFixed(2)}`}
+                    : `${linearitySlopePer10v >= 0 ? "+" : ""}${linearitySlopePer10v.toFixed(3)}‰ / 10 V · R² ${linearityRSquared.toFixed(2)}`)}
                 </div>
               </div>
             </div>
@@ -4880,7 +4694,7 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help text-stone-400" : "text-stone-900",
                     )}
                   >
-                    {displayValue}
+                    {tr(displayValue)}
                   </span>
                 );
                 return (
@@ -4900,10 +4714,10 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
                     )}
                   >
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{formatScientificText(item.label)}</div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr(formatScientificText(item.label))}</div>
                     <div className="mt-0.5 text-base font-semibold">
                       {blockedByLinearityCycleCount ? (
-                        <Tooltip label="not enough cycles for linearity calculation" align="start">
+                        <Tooltip label={tr("not enough cycles for linearity calculation")} align="start">
                           {valueElement}
                         </Tooltip>
                       ) : (
@@ -4911,14 +4725,14 @@ function DiagnosticsPanel({
                       )}
                     </div>
                     {item.stdev != null ? (
-                      <div className="mt-0.5 text-[11px] text-stone-500">σ {formatDeltaValue(item.stdev)}</div>
+                      <div className="mt-0.5 text-[11px] text-stone-500">σ {tr(formatDeltaValue(item.stdev))}</div>
                     ) : null}
                   </button>
                 );
               })}
             </div>
 
-            {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
+            {reason ? <div className="text-sm text-stone-500">{tr("Diagnostics note: ")}{tr(reason)}</div> : null}
 
             {showCycleEvidence ? (
               <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
@@ -4940,7 +4754,7 @@ function DiagnosticsPanel({
               <>
                 <div className="flex flex-wrap items-end gap-4">
                   <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label="Chart color axis" />
+                    <SaturationAxisHelpTooltip label={tr("Chart color axis")} />
                     <select
                       value={saturationColorAxis}
                       onChange={(event) => setSaturationColorAxis(event.target.value as SaturationColorAxisKey)}
@@ -4948,13 +4762,13 @@ function DiagnosticsPanel({
                     >
                       {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
-                          {option.label}
+                          {tr(option.label)}
                         </option>
                       ))}
                     </select>
                   </label>
                   <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label="Chart y axis" />
+                    <SaturationAxisHelpTooltip label={tr("Chart y axis")} />
                     <select
                       value={saturationYAxis}
                       onChange={(event) => setSaturationYAxis(event.target.value as SaturationAxisKey)}
@@ -4962,7 +4776,7 @@ function DiagnosticsPanel({
                     >
                       {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
-                          {option.label}
+                          {tr(option.label)}
                         </option>
                       ))}
                     </select>
@@ -4974,8 +4788,8 @@ function DiagnosticsPanel({
                     <SaturationFigureCard
                       key={item.key}
                       chartKey={item.key}
-                      title={item.title}
-                      description={item.description}
+                      title={tr(item.title)}
+                      description={tr(item.description)}
                       figure={item.figure}
                       colorAxis={saturationColorAxis}
                       yAxis={saturationYAxis}
@@ -4990,7 +4804,7 @@ function DiagnosticsPanel({
             ) : null}
           </>
         ) : loading ? null : (
-          <div className="text-sm text-stone-500">Cycle diagnostics appear here once a point is selected.</div>
+          <div className="text-sm text-stone-500">{tr("Cycle diagnostics appear here once a point is selected.")}</div>
         )}
       </CardContent>
     </Card>
@@ -5012,6 +4826,7 @@ function DuplicateCycleDiagnostics({
   onInspect: (target: SelectedTarget) => void;
   legendCollapsed?: boolean;
 }) {
+  const tr = useTranslation();
   const diagnosticQueries = useQueries({
     queries: targets.map((target) => ({
       queryKey: ["processing-diagnostics", sessionId, target.rowLabel, isotopeKey],
@@ -5043,12 +4858,8 @@ function DuplicateCycleDiagnostics({
   return (
     <section className="space-y-4" aria-labelledby="duplicate-cycle-diagnostics-heading">
       <div>
-        <h3 id="duplicate-cycle-diagnostics-heading" className="text-sm font-semibold text-stone-900">
-          Cycle evidence for matching samples
-        </h3>
-        <p className="mt-0.5 max-w-3xl text-xs leading-5 text-stone-500">
-          Each chart and table belongs to one analysis row. Current analysis values can differ from cycle evidence after an edit, restoration, or interpolation.
-        </p>
+        <h3 id="duplicate-cycle-diagnostics-heading" className="text-sm font-semibold text-stone-900">{tr("Cycle evidence for matching samples")}</h3>
+        <p className="mt-0.5 max-w-3xl text-xs leading-5 text-stone-500">{tr("Each chart and table belongs to one analysis row. Current analysis values can differ from cycle evidence after an edit, restoration, or interpolation.")}</p>
       </div>
       <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
         {samples.map(({ target, index, query, diagnostics, currentValue, currentMethod, cycleMean, valuesDiffer, isActive }) => (
@@ -5056,47 +4867,42 @@ function DuplicateCycleDiagnostics({
             <div className="flex flex-wrap items-start justify-between gap-3 border-b border-stone-200 px-3 py-2.5">
               <div className="min-w-0 space-y-1.5">
                 <div className="flex flex-wrap items-center gap-2">
-                  <h4 className="text-sm font-semibold text-stone-900">Sample {index + 1}</h4>
-                  <span className="rounded-md bg-stone-100 px-1.5 py-0.5 text-[11px] tabular-nums text-stone-600">Row {target.rowLabel}</span>
+                  <h4 className="text-sm font-semibold text-stone-900">{tr("Sample ")}{index + 1}</h4>
+                  <span className="rounded-md bg-stone-100 px-1.5 py-0.5 text-[11px] tabular-nums text-stone-600">{tr("Row ")}{tr(target.rowLabel)}</span>
                   {isActive ? (
-                    <span className="rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-800">Active sample</span>
+                    <span className="rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-800">{tr("Active sample")}</span>
                   ) : null}
                 </div>
                 <div className="truncate text-xs text-stone-500">
-                  {(target.identifier1 || "No Identifier 1").trim()} · {(target.identifier2 || "No Identifier 2").trim()}
+                  {tr((target.identifier1 || "No Identifier 1").trim())} · {tr((target.identifier2 || "No Identifier 2").trim())}
                 </div>
                 <dl className="flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
                   <div className="flex gap-1">
-                    <dt className="text-stone-500">Current value:</dt>
-                    <dd className="font-semibold tabular-nums text-stone-800">{currentValue == null ? "N/A" : formatDeltaValue(currentValue)}</dd>
+                    <dt className="text-stone-500">{tr("Current value:")}</dt>
+                    <dd className="font-semibold tabular-nums text-stone-800">{tr(currentValue == null ? "N/A" : formatDeltaValue(currentValue))}</dd>
                   </div>
                   <div className="flex gap-1">
-                    <dt className="text-stone-500">Cycle mean:</dt>
-                    <dd className="font-semibold tabular-nums text-stone-800">{cycleMean == null ? "N/A" : formatDeltaValue(cycleMean)}</dd>
+                    <dt className="text-stone-500">{tr("Cycle mean:")}</dt>
+                    <dd className="font-semibold tabular-nums text-stone-800">{tr(cycleMean == null ? "N/A" : formatDeltaValue(cycleMean))}</dd>
                   </div>
                   <div className="flex gap-1">
-                    <dt className="text-stone-500">Source:</dt>
-                    <dd className="font-medium text-stone-700">{currentMethod}</dd>
+                    <dt className="text-stone-500">{tr("Source:")}</dt>
+                    <dd className="font-medium text-stone-700">{tr(currentMethod)}</dd>
                   </div>
                 </dl>
               </div>
               {!isActive ? (
-                <Button type="button" variant="outline" size="sm" onClick={() => onInspect(target)}>
-                  Inspect/edit sample
-                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={() => onInspect(target)}>{tr("Inspect/edit sample")}</Button>
               ) : null}
             </div>
             <div className="space-y-3 p-3">
               {valuesDiffer ? (
-                <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950" role="note">
-                  The current analysis value uses <span className="font-semibold">{currentMethod.toLowerCase()}</span> data, while the chart and table preserve the original cycle-level evidence.
-                </div>
+                <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950" role="note">{tr("The current analysis value uses")}<span className="font-semibold">{tr(currentMethod.toLowerCase())}</span>{tr("data, while the chart and table preserve the original cycle-level evidence.")}</div>
               ) : null}
-              {query?.isLoading ? <div className="text-sm text-stone-500">Loading cycle evidence...</div> : null}
-              <div aria-label={`Cycle intensity chart for sample ${index + 1}, row ${target.rowLabel}`}>
+              {query?.isLoading ? <div className="text-sm text-stone-500">{tr("Loading cycle evidence...")}</div> : null}
+              <div aria-label={tr(`Cycle intensity chart for sample ${index + 1}, row ${target.rowLabel}`)}>
                 {query?.isError ? (
-                  <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
-                    Unable to load cycle evidence for row {target.rowLabel}.
+                  <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">{tr("Unable to load cycle evidence for row")}{tr(target.rowLabel)}.
                   </div>
                 ) : diagnostics ? (
                   <PlotlyChart
@@ -5110,7 +4916,7 @@ function DuplicateCycleDiagnostics({
                 ) : null}
               </div>
               {diagnostics && !query?.isError ? (
-                <div className="min-w-0 border-t border-stone-200 pt-3" aria-label={`Cycle table for sample ${index + 1}, row ${target.rowLabel}`}>
+                <div className="min-w-0 border-t border-stone-200 pt-3" aria-label={tr(`Cycle table for sample ${index + 1}, row ${target.rowLabel}`)}>
                   <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
                 </div>
               ) : null}
@@ -5151,14 +4957,15 @@ function FigureCard({
   onPointHover?: (payload: PlotlyHoverPayload) => void;
   onHoverEnd?: () => void;
 }) {
+  const tr = useTranslation();
   return (
     <Card className={cn("min-w-0", cardClassName)}>
       <CardHeader className="gap-1.5 py-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <CardTitle className="text-base">{title}</CardTitle>
-          {headerActions ? <div className="ml-auto">{headerActions}</div> : null}
+          <CardTitle className="text-base">{tr(title)}</CardTitle>
+          {headerActions ? <div className="ml-auto">{tr(headerActions)}</div> : null}
         </div>
-        <CardDescription>{description}</CardDescription>
+        <CardDescription>{tr(description)}</CardDescription>
       </CardHeader>
       <CardContent className="min-w-0 overflow-hidden">
         <PlotlyChart
@@ -5180,6 +4987,9 @@ function FigureCard({
 }
 
 export default function ProcessingPage() {
+  const consultation = useMetrologyConsultation();
+  const metrologyResults = useContext(MetrologyProcessingResults);
+  const tr = useTranslation();
   const sessionId = useSessionStore((state) => state.sessionId);
   const queryClient = useQueryClient();
   const [config, setConfig] = useState<ProcessingConfig | null>(null);
@@ -5287,6 +5097,12 @@ export default function ProcessingPage() {
     enabled: Boolean(sessionId),
     staleTime: 60_000,
   });
+  const effectiveLinearityPreviewConfig =
+    linearityPreviewConfig ?? sharedLinearityConfig ?? calibrationWorkspaceQuery.data?.config.linearity ?? null;
+  const linearityPreviewValues = useMemo(
+    () => buildLinearityPreviewValues(linearityPreviewDataQuery.data, effectiveLinearityPreviewConfig),
+    [effectiveLinearityPreviewConfig, linearityPreviewDataQuery.data],
+  );
   const clientOutputPreviewPayload = useMemo<ExportRequest | null>(
     () =>
       config
@@ -5451,7 +5267,7 @@ export default function ProcessingPage() {
         calibrationWorkspaceQuery.data?.config?.selected_standards ?? [],
         { summaryOnly: true },
       ),
-    onSuccess: (workspace) => {
+    onSuccess: (workspace, submittedLinearity) => {
       queryClient.setQueryData<CalibrationWorkspace | undefined>(["calibration-workspace", sessionId], (current) =>
         current
           ? {
@@ -5467,7 +5283,9 @@ export default function ProcessingPage() {
       queryClient.setQueryData<ProcessingLinearityPreviewData | undefined>(["processing-linearity-preview-data", sessionId], (current) =>
         current ? { ...current, fits: workspace.linearity_fits } : current,
       );
-      setSharedLinearityConfig(workspace.config.linearity);
+      setSharedLinearityConfig((current) =>
+        current && !linearityConfigEquals(current, submittedLinearity) ? current : workspace.config.linearity,
+      );
       setLinearityPreviewStale(true);
       void queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", sessionId] });
       void queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
@@ -5762,7 +5580,7 @@ export default function ProcessingPage() {
       if (url.origin !== window.location.origin || url.pathname === window.location.pathname) {
         return;
       }
-      if (!window.confirm(message)) {
+      if (!window.confirm(tr(message))) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -6045,34 +5863,27 @@ export default function ProcessingPage() {
     key: keyof CalibrationConfig["linearity"],
     value: boolean | number | string | null,
   ) {
-    setSharedLinearityConfig((current) => {
-      if (!current) {
-        return current;
-      }
-      const next = {
-        ...current,
-        [key]: value,
-      };
-      setLinearityPreviewConfig(next);
-      setLinearityPreviewStale(true);
-      return next;
-    });
+    if (!effectiveLinearityPreviewConfig) {
+      return;
+    }
+    const next = { ...effectiveLinearityPreviewConfig, [key]: value };
+    setSharedLinearityConfig(next);
+    setLinearityPreviewConfig(next);
+    setLinearityPreviewStale(true);
   }
 
   function updateSharedLinearityIntensityCol(intensityCol: string) {
-    setSharedLinearityConfig((current) => {
-      if (!current) {
-        return current;
-      }
-      const next = {
-        ...current,
-        intensity_col: intensityCol,
-        use_diff_intensity: intensityCol === LINEARITY_INTENSITY_DIFF44,
-      };
-      setLinearityPreviewConfig(next);
-      setLinearityPreviewStale(true);
-      return next;
-    });
+    if (!effectiveLinearityPreviewConfig) {
+      return;
+    }
+    const next = {
+      ...effectiveLinearityPreviewConfig,
+      intensity_col: intensityCol,
+      use_diff_intensity: intensityCol === LINEARITY_INTENSITY_DIFF44,
+    };
+    setSharedLinearityConfig(next);
+    setLinearityPreviewConfig(next);
+    setLinearityPreviewStale(true);
   }
 
   function updateLinearityCoefficientOffset(
@@ -6080,32 +5891,33 @@ export default function ProcessingPage() {
     term: LinearityCoefficientTerm,
     value: number,
   ) {
-    setSharedLinearityConfig((current) => {
-      if (!current) {
-        return current;
-      }
-      const next = { ...current };
-      if (term === "primary" && isotopeKey === "d13C") {
-        next.manual_d13_per_10v = value;
-      } else if (term === "primary") {
-        next.manual_d18_per_10v = value;
-      } else if (isotopeKey === "d13C") {
-        next.manual_d13_per_10v2 = value;
-      } else {
-        next.manual_d18_per_10v2 = value;
-      }
-      const activeOffsets = [
-        Number(next.manual_d13_per_10v ?? 0),
-        Number(next.manual_d18_per_10v ?? 0),
-        ...(next.quadratic || selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44
-          ? [Number(next.manual_d13_per_10v2 ?? 0), Number(next.manual_d18_per_10v2 ?? 0)]
-          : []),
-      ];
-      const hasOffset = activeOffsets.some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
-      next.manual_override_enabled = hasOffset;
+    if (!effectiveLinearityPreviewConfig) {
+      return;
+    }
+    const next = { ...effectiveLinearityPreviewConfig };
+    if (term === "primary" && isotopeKey === "d13C") {
+      next.manual_d13_per_10v = value;
+    } else if (term === "primary") {
+      next.manual_d18_per_10v = value;
+    } else if (isotopeKey === "d13C") {
+      next.manual_d13_per_10v2 = value;
+    } else {
+      next.manual_d18_per_10v2 = value;
+    }
+    const activeOffsets = [
+      Number(next.manual_d13_per_10v ?? 0),
+      Number(next.manual_d18_per_10v ?? 0),
+      ...(next.quadratic || selectedLinearityIntensityCol === LINEARITY_INTENSITY_TWO_TERM44
+        ? [Number(next.manual_d13_per_10v2 ?? 0), Number(next.manual_d18_per_10v2 ?? 0)]
+        : []),
+    ];
+    next.manual_override_enabled = activeOffsets.some(
+      (offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12,
+    );
+    startTransition(() => {
+      setSharedLinearityConfig(next);
       setLinearityPreviewConfig(next);
       setLinearityPreviewStale(true);
-      return next;
     });
   }
 
@@ -6867,19 +6679,19 @@ export default function ProcessingPage() {
     return (
       <Card>
         <CardHeader>
-          <CardTitle>No Active Session</CardTitle>
-          <CardDescription>Import data first to open the processing workspace.</CardDescription>
+          <CardTitle>{tr("No Active Session")}</CardTitle>
+          <CardDescription>{tr("Import data first to open the processing workspace.")}</CardDescription>
         </CardHeader>
       </Card>
     );
   }
 
   if (workspaceQuery.isLoading && !workspace) {
-    return <div className="text-sm text-stone-500">Loading processing workspace...</div>;
+    return <div className="text-sm text-stone-500">{tr("Loading processing workspace...")}</div>;
   }
 
   if (workspaceQuery.error) {
-    return <div className="text-sm text-red-600">Failed to load processing workspace.</div>;
+    return <div className="text-sm text-red-600">{tr("Failed to load processing workspace.")}</div>;
   }
 
   if (!workspace || !activeConfig) {
@@ -6955,7 +6767,13 @@ export default function ProcessingPage() {
   );
   const applyPreviewFigure = (figure: Record<string, unknown> | undefined) => {
     const linearityFigure = shouldApplyLinearityPreview
-      ? applyLinearityPreviewToFigure(figure, linearityPreviewDataQuery.data, previewLinearity, activeConfig)
+      ? applyLinearityPreviewToFigure(
+          figure,
+          linearityPreviewDataQuery.data,
+          previewLinearity,
+          activeConfig,
+          linearityPreviewValues,
+        )
       : figure;
     const processingFigure = hasPendingProcessingConfigChanges
       ? applyProcessingConfigPreviewToFigure(linearityFigure, processingPreviewMasks, activeConfig, processingPreviewRowLookup)
@@ -6963,9 +6781,10 @@ export default function ProcessingPage() {
     const draftFigure = hasPendingSelectionDrafts
       ? applySelectionDraftPreviewToFigure(processingFigure, selectionDraftValues, activeConfig, selectionDraftRowLabels)
       : processingFigure;
-    return hideDuplicateSymbologyAndCollapseLegends
+    const displayed = hideDuplicateSymbologyAndCollapseLegends
       ? draftFigure
       : applyDuplicateHighlightsToFigure(draftFigure, duplicateSampleState.rowLabels);
+    return withSessionUncertainty(displayed, metrologyResults, tr("Final result ± U"));
   };
   const selectedLinearityIntensityCol = previewLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(previewLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
@@ -7175,7 +6994,7 @@ export default function ProcessingPage() {
     return (
       <div className="flex flex-wrap items-end gap-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
         <label className="text-sm">
-          <span className="mb-1 block text-stone-700">Rate (%)</span>
+          <span className="mb-1 block text-stone-700">{tr("Rate (%)")}</span>
           <input
             type="number"
             min={0}
@@ -7191,7 +7010,7 @@ export default function ProcessingPage() {
           />
         </label>
         <label className="text-sm">
-          <span className="mb-1 block text-stone-700">Offset</span>
+          <span className="mb-1 block text-stone-700">{tr("Offset")}</span>
           <input
             type="number"
             step="0.001"
@@ -7201,7 +7020,7 @@ export default function ProcessingPage() {
           />
         </label>
         <label className="text-sm">
-          <span className="mb-1 block text-stone-700">Stdev</span>
+          <span className="mb-1 block text-stone-700">{tr("Stdev")}</span>
           <input
             type="number"
             min={0}
@@ -7214,13 +7033,9 @@ export default function ProcessingPage() {
         <Button
           onClick={() => restoreFailedSamples(table, selectedRowLabels)}
           disabled={restoreDisabled}
-        >
-          Restore
-        </Button>
-        <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>
-          Reset
-        </Button>
-        {hasSelectedRows ? <div className="text-xs text-stone-500">{selectedRowLabels.length} row(s) selected for restore.</div> : null}
+        >{tr("Restore")}</Button>
+        <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>{tr("Reset")}</Button>
+        {hasSelectedRows ? <div className="text-xs text-stone-500">{selectedRowLabels.length}{tr(" row(s) selected for restore.")}</div> : null}
       </div>
     );
   };
@@ -7305,7 +7120,7 @@ export default function ProcessingPage() {
       hasGapBefore: index > 0 && rowIndex - indexes[index - 1] > 1,
     }));
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
-  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 720, 680) : null;
+  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 980, 450) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
     ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
   );
@@ -7573,7 +7388,7 @@ export default function ProcessingPage() {
     return (
       <div className="grid gap-3 sm:grid-cols-3">
         <label className="block min-w-0 text-sm" htmlFor={`${fieldIdPrefix}-identifier1`}>
-          <span className="mb-1 block text-xs font-semibold text-stone-700">Identifier 1</span>
+          <span className="mb-1 block text-xs font-semibold text-stone-700">{tr("Identifier 1")}</span>
           <input
             id={`${fieldIdPrefix}-identifier1`}
             key={`identifier1:${target.rowLabel}:${identifier1Source}`}
@@ -7596,11 +7411,11 @@ export default function ProcessingPage() {
             className={inputClassName}
           />
           <span id={`${fieldIdPrefix}-identifier1-help`} className="mt-1 block text-[11px] leading-4 text-stone-500">
-            {hasIdentifier1Draft ? "Draft change queued." : "Type or choose an existing value."}
+            {tr(hasIdentifier1Draft ? "Draft change queued." : "Type or choose an existing value.")}
           </span>
         </label>
         <label className="block min-w-0 text-sm" htmlFor={`${fieldIdPrefix}-identifier2`}>
-          <span className="mb-1 block text-xs font-semibold text-stone-700">Identifier 2</span>
+          <span className="mb-1 block text-xs font-semibold text-stone-700">{tr("Identifier 2")}</span>
           <input
             id={`${fieldIdPrefix}-identifier2`}
             key={`identifier2:${target.rowLabel}:${identifier2}`}
@@ -7623,11 +7438,11 @@ export default function ProcessingPage() {
             className={inputClassName}
           />
           <span id={`${fieldIdPrefix}-identifier2-help`} className="mt-1 block text-[11px] leading-4 text-stone-500">
-            {hasIdentifier2Draft ? "Draft change queued." : "Type or choose an existing value."}
+            {tr(hasIdentifier2Draft ? "Draft change queued." : "Type or choose an existing value.")}
           </span>
         </label>
         <label className="block min-w-0 text-sm" htmlFor={`${fieldIdPrefix}-species`}>
-          <span className="mb-1 block text-xs font-semibold text-stone-700">Species</span>
+          <span className="mb-1 block text-xs font-semibold text-stone-700">{tr("Species")}</span>
           <input
             id={`${fieldIdPrefix}-species`}
             key={`species:${target.rowLabel}:${speciesSource}`}
@@ -7650,7 +7465,7 @@ export default function ProcessingPage() {
             className={cn(inputClassName, "italic")}
           />
           <span id={`${fieldIdPrefix}-species-help`} className="mt-1 block text-[11px] leading-4 text-stone-500">
-            {hasSpeciesDraft ? "Draft change queued." : "Type or choose an existing value."}
+            {tr(hasSpeciesDraft ? "Draft change queued." : "Type or choose an existing value.")}
           </span>
         </label>
       </div>
@@ -7660,19 +7475,16 @@ export default function ProcessingPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Analysis pipeline"
-        title="Processing"
-        description="Filter, edit, validate, and export the processed measurement set."
+        eyebrow={tr("Analysis pipeline")}
+        title={tr("Processing")}
+        description={tr(consultation ? "Explore this acquisition. Use Results & export for corrected values, uncertainty and release." : "Filter, edit, validate, and export the processed measurement set.")}
         actions={
           <>
-            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">Edited rows: {workspace.edit_state.edited_rows.length}</span>
-            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">
-              Manual overrides: {manualOverrideCount}
+            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">{tr("Edited rows: ")}{workspace.edit_state.edited_rows.length}</span>
+            <span className="rounded-md bg-white px-3 py-1 ring-1 ring-stone-200">{tr("Manual overrides:")}{manualOverrideCount}
             </span>
-            <Button variant="secondary" size="sm" onClick={() => setExportModalOpen(true)} disabled={busy}>
-              <Download className="h-4 w-4" />
-              Export
-            </Button>
+            <Button variant="secondary" size="sm" onClick={() => setExportModalOpen(true)} disabled={consultation || busy}>
+              <Download className="h-4 w-4" />{tr("Export")}</Button>
           </>
         }
       />
@@ -7681,7 +7493,7 @@ export default function ProcessingPage() {
         <Card className="border-blue-200 bg-blue-50/70" aria-live="polite">
           <CardContent className="space-y-3 pt-6">
             <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
-              <span className="font-medium text-blue-950">{activeBackgroundJob.message || "Processing in background"}</span>
+              <span className="font-medium text-blue-950">{tr(activeBackgroundJob.message || "Processing in background")}</span>
               <div className="flex items-center gap-3">
                 <span className="text-blue-800">{Math.round(activeBackgroundJob.progress)}%</span>
                 {activeBackgroundJob.cancellable ? (
@@ -7691,7 +7503,7 @@ export default function ProcessingPage() {
                     onClick={() => cancelBackgroundJobMutation.mutate(activeBackgroundJob.job_id)}
                     disabled={cancelBackgroundJobMutation.isPending}
                   >
-                    {cancelBackgroundJobMutation.isPending ? "Cancelling..." : "Cancel"}
+                    {tr(cancelBackgroundJobMutation.isPending ? "Cancelling..." : "Cancel")}
                   </Button>
                 ) : null}
               </div>
@@ -7703,8 +7515,7 @@ export default function ProcessingPage() {
         </Card>
       ) : null}
       {processingOperationError ? (
-        <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-          Processing operation failed: {processingOperationError}
+        <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">{tr("Processing operation failed:")}{tr(processingOperationError)}
         </div>
       ) : null}
 
@@ -7714,29 +7525,23 @@ export default function ProcessingPage() {
             <CardHeader className="gap-3">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                  <CardTitle>Processing Controls</CardTitle>
-                  <CardDescription>Filters, outliers, and shared linearity controls synced with Calibration.</CardDescription>
+                  <CardTitle>{tr("Processing Controls")}</CardTitle>
+                  <CardDescription>{tr("Filters, outliers, and shared linearity controls synced with Calibration.")}</CardDescription>
                 </div>
                 <Button onClick={applyConfig} disabled={busy || !hasSaveableChanges} size="sm">
-                  {busy ? "Saving..." : "Save changes"}
+                  {tr(busy ? "Saving..." : "Save changes")}
                 </Button>
               </div>
               {hasPendingProcessingConfigChanges || hasUnsavedLinearityChanges || hasPendingSelectionDrafts ? (
                 <div className="flex flex-wrap gap-2">
                   {hasPendingProcessingConfigChanges ? (
-                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
-                      Preview active
-                    </span>
+                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Preview active")}</span>
                   ) : null}
                   {hasUnsavedLinearityChanges ? (
-                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
-                      Unsaved linearity
-                    </span>
+                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Unsaved linearity")}</span>
                   ) : null}
                   {hasPendingSelectionDrafts ? (
-                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
-                      Unsaved selection edits
-                    </span>
+                    <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">{tr("Unsaved selection edits")}</span>
                   ) : null}
                 </div>
               ) : null}
@@ -7744,7 +7549,7 @@ export default function ProcessingPage() {
             <CardContent className="space-y-4">
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
                 <label className="text-sm">
-                  <span className="mb-1 block font-medium text-stone-700">Identifier scope</span>
+                  <span className="mb-1 block font-medium text-stone-700">{tr("Identifier scope")}</span>
                   <select
                     value={activeConfig.selected_identifier}
                     onChange={(event) => updateConfig("selected_identifier", event.target.value)}
@@ -7752,24 +7557,24 @@ export default function ProcessingPage() {
                   >
                     {workspace.available_values.identifiers.map((option) => (
                       <option key={option} value={option}>
-                        {option}
+                        {tr(option)}
                       </option>
                     ))}
                   </select>
                 </label>
                 <label className="text-sm">
-                  <span className="mb-1 block font-medium text-stone-700">X axis</span>
+                  <span className="mb-1 block font-medium text-stone-700">{tr("X axis")}</span>
                   <select
                     value={activeConfig.x_axis_option}
                     onChange={(event) => updateConfig("x_axis_option", event.target.value as ProcessingConfig["x_axis_option"])}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
-                    <option value="By Identifier 2">By Identifier 2</option>
-                    <option value="By Sequence">By Sequence</option>
+                    <option value="By Identifier 2">{tr("By Identifier 2")}</option>
+                    <option value="By Sequence">{tr("By Sequence")}</option>
                   </select>
                 </label>
                 <div className="text-sm">
-                  <span className="mb-1 block font-medium text-stone-700">Color parameter</span>
+                  <span className="mb-1 block font-medium text-stone-700">{tr("Color parameter")}</span>
                   <select
                     value={activeConfig.color_param}
                     onChange={(event) => updateConfig("color_param", event.target.value)}
@@ -7779,7 +7584,7 @@ export default function ProcessingPage() {
                       .filter((option) => option !== "Date_ordinal")
                       .map((option) => (
                       <option key={option} value={option}>
-                        {previewColorLabel(option)}
+                        {tr(previewColorLabel(option))}
                       </option>
                     ))}
                   </select>
@@ -7790,7 +7595,7 @@ export default function ProcessingPage() {
                   ) : null}
                   <div className="mt-2">
                     <RangeSliderField
-                      label="Color scale interval"
+                      label={tr("Color scale interval")}
                       value={effectiveColorScaleRange}
                       min={colorSliderBounds.min}
                       max={colorSliderBounds.max}
@@ -7801,7 +7606,7 @@ export default function ProcessingPage() {
                   </div>
                 </div>
                 <label className="text-sm">
-                  <span className="mb-1 block font-medium text-stone-700">3D Z axis</span>
+                  <span className="mb-1 block font-medium text-stone-700">{tr("3D Z axis")}</span>
                   <select
                     value={activeConfig.z_axis}
                     onChange={(event) => updateConfig("z_axis", event.target.value)}
@@ -7809,7 +7614,7 @@ export default function ProcessingPage() {
                   >
                     {workspace.available_values.z_axis_options.map((option) => (
                       <option key={option} value={option}>
-                        {option}
+                        {tr(option)}
                       </option>
                     ))}
                   </select>
@@ -7817,10 +7622,10 @@ export default function ProcessingPage() {
               </div>
 
               <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-800">Range filters</div>
+                <div className="text-sm font-medium text-stone-800">{tr("Range filters")}</div>
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
                   <RangeSliderField
-                    label="Signal range"
+                    label={tr("Signal range")}
                     value={activeConfig.signal_range}
                     min={Math.min(0, activeConfig.signal_range[0], activeConfig.signal_range[1])}
                     max={Math.max(100, activeConfig.signal_range[0], activeConfig.signal_range[1])}
@@ -7830,7 +7635,7 @@ export default function ProcessingPage() {
                     onChange={(nextRange) => updateConfig("signal_range", nextRange)}
                   />
                   <RangeSliderField
-                    label="Leak range"
+                    label={tr("Leak range")}
                     value={activeConfig.leak_range}
                     min={Math.min(0, activeConfig.leak_range[0], activeConfig.leak_range[1])}
                     max={Math.max(2000, activeConfig.leak_range[0], activeConfig.leak_range[1])}
@@ -7840,7 +7645,7 @@ export default function ProcessingPage() {
                     onChange={(nextRange) => updateConfig("leak_range", nextRange)}
                   />
                   <RangeSliderField
-                    label="δ¹³C range"
+                    label={tr("δ¹³C range")}
                     value={activeConfig.d13c_range}
                     min={Math.min(-50, activeConfig.d13c_range[0], activeConfig.d13c_range[1])}
                     max={Math.max(50, activeConfig.d13c_range[0], activeConfig.d13c_range[1])}
@@ -7850,7 +7655,7 @@ export default function ProcessingPage() {
                     onChange={(nextRange) => updateConfig("d13c_range", nextRange)}
                   />
                   <RangeSliderField
-                    label="δ¹⁸O range"
+                    label={tr("δ¹⁸O range")}
                     value={activeConfig.d18o_range}
                     min={Math.min(-50, activeConfig.d18o_range[0], activeConfig.d18o_range[1])}
                     max={Math.max(50, activeConfig.d18o_range[0], activeConfig.d18o_range[1])}
@@ -7861,19 +7666,19 @@ export default function ProcessingPage() {
                   />
                 </div>
                 <label className="text-sm">
-                  <span className="mb-1 block text-stone-700">Statistical outlier method</span>
+                  <span className="mb-1 block text-stone-700">{tr("Statistical outlier method")}</span>
                   <select
                     value={activeConfig.statistical_outlier_method}
                     onChange={(event) => updateConfig("statistical_outlier_method", event.target.value as ProcessingConfig["statistical_outlier_method"])}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
-                    <option value="Z-Score">Z-Score</option>
-                    <option value="IQR">IQR</option>
+                    <option value="Z-Score">{tr("Z-Score")}</option>
+                    <option value="IQR">{tr("IQR")}</option>
                   </select>
                 </label>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">Sigma level</span>
+                    <span className="mb-1 block text-stone-700">{tr("Sigma level")}</span>
                     <input
                       type="number"
                       step="0.1"
@@ -7883,7 +7688,7 @@ export default function ProcessingPage() {
                     />
                   </label>
                   <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">IQR multiplier</span>
+                    <span className="mb-1 block text-stone-700">{tr("IQR multiplier")}</span>
                     <input
                       type="number"
                       step="0.1"
@@ -7896,46 +7701,44 @@ export default function ProcessingPage() {
               </div>
 
               <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-800">Show on chart</div>
+                <div className="text-sm font-medium text-stone-800">{tr("Show on chart")}</div>
                 <CheckboxField
                   checked={hideDuplicateSymbologyAndCollapseLegends}
-                  label="Hide duplicate symbols and collapse legends"
-                  description="Removes the duplicate-sample diamond overlay and closes every chart legend. Duplicate detection and editing stay active."
+                  label={tr("Hide duplicate symbols and collapse legends")}
+                  description={tr("Removes the duplicate-sample diamond overlay and closes every chart legend. Duplicate detection and editing stay active.")}
                   onChange={setHideDuplicateSymbologyAndCollapseLegends}
                 />
-                <CheckboxField checked={activeConfig.overlays.show_statistical_outliers} label="Statistical outliers" onChange={(checked) => updateOverlay("show_statistical_outliers", checked)} />
-                <CheckboxField checked={activeConfig.overlays.show_range_outliers} label="Range outliers" onChange={(checked) => updateOverlay("show_range_outliers", checked)} />
-                <CheckboxField checked={activeConfig.overlays.show_manual_outliers} label="Manual outliers" onChange={(checked) => updateOverlay("show_manual_outliers", checked)} />
+                <CheckboxField checked={activeConfig.overlays.show_statistical_outliers} label={tr("Statistical outliers")} onChange={(checked) => updateOverlay("show_statistical_outliers", checked)} />
+                <CheckboxField checked={activeConfig.overlays.show_range_outliers} label={tr("Range outliers")} onChange={(checked) => updateOverlay("show_range_outliers", checked)} />
+                <CheckboxField checked={activeConfig.overlays.show_manual_outliers} label={tr("Manual outliers")} onChange={(checked) => updateOverlay("show_manual_outliers", checked)} />
                 <CheckboxField
                   checked={activeConfig.overlays.show_saturated_collectors}
-                  label="Partially saturated collectors"
-                  description="Checked keeps partially saturated samples on the curve. Unchecked treats them as outliers."
+                  label={tr("Partially saturated collectors")}
+                  description={tr("Checked keeps partially saturated samples on the curve. Unchecked treats them as outliers.")}
                   onChange={(checked) => updateOverlay("show_saturated_collectors", checked)}
                 />
-                <CheckboxField checked={activeConfig.overlays.show_saturated_samples} label="Fully saturated samples" onChange={(checked) => updateOverlay("show_saturated_samples", checked)} />
-                <CheckboxField checked={activeConfig.overlays.show_failed_samples} label="Failed samples" onChange={(checked) => updateOverlay("show_failed_samples", checked)} />
+                <CheckboxField checked={activeConfig.overlays.show_saturated_samples} label={tr("Fully saturated samples")} onChange={(checked) => updateOverlay("show_saturated_samples", checked)} />
+                <CheckboxField checked={activeConfig.overlays.show_failed_samples} label={tr("Failed samples")} onChange={(checked) => updateOverlay("show_failed_samples", checked)} />
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() => void resetManualOutliers()}
                   disabled={busy || manualOverrideCount === 0}
-                >
-                  Reset manual outliers
-                </Button>
+                >{tr("Reset manual outliers")}</Button>
               </div>
 
               <div className="space-y-3">
-                <div className="text-sm font-medium text-stone-800">Saturation correction</div>
+                <div className="text-sm font-medium text-stone-800">{tr("Saturation correction")}</div>
                 <CheckboxField
                   checked={Boolean(activeConfig.enable_saturation_correction)}
-                  label="Enable saturation correction"
-                  description="Applies only to unedited partially saturated samples before shared linearity."
+                  label={tr("Enable saturation correction")}
+                  description={tr("Applies only to unedited partially saturated samples before shared linearity.")}
                   onChange={(checked) => updateConfig("enable_saturation_correction", checked)}
                 />
                 {activeConfig.enable_saturation_correction ? (
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">δ¹³C default method</span>
+                      <span className="mb-1 block text-stone-700">{tr("δ¹³C default method")}</span>
                       <select
                         value={activeConfig.saturation_correction_method_d13 ?? activeConfig.saturation_correction_method}
                         onChange={(event) => updateSaturationMethod("d13C", event.target.value as SaturationCorrectionMethod)}
@@ -7943,13 +7746,13 @@ export default function ProcessingPage() {
                       >
                         {SATURATION_METHOD_OPTIONS.map((option) => (
                           <option key={option.value} value={option.value}>
-                            {option.label}
+                            {tr(option.label)}
                           </option>
                         ))}
                       </select>
                     </label>
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">δ¹⁸O default method</span>
+                      <span className="mb-1 block text-stone-700">{tr("δ¹⁸O default method")}</span>
                       <select
                         value={activeConfig.saturation_correction_method_d18 ?? activeConfig.saturation_correction_method}
                         onChange={(event) => updateSaturationMethod("d18O", event.target.value as SaturationCorrectionMethod)}
@@ -7957,7 +7760,7 @@ export default function ProcessingPage() {
                       >
                         {SATURATION_METHOD_OPTIONS.map((option) => (
                           <option key={option.value} value={option.value}>
-                            {option.label}
+                            {tr(option.label)}
                           </option>
                         ))}
                       </select>
@@ -7968,76 +7771,74 @@ export default function ProcessingPage() {
 
               <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="text-sm font-medium text-stone-800">Linearity (shared with calibration)</div>
+                  <div className="text-sm font-medium text-stone-800">{tr("Linearity (shared with calibration)")}</div>
                   <div className="flex flex-wrap items-center gap-2">
                     {hasUnsavedLinearityChanges || linearityPreviewStale || linearityPreviewConfig ? (
                       <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
-                        {hasUnsavedLinearityChanges ? "Draft preview" : "Preview active"}
+                        {tr(hasUnsavedLinearityChanges ? "Draft preview" : "Preview active")}
                       </span>
                     ) : null}
-                    <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                    <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">{tr("Basis: ")}{tr(selectedLinearityBasisLabel)}</span>
                   </div>
                 </div>
                 {previewLinearity ? (
                   <>
                     <CheckboxField
                       checked={previewLinearity.apply}
-                      label="Enable linearity correction"
-                      description="Uses the same basis, fits, and offsets as Calibration."
+                      label={tr("Enable linearity correction")}
+                      description={tr("Uses the same basis, fits, and offsets as Calibration.")}
                       onChange={(checked) => updateSharedLinearity("apply", checked)}
                     />
                     <CheckboxField
                       checked={activeConfig.apply_shared_linearity_to_partially_saturated}
-                      label="Apply to partially saturated samples"
-                      description="Also corrects recovered partially saturated values with the shared linearity fit."
+                      label={tr("Apply to partially saturated samples")}
+                      description={tr("Also corrects recovered partially saturated values with the shared linearity fit.")}
                       onChange={(checked) => updateConfig("apply_shared_linearity_to_partially_saturated", checked)}
                     />
                     {!isTwoTermLinearityBasis ? (
                       <CheckboxField
                         checked={Boolean(previewLinearity.quadratic)}
-                        label="Use quadratic linearity relationship"
-                        description="Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I."
+                        label={tr("Use quadratic linearity relationship")}
+                        description={tr("Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I.")}
                         onChange={(checked) => updateSharedLinearity("quadratic", checked)}
                       />
                     ) : null}
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">Linearity basis</span>
+                      <span className="mb-1 block text-stone-700">{tr("Linearity basis")}</span>
                       <select
                         value={selectedLinearityIntensityCol}
                         onChange={(event) => updateSharedLinearityIntensityCol(event.target.value)}
-                        title={getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
+                        title={tr(getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))}
                         className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                       >
                         {LINEARITY_INTENSITY_OPTIONS.map((option) => (
-                          <option key={option} value={option} title={getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation)}>
-                            {getLinearityIntensityOptionLabel(option)}
+                          <option key={option} value={option} title={tr(getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation))}>
+                            {tr(getLinearityIntensityOptionLabel(option))}
                           </option>
                         ))}
                       </select>
                     </label>
                     <label className="text-sm">
-                      <span className="mb-1 block text-stone-700">Linearity cycle intensity</span>
+                      <span className="mb-1 block text-stone-700">{tr("Linearity cycle intensity")}</span>
                       <select
                         value={selectedLinearityCycleIntensityAggregation}
                         onChange={(event) => updateSharedLinearity("cycle_intensity_aggregation", event.target.value)}
-                        title="Choose which cycle intensity is used when building the selected linearity basis for each analysis."
+                        title={tr("Choose which cycle intensity is used when building the selected linearity basis for each analysis.")}
                         className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                       >
                         {LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.map((option) => (
                           <option key={option.value} value={option.value}>
-                            {option.label}
+                            {tr(option.label)}
                           </option>
                         ))}
                       </select>
                     </label>
-                    <Tooltip label={getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)} align="start">
-                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">
-                        Basis formula
-                      </span>
+                    <Tooltip label={tr(getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))} align="start">
+                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Basis formula")}</span>
                     </Tooltip>
                     {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">Max sample intensity</span>
+                        <span className="mb-1 block text-stone-700">{tr("Max sample intensity")}</span>
                         <input
                           type="number"
                           step="0.1"
@@ -8058,31 +7859,31 @@ export default function ProcessingPage() {
                     ) : null}
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div className="border-t border-stone-200 pt-2 text-sm">
-                        <div className="text-xs font-medium text-stone-500">δ¹³C fitted coefficients</div>
+                        <div className="text-xs font-medium text-stone-500">{tr("δ¹³C fitted coefficients")}</div>
                         <div className="mt-1 space-y-1 font-semibold text-stone-900">
                           <div>
-                            <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
-                            {formatFirstNonZeroDigits(d13FitSlope)}
+                            <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                            {tr(formatFirstNonZeroDigits(d13FitSlope))}
                           </div>
                           {showSecondaryCoefficientOffset ? (
                             <div>
-                              <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
-                              {formatFirstNonZeroDigits(d13FitQuad)}
+                              <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                              {tr(formatFirstNonZeroDigits(d13FitQuad))}
                             </div>
                           ) : null}
                         </div>
                       </div>
                       <div className="border-t border-stone-200 pt-2 text-sm">
-                        <div className="text-xs font-medium text-stone-500">δ¹⁸O fitted coefficients</div>
+                        <div className="text-xs font-medium text-stone-500">{tr("δ¹⁸O fitted coefficients")}</div>
                         <div className="mt-1 space-y-1 font-semibold text-stone-900">
                           <div>
-                            <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
-                            {formatFirstNonZeroDigits(d18FitSlope)}
+                            <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                            {tr(formatFirstNonZeroDigits(d18FitSlope))}
                           </div>
                           {showSecondaryCoefficientOffset ? (
                             <div>
-                              <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
-                              {formatFirstNonZeroDigits(d18FitQuad)}
+                              <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                              {tr(formatFirstNonZeroDigits(d18FitQuad))}
                             </div>
                           ) : null}
                         </div>
@@ -8091,7 +7892,7 @@ export default function ProcessingPage() {
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">
-                              {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
+                              {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
                         </span>
                         <DecimalInput
                           value={previewLinearity.manual_d13_per_10v ?? 0}
@@ -8101,7 +7902,7 @@ export default function ProcessingPage() {
                       </label>
                       <label className="text-sm">
                         <span className="mb-1 block text-stone-700">
-                              {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
+                              {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
                         </span>
                         <DecimalInput
                           value={previewLinearity.manual_d18_per_10v ?? 0}
@@ -8114,7 +7915,7 @@ export default function ProcessingPage() {
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
                           <span className="mb-1 block text-stone-700">
-                                {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                                {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
                           </span>
                           <DecimalInput
                             value={previewLinearity.manual_d13_per_10v2 ?? 0}
@@ -8124,7 +7925,7 @@ export default function ProcessingPage() {
                         </label>
                         <label className="text-sm">
                           <span className="mb-1 block text-stone-700">
-                                {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                                {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
                           </span>
                           <DecimalInput
                             value={previewLinearity.manual_d18_per_10v2 ?? 0}
@@ -8134,15 +7935,14 @@ export default function ProcessingPage() {
                         </label>
                       </div>
                     ) : null}
-                    <div className="text-xs text-stone-500">
-                      Coefficient offset active: {coefficientOffsetEnabled ? "Yes" : "No"}
+                    <div className="text-xs text-stone-500">{tr("Coefficient offset active:")}{tr(coefficientOffsetEnabled ? "Yes" : "No")}
                     </div>
                     <div className="grid gap-4 sm:grid-cols-2">
                       <div className="space-y-3">
-                        <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
+                        <span className="text-sm font-medium text-stone-800">{tr("Line 1 offset")}</span>
                         <div className="grid gap-3 sm:grid-cols-2">
                           <label className="text-sm">
-                            <span className="mb-1 block text-stone-700">δ¹³C</span>
+                            <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -8155,7 +7955,7 @@ export default function ProcessingPage() {
                             />
                           </label>
                           <label className="text-sm">
-                            <span className="mb-1 block text-stone-700">δ¹⁸O</span>
+                            <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -8170,10 +7970,10 @@ export default function ProcessingPage() {
                         </div>
                       </div>
                       <div className="space-y-3">
-                        <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
+                        <span className="text-sm font-medium text-stone-800">{tr("Line 2 offset")}</span>
                         <div className="grid gap-3 sm:grid-cols-2">
                           <label className="text-sm">
-                            <span className="mb-1 block text-stone-700">δ¹³C</span>
+                            <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -8186,7 +7986,7 @@ export default function ProcessingPage() {
                             />
                           </label>
                           <label className="text-sm">
-                            <span className="mb-1 block text-stone-700">δ¹⁸O</span>
+                            <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -8203,27 +8003,25 @@ export default function ProcessingPage() {
                     </div>
                     {previewLinearity.apply ? (
                       <div className="space-y-1 border-t border-stone-200 pt-2">
-                        <Tooltip label="Precision after applying the shared linearity correction to each selected standard." align="start">
-                          <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">Corrected precision</span>
+                        <Tooltip label={tr("Precision after applying the shared linearity correction to each selected standard.")} align="start">
+                          <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Corrected precision")}</span>
                         </Tooltip>
                         {standardPrecisionRows.length ? (
                           standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
                             <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
-                              <span className="font-medium text-stone-800">{summary.standard}</span>
-                              <span>δ¹³C: {formatPrecisionMetric(summary.d13_linearity_corrected_precision)}</span>
-                              <span>δ¹⁸O: {formatPrecisionMetric(summary.d18_linearity_corrected_precision)}</span>
+                              <span className="font-medium text-stone-800">{tr(summary.standard)}</span>
+                              <span>{tr("δ¹³C: ")}{tr(formatPrecisionMetric(summary.d13_linearity_corrected_precision))}</span>
+                              <span>{tr("δ¹⁸O: ")}{tr(formatPrecisionMetric(summary.d18_linearity_corrected_precision))}</span>
                             </div>
                           ))
                         ) : (
-                          <div className="text-xs text-stone-500">No selected standards available for precision.</div>
+                          <div className="text-xs text-stone-500">{tr("No selected standards available for precision.")}</div>
                         )}
                       </div>
                     ) : null}
                   </>
                 ) : (
-                  <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">
-                    Load calibration workspace to edit shared linearity parameters.
-                  </div>
+                  <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">{tr("Load calibration workspace to edit shared linearity parameters.")}</div>
                 )}
               </div>
 
@@ -8244,15 +8042,11 @@ export default function ProcessingPage() {
                     setSelectionDraftSpecies({});
                   }}
                   disabled={busy}
-                >
-                  Restore saved
-                </Button>
+                >{tr("Restore saved")}</Button>
                 <Button variant="outline" onClick={() => removeCalibrationMutation.mutate()} disabled={busy}>
-                  {removeCalibrationMutation.isPending ? "Removing calibration..." : "Remove calibration"}
+                  {tr(removeCalibrationMutation.isPending ? "Removing calibration..." : "Remove calibration")}
                 </Button>
-                <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>
-                  Reset all edits
-                </Button>
+                <Button variant="outline" onClick={() => resetAllMutation.mutate()} disabled={busy}>{tr("Reset all edits")}</Button>
               </div>
             </CardContent>
           </Card>
@@ -8269,14 +8063,11 @@ export default function ProcessingPage() {
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" aria-hidden="true" />
                 <div>
                   <div className="text-sm font-semibold">
-                    {duplicateSampleState.rowLabels.size} duplicate sample row{duplicateSampleState.rowLabels.size === 1 ? "" : "s"} highlighted
-                  </div>
-                  <div className="mt-0.5 text-xs text-amber-800">
-                    Orange diamonds share Identifier 1, Identifier 2, and Species. Click one to edit those fields in the Selection Editor.
-                  </div>
+                    {duplicateSampleState.rowLabels.size}{tr(" duplicate sample row")}{tr(duplicateSampleState.rowLabels.size === 1 ? "" : "s")}{tr("highlighted")}</div>
+                  <div className="mt-0.5 text-xs text-amber-800">{tr("Orange diamonds share Identifier 1, Identifier 2, and Species. Click one to edit those fields in the Selection Editor.")}</div>
                 </div>
               </div>
-              <span className="shrink-0 text-xs font-semibold text-amber-800">Resolve before export</span>
+              <span className="shrink-0 text-xs font-semibold text-amber-800">{tr("Resolve before export")}</span>
             </div>
           ) : null}
 
@@ -8285,8 +8076,8 @@ export default function ProcessingPage() {
               <FigureCard
                 key={overviewCards.processing3d.key}
                 chartKey={overviewCards.processing3d.key}
-                title={overviewCards.processing3d.title}
-                description={overviewCards.processing3d.description}
+                title={tr(overviewCards.processing3d.title)}
+                description={tr(overviewCards.processing3d.description)}
                 figure={hideEmbeddedColorbars(overviewCards.processing3d.figure)}
                 legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
                 chartClassName="h-[clamp(380px,42vw,620px)] w-full"
@@ -8299,8 +8090,8 @@ export default function ProcessingPage() {
                 <FigureCard
                   key={overviewCards.crossplot.key}
                   chartKey={overviewCards.crossplot.key}
-                  title={overviewCards.crossplot.title}
-                  description={overviewCards.crossplot.description}
+                  title={tr(overviewCards.crossplot.title)}
+                  description={tr(overviewCards.crossplot.description)}
                   figure={hideEmbeddedColorbars(overviewCards.crossplot.figure)}
                   legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
                   chartClassName="h-[clamp(380px,42vw,620px)] w-full"
@@ -8324,18 +8115,16 @@ export default function ProcessingPage() {
               >
                 <div className="relative z-20 flex items-start justify-between gap-4 border-b border-slate-200 bg-white px-4 py-4 sm:px-6">
                   <div className="min-w-0">
-                    <div id="export-dialog-title" className="text-lg font-semibold text-slate-950">Prepare export</div>
-                    <div className="mt-0.5 text-sm text-slate-500">Choose the delivery scope, confirm the analysis summary, and prepare the client message.</div>
+                    <div id="export-dialog-title" className="text-lg font-semibold text-slate-950">{tr("Prepare export")}</div>
+                    <div className="mt-0.5 text-sm text-slate-500">{tr("Choose the delivery scope, confirm the analysis summary, and prepare the client message.")}</div>
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => setExportModalOpen(false)} aria-label="Close export dialog" className="shrink-0 whitespace-nowrap">
-                    <X className="h-4 w-4" />
-                    Close
-                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => setExportModalOpen(false)} aria-label={tr("Close export dialog")} className="shrink-0 whitespace-nowrap">
+                    <X className="h-4 w-4" />{tr("Close")}</Button>
                 </div>
                 <div className="border-b border-slate-200 bg-slate-50 px-4 py-3 sm:px-6">
                   <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="text-sm font-medium text-slate-700">Export type</div>
-                    <div className="inline-flex rounded-lg border border-slate-300 bg-white p-1" role="group" aria-label="Export type">
+                    <div className="text-sm font-medium text-slate-700">{tr("Export type")}</div>
+                    <div className="inline-flex rounded-lg border border-slate-300 bg-white p-1" role="group" aria-label={tr("Export type")}>
                       <Button
                         type="button"
                         variant={exportOutputType === "dataset" ? "default" : "secondary"}
@@ -8344,9 +8133,7 @@ export default function ProcessingPage() {
                         onClick={() => setExportOutputType("dataset")}
                         disabled={busy}
                         className={exportOutputType === "dataset" ? "shadow-sm" : "bg-transparent shadow-none"}
-                      >
-                        Entire dataset
-                      </Button>
+                      >{tr("Entire dataset")}</Button>
                       <Button
                         type="button"
                         variant={exportOutputType === "client_output" ? "default" : "secondary"}
@@ -8355,9 +8142,7 @@ export default function ProcessingPage() {
                         onClick={() => setExportOutputType("client_output")}
                         disabled={busy}
                         className={exportOutputType === "client_output" ? "shadow-sm" : "bg-transparent shadow-none"}
-                      >
-                        Client output
-                      </Button>
+                      >{tr("Client output")}</Button>
                     </div>
                   </div>
                 </div>
@@ -8367,18 +8152,18 @@ export default function ProcessingPage() {
                     <div className="min-w-0 space-y-6 p-4 sm:p-6 lg:border-r lg:border-slate-200">
                       <section className="space-y-3" aria-labelledby="export-delivery-heading">
                         <div>
-                          <h3 id="export-delivery-heading" className="text-sm font-semibold text-slate-950">Client and series</h3>
-                          <p className="mt-0.5 text-xs text-slate-500">These details define the filename, summary, and email preview.</p>
+                          <h3 id="export-delivery-heading" className="text-sm font-semibold text-slate-950">{tr("Client and series")}</h3>
+                          <p className="mt-0.5 text-xs text-slate-500">{tr("These details define the filename, summary, and email preview.")}</p>
                         </div>
                         <label className="form-field">
-                          <span className="form-label">Client name</span>
+                          <span className="form-label">{tr("Client name")}</span>
                           <ClientNameInput
                             value={activeConfig.export.client_name ?? ""}
                             onCommit={(value) => updateExport("client_name", value || null)}
                           />
                         </label>
                         <fieldset className="space-y-1.5">
-                          <legend className="form-label">Series to export</legend>
+                          <legend className="form-label">{tr("Series to export")}</legend>
                           <div className="max-h-44 overflow-y-auto rounded-lg border border-slate-300 bg-white p-1 shadow-sm">
                             {workspace.available_values.export_identifiers.map((option) => {
                               const checked = activeConfig.export.selected_ids.includes(option);
@@ -8400,7 +8185,7 @@ export default function ProcessingPage() {
                                     }}
                                     className="h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-500"
                                   />
-                                  <span>{option === "All" ? "All series" : option}</span>
+                                  <span>{tr(option === "All" ? "All series" : option)}</span>
                                 </label>
                               );
                             })}
@@ -8409,11 +8194,11 @@ export default function ProcessingPage() {
                       </section>
 
                       <section className="space-y-3 border-t border-slate-200 pt-5" aria-labelledby="export-filters-heading">
-                        <h3 id="export-filters-heading" className="text-sm font-semibold text-slate-950">Analysis filters</h3>
+                        <h3 id="export-filters-heading" className="text-sm font-semibold text-slate-950">{tr("Analysis filters")}</h3>
                         <CheckboxField
                           checked={activeConfig.export.include_outliers}
-                          label="Include outliers"
-                          description="Keep analyses currently marked as outliers in the exported file."
+                          label={tr("Include outliers")}
+                          description={tr("Keep analyses currently marked as outliers in the exported file.")}
                           onChange={(checked) => {
                             updateExport("include_outliers", checked);
                             if (!checked) {
@@ -8423,8 +8208,8 @@ export default function ProcessingPage() {
                         />
                         <CheckboxField
                           checked={activeConfig.export.interpolate_outliers}
-                          label="Interpolate included outliers"
-                          description={!activeConfig.export.include_outliers ? "Available after outliers are included." : "Replace included outlier values by interpolation before export."}
+                          label={tr("Interpolate included outliers")}
+                          description={tr(!activeConfig.export.include_outliers ? "Available after outliers are included." : "Replace included outlier values by interpolation before export.")}
                           onChange={(checked) => updateExport("interpolate_outliers", checked)}
                           disabled={!activeConfig.export.include_outliers}
                         />
@@ -8433,14 +8218,12 @@ export default function ProcessingPage() {
                       {exportOutputType === "client_output" ? (
                         <section className="space-y-4 border-t border-slate-200 pt-5" aria-labelledby="client-output-options-heading">
                           <div>
-                            <h3 id="client-output-options-heading" className="text-sm font-semibold text-slate-950">Client-output checks</h3>
-                            <p className="mt-0.5 text-xs text-slate-500">Shape, review, and verify the final client table before delivery.</p>
+                            <h3 id="client-output-options-heading" className="text-sm font-semibold text-slate-950">{tr("Client-output checks")}</h3>
+                            <p className="mt-0.5 text-xs text-slate-500">{tr("Shape, review, and verify the final client table before delivery.")}</p>
                           </div>
                           <fieldset className="space-y-2">
-                            <legend className="text-xs font-semibold text-slate-700">Final-column content</legend>
-                            <p className="text-xs text-slate-500">
-                              Choose which field populates each output column. Raw options preserve the original pre-cleanup text exactly.
-                            </p>
+                            <legend className="text-xs font-semibold text-slate-700">{tr("Final-column content")}</legend>
+                            <p className="text-xs text-slate-500">{tr("Choose which field populates each output column. Raw options preserve the original pre-cleanup text exactly.")}</p>
                             <div className="grid gap-2 sm:grid-cols-3">
                               {([
                                 ["Identifier", "client_output_identifier_source"],
@@ -8448,14 +8231,14 @@ export default function ProcessingPage() {
                                 ["Species", "client_output_species_source"],
                               ] as const).map(([label, key]) => (
                                 <label key={key} className="form-field min-w-0">
-                                  <span className="form-label">{formatScientificText(label)}</span>
+                                  <span className="form-label">{tr(formatScientificText(label))}</span>
                                   <select
                                     value={activeConfig.export[key]}
                                     onChange={(event) => updateExport(key, event.target.value as ProcessingConfig["export"][typeof key])}
                                     className="form-control"
                                   >
                                     {CLIENT_OUTPUT_SOURCE_OPTIONS.map((option) => (
-                                      <option key={option.value} value={option.value}>{option.label}</option>
+                                      <option key={option.value} value={option.value}>{tr(option.label)}</option>
                                     ))}
                                   </select>
                                 </label>
@@ -8464,19 +8247,19 @@ export default function ProcessingPage() {
                           </fieldset>
                           <CheckboxField
                             checked={activeConfig.export.show_sequence}
-                            label="Show Sequence column"
-                            description="Include the sortable sequence value in the preview and final workbook."
+                            label={tr("Show Sequence column")}
+                            description={tr("Include the sortable sequence value in the preview and final workbook.")}
                             onChange={(checked) => updateExport("show_sequence", checked)}
                           />
                           <div className="space-y-3">
                             <CheckboxField
                               checked={restoreStdevEnabled}
-                              label="Cap internal standard deviation"
-                              description="Limit high per-analysis standard deviations to the value below."
+                              label={tr("Cap internal standard deviation")}
+                              description={tr("Limit high per-analysis standard deviations to the value below.")}
                               onChange={setRestoreStdevEnabled}
                             />
                             <label className="form-field max-w-36">
-                              <span className="form-label">Maximum stdev</span>
+                              <span className="form-label">{tr("Maximum stdev")}</span>
                               <input
                                 type="number"
                                 min={0}
@@ -8498,22 +8281,21 @@ export default function ProcessingPage() {
                           </div>
                           <div className="space-y-2 rounded-lg bg-slate-50 p-3">
                             <div className="flex flex-wrap items-center justify-between gap-2">
-                              <span className="text-sm font-medium text-slate-800">Duplicate check</span>
+                              <span className="text-sm font-medium text-slate-800">{tr("Duplicate check")}</span>
                               <Button type="button" variant="outline" size="sm" onClick={() => void handleDuplicateCheck()} disabled={busy}>
                                 <SearchCheck className="h-4 w-4" />
-                                {duplicateCheckMutation.isPending ? "Checking..." : "Check for duplicates"}
+                                {tr(duplicateCheckMutation.isPending ? "Checking..." : "Check for duplicates")}
                               </Button>
                             </div>
-                            <div className="text-xs text-slate-600">Duplicate rows are highlighted in the data preview using Identifier 1 + Identifier 2 + Species.</div>
+                            <div className="text-xs text-slate-600">{tr("Duplicate rows are highlighted in the data preview using Identifier 1 + Identifier 2 + Species.")}</div>
                             {duplicateClientOutputRowIndexes.size > 0 ? (
                               <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-900">
-                                {duplicateClientOutputRowIndexes.size} duplicate row(s) currently highlighted.
-                              </div>
+                                {duplicateClientOutputRowIndexes.size}{tr("duplicate row(s) currently highlighted.")}</div>
                             ) : clientOutputDraftRows.length ? (
-                              <div className="rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs text-emerald-900">No duplicates in the reviewed table.</div>
+                              <div className="rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs text-emerald-900">{tr("No duplicates in the reviewed table.")}</div>
                             ) : null}
                             {duplicateCheckMutation.isError ? (
-                              <div className="text-xs font-medium text-red-700">Duplicate check failed.</div>
+                              <div className="text-xs font-medium text-red-700">{tr("Duplicate check failed.")}</div>
                             ) : null}
                             {duplicateCheckResult ? (
                               <div
@@ -8525,15 +8307,14 @@ export default function ProcessingPage() {
                                 )}
                               >
                                 <div>
-                                  {duplicateCheckResult.duplicate_row_count > 0
+                                  {tr(duplicateCheckResult.duplicate_row_count > 0
                                     ? `${duplicateCheckResult.duplicate_row_count} duplicate row(s) found.`
-                                    : "No duplicates found."}
+                                    : "No duplicates found.")}
                                 </div>
                                 {duplicateCheckResult.duplicate_identifier1_identifier2_species_values.length ? (
-                                  <div>
-                                    Identifier 1 + Identifier 2 + Species:{" "}
-                                    {duplicateCheckResult.duplicate_identifier1_identifier2_species_values.slice(0, 8).join(", ")}
-                                    {duplicateCheckResult.duplicate_identifier1_identifier2_species_values.length > 8 ? "..." : ""}
+                                  <div>{tr("Identifier 1 + Identifier 2 + Species:")}{tr(" ")}
+                                    {tr(duplicateCheckResult.duplicate_identifier1_identifier2_species_values.slice(0, 8).join(", "))}
+                                    {tr(duplicateCheckResult.duplicate_identifier1_identifier2_species_values.length > 8 ? "..." : "")}
                                   </div>
                                 ) : null}
                               </div>
@@ -8543,9 +8324,9 @@ export default function ProcessingPage() {
                       ) : null}
 
                       <details className="border-t border-slate-200 pt-5">
-                        <summary className="cursor-pointer text-sm font-semibold text-slate-950">Comment replacements</summary>
+                        <summary className="cursor-pointer text-sm font-semibold text-slate-950">{tr("Comment replacements")}</summary>
                         <label className="mt-3 block text-sm">
-                          <span className="mb-1.5 block text-xs text-slate-500">One replacement per line, formatted as original=replacement.</span>
+                          <span className="mb-1.5 block text-xs text-slate-500">{tr("One replacement per line, formatted as original=replacement.")}</span>
                           <textarea
                             value={commentMapText}
                             onChange={(event) => {
@@ -8555,7 +8336,7 @@ export default function ProcessingPage() {
                             }}
                             rows={5}
                             className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100"
-                            placeholder={"old=value\nflag=client label"}
+                            placeholder={tr("old=value\nflag=client label")}
                           />
                         </label>
                       </details>
@@ -8565,27 +8346,27 @@ export default function ProcessingPage() {
                       <section className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200" aria-labelledby="export-summary-heading">
                         <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-4 py-4 sm:px-5">
                           <div>
-                            <h3 id="export-summary-heading" className="font-semibold text-slate-950">Export summary</h3>
+                            <h3 id="export-summary-heading" className="font-semibold text-slate-950">{tr("Export summary")}</h3>
                             <p className="mt-0.5 text-sm text-slate-500">
-                              {activeConfig.export.client_name?.trim() || "Client name not set"}
+                              {tr(activeConfig.export.client_name?.trim() || "Client name not set")}
                             </p>
                           </div>
                           <span className="rounded-md bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-800">
-                            {exportOutputType === "client_output" ? "Client output" : "Entire dataset"}
+                            {tr(exportOutputType === "client_output" ? "Client output" : "Entire dataset")}
                           </span>
                         </div>
 
                         <div className="grid grid-cols-3 border-b border-slate-200">
                           <div className="px-3 py-3 sm:px-5">
-                            <div className="text-xs text-slate-500">Series</div>
+                            <div className="text-xs text-slate-500">{tr("Series")}</div>
                             <div className="mt-1 text-lg font-semibold tabular-nums text-slate-950">{exportIdentifierCounts.length}</div>
                           </div>
                           <div className="border-x border-slate-200 px-3 py-3 sm:px-5">
-                            <div className="text-xs text-slate-500">Analyses</div>
+                            <div className="text-xs text-slate-500">{tr("Analyses")}</div>
                             <div className="mt-1 text-lg font-semibold tabular-nums text-slate-950">{exportAnalysisTotal}</div>
                           </div>
                           <div className="px-3 py-3 sm:px-5">
-                            <div className="text-xs text-slate-500">Standard measurements</div>
+                            <div className="text-xs text-slate-500">{tr("Standard measurements")}</div>
                             <div className="mt-1 text-lg font-semibold tabular-nums text-slate-950">{standardMeasurementTotal}</div>
                           </div>
                         </div>
@@ -8593,60 +8374,60 @@ export default function ProcessingPage() {
                         <div className="space-y-5 px-4 py-4 sm:px-5">
                           <div>
                             <div className="mb-2 flex items-center justify-between gap-3">
-                              <h4 className="text-sm font-semibold text-slate-900">Analyses by series</h4>
-                              <span className="text-xs text-slate-500">{activeConfig.export.include_outliers ? "Outliers included" : "Outliers excluded"}</span>
+                              <h4 className="text-sm font-semibold text-slate-900">{tr("Analyses by series")}</h4>
+                              <span className="text-xs text-slate-500">{tr(activeConfig.export.include_outliers ? "Outliers included" : "Outliers excluded")}</span>
                             </div>
                             {exportIdentifierCounts.length ? (
                               <div className="overflow-hidden rounded-lg border border-slate-200">
                                 <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-4 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
-                                  <span>Series</span>
-                                  <span className="text-right">Analyses</span>
-                                  <span className="text-right">Outliers excluded</span>
+                                  <span>{tr("Series")}</span>
+                                  <span className="text-right">{tr("Analyses")}</span>
+                                  <span className="text-right">{tr("Outliers excluded")}</span>
                                 </div>
                                 <div className="divide-y divide-slate-100">
                                 {exportIdentifierCounts.map((item) => (
                                   <div key={item.identifier} className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-4 px-3 py-2 text-sm">
-                                    <span className="truncate font-medium text-slate-800">{item.identifier}</span>
+                                    <span className="truncate font-medium text-slate-800">{tr(item.identifier)}</span>
                                     <span className="min-w-14 text-right tabular-nums text-slate-600">{item.analyses}</span>
                                     <span className="min-w-24 text-right tabular-nums text-slate-600">{item.outliersExcluded}</span>
                                   </div>
                                 ))}
                                 </div>
                                 <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-4 border-t border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-950">
-                                  <span>Total</span>
+                                  <span>{tr("Total")}</span>
                                   <span className="min-w-14 text-right tabular-nums">{exportAnalysisTotal}</span>
                                   <span className="min-w-24 text-right tabular-nums">{exportOutliersExcludedTotal}</span>
                                 </div>
                               </div>
                             ) : (
                               <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-sm text-slate-500">
-                                {linearityPreviewDataQuery.isLoading ? "Calculating analyses in this export…" : "No analyses match the current export scope."}
+                                {tr(linearityPreviewDataQuery.isLoading ? "Calculating analyses in this export…" : "No analyses match the current export scope.")}
                               </div>
                             )}
                           </div>
 
                           <div>
                             <div className="mb-2 flex items-center justify-between gap-3">
-                              <h4 className="text-sm font-semibold text-slate-900">Reference-material precision</h4>
-                              <span className="text-xs text-slate-500">{useCorrectedStandardPrecision ? "Linearity corrected" : "Measured"}</span>
+                              <h4 className="text-sm font-semibold text-slate-900">{tr("Reference-material precision")}</h4>
+                              <span className="text-xs text-slate-500">{tr(useCorrectedStandardPrecision ? "Linearity corrected" : "Measured")}</span>
                             </div>
                             {exportStandardPrecisionRows.length ? (
                               <div className="overflow-x-auto rounded-lg border border-slate-200">
                                 <table className="w-full min-w-[430px] text-left text-sm">
                                   <thead className="bg-slate-50 text-xs text-slate-500">
                                     <tr>
-                                      <th className="px-3 py-2 font-medium">Standard</th>
-                                      <th className="px-3 py-2 text-right font-medium">δ¹³C stdev</th>
-                                      <th className="px-3 py-2 text-right font-medium">δ¹⁸O stdev</th>
-                                      <th className="px-3 py-2 text-right font-medium">Measurements</th>
+                                      <th className="px-3 py-2 font-medium">{tr("Standard")}</th>
+                                      <th className="px-3 py-2 text-right font-medium">{tr("δ¹³C stdev")}</th>
+                                      <th className="px-3 py-2 text-right font-medium">{tr("δ¹⁸O stdev")}</th>
+                                      <th className="px-3 py-2 text-right font-medium">{tr("Measurements")}</th>
                                     </tr>
                                   </thead>
                                   <tbody className="divide-y divide-slate-100 text-slate-700">
                                     {exportStandardPrecisionRows.map((standard) => (
                                       <tr key={standard.standard}>
-                                        <td className="px-3 py-2 font-medium text-slate-900">{standard.standard}</td>
-                                        <td className="px-3 py-2 text-right tabular-nums">{standard.d13 == null ? "—" : `${formatEmailPrecision(standard.d13, "en")}‰`}</td>
-                                        <td className="px-3 py-2 text-right tabular-nums">{standard.d18 == null ? "—" : `${formatEmailPrecision(standard.d18, "en")}‰`}</td>
+                                        <td className="px-3 py-2 font-medium text-slate-900">{tr(standard.standard)}</td>
+                                        <td className="px-3 py-2 text-right tabular-nums">{tr(standard.d13 == null ? "—" : `${formatEmailPrecision(standard.d13, "en")}‰`)}</td>
+                                        <td className="px-3 py-2 text-right tabular-nums">{tr(standard.d18 == null ? "—" : `${formatEmailPrecision(standard.d18, "en")}‰`)}</td>
                                         <td className="px-3 py-2 text-right tabular-nums">{standard.total}</td>
                                       </tr>
                                     ))}
@@ -8654,7 +8435,7 @@ export default function ProcessingPage() {
                                 </table>
                               </div>
                             ) : (
-                              <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-sm text-slate-500">No selected standard precision is available.</div>
+                              <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-sm text-slate-500">{tr("No selected standard precision is available.")}</div>
                             )}
                           </div>
                         </div>
@@ -8667,33 +8448,27 @@ export default function ProcessingPage() {
                         >
                           <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-4 py-4 sm:px-5">
                             <div>
-                              <h3 id="client-output-preview-heading" className="font-semibold text-slate-950">Data output preview</h3>
-                              <p className="mt-0.5 text-sm text-slate-500">
-                                Review and edit every row in the final workbook. Duplicate rows are highlighted; isotope values are capped at 2 decimals.
-                              </p>
+                              <h3 id="client-output-preview-heading" className="font-semibold text-slate-950">{tr("Data output preview")}</h3>
+                              <p className="mt-0.5 text-sm text-slate-500">{tr("Review and edit every row in the final workbook. Duplicate rows are highlighted; isotope values are capped at 2 decimals.")}</p>
                             </div>
                             <div className="flex flex-wrap items-center justify-end gap-2">
                               {clientOutputPreviewQuery.data ? (
                                 <>
                                   {clientOutputRemovedRowCount > 0 ? (
                                     <span className="rounded-md bg-rose-50 px-2.5 py-1 text-xs font-medium tabular-nums text-rose-800">
-                                      {clientOutputRemovedRowCount} removed
-                                    </span>
+                                      {clientOutputRemovedRowCount}{tr("removed")}</span>
                                   ) : null}
                                   <span className="rounded-md bg-cyan-50 px-2.5 py-1 text-xs font-medium tabular-nums text-cyan-800">
-                                    {clientOutputDraftRows.length} rows
-                                  </span>
+                                    {clientOutputDraftRows.length}{tr("rows")}</span>
                                   <Button type="button" variant="outline" size="sm" onClick={resetClientOutputRows} disabled={busy}>
-                                    <RotateCcw className="h-4 w-4" />
-                                    Reset table
-                                  </Button>
+                                    <RotateCcw className="h-4 w-4" />{tr("Reset table")}</Button>
                                 </>
                               ) : null}
                             </div>
                           </div>
 
                           {clientOutputPreviewQuery.isLoading && !clientOutputPreviewQuery.data ? (
-                            <div className="px-4 py-6 text-sm text-slate-500 sm:px-5">Preparing the data preview…</div>
+                            <div className="px-4 py-6 text-sm text-slate-500 sm:px-5">{tr("Preparing the data preview…")}</div>
                           ) : clientOutputPreviewQuery.data?.columns.length ? (
                             <>
                               <div className="max-h-[32rem] overflow-auto">
@@ -8702,10 +8477,10 @@ export default function ProcessingPage() {
                                     <tr>
                                       {clientOutputPreviewQuery.data.columns.map((column) => (
                                         <th key={column} className={cn("max-w-56 whitespace-normal px-3 py-2.5 font-semibold", column === "Species" && "italic")}>
-                                          {formatScientificText(column)}
+                                          {tr(formatScientificText(column))}
                                         </th>
                                       ))}
-                                      <th className="sticky right-0 min-w-28 bg-slate-100 px-3 py-2.5 text-right font-semibold">Actions</th>
+                                      <th className="sticky right-0 min-w-28 bg-slate-100 px-3 py-2.5 text-right font-semibold">{tr("Actions")}</th>
                                     </tr>
                                   </thead>
                                   <tbody className="divide-y divide-slate-100 text-slate-700">
@@ -8739,14 +8514,14 @@ export default function ProcessingPage() {
                                         })}
                                         <td className={cn("sticky right-0 px-2 py-1.5 text-right", isDuplicate ? "bg-amber-100" : "bg-white group-even:bg-slate-50")}>
                                           <div className="flex items-center justify-end gap-2">
-                                            {isDuplicate ? <span className="text-[11px] font-semibold text-amber-900">Duplicate</span> : null}
+                                            {isDuplicate ? <span className="text-[11px] font-semibold text-amber-900">{tr("Duplicate")}</span> : null}
                                             <Button
                                               type="button"
                                               variant="secondary"
                                               size="icon"
                                               onClick={() => removeClientOutputRow(rowIndex)}
-                                              aria-label={`Remove row ${rowIndex + 1}`}
-                                              title={`Remove row ${rowIndex + 1}`}
+                                              aria-label={tr(`Remove row ${rowIndex + 1}`)}
+                                              title={tr(`Remove row ${rowIndex + 1}`)}
                                               className="text-rose-700 hover:bg-rose-50 hover:text-rose-800"
                                             >
                                               <Trash2 className="h-4 w-4" />
@@ -8761,22 +8536,22 @@ export default function ProcessingPage() {
                               </div>
                               <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500 sm:px-5">
                                 <div>
-                                  <span className="font-medium text-slate-700">File:</span>{" "}
-                                  <span className="break-all font-mono">{clientOutputFilename}</span>
+                                  <span className="font-medium text-slate-700">{tr("File:")}</span>{tr(" ")}
+                                  <span className="break-all font-mono">{tr(clientOutputFilename)}</span>
                                 </div>
                                 {duplicateClientOutputRowIndexes.size > 0 ? (
-                                  <span className="font-medium text-amber-800">{duplicateClientOutputRowIndexes.size} duplicate row(s)</span>
+                                  <span className="font-medium text-amber-800">{duplicateClientOutputRowIndexes.size}{tr(" duplicate row(s)")}</span>
                                 ) : null}
                               </div>
                             </>
                           ) : clientOutputPreviewQuery.isError ? (
                             <div className="space-y-3 px-4 py-6 sm:px-5" role="alert">
                               <div>
-                                <div className="text-sm font-medium text-red-700">The data preview could not be prepared.</div>
+                                <div className="text-sm font-medium text-red-700">{tr("The data preview could not be prepared.")}</div>
                                 <div className="mt-1 text-xs text-red-600">
-                                  {clientOutputPreviewQuery.error instanceof Error
+                                  {tr(clientOutputPreviewQuery.error instanceof Error
                                     ? clientOutputPreviewQuery.error.message
-                                    : "Check the export options and try again."}
+                                    : "Check the export options and try again.")}
                                 </div>
                               </div>
                               <Button
@@ -8787,11 +8562,11 @@ export default function ProcessingPage() {
                                 disabled={clientOutputPreviewQuery.isFetching}
                               >
                                 <RotateCcw className={cn("h-4 w-4", clientOutputPreviewQuery.isFetching && "animate-spin")} />
-                                {clientOutputPreviewQuery.isFetching ? "Retrying…" : "Retry preview"}
+                                {tr(clientOutputPreviewQuery.isFetching ? "Retrying…" : "Retry preview")}
                               </Button>
                             </div>
                           ) : (
-                            <div className="px-4 py-6 text-sm text-slate-500 sm:px-5">No rows match the current client-output scope.</div>
+                            <div className="px-4 py-6 text-sm text-slate-500 sm:px-5">{tr("No rows match the current client-output scope.")}</div>
                           )}
                         </section>
                       ) : null}
@@ -8800,53 +8575,53 @@ export default function ProcessingPage() {
                         <section className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200" aria-labelledby="email-preview-heading">
                           <div className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-200 px-4 py-4 sm:px-5">
                             <div>
-                              <h3 id="email-preview-heading" className="font-semibold text-slate-950">Email to client</h3>
-                              <p className="mt-0.5 text-sm text-slate-500">Prefilled from the current dataset and precision summary.</p>
+                              <h3 id="email-preview-heading" className="font-semibold text-slate-950">{tr("Email to client")}</h3>
+                              <p className="mt-0.5 text-sm text-slate-500">{tr("Prefilled from the current dataset and precision summary.")}</p>
                             </div>
                             <label className="form-field min-w-36">
-                              <span className="form-label">Language</span>
+                              <span className="form-label">{tr("Language")}</span>
                               <select
                                 value={exportEmailLanguage}
                                 onChange={(event) => setExportEmailLanguage(event.target.value as ExportEmailLanguage)}
                                 className="form-control"
                               >
                                 {EXPORT_EMAIL_LANGUAGE_OPTIONS.map((option) => (
-                                  <option key={option.value} value={option.value}>{option.label}</option>
+                                  <option key={option.value} value={option.value}>{tr(option.label)}</option>
                                 ))}
                               </select>
                             </label>
                           </div>
                           <div className="space-y-1 border-b border-slate-200 px-4 py-3 sm:px-5">
-                            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Optional considerations</div>
+                            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">{tr("Optional considerations")}</div>
                             <CheckboxField
                               checked={includeInsufficientSignalEmailNote}
-                              label={insufficientSignalSamples.length
+                              label={tr(insufficientSignalSamples.length
                                 ? `Mention insufficient signal samples (${insufficientSignalSamples.length})`
-                                : "Mention insufficient signal samples"}
-                              description={insufficientSignalSamples.length
+                                : "Mention insufficient signal samples")}
+                              description={tr(insufficientSignalSamples.length
                                 ? "Add a short note naming failed samples and outliers with signal intensity below 2 V."
-                                : "No failed samples or outliers below 2 V were found in the current export scope."}
+                                : "No failed samples or outliers below 2 V were found in the current export scope.")}
                               onChange={setIncludeInsufficientSignalEmailNote}
                               disabled={!insufficientSignalSamples.length}
                             />
                             <CheckboxField
                               checked={includeConservativeOutlierEmailNote}
-                              label="Add conservative outlier-removal note"
-                              description='Add "Outliers removal was done conservatively" to the message.'
+                              label={tr("Add conservative outlier-removal note")}
+                              description={tr("Add \"Outliers removal was done conservatively\" to the message.")}
                               onChange={setIncludeConservativeOutlierEmailNote}
                             />
                           </div>
                           <div className="border-b border-slate-200 bg-slate-50/70 px-4 py-3 sm:px-5">
-                            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Subject</div>
+                            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{tr("Subject")}</div>
                             <div className="mt-1 break-words text-sm font-medium text-slate-900">
-                              {exportEmailSubject || (clientOutputPreviewQuery.isLoading ? "Preparing subject…" : "Subject unavailable")}
+                              {tr(exportEmailSubject || (clientOutputPreviewQuery.isLoading ? "Preparing subject…" : "Subject unavailable"))}
                             </div>
                           </div>
                           <div className="max-h-80 overflow-y-auto whitespace-pre-wrap break-words px-4 py-5 font-sans text-sm leading-6 text-slate-700 sm:px-5">
-                            {renderEmailText(exportEmailBody, exportEmailItalicTerms)}
+                            {tr(renderEmailText(exportEmailBody, exportEmailItalicTerms))}
                           </div>
                           <div className="flex items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 sm:px-5">
-                            <span className="text-xs text-slate-500" aria-live="polite">{isExportEmailCopied ? "Email copied to clipboard." : "Review the message before sending."}</span>
+                            <span className="text-xs text-slate-500" aria-live="polite">{tr(isExportEmailCopied ? "Email copied to clipboard." : "Review the message before sending.")}</span>
                             <Button
                               type="button"
                               variant={isExportEmailCopied ? "secondary" : "outline"}
@@ -8859,25 +8634,21 @@ export default function ProcessingPage() {
                               }}
                             >
                               {isExportEmailCopied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                              {isExportEmailCopied ? "Copied" : "Copy email"}
+                              {tr(isExportEmailCopied ? "Copied" : "Copy email")}
                             </Button>
                           </div>
                         </section>
                       ) : (
-                        <div className="rounded-xl border border-dashed border-slate-300 bg-white px-4 py-5 text-sm text-slate-600">
-                          Select <span className="font-medium text-slate-900">Client output</span> to generate the client email preview.
-                        </div>
+                        <div className="rounded-xl border border-dashed border-slate-300 bg-white px-4 py-5 text-sm text-slate-600">{tr("Select")}<span className="font-medium text-slate-900">{tr("Client output")}</span>{tr("to generate the client email preview.")}</div>
                       )}
                     </div>
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 bg-white px-4 py-3 sm:px-6">
-                  <Button variant="outline" onClick={() => setExportModalOpen(false)} disabled={busy}>
-                    Cancel
-                  </Button>
+                  <Button variant="outline" onClick={() => setExportModalOpen(false)} disabled={busy}>{tr("Cancel")}</Button>
                   <Button onClick={() => handleExport(exportOutputType)} disabled={busy} className="whitespace-nowrap">
                     <Download className="h-4 w-4" />
-                    {exportOutputType === "client_output" ? "Download client output" : "Download dataset"}
+                    {tr(exportOutputType === "client_output" ? "Download client output" : "Download dataset")}
                   </Button>
                 </div>
               </div>
@@ -8892,13 +8663,11 @@ export default function ProcessingPage() {
               >
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-3 py-2">
                   <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-                    <div className="text-sm font-semibold text-stone-900">Selection Editor</div>
+                    <div className="text-sm font-semibold text-stone-900">{tr("Selection Editor")}</div>
                     <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500">
-                      <span>Edit values and inspect cycles.</span>
+                      <span>{tr("Edit values and inspect cycles.")}</span>
                       {hasPendingSelectionDrafts ? (
-                        <span className="rounded-md bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
-                          Draft preview
-                        </span>
+                        <span className="rounded-md bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">{tr("Draft preview")}</span>
                       ) : null}
                     </div>
                   </div>
@@ -8913,7 +8682,7 @@ export default function ProcessingPage() {
                     }}
                   >
                     <X className="h-4 w-4" />
-                    <span className="hidden sm:inline">Close</span>
+                    <span className="hidden sm:inline">{tr("Close")}</span>
                   </Button>
                 </div>
                 <div className="min-h-0 space-y-3 overflow-y-auto p-3">
@@ -8926,10 +8695,9 @@ export default function ProcessingPage() {
                               {activeTargetIndex + 1}/{selectedTargets.length}
                             </span>
                             <span className="truncate text-sm font-semibold text-stone-900">
-                              {(activeIdentifier1Label || "No Identifier 1").trim()} · {(activeIdentifier2 || "No Identifier 2").trim()}
+                              {tr((activeIdentifier1Label || "No Identifier 1").trim())} · {tr((activeIdentifier2 || "No Identifier 2").trim())}
                             </span>
-                            <span className="rounded-md bg-white px-1.5 py-0.5 text-[11px] text-stone-500 ring-1 ring-stone-200">
-                              Row {(activeTarget?.rowLabel || "").trim()}
+                            <span className="rounded-md bg-white px-1.5 py-0.5 text-[11px] text-stone-500 ring-1 ring-stone-200">{tr("Row")}{tr((activeTarget?.rowLabel || "").trim())}
                             </span>
                             {duplicateGroupTargets.length > 1 ? (
                               <span
@@ -8940,24 +8708,20 @@ export default function ProcessingPage() {
                                     : "bg-emerald-100 text-emerald-900 ring-emerald-300",
                                 )}
                               >
-                                {activeDuplicateGroupSize > 1
+                                {tr(activeDuplicateGroupSize > 1
                                   ? `Duplicate · ${duplicateGroupTargets.length} matching rows`
-                                  : "Duplicate resolved in draft"}
+                                  : "Duplicate resolved in draft")}
                               </span>
                             ) : null}
                           </div>
                           <div className="flex gap-2">
-                            <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>
-                              Prev
-                            </Button>
+                            <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>{tr("Prev")}</Button>
                             <Button
                               variant="outline"
                               size="sm"
                               onClick={() => moveSelectionTarget("next")}
                               disabled={!canMoveToNextTarget}
-                            >
-                              Next
-                            </Button>
+                            >{tr("Next")}</Button>
                           </div>
                         </div>
                         {duplicateGroupTargets.length > 1 ? (
@@ -8971,16 +8735,16 @@ export default function ProcessingPage() {
                               )}
                               role="status"
                             >
-                              {activeDuplicateGroupSize > 1
+                              {tr(activeDuplicateGroupSize > 1
                                 ? "Edit either matching sample below. Changing Identifier 1, Identifier 2, or Species resolves the duplicate immediately in the draft."
-                                : "Duplicate resolved in this draft. Both original matches remain visible until you apply or discard the changes."}
+                                : "Duplicate resolved in this draft. Both original matches remain visible until you apply or discard the changes.")}
                             </div>
                             <div className="flex items-end justify-between gap-3">
                               <div>
-                                <div className="text-sm font-semibold text-stone-900">Matching samples</div>
-                                <div className="text-[11px] text-stone-500">Edit each analysis independently.</div>
+                                <div className="text-sm font-semibold text-stone-900">{tr("Matching samples")}</div>
+                                <div className="text-[11px] text-stone-500">{tr("Edit each analysis independently.")}</div>
                               </div>
-                              <span className="text-xs tabular-nums text-stone-500">{duplicateGroupTargets.length} rows</span>
+                              <span className="text-xs tabular-nums text-stone-500">{duplicateGroupTargets.length}{tr(" rows")}</span>
                             </div>
                             <div className="grid gap-3 xl:grid-cols-2">
                               {duplicateGroupTargets.map((target, duplicateIndex) => {
@@ -8992,16 +8756,15 @@ export default function ProcessingPage() {
                                       "min-w-0 rounded-lg border bg-white p-3",
                                       isActiveDuplicate ? "border-blue-300 ring-2 ring-blue-100" : "border-stone-200",
                                     )}
-                                    aria-label={`Matching sample ${duplicateIndex + 1}, row ${target.rowLabel}`}
+                                    aria-label={tr(`Matching sample ${duplicateIndex + 1}, row ${target.rowLabel}`)}
                                   >
                                     <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                                       <div className="flex items-center gap-2">
-                                        <span className="text-xs font-semibold text-stone-900">Sample {duplicateIndex + 1}</span>
-                                        <span className="rounded-md bg-stone-100 px-1.5 py-0.5 text-[11px] tabular-nums text-stone-600">
-                                          Row {target.rowLabel}
+                                        <span className="text-xs font-semibold text-stone-900">{tr("Sample ")}{duplicateIndex + 1}</span>
+                                        <span className="rounded-md bg-stone-100 px-1.5 py-0.5 text-[11px] tabular-nums text-stone-600">{tr("Row")}{tr(target.rowLabel)}
                                         </span>
                                         {isActiveDuplicate ? (
-                                          <span className="rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-800">Inspecting cycles</span>
+                                          <span className="rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-800">{tr("Inspecting cycles")}</span>
                                         ) : null}
                                       </div>
                                       {!isActiveDuplicate ? (
@@ -9009,9 +8772,7 @@ export default function ProcessingPage() {
                                           type="button"
                                           className="text-xs font-medium text-blue-700 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
                                           onClick={() => setTargets([target])}
-                                        >
-                                          Inspect cycles
-                                        </button>
+                                        >{tr("Inspect cycles")}</button>
                                       ) : null}
                                     </div>
                                     {renderSelectionIdentityFields(target, `duplicate-${duplicateIndex}`)}
@@ -9034,34 +8795,34 @@ export default function ProcessingPage() {
                         </datalist>
                         <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-white sm:grid-cols-[1.2fr_1fr_1fr] sm:divide-x sm:divide-stone-200">
                           <div className="px-3 py-2">
-                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{formatScientificText(selectionEditorTab)} delta</div>
+                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr(formatScientificText(selectionEditorTab))}{tr(" delta")}</div>
                             <div className="mt-0.5 text-3xl font-semibold leading-none tabular-nums text-stone-950">
-                              {activeCurrentDelta == null ? "N/A" : formatDeltaValue(activeCurrentDelta)}
+                              {tr(activeCurrentDelta == null ? "N/A" : formatDeltaValue(activeCurrentDelta))}
                             </div>
                           </div>
                           <div className="border-t border-stone-200 px-3 py-2 sm:border-t-0">
-                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">Internal standard deviation</div>
+                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr("Internal standard deviation")}</div>
                             <div className="mt-0.5 text-2xl font-semibold leading-none tabular-nums text-stone-950">
-                              {activeInternalStdDev == null ? "N/A" : formatDeltaValue(activeInternalStdDev)}
+                              {tr(activeInternalStdDev == null ? "N/A" : formatDeltaValue(activeInternalStdDev))}
                             </div>
                           </div>
                           <div className="border-t border-stone-200 px-3 py-2 sm:border-t-0">
                             <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
-                              {selectionEditorTab === "d13C" ? "δ¹⁸O delta" : "δ¹³C delta"}
+                              {tr(selectionEditorTab === "d13C" ? "δ¹⁸O delta" : "δ¹³C delta")}
                             </div>
                             <div className="mt-0.5 text-2xl font-semibold leading-none tabular-nums text-stone-800">
-                              {(selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue) == null
+                              {tr((selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue) == null
                                 ? "N/A"
-                                : formatDeltaValue(selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue)}
+                                : formatDeltaValue(selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue))}
                             </div>
                           </div>
                         </div>
                         {activeTargetMetadataItems.length ? (
                           <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-stone-600">
                             {activeTargetMetadataItems.map((item, index) => (
-                              <span key={`${item.label}:${item.value}:${index}`} className="max-w-full truncate" title={`${item.label}: ${item.value}`}>
-                                <span className="font-medium text-stone-500">{formatScientificText(item.label)}:</span> {formatScientificText(item.value)}
-                                {item.unit ? ` ${item.unit}` : ""}
+                              <span key={`${item.label}:${item.value}:${index}`} className="max-w-full truncate" title={tr(`${item.label}: ${item.value}`)}>
+                                <span className="font-medium text-stone-500">{tr(formatScientificText(item.label))}:</span> {tr(formatScientificText(item.value))}
+                                {tr(item.unit ? ` ${item.unit}` : "")}
                               </span>
                             ))}
                           </div>
@@ -9070,25 +8831,25 @@ export default function ProcessingPage() {
                           <section className="overflow-hidden rounded-lg border border-stone-200 bg-white" aria-labelledby="duplicate-sequence-heading">
                             <div className="flex flex-wrap items-end justify-between gap-2 border-b border-stone-200 px-3 py-2.5">
                               <div>
-                                <h3 id="duplicate-sequence-heading" className="text-xs font-semibold text-stone-900">Raw data sequence</h3>
-                                <p className="mt-0.5 text-[11px] text-stone-500">Original row order and source fields; isotope columns show the current analysis values.</p>
+                                <h3 id="duplicate-sequence-heading" className="text-xs font-semibold text-stone-900">{tr("Raw data sequence")}</h3>
+                                <p className="mt-0.5 text-[11px] text-stone-500">{tr("Original row order and source fields; isotope columns show the current analysis values.")}</p>
                               </div>
-                              <span className="text-[11px] text-stone-500">Matching analyses are highlighted</span>
+                              <span className="text-[11px] text-stone-500">{tr("Matching analyses are highlighted")}</span>
                             </div>
                             <div className="overflow-x-auto">
                               <table className="w-full min-w-[1080px] border-collapse text-left text-xs">
                                 <thead className="bg-stone-50 text-[11px] font-semibold text-stone-600">
                                   <tr>
-                                    <th className="px-3 py-2">Sequence</th>
-                                    <th className="px-3 py-2">Raw row</th>
-                                    <th className="px-3 py-2">Raw label</th>
-                                    <th className="px-3 py-2">Raw comment</th>
-                                    <th className="px-3 py-2">Identifier 1</th>
-                                    <th className="px-3 py-2">Identifier 2</th>
-                                    <th className="px-3 py-2">Species</th>
-                                    <th className="px-3 py-2 text-right">Current δ¹³C</th>
-                                    <th className="px-3 py-2 text-right">Current δ¹⁸O</th>
-                                    <th className="px-3 py-2 text-right">Signal</th>
+                                    <th className="px-3 py-2">{tr("Sequence")}</th>
+                                    <th className="px-3 py-2">{tr("Raw row")}</th>
+                                    <th className="px-3 py-2">{tr("Raw label")}</th>
+                                    <th className="px-3 py-2">{tr("Raw comment")}</th>
+                                    <th className="px-3 py-2">{tr("Identifier 1")}</th>
+                                    <th className="px-3 py-2">{tr("Identifier 2")}</th>
+                                    <th className="px-3 py-2">{tr("Species")}</th>
+                                    <th className="px-3 py-2 text-right">{tr("Current δ¹³C")}</th>
+                                    <th className="px-3 py-2 text-right">{tr("Current δ¹⁸O")}</th>
+                                    <th className="px-3 py-2 text-right">{tr("Signal")}</th>
                                   </tr>
                                 </thead>
                                 <tbody className="divide-y divide-stone-100">
@@ -9107,22 +8868,20 @@ export default function ProcessingPage() {
                                       <Fragment key={rowLabel || rowIndex}>
                                         {hasGapBefore ? (
                                           <tr aria-hidden="true">
-                                            <td colSpan={10} className="bg-stone-50 px-3 py-1 text-center text-[11px] text-stone-400">
-                                              ··· rows between matching sequence windows ···
-                                            </td>
+                                            <td colSpan={10} className="bg-stone-50 px-3 py-1 text-center text-[11px] text-stone-400">{tr("··· rows between matching sequence windows ···")}</td>
                                           </tr>
                                         ) : null}
                                         <tr className={cn(rowToneClassName, rowLabel === activeTarget?.rowLabel && "ring-1 ring-inset ring-blue-300")}>
                                           <td className="whitespace-nowrap px-3 py-2 font-medium tabular-nums">{rowIndex + 1}</td>
-                                          <td className="whitespace-nowrap px-3 py-2 tabular-nums">{rowLabel || "—"}</td>
-                                          <td className="max-w-56 truncate px-3 py-2" title={rowRawLabel}>{rowRawLabel || "—"}</td>
-                                          <td className="max-w-64 truncate px-3 py-2" title={rowRawComment}>{rowRawComment || "—"}</td>
-                                          <td className="max-w-44 truncate px-3 py-2 font-medium" title={rowIdentifier1}>{rowIdentifier1 || "—"}</td>
-                                          <td className="max-w-36 truncate px-3 py-2" title={rowIdentifier2}>{rowIdentifier2 || "—"}</td>
-                                          <td className="max-w-48 truncate px-3 py-2 italic" title={rowSpecies}>{rowSpecies || "—"}</td>
-                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{row.d13_raw == null ? "—" : formatDeltaValue(row.d13_raw)}</td>
-                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{row.d18_raw == null ? "—" : formatDeltaValue(row.d18_raw)}</td>
-                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{row.signal == null ? "—" : row.signal.toFixed(3)}</td>
+                                          <td className="whitespace-nowrap px-3 py-2 tabular-nums">{tr(rowLabel || "—")}</td>
+                                          <td className="max-w-56 truncate px-3 py-2" title={tr(rowRawLabel)}>{tr(rowRawLabel || "—")}</td>
+                                          <td className="max-w-64 truncate px-3 py-2" title={tr(rowRawComment)}>{tr(rowRawComment || "—")}</td>
+                                          <td className="max-w-44 truncate px-3 py-2 font-medium" title={tr(rowIdentifier1)}>{tr(rowIdentifier1 || "—")}</td>
+                                          <td className="max-w-36 truncate px-3 py-2" title={tr(rowIdentifier2)}>{tr(rowIdentifier2 || "—")}</td>
+                                          <td className="max-w-48 truncate px-3 py-2 italic" title={tr(rowSpecies)}>{tr(rowSpecies || "—")}</td>
+                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{tr(row.d13_raw == null ? "—" : formatDeltaValue(row.d13_raw))}</td>
+                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{tr(row.d18_raw == null ? "—" : formatDeltaValue(row.d18_raw))}</td>
+                                          <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{tr(row.signal == null ? "—" : row.signal.toFixed(3))}</td>
                                         </tr>
                                       </Fragment>
                                     );
@@ -9142,7 +8901,7 @@ export default function ProcessingPage() {
                                   label === `${activeTarget?.rowLabel}:${activeTarget?.isotopeKey}` ? "bg-stone-900 text-white" : "bg-white text-stone-700",
                                 )}
                               >
-                                {formatScientificText(label)}
+                                {tr(formatScientificText(label))}
                               </span>
                             ))}
                           </div>
@@ -9166,18 +8925,18 @@ export default function ProcessingPage() {
                             <div className="flex min-w-0 items-center gap-2">
                               <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-400 transition-transform group-open:rotate-90" />
                               <div className="min-w-0">
-                                <div className="text-xs font-semibold text-stone-800">Selection source chart</div>
-                                <div className="truncate text-[11px] text-stone-500">{formatScientificText(selectionSourceChart.title)}</div>
+                                <div className="text-xs font-semibold text-stone-800">{tr("Selection source chart")}</div>
+                                <div className="truncate text-[11px] text-stone-500">{tr(formatScientificText(selectionSourceChart.title))}</div>
                               </div>
                             </div>
-                            <span className="shrink-0 text-[11px] text-stone-500">Expand</span>
+                            <span className="shrink-0 text-[11px] text-stone-500">{tr("Expand")}</span>
                           </summary>
                           <div className="border-t border-stone-200 p-3">
                             {selectionSourceChart.stackedFigures?.length ? (
                               <div className="space-y-3">
                                 {selectionSourceChart.stackedFigures.map((item) => (
                                   <div key={item.key} className="rounded-lg border border-stone-200 p-2">
-                                    <div className="px-1 pb-2 text-sm font-medium text-stone-700">{formatScientificText(item.title)}</div>
+                                    <div className="px-1 pb-2 text-sm font-medium text-stone-700">{tr(formatScientificText(item.title))}</div>
                                     <PlotlyChart
                                       figure={item.figure}
                                       className="pointer-events-none h-[280px] w-full"
@@ -9202,38 +8961,36 @@ export default function ProcessingPage() {
                           {duplicateGroupTargets.length <= 1 ? (
                             <details className="group rounded-lg border border-stone-200 bg-white">
                               <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-semibold text-stone-700">
-                                <ChevronRight className="h-3.5 w-3.5 text-stone-400 transition-transform group-open:rotate-90" />
-                                Isotope method details
-                              </summary>
+                                <ChevronRight className="h-3.5 w-3.5 text-stone-400 transition-transform group-open:rotate-90" />{tr("Isotope method details")}</summary>
                               <div className="grid gap-2 border-t border-stone-200 p-3 md:grid-cols-2">
                                 <div className="rounded-lg bg-stone-50/70 p-3">
-                                  <div className="text-xs font-semibold text-stone-700">δ¹³C</div>
+                                  <div className="text-xs font-semibold text-stone-700">{tr("δ¹³C")}</div>
                                   <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
-                                    <div className="text-stone-500">Current</div>
+                                    <div className="text-stone-500">{tr("Current")}</div>
                                     <div className="text-right font-medium text-stone-900">
-                                      {d13CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d13CurrentDisplayValue)}
+                                      {tr(d13CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d13CurrentDisplayValue))}
                                     </div>
-                                    <div className="text-stone-500">Linearity corrected</div>
+                                    <div className="text-stone-500">{tr("Linearity corrected")}</div>
                                     <div className="text-right font-medium text-stone-900">
-                                      {d13LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d13LinearityCorrectedDisplayValue)}
+                                      {tr(d13LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d13LinearityCorrectedDisplayValue))}
                                     </div>
-                                    <div className="text-stone-500">Method</div>
-                                    <div className="text-right font-medium text-stone-900">{d13Method}</div>
+                                    <div className="text-stone-500">{tr("Method")}</div>
+                                    <div className="text-right font-medium text-stone-900">{tr(d13Method)}</div>
                                   </div>
                                 </div>
                                 <div className="rounded-lg bg-stone-50/70 p-3">
-                                  <div className="text-xs font-semibold text-stone-700">δ¹⁸O</div>
+                                  <div className="text-xs font-semibold text-stone-700">{tr("δ¹⁸O")}</div>
                                   <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
-                                    <div className="text-stone-500">Current</div>
+                                    <div className="text-stone-500">{tr("Current")}</div>
                                     <div className="text-right font-medium text-stone-900">
-                                      {d18CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d18CurrentDisplayValue)}
+                                      {tr(d18CurrentDisplayValue == null ? "N/A" : formatDeltaValue(d18CurrentDisplayValue))}
                                     </div>
-                                    <div className="text-stone-500">Linearity corrected</div>
+                                    <div className="text-stone-500">{tr("Linearity corrected")}</div>
                                     <div className="text-right font-medium text-stone-900">
-                                      {d18LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d18LinearityCorrectedDisplayValue)}
+                                      {tr(d18LinearityCorrectedDisplayValue == null ? "N/A" : formatDeltaValue(d18LinearityCorrectedDisplayValue))}
                                     </div>
-                                    <div className="text-stone-500">Method</div>
-                                    <div className="text-right font-medium text-stone-900">{d18Method}</div>
+                                    <div className="text-stone-500">{tr("Method")}</div>
+                                    <div className="text-right font-medium text-stone-900">{tr(d18Method)}</div>
                                   </div>
                                 </div>
                               </div>
@@ -9255,7 +9012,7 @@ export default function ProcessingPage() {
                                     isActive ? "bg-stone-900 text-white shadow-sm" : "text-stone-700 hover:bg-stone-100",
                                   )}
                                 >
-                                  {formatScientificText(isotopeKey)}
+                                  {tr(formatScientificText(isotopeKey))}
                                 </button>
                               );
                             })}
@@ -9263,7 +9020,7 @@ export default function ProcessingPage() {
 
                           <div className="grid gap-3 sm:grid-cols-2">
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Set value ({formatScientificText(selectionEditorTab)})</span>
+                              <span className="mb-1 block text-stone-700">{tr("Set value (")}{tr(formatScientificText(selectionEditorTab))})</span>
                               <input
                                 type="number"
                                 step="0.001"
@@ -9281,7 +9038,7 @@ export default function ProcessingPage() {
                               />
                             </label>
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">Offset ({formatScientificText(selectionEditorTab)})</span>
+                              <span className="mb-1 block text-stone-700">{tr("Offset (")}{tr(formatScientificText(selectionEditorTab))})</span>
                               <input
                                 type="number"
                                 step="0.001"
@@ -9295,32 +9052,22 @@ export default function ProcessingPage() {
                           </div>
 
                           <div className="flex flex-wrap gap-2">
-                            <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>
-                              Set {formatScientificText(selectionEditorTab)}
+                            <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>{tr("Set")}{tr(formatScientificText(selectionEditorTab))}
                             </Button>
-                            <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>
-                              Offset {formatScientificText(selectionEditorTab)}
+                            <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>{tr("Offset")}{tr(formatScientificText(selectionEditorTab))}
                             </Button>
                             <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
-                              {singleInterpolateLabel}
+                              {tr(singleInterpolateLabel)}
                             </Button>
-                            <Button variant="outline" onClick={resetSelected} disabled={busy}>
-                              Reset selected
-                            </Button>
-                            <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>
-                              Clear selection
-                            </Button>
-                            <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
-                              Force outlier
-                            </Button>
-                            <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
-                              Force keep
-                            </Button>
+                            <Button variant="outline" onClick={resetSelected} disabled={busy}>{tr("Reset selected")}</Button>
+                            <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>{tr("Clear selection")}</Button>
+                            <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>{tr("Force outlier")}</Button>
+                            <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>{tr("Force keep")}</Button>
                           </div>
 
                           {duplicateGroupTargets.length <= 1 ? (
                             <DiagnosticsPanel
-                              title={`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`}
+                              title={tr(`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`)}
                               diagnostics={activeDiagnostics}
                               loading={activeDiagnosticsLoading}
                               displayDelta={rawToDisplayDelta(selectionEditorTab)}
@@ -9335,10 +9082,10 @@ export default function ProcessingPage() {
 
                       {selectedTargets.length > 1 ? (
                         <div className="space-y-4 rounded-lg border border-stone-200 p-4">
-                          <div className="text-sm font-medium text-stone-800">Multi-point actions</div>
+                          <div className="text-sm font-medium text-stone-800">{tr("Multi-point actions")}</div>
                           <div className="grid gap-3 sm:grid-cols-2">
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">δ¹³C offset for selection</span>
+                              <span className="mb-1 block text-stone-700">{tr("δ¹³C offset for selection")}</span>
                               <input
                                 type="number"
                                 step="0.001"
@@ -9348,7 +9095,7 @@ export default function ProcessingPage() {
                               />
                             </label>
                             <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">δ¹⁸O offset for selection</span>
+                              <span className="mb-1 block text-stone-700">{tr("δ¹⁸O offset for selection")}</span>
                               <input
                                 type="number"
                                 step="0.001"
@@ -9359,23 +9106,15 @@ export default function ProcessingPage() {
                             </label>
                           </div>
                           <div className="flex flex-wrap gap-2">
-                            <Button variant="outline" onClick={() => applyMultiOffset("d13C", multiOffsetD13)} disabled={busy}>
-                              Offset selected δ¹³C
-                            </Button>
-                            <Button variant="outline" onClick={() => applyMultiOffset("d18O", multiOffsetD18)} disabled={busy}>
-                              Offset selected δ¹⁸O
-                            </Button>
-                            <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>
-                              Interpolate selected
-                            </Button>
+                            <Button variant="outline" onClick={() => applyMultiOffset("d13C", multiOffsetD13)} disabled={busy}>{tr("Offset selected δ¹³C")}</Button>
+                            <Button variant="outline" onClick={() => applyMultiOffset("d18O", multiOffsetD18)} disabled={busy}>{tr("Offset selected δ¹⁸O")}</Button>
+                            <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>{tr("Interpolate selected")}</Button>
                           </div>
                         </div>
                       ) : null}
                     </>
                   ) : (
-                    <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                      No active selection.
-                    </div>
+                    <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("No active selection.")}</div>
                   )}
                 </div>
               </div>
@@ -9387,8 +9126,8 @@ export default function ProcessingPage() {
               <FigureCard
                 key={overviewCards.d13Summary.key}
                 chartKey={overviewCards.d13Summary.key}
-                title={overviewCards.d13Summary.title}
-                description={overviewCards.d13Summary.description}
+                title={tr(overviewCards.d13Summary.title)}
+                description={tr(overviewCards.d13Summary.description)}
                 figure={hideEmbeddedColorbars(d13SummaryFigure)}
                 legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
                 headerActions={
@@ -9407,8 +9146,8 @@ export default function ProcessingPage() {
               <FigureCard
                 key={overviewCards.d18Summary.key}
                 chartKey={overviewCards.d18Summary.key}
-                title={overviewCards.d18Summary.title}
-                description={overviewCards.d18Summary.description}
+                title={tr(overviewCards.d18Summary.title)}
+                description={tr(overviewCards.d18Summary.description)}
                 figure={hideEmbeddedColorbars(d18SummaryFigure)}
                 legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
                 headerActions={
@@ -9428,7 +9167,7 @@ export default function ProcessingPage() {
           </div>
 
           <OutlierTablesPanel
-            title="Data outlier tables"
+            title={tr("Data outlier tables")}
             tables={displayedDataOutlierTables}
             isPreview={Boolean(processingPreviewMasks)}
             renderTableControls={renderFailedSampleTableControls}
@@ -9450,18 +9189,14 @@ export default function ProcessingPage() {
                   onToggle={(event) => setSpeciesSectionOpen(section.species, event.currentTarget.open)}
                 >
                   <summary className="cursor-pointer px-6 py-4 text-lg font-semibold text-stone-900">
-                    {section.species} ({identifierCount} identifiers)
-                  </summary>
+                    {tr(section.species)} ({identifierCount}{tr("identifiers)")}</summary>
                   {isSectionOpen ? (
                     <div className="space-y-3 p-6 pt-0">
                   {isLoadingSectionFigures ? (
-                    <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                      Loading species charts...
-                    </div>
+                    <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Loading species charts...")}</div>
                   ) : null}
                   {sectionQueryState?.error ? (
-                    <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-                      Failed to load species charts: {sectionQueryState.error.message}
+                    <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">{tr("Failed to load species charts:")}{tr(sectionQueryState.error.message)}
                     </div>
                   ) : null}
                   {section.identifier_figures.map((figureSet) => {
@@ -9472,14 +9207,14 @@ export default function ProcessingPage() {
                     return (
                       <Card key={`${section.species}-${figureSet.identifier}`} className="border-stone-300">
                         <CardHeader>
-                          <CardTitle>{figureSet.identifier}</CardTitle>
+                          <CardTitle>{tr(figureSet.identifier)}</CardTitle>
                         </CardHeader>
                         <CardContent className="space-y-4">
                           <div className="space-y-3">
                             <div className="space-y-3">
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
-                                  <div className="text-sm font-medium text-stone-800">δ¹³C chart</div>
+                                  <div className="text-sm font-medium text-stone-800">{tr("δ¹³C chart")}</div>
                                 </div>
                                 <TraceModeControl
                                   state={d13State}
@@ -9507,7 +9242,7 @@ export default function ProcessingPage() {
                             <div className="space-y-3">
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
-                                  <div className="text-sm font-medium text-stone-800">δ¹⁸O chart</div>
+                                  <div className="text-sm font-medium text-stone-800">{tr("δ¹⁸O chart")}</div>
                                 </div>
                                 <TraceModeControl
                                   state={d18State}
@@ -9538,7 +9273,7 @@ export default function ProcessingPage() {
                   })}
 
                   <OutlierTablesPanel
-                    title={`${section.species} outlier tables`}
+                    title={tr(`${section.species} outlier tables`)}
                     tables={displayedSpeciesOutlierTables.get(section.species) ?? section.outlier_tables}
                     isPreview={Boolean(processingPreviewMasks)}
                     renderTableControls={renderFailedSampleTableControls}
@@ -9554,29 +9289,34 @@ export default function ProcessingPage() {
       </div>
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="fixed z-[80] max-h-[calc(100vh-20px)] w-[min(720px,calc(100vw-20px))] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          role="tooltip"
+          className="fixed z-[80] max-h-[calc(100vh-20px)] w-[min(980px,calc(100vw-20px))] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
           onMouseEnter={clearHoverPreviewHideTimer}
           onMouseLeave={scheduleHoverPreviewHide}
         >
           <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
             <span className="font-medium text-stone-800">
-              {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
+              {tr(hoverPreview.target.identifier1 || "Sample")} | {tr(hoverPreview.target.identifier2 || "N/A")}
             </span>
             <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
-              {hoverPreview.target.isotopeKey}
+              {tr(hoverPreview.target.isotopeKey)}
             </span>
           </div>
-          <RawAnalysisInfoTable info={hoverAnalysisInfo} />
-          {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
-            <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
-          ) : hasHoverDiagnosticsFigureData ? (
-            <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
-          ) : (
-            <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-              Cycle-intensity preview unavailable for this point.
+          <div className="grid min-h-0 gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:items-stretch">
+            <div className="h-[390px] min-w-0">
+              <RawAnalysisInfoTable info={hoverAnalysisInfo} layout="vertical" />
             </div>
-          )}
+            <div className="flex min-h-[390px] min-w-0 items-center">
+              {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
+                <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Loading hover preview...")}</div>
+              ) : hasHoverDiagnosticsFigureData ? (
+                <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
+              ) : (
+                <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Cycle-intensity preview unavailable for this point.")}</div>
+              )}
+            </div>
+          </div>
         </div>
       ) : null}
     </div>

@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
@@ -8,18 +9,20 @@ import { useEffect, useRef } from "react";
 
 import brandIcon from "@/app/icon.png";
 import { SessionHeader } from "@/components/layout/session-header";
+import { LanguageSelector } from "@/components/layout/language-provider";
 import { cn } from "@/lib/utils";
 
 const navItems = [
-  { href: "/import", label: "Import", icon: Import },
-  { href: "/diagnostics", label: "Diagnostics", icon: Microscope },
-  { href: "/calibration", label: "Calibration", icon: FlaskConical },
-  { href: "/processing", label: "Processing", icon: SlidersHorizontal },
+  { href: "/metrology", label: "Metrology overview", icon: FlaskConical },
+  { href: "/metrology/results", label: "Results Station", icon: SlidersHorizontal },
+  { href: "/metrology/qualification", label: "Qualification", icon: Microscope },
+  { href: "/metrology/history", label: "QC history", icon: Import },
   { href: "/assistant", label: "Assistant", icon: Bot },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
 export function AppHeader() {
+  const tr = useTranslation();
   const pathname = usePathname();
   const router = useRouter();
   const headerRef = useRef<HTMLElement | null>(null);
@@ -43,21 +46,21 @@ export function AppHeader() {
   return (
     <header ref={headerRef} className="fixed inset-x-0 top-0 z-40 border-b border-slate-200 bg-white/95 shadow-sm backdrop-blur">
       <div className="mx-auto flex min-h-14 max-w-[1680px] items-center gap-3 px-3 sm:px-4 lg:px-6">
-        <Link href="/import" className="group flex min-w-0 items-center gap-2.5" aria-label="IRMS Results Station home">
+        <Link href="/metrology" className="group flex min-w-0 items-center gap-2.5" aria-label={tr("IRMS Metrology Station home")}>
           <Image
             src={brandIcon}
-            alt=""
+            alt={tr("")}
             aria-hidden="true"
             priority
-            className="h-8 w-8 shrink-0 rounded-md border border-slate-200 bg-white object-contain shadow-sm transition-transform group-hover:scale-95"
+            className="h-10 w-10 shrink-0 object-contain mix-blend-multiply transition-transform group-hover:scale-95"
           />
           <span className="min-w-0">
-            <span className="block truncate font-display text-sm font-semibold leading-tight text-slate-950">IRMS Results Station</span>
-            <span className="hidden truncate font-mono text-[10px] text-slate-500 sm:block">Isotope measurement workspace</span>
+            <span className="block truncate font-display text-sm font-semibold leading-tight text-slate-950"><span className="sm:hidden">IRMS</span><span className="hidden sm:inline">{tr("IRMS Metrology Station")}</span></span>
+            <span className="hidden truncate font-mono text-[10px] text-slate-500 sm:block">{tr("Isotope measurement workspace")}</span>
           </span>
         </Link>
 
-        <nav className="ml-auto hidden items-center gap-1 lg:flex" aria-label="Primary navigation">
+        {!pathname.startsWith("/metrology") && <nav className="ml-auto hidden items-center gap-1 xl:flex" aria-label={tr("Primary navigation")}>
           {navItems.map(({ href, label, icon: Icon }) => {
             const active = pathname === href;
             return (
@@ -73,28 +76,29 @@ export function AppHeader() {
                 )}
               >
                 <Icon className="h-3.5 w-3.5" aria-hidden="true" />
-                {label}
+                {tr(label)}
               </Link>
             );
           })}
-        </nav>
+        </nav>}
 
-        <label className="ml-auto flex min-w-0 items-center gap-2 lg:hidden">
-          <span className="sr-only">Current section</span>
+        {!pathname.startsWith("/metrology") && <label className="ml-auto flex min-w-0 items-center gap-2 xl:hidden">
+          <span className="sr-only">{tr("Current section")}</span>
           <select
             className="h-9 max-w-[10.5rem] rounded-md border border-slate-300 bg-white px-2.5 text-sm font-medium text-slate-800 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100"
-            value={navItems.find((item) => item.href === pathname)?.href ?? "/import"}
+            value={navItems.find((item) => item.href === pathname)?.href ?? "/metrology"}
             onChange={(event) => router.push(event.target.value)}
           >
             {navItems.map((item) => (
               <option key={item.href} value={item.href}>
-                {item.label}
+                {tr(item.label)}
               </option>
             ))}
           </select>
-        </label>
+        </label>}
+        <div className="ml-auto"><LanguageSelector /></div>
       </div>
-      <SessionHeader />
+      {!pathname.startsWith("/metrology") && <SessionHeader />}
     </header>
   );
 }

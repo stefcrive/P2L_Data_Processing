@@ -10,6 +10,8 @@ const distDir = process.env.NEXT_DIST_DIR || ".next";
 const nextConfig: NextConfig = {
   distDir,
   reactStrictMode: true,
+  // Building a consultation of many original workbooks can exceed 30 seconds.
+  experimental: { proxyTimeout: 300000 },
   async rewrites() {
     return [
       {

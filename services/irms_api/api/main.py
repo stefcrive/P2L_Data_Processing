@@ -19,7 +19,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from ..domain.calibration.core import (
@@ -160,6 +160,11 @@ from ..runtime_secrets import (
 
 app = FastAPI(title="IRMS API", version="0.1.0")
 
+# The metrology workspace has independent local storage and controlled approvals.
+from ..metrology.api import router as metrology_router
+
+app.include_router(metrology_router)
+
 
 def _cors_origins() -> list[str]:
     # Accept a comma-separated allow list via env var for deploys.
@@ -187,6 +192,12 @@ async def add_performance_headers(request: Request, call_next):
     """Expose end-to-end server work so UI latency can be measured in place."""
 
     started = time.perf_counter()
+    parts = request.url.path.strip("/").split("/")
+    if len(parts) >= 3 and parts[0] == "sessions" and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        suffix = "/".join(parts[2:])
+        protected = suffix.startswith(("calibration/run", "calibration/reset", "processing/edit", "processing/calibration/remove", "exports/dataset", "append", "exclude-file"))
+        if protected and store.session_exists(parts[1]) and store.load_metadata(parts[1]).get("metrology_link"):
+            return JSONResponse(status_code=409, content={"detail":"This is a consultation copy linked to an approved metrological method. Use Results Station for scientific review, re-evaluation and traceable result export."})
     response = await call_next(request)
     duration_ms = (time.perf_counter() - started) * 1000.0
     response.headers["Server-Timing"] = f"app;dur={duration_ms:.1f}"

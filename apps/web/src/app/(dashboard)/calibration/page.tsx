@@ -1,9 +1,11 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, ChevronUp, Database, GripVertical, X } from "lucide-react";
 import Link from "next/link";
 import {
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -14,6 +16,7 @@ import {
 
 import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/components/charts/lazy-plotly-chart";
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
+import { RawAnalysisInfoTable } from "@/components/diagnostics/raw-analysis-info-table";
 import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
 import {
   SATURATION_COLOR_AXIS_OPTIONS,
@@ -44,6 +47,7 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { formatScientificText } from "@/lib/scientific-notation";
+import { MetrologyChartWorkspace, useMetrologyConsultation } from "@/components/metrology/consultation-context";
 import { useSessionStore } from "@/store/use-session-store";
 
 type SelectedTarget = {
@@ -984,10 +988,10 @@ function compactHoverDiagnosticsFigure(figure: Record<string, unknown> | undefin
       xanchor: "center",
       font: { size: 14 },
     },
-    margin: { l: 42, r: 12, t: 46, b: 126 },
+    margin: { l: 42, r: 12, t: 42, b: 112 },
     legend: { orientation: "h", yanchor: "top", y: -0.28, x: 0, xanchor: "left", font: { size: 10 } },
     hovermode: "closest",
-    height: 460,
+    height: 390,
   };
   return ensureFigureUiRevision(
     {
@@ -2016,6 +2020,7 @@ function RangeSliderField({
   precision?: number;
   onChange: (next: [number, number]) => void;
 }) {
+  const tr = useTranslation();
   const resolvedMin = Math.min(min, max);
   const resolvedMax = Math.max(min, max);
   const low = clampNumber(Math.min(value[0], value[1]), resolvedMin, resolvedMax);
@@ -2023,7 +2028,7 @@ function RangeSliderField({
 
   return (
     <DualRangeField
-      label={label}
+      label={tr(label)}
       value={[low, high]}
       min={resolvedMin}
       max={resolvedMax}
@@ -2047,6 +2052,7 @@ function CheckboxField({
   onChange: (checked: boolean) => void;
   disabled?: boolean;
 }) {
+  const tr = useTranslation();
   return (
     <label className={cn("flex items-center gap-2 py-1.5 text-sm", disabled ? "cursor-not-allowed opacity-60" : "")}>
       <input
@@ -2056,10 +2062,10 @@ function CheckboxField({
         onChange={(event) => onChange(event.target.checked)}
         className="h-4 w-4"
       />
-      <span className="font-medium text-stone-800">{formatScientificText(label)}</span>
+      <span className="font-medium text-stone-800">{tr(formatScientificText(label))}</span>
       {description ? (
-        <Tooltip label={description}>
-          <span tabIndex={0} aria-label={`More information about ${label}`} className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">
+        <Tooltip label={tr(description)}>
+          <span tabIndex={0} aria-label={tr(`More information about ${label}`)} className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">
             ?
           </span>
         </Tooltip>
@@ -2204,20 +2210,21 @@ function CalibrationColorScaleBar({
   colorParam: string | null;
   range: [number, number];
 }) {
+  const tr = useTranslation();
   const label = calibrationColorParameterLabel(colorParam);
   const ticks = calibrationColorScaleTicks(range);
   return (
     <div className="mx-auto w-full max-w-xl rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs">
-      <div className="mb-1 font-semibold text-stone-900">{formatScientificText(label)}</div>
+      <div className="mb-1 font-semibold text-stone-900">{tr(formatScientificText(label))}</div>
       <div
         className="h-2 w-full rounded-full border border-stone-300 bg-[linear-gradient(90deg,#440154_0%,#3b528b_25%,#21918c_50%,#5ec962_75%,#fde725_100%)]"
         role="img"
-        aria-label={`${label} color scale from ${range[0]} to ${range[1]}`}
+        aria-label={tr(`${label} color scale from ${range[0]} to ${range[1]}`)}
       />
       <div className="mt-1 grid grid-cols-6 text-[10px] tabular-nums text-stone-500">
         {ticks.map((tick, index) => (
           <span key={`${tick}-${index}`} className={index === 0 ? "text-left" : index === ticks.length - 1 ? "text-right" : "text-center"}>
-            {formatCalibrationColorScaleValue(tick, colorParam)}
+            {tr(formatCalibrationColorScaleValue(tick, colorParam))}
           </span>
         ))}
       </div>
@@ -2398,8 +2405,9 @@ function applyColorScaleRangeToFigure(
 }
 
 function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> }) {
+  const tr = useTranslation();
   if (!rows.length) {
-    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">No cycle rows returned for this point.</div>;
+    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("No cycle rows returned for this point.")}</div>;
   }
 
   const statusRows: Array<Record<string, unknown>> = rows.map((row) => {
@@ -2470,11 +2478,11 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">First valid cycle</span>
-        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">Last valid cycle</span>
-        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">Successful cycle</span>
-        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">Saturated cycle</span>
-        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">Sample gas escape</span>
+        <span className="rounded-md bg-sky-100 px-2 py-1 text-sky-800">{tr("First valid cycle")}</span>
+        <span className="rounded-md bg-amber-100 px-2 py-1 text-amber-800">{tr("Last valid cycle")}</span>
+        <span className="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">{tr("Successful cycle")}</span>
+        <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">{tr("Saturated cycle")}</span>
+        <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">{tr("Sample gas escape")}</span>
       </div>
       <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -2482,7 +2490,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             <tr>
               {columns.map((column) => (
                 <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                  {formatScientificText(column)}
+                  {tr(formatScientificText(column))}
                 </th>
               ))}
             </tr>
@@ -2533,7 +2541,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
                             : "text-stone-700",
                         )}
                       >
-                        {formatScientificText(formatCell(cellValue, column))}
+                        {tr(formatScientificText(formatCell(cellValue, column)))}
                       </td>
                     );
                   })}
@@ -2542,7 +2550,7 @@ function CycleDiagnosticsTable({ rows }: { rows: Array<Record<string, unknown>> 
             })}
           </tbody>
         </table>
-        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">Showing first 25 of {rows.length} rows.</div> : null}
+        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">{tr("Showing first 25 of ")}{rows.length}{tr(" rows.")}</div> : null}
       </div>
     </div>
   );
@@ -2568,6 +2576,7 @@ function DiagnosticsPanel({
   loading: boolean;
   onPickDeltaValue?: (value: number, stdev?: number | null) => void;
 }) {
+  const tr = useTranslation();
   const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
   const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
   const cycleMean = diagnostics?.cycle_mean ?? {};
@@ -2657,11 +2666,11 @@ function DiagnosticsPanel({
   return (
     <Card className="border-stone-300">
       <CardHeader>
-        <CardTitle className="text-base">{title}</CardTitle>
-        <CardDescription>Cycle-level intensity and exclusion diagnostics for the active sample.</CardDescription>
+        <CardTitle className="text-base">{tr(title)}</CardTitle>
+        <CardDescription>{tr("Cycle-level intensity and exclusion diagnostics for the active sample.")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {loading ? <div className="text-sm text-stone-500">Loading cycle diagnostics...</div> : null}
+        {loading ? <div className="text-sm text-stone-500">{tr("Loading cycle diagnostics...")}</div> : null}
 
         {diagnostics ? (
           <>
@@ -2677,7 +2686,7 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help text-stone-400" : "text-stone-900",
                     )}
                   >
-                    {displayValue}
+                    {tr(displayValue)}
                   </span>
                 );
                 return (
@@ -2697,10 +2706,10 @@ function DiagnosticsPanel({
                       blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
                     )}
                   >
-                    <div className="text-xs uppercase tracking-normal text-stone-500">{formatScientificText(item.label)}</div>
+                    <div className="text-xs uppercase tracking-normal text-stone-500">{tr(formatScientificText(item.label))}</div>
                     <div className="mt-1 text-lg font-semibold">
                       {blockedByLinearityCycleCount ? (
-                        <Tooltip label="not enough cycles for linearity calculation" align="start">
+                        <Tooltip label={tr("not enough cycles for linearity calculation")} align="start">
                           {valueElement}
                         </Tooltip>
                       ) : (
@@ -2708,18 +2717,18 @@ function DiagnosticsPanel({
                       )}
                     </div>
                     {item.stdev != null ? (
-                      <div className="mt-1 text-xs text-stone-500">Std dev: {formatDeltaValue(item.stdev)}</div>
+                      <div className="mt-1 text-xs text-stone-500">{tr("Std dev: ")}{tr(formatDeltaValue(item.stdev))}</div>
                     ) : null}
                   </button>
                 );
               })}
               <div className="rounded-lg border border-stone-200 p-3">
-                <div className="text-xs uppercase tracking-normal text-stone-500">Method</div>
-                <div className="mt-1 text-sm font-medium text-stone-900">{asString(cycleMean.method) || "N/A"}</div>
+                <div className="text-xs uppercase tracking-normal text-stone-500">{tr("Method")}</div>
+                <div className="mt-1 text-sm font-medium text-stone-900">{tr(asString(cycleMean.method) || "N/A")}</div>
               </div>
             </div>
 
-            {reason ? <div className="text-sm text-stone-500">Diagnostics note: {reason}</div> : null}
+            {reason ? <div className="text-sm text-stone-500">{tr("Diagnostics note: ")}{tr(reason)}</div> : null}
 
             <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
               <PlotlyChart
@@ -2736,7 +2745,7 @@ function DiagnosticsPanel({
               <>
                 <div className="flex flex-wrap items-end gap-4">
                   <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label="Chart color axis" />
+                    <SaturationAxisHelpTooltip label={tr("Chart color axis")} />
                     <select
                       value={saturationColorAxis}
                       onChange={(event) => setSaturationColorAxis(event.target.value as SaturationColorAxisKey)}
@@ -2744,13 +2753,13 @@ function DiagnosticsPanel({
                     >
                       {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
-                          {option.label}
+                          {tr(option.label)}
                         </option>
                       ))}
                     </select>
                   </label>
                   <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label="Chart y axis" />
+                    <SaturationAxisHelpTooltip label={tr("Chart y axis")} />
                     <select
                       value={saturationYAxis}
                       onChange={(event) => setSaturationYAxis(event.target.value as SaturationAxisKey)}
@@ -2758,7 +2767,7 @@ function DiagnosticsPanel({
                     >
                       {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
-                          {option.label}
+                          {tr(option.label)}
                         </option>
                       ))}
                     </select>
@@ -2770,8 +2779,8 @@ function DiagnosticsPanel({
                     <SaturationFigureCard
                       key={item.key}
                       chartKey={item.key}
-                      title={item.title}
-                      description={item.description}
+                      title={tr(item.title)}
+                      description={tr(item.description)}
                       figure={item.figure}
                       colorAxis={saturationColorAxis}
                       yAxis={saturationYAxis}
@@ -2783,7 +2792,7 @@ function DiagnosticsPanel({
             ) : null}
           </>
         ) : loading ? null : (
-          <div className="text-sm text-stone-500">Cycle diagnostics appear here once a point is selected.</div>
+          <div className="text-sm text-stone-500">{tr("Cycle diagnostics appear here once a point is selected.")}</div>
         )}
       </CardContent>
     </Card>
@@ -2832,8 +2841,9 @@ function toneClasses(tone: "pass" | "fail" | "neutral") {
 }
 
 function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>; emptyLabel: string }) {
+  const tr = useTranslation();
   if (!rows.length) {
-    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{emptyLabel}</div>;
+    return <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr(emptyLabel)}</div>;
   }
   const columns = Object.keys(rows[0] ?? {});
   return (
@@ -2843,7 +2853,7 @@ function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>;
           <tr>
             {columns.map((column) => (
               <th key={column} className="px-3 py-2 font-medium text-stone-700">
-                {formatScientificText(column)}
+                {tr(formatScientificText(column))}
               </th>
             ))}
           </tr>
@@ -2853,7 +2863,7 @@ function DataTable({ rows, emptyLabel }: { rows: Array<Record<string, unknown>>;
             <tr key={index}>
               {columns.map((column) => (
                 <td key={column} className="px-3 py-2 text-stone-600">
-                  {formatScientificText(String(row[column] ?? ""))}
+                  {tr(formatScientificText(String(row[column] ?? "")))}
                 </td>
               ))}
             </tr>
@@ -2873,12 +2883,13 @@ function PrecisionMetricPanel({
   value?: number | null;
   detail?: string;
 }) {
+  const tr = useTranslation();
   const styles = toneClasses(classifyPrecision(value));
   return (
     <div className={`rounded-lg border px-4 py-3 ${styles.shell}`}>
-      <div className={`text-xs font-medium ${styles.subtle}`}>{formatScientificText(label)}</div>
-      <div className={`mt-1.5 text-2xl font-semibold leading-none tabular-nums ${styles.value}`}>{formatMetricWithUnit(value)}</div>
-      {detail ? <div className={`mt-2 text-xs tabular-nums ${styles.subtle}`}>{detail}</div> : null}
+      <div className={`text-xs font-medium ${styles.subtle}`}>{tr(formatScientificText(label))}</div>
+      <div className={`mt-1.5 text-2xl font-semibold leading-none tabular-nums ${styles.value}`}>{tr(formatMetricWithUnit(value))}</div>
+      {detail ? <div className={`mt-2 text-xs tabular-nums ${styles.subtle}`}>{tr(detail)}</div> : null}
     </div>
   );
 }
@@ -2900,11 +2911,12 @@ function IsotopeSummaryTile({
   includedRows: number;
   includedPct: number;
 }) {
+  const tr = useTranslation();
   const outlierCount = Math.max(0, totalRows - includedRows);
   const outlierLabel = outlierCount === 1 ? "outlier" : "outliers";
   return (
     <PrecisionMetricPanel
-      label={`${label} precision`}
+      label={tr(`${label} precision`)}
       value={linearityEnabled ? correctedPrecision : precision}
       detail={`${outlierCount} ${outlierLabel} · ${includedPct.toFixed(1)}% successful`}
     />
@@ -2912,6 +2924,7 @@ function IsotopeSummaryTile({
 }
 
 function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrecisionSummary; linearityEnabled: boolean }) {
+  const tr = useTranslation();
   const linePrecisionEntries = Object.entries(summary.line_precisions).sort(([left], [right]) => {
     const leftNumber = Number(left);
     const rightNumber = Number(right);
@@ -2925,17 +2938,17 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
     <Card className="w-full overflow-hidden border-stone-300">
       <CardHeader className="border-b border-stone-200 bg-stone-50 py-3">
         <div className="flex flex-wrap items-center gap-2">
-          <CardTitle className="text-lg tracking-normal">{summary.standard}</CardTitle>
+          <CardTitle className="text-lg tracking-normal">{tr(summary.standard)}</CardTitle>
           {linearityEnabled ? (
-            <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800">Linearity corrected</Badge>
+            <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800">{tr("Linearity corrected")}</Badge>
           ) : null}
         </div>
-        <CardDescription>Precision across included measurements. Values below 0.07 permil are shown in green.</CardDescription>
+        <CardDescription>{tr("Precision across included measurements. Values below 0.07 permil are shown in green.")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4 p-4">
         <div className="grid gap-3 md:grid-cols-2">
           <IsotopeSummaryTile
-            label="Carbon isotope (δ¹³C)"
+            label={tr("Carbon isotope (δ¹³C)")}
             precision={summary.d13_precision}
             correctedPrecision={summary.d13_linearity_corrected_precision}
             linearityEnabled={linearityEnabled}
@@ -2944,7 +2957,7 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
             includedPct={summary.included_pct_d13}
           />
           <IsotopeSummaryTile
-            label="Oxygen isotope (δ¹⁸O)"
+            label={tr("Oxygen isotope (δ¹⁸O)")}
             precision={summary.d18_precision}
             correctedPrecision={summary.d18_linearity_corrected_precision}
             linearityEnabled={linearityEnabled}
@@ -2956,14 +2969,14 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
         {linePrecisionEntries.length ? (
           <div>
             <div className="mb-2 flex items-center justify-between">
-              <div className="text-xs font-medium text-stone-600">Precision breakdown</div>
-              <div className="text-xs text-stone-500">{linePrecisionEntries.length} lines</div>
+              <div className="text-xs font-medium text-stone-600">{tr("Precision breakdown")}</div>
+              <div className="text-xs text-stone-500">{linePrecisionEntries.length}{tr(" lines")}</div>
             </div>
             <div className="overflow-x-auto rounded-lg border border-stone-200">
               <div className="grid min-w-[460px] grid-cols-[100px_repeat(2,minmax(0,1fr))] bg-stone-100 px-3 py-2 text-xs font-medium text-stone-600">
-                <span>Line</span>
-                <span>δ¹³C (‰)</span>
-                <span>δ¹⁸O (‰)</span>
+                <span>{tr("Line")}</span>
+                <span>{tr("δ¹³C (‰)")}</span>
+                <span>{tr("δ¹⁸O (‰)")}</span>
               </div>
               {linePrecisionEntries.map(([line, values], index) => {
                 const d13Precision = linearityEnabled ? values.d13_linearity_corrected_precision : values.d13_precision;
@@ -2977,20 +2990,18 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
                       index % 2 ? "bg-stone-50" : "bg-white"
                     }`}
                   >
-                    <span className="font-medium text-stone-900">Line {line}</span>
+                    <span className="font-medium text-stone-900">{tr("Line ")}{tr(line)}</span>
                     <span className={`inline-flex max-w-fit rounded-md border px-2 py-1 text-base font-semibold ${d13Tone.shell} ${d13Tone.value}`}>
-                      {formatMetricWithUnit(d13Precision)}
+                      {tr(formatMetricWithUnit(d13Precision))}
                     </span>
                     <span className={`inline-flex max-w-fit rounded-md border px-2 py-1 text-base font-semibold ${d18Tone.shell} ${d18Tone.value}`}>
-                      {formatMetricWithUnit(d18Precision)}
+                      {tr(formatMetricWithUnit(d18Precision))}
                     </span>
                   </div>
                 );
               })}
             </div>
-            <div className="mt-2 text-xs text-stone-500">
-              Overall precision is computed from all included rows, so it is not the arithmetic mean of per-line precision values.
-            </div>
+            <div className="mt-2 text-xs text-stone-500">{tr("Overall precision is computed from all included rows, so it is not the arithmetic mean of per-line precision values.")}</div>
           </div>
         ) : null}
       </CardContent>
@@ -2999,6 +3010,9 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
 }
 
 export default function CalibrationPage() {
+  const station = useContext(MetrologyChartWorkspace);
+  const consultation = useMetrologyConsultation();
+  const tr = useTranslation();
   const sessionId = useSessionStore((state) => state.sessionId);
   const queryClient = useQueryClient();
   const [config, setConfig] = useState<CalibrationConfig | null>(null);
@@ -3007,6 +3021,22 @@ export default function CalibrationPage() {
   const [selectedTargets, setSelectedTargets] = useState<SelectedTarget[]>([]);
   const [activeTargetIndex, setActiveTargetIndex] = useState(0);
   const [isSelectionEditorOpen, setSelectionEditorOpen] = useState(false);
+  const selectionDialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isSelectionEditorOpen) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const dialog = selectionDialogRef.current;
+    dialog?.querySelector<HTMLElement>("button")?.focus();
+    const trap = (event: KeyboardEvent) => {
+      if (event.key !== "Tab" || !dialog) return;
+      const controls = [...dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex='0']")].filter(el => el.getClientRects().length);
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    };
+    dialog?.addEventListener("keydown", trap);
+    return () => { dialog?.removeEventListener("keydown", trap); previous?.focus(); };
+  }, [isSelectionEditorOpen]);
   const [isOfficialValuesModalOpen, setOfficialValuesModalOpen] = useState(false);
   const [isOfficialValuesEditMode, setOfficialValuesEditMode] = useState(false);
   const [officialValuesDraftRows, setOfficialValuesDraftRows] = useState<Record<string, { d13: string; d18: string }>>({});
@@ -3050,7 +3080,7 @@ export default function CalibrationPage() {
   const pendingHoverPreviewRef = useRef<HoverPreviewState | null>(null);
   const colorScaledFigureCacheRef = useRef<WeakMap<Record<string, unknown>, Record<string, unknown>>>(new WeakMap());
   const colorScaleSignatureRef = useRef<string>("");
-  const draftStorageKey = sessionId ? `calibration-config:${sessionId}` : null;
+  const draftStorageKey = sessionId ? `${consultation ? "metrology-calibration-config" : "calibration-config"}:${sessionId}` : null;
   const activeTarget = selectedTargets.length ? selectedTargets[Math.min(activeTargetIndex, selectedTargets.length - 1)] : null;
   const activeIsotopeTarget = activeTarget && activeTarget.isotopeKey !== "cross" ? activeTarget : null;
   const activeCrossTarget = activeTarget && activeTarget.isotopeKey === "cross" ? activeTarget : null;
@@ -3131,7 +3161,7 @@ export default function CalibrationPage() {
   const officialValuesQuery = useQuery({
     queryKey: ["official-standard-values"],
     queryFn: () => api.listOfficialStandardValues(),
-    enabled: isOfficialValuesModalOpen,
+    enabled: isOfficialValuesModalOpen && !consultation,
   });
 
   const singleDiagnosticsQuery = useQuery({
@@ -3261,8 +3291,8 @@ export default function CalibrationPage() {
             ...workspaceQuery.data.config,
             ...current,
             linearity: {
-              ...workspaceQuery.data.config.linearity,
               ...current.linearity,
+              ...workspaceQuery.data.config.linearity,
             },
           }
         : workspaceQuery.data.config,
@@ -3746,6 +3776,12 @@ export default function CalibrationPage() {
     };
   }
 
+  const stationInteractions = (key: string) => ({
+    ...chartHoverProps(key),
+    onPointClick: (points: PlotlyPoint[]) => openProcessingSelectionEditor(key, points, false),
+    onSelection: (points: PlotlyPoint[]) => openProcessingSelectionEditor(key, points, true),
+  });
+
   function buildTargetsForAction(selection: SelectedTarget[], isotopeKey?: "d13C" | "d18O") {
     const targets: Array<{ row_label: string; isotope_key: "d13C" | "d18O" }> = [];
     const seen = new Set<string>();
@@ -4045,19 +4081,19 @@ export default function CalibrationPage() {
     return (
       <Card>
         <CardHeader>
-          <CardTitle>No Active Session</CardTitle>
-          <CardDescription>Import data first to unlock calibration.</CardDescription>
+          <CardTitle>{tr("No Active Session")}</CardTitle>
+          <CardDescription>{tr("Import data first to unlock calibration.")}</CardDescription>
         </CardHeader>
       </Card>
     );
   }
 
   if (workspaceQuery.isLoading && !workspaceQuery.data) {
-    return <div className="text-sm text-stone-500">Loading calibration workspace...</div>;
+    return <div className="text-sm text-stone-500">{tr("Loading calibration workspace...")}</div>;
   }
 
   if (workspaceQuery.error) {
-    return <div className="text-sm text-red-600">Failed to load calibration workspace.</div>;
+    return <div className="text-sm text-red-600">{tr("Failed to load calibration workspace.")}</div>;
   }
 
   const workspace = persistedWorkspace;
@@ -4114,7 +4150,7 @@ export default function CalibrationPage() {
   const selectedStandards = activeConfig.selected_standards;
   const selectedStandardOfficialValues = displayedWorkspace.selected_standard_official_values ?? [];
   const selectedStandardsSet = new Set(selectedStandards.map((item) => String(item ?? "").trim().toUpperCase()).filter(Boolean));
-  const officialValueRows = buildOfficialValuesRows(officialValuesQuery.data ?? selectedStandardOfficialValues);
+  const officialValueRows = buildOfficialValuesRows(consultation ? selectedStandardOfficialValues : officialValuesQuery.data ?? selectedStandardOfficialValues);
   const officialValueRowsByStandard = new Map(officialValueRows.map((row) => [row.standard, row]));
   const storedOfficialValueRows = officialValuesOrder.flatMap((standard) => {
     const row = officialValueRowsByStandard.get(standard);
@@ -4168,7 +4204,7 @@ export default function CalibrationPage() {
   ].some((offset) => Number.isFinite(offset) && Math.abs(offset) > 1e-12);
   const busy = runMutation.isPending || editMutation.isPending || resetCalibrationMutation.isPending;
   const selectedRowLabels = selectedTargets.map((target) => `${target.rowLabel}:${target.isotopeKey}`);
-  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 560, 560) : null;
+  const hoverPreviewPosition = hoverPreview ? computeHoverPreviewPosition(hoverPreview.clientX, hoverPreview.clientY, 980, 450) : null;
   const hoverDiagnosticsFigure = compactHoverDiagnosticsFigure(
     ensureCollectorIntensityTraces(hoverDiagnosticsQuery.data?.figure, hoverDiagnosticsQuery.data?.table ?? []),
   );
@@ -4296,20 +4332,20 @@ export default function CalibrationPage() {
 
   return (
     <div className="space-y-5">
-      <PageHeader
-        title="Calibration"
-        description="Configure standards, review precision, and apply calibration."
+      {!station && <PageHeader
+        title={tr("Calibration")}
+        description={tr(consultation ? "Explore the qualification observations; the session retains its approved calibration." : "Configure standards, review precision, and apply calibration.")}
         compact
         actions={
           <>
-            <span className="rounded-md bg-white px-2 py-0.5 ring-1 ring-stone-200">Standards: {selectedStandards.length}</span>
-            <span className="rounded-md bg-white px-2 py-0.5 ring-1 ring-stone-200">Method: {activeConfig.calibration_type}</span>
+            <span className="rounded-md bg-white px-2 py-0.5 ring-1 ring-stone-200">{tr("Standards: ")}{selectedStandards.length}</span>
+            <span className="rounded-md bg-white px-2 py-0.5 ring-1 ring-stone-200">{tr("Method: ")}{tr(activeConfig.calibration_type)}</span>
             <span className="rounded-md bg-white px-2 py-0.5 ring-1 ring-stone-200">
-              {hasUnsavedPreview ? "Preview active" : "Saved config"}
+              {tr(hasUnsavedPreview ? "Preview active" : "Saved config")}
             </span>
           </>
         }
-      />
+      />}
 
       {isOfficialValuesModalOpen ? (
         <div
@@ -4326,19 +4362,19 @@ export default function CalibrationPage() {
           >
             <div className="relative z-20 flex items-center justify-between border-b border-stone-200 bg-white px-4 py-3">
               <div>
-                <div className="text-base font-semibold text-stone-900">Official Standard Values</div>
-                <div className="text-sm text-stone-500">Values from the standards database used by calibration calculations.</div>
+                <div className="text-base font-semibold text-stone-900">{tr("Official Standard Values")}</div>
+                <div className="text-sm text-stone-500">{tr("Values from the standards database used by calibration calculations.")}</div>
               </div>
               <div className="flex gap-2">
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                    setOfficialValuesEditMode((current) => !current);
+                    if (!consultation) setOfficialValuesEditMode((current) => !current);
                     setOfficialValuesError(null);
                   }}
                 >
-                  {isOfficialValuesEditMode ? "Done" : "Edit"}
+                  {tr(isOfficialValuesEditMode ? "Done" : "Edit")}
                 </Button>
                 <Button
                   variant="outline"
@@ -4349,27 +4385,25 @@ export default function CalibrationPage() {
                     setOfficialValuesError(null);
                   }}
                 >
-                  <X className="h-4 w-4" />
-                  Close
-                </Button>
+                  <X className="h-4 w-4" />{tr("Close")}</Button>
               </div>
             </div>
             <div className="space-y-4 p-4">
               {officialValuesLoading ? (
-                <div className="text-sm text-stone-500">Loading official values...</div>
+                <div className="text-sm text-stone-500">{tr("Loading official values...")}</div>
               ) : officialValuesQueryError ? (
-                <div className="text-sm text-red-600">Failed to load official values: {officialValuesQueryError}</div>
+                <div className="text-sm text-red-600">{tr("Failed to load official values: ")}{tr(officialValuesQueryError)}</div>
               ) : allOfficialValueRows.length ? (
                 <>
                   <div className="w-fit max-w-full overflow-x-auto rounded-lg border border-stone-200">
                     <table className="w-auto min-w-[680px] border-collapse text-sm">
                       <thead className="bg-stone-50 text-left text-xs uppercase tracking-normal text-stone-500">
                         <tr>
-                          <th className="w-10 px-2 py-2.5 font-semibold" aria-label="Reorder" />
-                          <th className="px-3 py-2.5 font-semibold">Standard</th>
-                          <th className="px-3 py-2.5 font-semibold">δ¹³C ({OFFICIAL_VALUE_TYPE_D13})</th>
-                          <th className="px-3 py-2.5 font-semibold">δ¹⁸O ({OFFICIAL_VALUE_TYPE_D18})</th>
-                          {isOfficialValuesEditMode ? <th className="px-3 py-2.5 font-semibold">Actions</th> : null}
+                          <th className="w-10 px-2 py-2.5 font-semibold" aria-label={tr("Reorder")} />
+                          <th className="px-3 py-2.5 font-semibold">{tr("Standard")}</th>
+                          <th className="px-3 py-2.5 font-semibold">{tr("δ¹³C (")}{tr(OFFICIAL_VALUE_TYPE_D13)})</th>
+                          <th className="px-3 py-2.5 font-semibold">{tr("δ¹⁸O (")}{tr(consultation ? "VPDB(18O)" : OFFICIAL_VALUE_TYPE_D18)})</th>
+                          {isOfficialValuesEditMode ? <th className="px-3 py-2.5 font-semibold">{tr("Actions")}</th> : null}
                         </tr>
                       </thead>
                       <tbody>
@@ -4389,7 +4423,7 @@ export default function CalibrationPage() {
                             )}
                           >
                             <td className="px-2 py-2.5 text-stone-400">
-                              <div className="flex items-center gap-0.5" title="Drag to reorder">
+                              <div className="flex items-center gap-0.5" title={tr("Drag to reorder")}>
                                 <GripVertical className="h-4 w-4 cursor-grab" aria-hidden="true" />
                                 {isOfficialValuesEditMode ? (
                                   <span className="flex flex-col">
@@ -4398,7 +4432,7 @@ export default function CalibrationPage() {
                                       className="rounded p-0.5 text-stone-400 hover:bg-stone-200 hover:text-stone-800 disabled:opacity-30"
                                       onClick={() => moveOfficialStandard(row.standard, "up")}
                                       disabled={index === 0}
-                                      aria-label={`Move ${row.standard} up`}
+                                      aria-label={tr(`Move ${row.standard} up`)}
                                     >
                                       <ChevronUp className="h-3 w-3" />
                                     </button>
@@ -4407,7 +4441,7 @@ export default function CalibrationPage() {
                                       className="rounded p-0.5 text-stone-400 hover:bg-stone-200 hover:text-stone-800 disabled:opacity-30"
                                       onClick={() => moveOfficialStandard(row.standard, "down")}
                                       disabled={index === allOfficialValueRows.length - 1}
-                                      aria-label={`Move ${row.standard} down`}
+                                      aria-label={tr(`Move ${row.standard} down`)}
                                     >
                                       <ChevronDown className="h-3 w-3" />
                                     </button>
@@ -4417,16 +4451,14 @@ export default function CalibrationPage() {
                             </td>
                             <td className="px-3 py-2.5 font-semibold text-stone-800">
                               <div className="flex items-center gap-2">
-                                <span>{row.standard}</span>
+                                <span>{tr(row.standard)}</span>
                                 {selectedStandardsSet.has(row.standard) ? (
-                                  <span className="rounded-md bg-stone-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-normal text-white">
-                                    selected
-                                  </span>
+                                  <span className="rounded-md bg-stone-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-normal text-white">{tr("selected")}</span>
                                 ) : null}
                               </div>
                             </td>
                             <td className="px-3 py-2.5 text-stone-700">
-                              {isOfficialValuesEditMode ? (
+                              {tr(isOfficialValuesEditMode ? (
                                 <input
                                   type="number"
                                   step="0.001"
@@ -4436,10 +4468,10 @@ export default function CalibrationPage() {
                                 />
                               ) : (
                                 formatOfficialValue(row.d13Value)
-                              )}
+                              ))}
                             </td>
                             <td className="px-3 py-2.5 text-stone-700">
-                              {isOfficialValuesEditMode ? (
+                              {tr(isOfficialValuesEditMode ? (
                                 <input
                                   type="number"
                                   step="0.001"
@@ -4449,22 +4481,18 @@ export default function CalibrationPage() {
                                 />
                               ) : (
                                 formatOfficialValue(row.d18Value)
-                              )}
+                              ))}
                             </td>
                             {isOfficialValuesEditMode ? (
                               <td className="px-3 py-2.5 text-stone-700">
                                 <div className="flex gap-2">
-                                  <Button size="sm" variant="outline" disabled={standardsValuesBusy} onClick={() => saveOfficialValuesRow(row.standard)}>
-                                    Save
-                                  </Button>
+                                  <Button size="sm" variant="outline" disabled={consultation || standardsValuesBusy} onClick={() => saveOfficialValuesRow(row.standard)}>{tr("Save")}</Button>
                                   <Button
                                     size="sm"
                                     variant="outline"
                                     disabled={standardsValuesBusy}
                                     onClick={() => removeOfficialValuesItem(row.standard)}
-                                  >
-                                    Remove
-                                  </Button>
+                                  >{tr("Remove")}</Button>
                                 </div>
                               </td>
                             ) : null}
@@ -4475,58 +4503,52 @@ export default function CalibrationPage() {
                     </table>
                   </div>
                   {hasMissingOfficialValues ? (
-                    <div className="text-xs text-red-600">
-                      One or more selected standards are missing official values in the database. Calibration may fail until these values are added.
-                    </div>
+                    <div className="text-xs text-red-600">{tr("One or more selected standards are missing official values in the database. Calibration may fail until these values are added.")}</div>
                   ) : null}
                 </>
               ) : (
-                <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-600">
-                  No official standard values found in the database yet.
-                </div>
+                <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-600">{tr("No official standard values found in the database yet.")}</div>
               )}
-              {officialValuesError ? <div className="text-sm text-red-600">{officialValuesError}</div> : null}
+              {officialValuesError ? <div className="text-sm text-red-600">{tr(officialValuesError)}</div> : null}
 
               {isOfficialValuesEditMode ? (
                 <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/60 p-3">
-                  <div className="text-sm font-semibold text-stone-800">Add Standard</div>
+                  <div className="text-sm font-semibold text-stone-800">{tr("Add Standard")}</div>
                   <div className="grid gap-3 md:grid-cols-4">
                     <label className="form-field">
-                      <span className="form-label">Standard</span>
+                      <span className="form-label">{tr("Standard")}</span>
                       <input
                         type="text"
                         value={newStandardName}
                         onChange={(event) => setNewStandardName(event.target.value.toUpperCase())}
                         className="form-control"
-                        placeholder="NBS18"
+                        placeholder={tr("NBS18")}
                       />
                     </label>
                     <label className="form-field">
-                      <span className="form-label">δ¹³C</span>
+                      <span className="form-label">{tr("δ¹³C")}</span>
                       <input
                         type="number"
                         step="0.001"
                         value={newStandardD13}
                         onChange={(event) => setNewStandardD13(event.target.value)}
                         className="form-control"
-                        placeholder="-5.010"
+                        placeholder={tr("-5.010")}
                       />
                     </label>
                     <label className="form-field">
-                      <span className="form-label">δ¹⁸O</span>
+                      <span className="form-label">{tr("δ¹⁸O")}</span>
                       <input
                         type="number"
                         step="0.001"
                         value={newStandardD18}
                         onChange={(event) => setNewStandardD18(event.target.value)}
                         className="form-control"
-                        placeholder="-23.010"
+                        placeholder={tr("-23.010")}
                       />
                     </label>
                     <div className="flex items-end">
-                      <Button onClick={addOfficialValuesItem} disabled={standardsValuesBusy} className="w-full">
-                        Add
-                      </Button>
+                      <Button onClick={addOfficialValuesItem} disabled={standardsValuesBusy} className="w-full">{tr("Add")}</Button>
                     </div>
                   </div>
                 </div>
@@ -4539,13 +4561,17 @@ export default function CalibrationPage() {
       {isSelectionEditorOpen ? (
         <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={closeSelectionEditor}>
           <div
+            ref={selectionDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label={tr("Selection Editor")}
             className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
               <div>
-                <div className="text-base font-semibold text-stone-900">Selection Editor</div>
-                <div className="text-sm text-stone-500">Sample editing and cycle diagnostics.</div>
+                <div className="text-base font-semibold text-stone-900">{tr("Selection Editor")}</div>
+                <div className="text-sm text-stone-500">{tr("Sample editing and cycle diagnostics.")}</div>
               </div>
               <Button
                 type="button"
@@ -4557,17 +4583,15 @@ export default function CalibrationPage() {
                   closeSelectionEditor();
                 }}
               >
-                <X className="h-4 w-4" />
-                Close
-              </Button>
+                <X className="h-4 w-4" />{tr("Close")}</Button>
             </div>
             <div className="min-h-0 space-y-4 overflow-y-auto p-4">
               {selectionSourceChart?.figure ? (
                 <Card className="border-stone-300">
                   <CardHeader>
-                    <CardTitle className="text-base">Selection Source Chart</CardTitle>
+                    <CardTitle className="text-base">{tr("Selection Source Chart")}</CardTitle>
                     <CardDescription>
-                      {selectionSourceChart.title} {selectionSourceChart.description}
+                      {tr(selectionSourceChart.title)} {tr(selectionSourceChart.description)}
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="min-w-0 overflow-hidden">
@@ -4586,26 +4610,21 @@ export default function CalibrationPage() {
                   <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/50 p-4">
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="space-y-1">
-                        <div className="text-sm font-semibold text-stone-700">
-                          Active target {activeTargetIndex + 1} / {selectedTargets.length}
+                        <div className="text-sm font-semibold text-stone-700">{tr("Active target")}{activeTargetIndex + 1} / {selectedTargets.length}
                         </div>
                         <div className="text-xl font-semibold text-stone-900">
-                          {(activeTarget?.identifier1 || "No Identifier 1").trim()} | {(activeTarget?.identifier2 || "No Identifier 2").trim()} |{" "}
-                          {(activeTarget?.rowLabel || "").trim()}
+                          {tr((activeTarget?.identifier1 || "No Identifier 1").trim())} | {tr((activeTarget?.identifier2 || "No Identifier 2").trim())} |{tr(" ")}
+                          {tr((activeTarget?.rowLabel || "").trim())}
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>
-                          Prev
-                        </Button>
+                        <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>{tr("Prev")}</Button>
                         <Button
                           variant="outline"
                           size="sm"
                           onClick={() => moveSelectionTarget("next")}
                           disabled={!canMoveToNextTarget}
-                        >
-                          Next
-                        </Button>
+                        >{tr("Next")}</Button>
                       </div>
                     </div>
                     {activeTargetInlineDisplayItems.length ? (
@@ -4624,10 +4643,10 @@ export default function CalibrationPage() {
                             )}
                           >
                             <div className="text-[11px] font-semibold uppercase tracking-normal text-stone-500">
-                              {formatScientificText(item.label)}
-                              {item.unit ? ` (${item.unit})` : ""}
+                              {tr(formatScientificText(item.label))}
+                              {tr(item.unit ? ` (${item.unit})` : "")}
                             </div>
-                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{formatScientificText(item.value)}</div>
+                            <div className="mt-1.5 text-xl font-semibold leading-tight text-stone-900">{tr(formatScientificText(item.value))}</div>
                           </div>
                         ))}
                       </div>
@@ -4640,17 +4659,19 @@ export default function CalibrationPage() {
                             label === `${activeTarget?.rowLabel}:${activeTarget?.isotopeKey}` ? "bg-stone-900 text-white" : "bg-white text-stone-700"
                           }`}
                         >
-                          {formatScientificText(label)}
+                          {tr(formatScientificText(label))}
                         </span>
                       ))}
                     </div>
                   </div>
 
+                  {station?.review(selectedTargets.map(target => target.rowLabel))}
                   {activeIsotopeTarget ? (
                     <div className="space-y-4">
+                      {!consultation && <>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">Set value</span>
+                          <span className="mb-1 block text-stone-700">{tr("Set value")}</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4668,7 +4689,7 @@ export default function CalibrationPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">Offset</span>
+                          <span className="mb-1 block text-stone-700">{tr("Offset")}</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4679,30 +4700,20 @@ export default function CalibrationPage() {
                         </label>
                       </div>
                       <div className="flex flex-wrap gap-2">
-                        <Button onClick={applySingleValue} disabled={busy}>
-                          Set {activeIsotopeTarget.isotopeKey}
+                        <Button onClick={applySingleValue} disabled={busy}>{tr("Set")}{tr(activeIsotopeTarget.isotopeKey)}
                         </Button>
-                        <Button variant="outline" onClick={applySingleOffset} disabled={busy}>
-                          Offset {activeIsotopeTarget.isotopeKey}
+                        <Button variant="outline" onClick={applySingleOffset} disabled={busy}>{tr("Offset")}{tr(activeIsotopeTarget.isotopeKey)}
                         </Button>
-                        <Button variant="outline" onClick={applySingleInterpolate} disabled={busy}>
-                          Interpolate {activeIsotopeTarget.isotopeKey}
+                        <Button variant="outline" onClick={applySingleInterpolate} disabled={busy}>{tr("Interpolate")}{tr(activeIsotopeTarget.isotopeKey)}
                         </Button>
-                        <Button variant="outline" onClick={resetSelected} disabled={busy}>
-                          Reset selected
-                        </Button>
-                        <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>
-                          Clear selection
-                        </Button>
-                        <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
-                          Force outlier
-                        </Button>
-                        <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
-                          Force keep
-                        </Button>
+                        <Button variant="outline" onClick={resetSelected} disabled={busy}>{tr("Reset selected")}</Button>
+                        <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>{tr("Clear selection")}</Button>
+                        <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>{tr("Force outlier")}</Button>
+                        <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>{tr("Force keep")}</Button>
                       </div>
+                      </>}
                       <DiagnosticsPanel
-                        title={`${activeIsotopeTarget.isotopeKey} cycle diagnostics`}
+                        title={tr(`${activeIsotopeTarget.isotopeKey} cycle diagnostics`)}
                         diagnostics={singleDiagnosticsQuery.data}
                         loading={singleDiagnosticsQuery.isLoading}
                         onPickDeltaValue={setSingleValueFromSuggestion}
@@ -4712,9 +4723,10 @@ export default function CalibrationPage() {
 
                   {activeCrossTarget ? (
                     <div className="space-y-4">
+                      {!consultation && <>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">Set δ¹³C</span>
+                          <span className="mb-1 block text-stone-700">{tr("Set δ¹³C")}</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4724,7 +4736,7 @@ export default function CalibrationPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">Set δ¹⁸O</span>
+                          <span className="mb-1 block text-stone-700">{tr("Set δ¹⁸O")}</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4735,77 +4747,60 @@ export default function CalibrationPage() {
                         </label>
                       </div>
                       <div className="flex flex-wrap gap-2">
-                        <Button onClick={applyCrossValues} disabled={busy}>
-                          Apply crossplot values
-                        </Button>
-                        <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>
-                          Interpolate both isotopes
-                        </Button>
-                        <Button variant="outline" onClick={resetSelected} disabled={busy}>
-                          Reset selected
-                        </Button>
-                        <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>
-                          Clear selection
-                        </Button>
-                        <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>
-                          Force outlier
-                        </Button>
-                        <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>
-                          Force keep
-                        </Button>
+                        <Button onClick={applyCrossValues} disabled={busy}>{tr("Apply crossplot values")}</Button>
+                        <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>{tr("Interpolate both isotopes")}</Button>
+                        <Button variant="outline" onClick={resetSelected} disabled={busy}>{tr("Reset selected")}</Button>
+                        <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>{tr("Clear selection")}</Button>
+                        <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>{tr("Force outlier")}</Button>
+                        <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>{tr("Force keep")}</Button>
                       </div>
+                      </>}
                       <div className="grid gap-3 md:grid-cols-2">
                         <div className="rounded-lg border border-stone-200 p-3">
-                          <div className="text-xs uppercase tracking-normal text-stone-500">δ¹³C details</div>
-                          <div className="mt-1 text-sm text-stone-800">
-                            Current:{" "}
-                            {asNumber((crossD13DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
+                          <div className="text-xs uppercase tracking-normal text-stone-500">{tr("δ¹³C details")}</div>
+                          <div className="mt-1 text-sm text-stone-800">{tr("Current:")}{tr(" ")}
+                            {tr(asNumber((crossD13DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
                               ? "N/A"
-                              : formatDeltaValue(asNumber((crossD13DiagnosticsQuery.data?.target ?? {})["current_value"]))}
+                              : formatDeltaValue(asNumber((crossD13DiagnosticsQuery.data?.target ?? {})["current_value"])))}
                           </div>
-                          <div className="text-sm text-stone-700">
-                            Cycle mean:{" "}
-                            {asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]) == null
+                          <div className="text-sm text-stone-700">{tr("Cycle mean:")}{tr(" ")}
+                            {tr(asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]) == null
                               ? "N/A"
-                              : formatDeltaValue(asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]))}
+                              : formatDeltaValue(asNumber((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"])))}
                           </div>
-                          <div className="text-xs text-stone-500">
-                            Method: {asString((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
+                          <div className="text-xs text-stone-500">{tr("Method:")}{tr(asString((crossD13DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A")}
                           </div>
                         </div>
                         <div className="rounded-lg border border-stone-200 p-3">
-                          <div className="text-xs uppercase tracking-normal text-stone-500">δ¹⁸O details</div>
-                          <div className="mt-1 text-sm text-stone-800">
-                            Current:{" "}
-                            {asNumber((crossD18DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
+                          <div className="text-xs uppercase tracking-normal text-stone-500">{tr("δ¹⁸O details")}</div>
+                          <div className="mt-1 text-sm text-stone-800">{tr("Current:")}{tr(" ")}
+                            {tr(asNumber((crossD18DiagnosticsQuery.data?.target ?? {})["current_value"]) == null
                               ? "N/A"
-                              : formatDeltaValue(asNumber((crossD18DiagnosticsQuery.data?.target ?? {})["current_value"]))}
+                              : formatDeltaValue(asNumber((crossD18DiagnosticsQuery.data?.target ?? {})["current_value"])))}
                           </div>
-                          <div className="text-sm text-stone-700">
-                            Cycle mean:{" "}
-                            {asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]) == null
+                          <div className="text-sm text-stone-700">{tr("Cycle mean:")}{tr(" ")}
+                            {tr(asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]) == null
                               ? "N/A"
-                              : formatDeltaValue(asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"]))}
+                              : formatDeltaValue(asNumber((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["valid_mean"])))}
                           </div>
-                          <div className="text-xs text-stone-500">
-                            Method: {asString((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A"}
+                          <div className="text-xs text-stone-500">{tr("Method:")}{tr(asString((crossD18DiagnosticsQuery.data?.cycle_mean ?? {})["method"]) || "N/A")}
                           </div>
                         </div>
                       </div>
                       <DiagnosticsPanel
-                        title="Crossplot cycle diagnostics, shared intensity chart and table, δ¹⁸O"
+                        title={tr("Crossplot cycle diagnostics, shared intensity chart and table, δ¹⁸O")}
                         diagnostics={crossSharedDiagnostics}
                         loading={crossSharedDiagnosticsLoading}
                       />
                     </div>
                   ) : null}
 
-                  {selectedTargets.length > 1 ? (
+                  {!consultation && selectedTargets.length > 1 ? (
                     <div className="space-y-4 rounded-lg border border-stone-200 p-4">
-                      <div className="text-sm font-medium text-stone-800">Multi-point actions</div>
+                      <div className="text-sm font-medium text-stone-800">{tr("Multi-point actions")}</div>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">δ¹³C offset for selection</span>
+                          <span className="mb-1 block text-stone-700">{tr("δ¹³C offset for selection")}</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4815,7 +4810,7 @@ export default function CalibrationPage() {
                           />
                         </label>
                         <label className="text-sm">
-                          <span className="mb-1 block text-stone-700">δ¹⁸O offset for selection</span>
+                          <span className="mb-1 block text-stone-700">{tr("δ¹⁸O offset for selection")}</span>
                           <input
                             type="number"
                             step="0.001"
@@ -4826,50 +4821,43 @@ export default function CalibrationPage() {
                         </label>
                       </div>
                       <div className="flex flex-wrap gap-2">
-                        <Button variant="outline" onClick={() => applyMultiOffset("d13C", multiOffsetD13)} disabled={busy}>
-                          Offset selected δ¹³C
-                        </Button>
-                        <Button variant="outline" onClick={() => applyMultiOffset("d18O", multiOffsetD18)} disabled={busy}>
-                          Offset selected δ¹⁸O
-                        </Button>
-                        <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>
-                          Interpolate selected
-                        </Button>
+                        <Button variant="outline" onClick={() => applyMultiOffset("d13C", multiOffsetD13)} disabled={busy}>{tr("Offset selected δ¹³C")}</Button>
+                        <Button variant="outline" onClick={() => applyMultiOffset("d18O", multiOffsetD18)} disabled={busy}>{tr("Offset selected δ¹⁸O")}</Button>
+                        <Button variant="outline" onClick={() => applyMultiInterpolate()} disabled={busy}>{tr("Interpolate selected")}</Button>
                       </div>
                     </div>
                   ) : null}
                 </>
               ) : (
-                <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-                  No active selection.
-                </div>
+                <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("No active selection.")}</div>
               )}
             </div>
           </div>
         </div>
       ) : null}
 
+      {station?.sequence(stationInteractions)}
       <div className="workspace-grid">
         <aside className="control-column">
+          {station?.controls}
+          <details open={!station}><summary className="station-chart-settings">{tr("Chart display settings")}</summary>
           <Card>
             <CardHeader>
-              <CardTitle>Calibration Controls</CardTitle>
-              <CardDescription>Configure standards, visualization, linearity, outlier detection, and precision date range settings.</CardDescription>
+              <CardTitle>{tr("Calibration Controls")}</CardTitle>
+              <CardDescription>{tr("Configure standards, visualization, linearity, outlier detection, and precision date range settings.")}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <MultiSelectDropdown
-                label="Selected standards"
+                label={tr("Selected standards")}
                 options={displayedWorkspace.available_values.standards}
                 selected={activeConfig.selected_standards}
                 onChange={(next) => updateConfig("selected_standards", next)}
-                placeholder="Select standards"
+                placeholder={tr("Select standards")}
               />
-              <p className="-mt-2 text-xs text-stone-500">
-                Choose reference materials from the standards database or any Identifier 1 in this dataset.
-              </p>
+              <p className="-mt-2 text-xs text-stone-500">{tr("Choose reference materials from the standards database or any Identifier 1 in this dataset.")}</p>
 
               <label className="form-field">
-                <span className="form-label">Carbonate material</span>
+                <span className="form-label">{tr("Carbonate material")}</span>
                 <select
                   value={activeConfig.carbonate_material ?? "calcite"}
                   onChange={(event) =>
@@ -4882,7 +4870,7 @@ export default function CalibrationPage() {
                 >
                   {CARBONATE_MATERIAL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
-                      {option.label}
+                      {tr(option.label)}
                     </option>
                   ))}
                 </select>
@@ -4890,7 +4878,7 @@ export default function CalibrationPage() {
 
               <div className="grid gap-4">
                 <div className="form-field">
-                  <span className="form-label">Color parameter</span>
+                  <span className="form-label">{tr("Color parameter")}</span>
                   <select
                     value={activeConfig.color_param}
                     onChange={(event) => updateConfig("color_param", event.target.value)}
@@ -4900,7 +4888,7 @@ export default function CalibrationPage() {
                       .filter((option) => option !== "Date_ordinal")
                       .map((option) => (
                       <option key={option} value={option}>
-                        {calibrationColorParameterLabel(option)}
+                        {tr(calibrationColorParameterLabel(option))}
                       </option>
                     ))}
                   </select>
@@ -4911,7 +4899,7 @@ export default function CalibrationPage() {
                   ) : null}
                 </div>
                 <label className="form-field">
-                  <span className="form-label">3D Z axis</span>
+                  <span className="form-label">{tr("3D Z axis")}</span>
                   <select
                     value={activeConfig.z_axis}
                     onChange={(event) => updateConfig("z_axis", event.target.value)}
@@ -4919,7 +4907,7 @@ export default function CalibrationPage() {
                   >
                     {displayedWorkspace.available_values.z_axis_options.map((option) => (
                       <option key={option} value={option}>
-                        {option}
+                        {tr(option)}
                       </option>
                     ))}
                   </select>
@@ -4927,7 +4915,7 @@ export default function CalibrationPage() {
                 {colorSliderBounds ? (
                   <div className="form-field">
                     <RangeSliderField
-                      label="Color scale interval"
+                      label={tr("Color scale interval")}
                       value={effectiveColorScaleRange}
                       min={colorSliderBounds.min}
                       max={colorSliderBounds.max}
@@ -4938,70 +4926,68 @@ export default function CalibrationPage() {
                   </div>
                 ) : (
                   <p className="text-xs text-stone-500" role="status">
-                    {calibrationPreviewWorkspaceQuery.isFetching || linearityPreviewDataQuery.isLoading
+                    {tr(calibrationPreviewWorkspaceQuery.isFetching || linearityPreviewDataQuery.isLoading
                       ? "Loading the selected color range..."
-                      : "No numeric values are available for the selected color parameter."}
+                      : "No numeric values are available for the selected color parameter.")}
                   </p>
                 )}
               </div>
 
               <div className="space-y-4 rounded-lg border border-stone-200 bg-white/80 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="text-sm font-medium text-stone-800">Linearity (shared with processing)</div>
-                  <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">Basis: {selectedLinearityBasisLabel}</span>
+                  <div className="text-sm font-medium text-stone-800">{tr("Linearity (shared with processing)")}</div>
+                  <span className="rounded-md bg-stone-100 px-2 py-1 text-xs text-stone-600">{tr("Basis: ")}{tr(selectedLinearityBasisLabel)}</span>
                 </div>
                 <CheckboxField
                   checked={activeConfig.linearity.apply}
-                  label="Enable linearity correction"
-                  description="Uses the same basis, fits, and offsets as Processing."
+                  label={tr("Enable linearity correction")}
+                  description={tr("Uses the same basis, fits, and offsets as Processing.")}
                   onChange={(checked) => updateLinearity("apply", checked)}
                 />
                 {!isTwoTermLinearityBasis ? (
                   <CheckboxField
                     checked={Boolean(activeConfig.linearity.quadratic)}
-                    label="Use quadratic linearity relationship"
-                    description="Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I."
+                    label={tr("Use quadratic linearity relationship")}
+                    description={tr("Fits and applies y = a + b*I + c*I^2 instead of y = a + b*I.")}
                     onChange={(checked) => updateLinearity("quadratic", checked)}
                   />
                 ) : null}
                 <label className="text-sm">
-                  <span className="mb-1 block text-stone-700">Linearity basis</span>
+                  <span className="mb-1 block text-stone-700">{tr("Linearity basis")}</span>
                   <select
                     value={selectedLinearityIntensityCol}
                     onChange={(event) => updateLinearityIntensityCol(event.target.value)}
-                    title={getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)}
+                    title={tr(getLinearityBasisDescription(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
                     {LINEARITY_INTENSITY_OPTIONS.map((option) => (
-                      <option key={option} value={option} title={getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation)}>
-                        {getLinearityIntensityOptionLabel(option)}
+                      <option key={option} value={option} title={tr(getLinearityBasisDescription(option, selectedLinearityCycleIntensityAggregation))}>
+                        {tr(getLinearityIntensityOptionLabel(option))}
                       </option>
                     ))}
                   </select>
                 </label>
                 <label className="text-sm">
-                  <span className="mb-1 block text-stone-700">Linearity cycle intensity</span>
+                  <span className="mb-1 block text-stone-700">{tr("Linearity cycle intensity")}</span>
                   <select
                     value={selectedLinearityCycleIntensityAggregation}
                     onChange={(event) => updateLinearity("cycle_intensity_aggregation", event.target.value)}
-                    title="Choose which cycle intensity is used when building the selected linearity basis for each analysis."
+                    title={tr("Choose which cycle intensity is used when building the selected linearity basis for each analysis.")}
                     className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
                   >
                     {LINEARITY_CYCLE_INTENSITY_AGGREGATION_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
-                        {option.label}
+                        {tr(option.label)}
                       </option>
                     ))}
                   </select>
                 </label>
-                <Tooltip label={getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation)} align="start">
-                  <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">
-                    Basis formula
-                  </span>
+                <Tooltip label={tr(getLinearityBasisFormula(selectedLinearityIntensityCol, selectedLinearityCycleIntensityAggregation))} align="start">
+                  <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Basis formula")}</span>
                 </Tooltip>
                 {selectedLinearityIntensityCol === LINEARITY_INTENSITY_SAMP44 ? (
                   <label className="text-sm">
-                    <span className="mb-1 block text-stone-700">Max sample intensity</span>
+                    <span className="mb-1 block text-stone-700">{tr("Max sample intensity")}</span>
                     <input
                       type="number"
                       min={0}
@@ -5022,31 +5008,31 @@ export default function CalibrationPage() {
                 ) : null}
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="border-t border-stone-200 pt-2 text-sm">
-                    <div className="text-xs font-medium text-stone-500">δ¹³C fitted coefficients</div>
+                    <div className="text-xs font-medium text-stone-500">{tr("δ¹³C fitted coefficients")}</div>
                     <div className="mt-1 space-y-1 font-semibold text-stone-900">
                       <div>
-                        <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
-                        {formatFirstNonZeroDigits(d13FitSlope)}
+                        <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                        {tr(formatFirstNonZeroDigits(d13FitSlope))}
                       </div>
                       {showSecondaryCoefficientOffset ? (
                         <div>
-                          <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
-                          {formatFirstNonZeroDigits(d13FitQuad)}
+                          <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                          {tr(formatFirstNonZeroDigits(d13FitQuad))}
                         </div>
                       ) : null}
                     </div>
                   </div>
                   <div className="border-t border-stone-200 pt-2 text-sm">
-                    <div className="text-xs font-medium text-stone-500">δ¹⁸O fitted coefficients</div>
+                    <div className="text-xs font-medium text-stone-500">{tr("δ¹⁸O fitted coefficients")}</div>
                     <div className="mt-1 space-y-1 font-semibold text-stone-900">
                       <div>
-                        <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol)}:</span>{" "}
-                        {formatFirstNonZeroDigits(d18FitSlope)}
+                        <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("primary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                        {tr(formatFirstNonZeroDigits(d18FitSlope))}
                       </div>
                       {showSecondaryCoefficientOffset ? (
                         <div>
-                          <span className="font-medium text-stone-500">{getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol)}:</span>{" "}
-                          {formatFirstNonZeroDigits(d18FitQuad)}
+                          <span className="font-medium text-stone-500">{tr(getLinearityCoefficientTermLabel("secondary", selectedLinearityIntensityCol))}:</span>{tr(" ")}
+                          {tr(formatFirstNonZeroDigits(d18FitQuad))}
                         </div>
                       ) : null}
                     </div>
@@ -5055,7 +5041,7 @@ export default function CalibrationPage() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <label className="text-sm">
                     <span className="mb-1 block text-stone-700">
-                      {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
+                      {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
                     </span>
                     <DecimalInput
                       value={activeConfig.linearity.manual_d13_per_10v ?? 0}
@@ -5065,7 +5051,7 @@ export default function CalibrationPage() {
                   </label>
                   <label className="text-sm">
                     <span className="mb-1 block text-stone-700">
-                      {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation)}
+                      {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "primary", selectedLinearityCycleIntensityAggregation))}
                     </span>
                     <DecimalInput
                       value={activeConfig.linearity.manual_d18_per_10v ?? 0}
@@ -5078,7 +5064,7 @@ export default function CalibrationPage() {
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">
-                        {getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                        {tr(getLinearityCoefficientLabel("d13C", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
                       </span>
                       <DecimalInput
                         value={activeConfig.linearity.manual_d13_per_10v2 ?? 0}
@@ -5088,7 +5074,7 @@ export default function CalibrationPage() {
                     </label>
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">
-                        {getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation)}
+                        {tr(getLinearityCoefficientLabel("d18O", selectedLinearityIntensityCol, "secondary", selectedLinearityCycleIntensityAggregation))}
                       </span>
                       <DecimalInput
                         value={activeConfig.linearity.manual_d18_per_10v2 ?? 0}
@@ -5098,15 +5084,14 @@ export default function CalibrationPage() {
                     </label>
                   </div>
                 ) : null}
-                <div className="text-xs text-stone-500">
-                  Coefficient offset active: {coefficientOffsetEnabled ? "Yes" : "No"}
+                <div className="text-xs text-stone-500">{tr("Coefficient offset active:")}{tr(coefficientOffsetEnabled ? "Yes" : "No")}
                 </div>
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div className="space-y-3">
-                    <span className="text-sm font-medium text-stone-800">Line 1 offset</span>
+                    <span className="text-sm font-medium text-stone-800">{tr("Line 1 offset")}</span>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">δ¹³C</span>
+                        <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -5119,7 +5104,7 @@ export default function CalibrationPage() {
                         />
                       </label>
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">δ¹⁸O</span>
+                        <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -5134,10 +5119,10 @@ export default function CalibrationPage() {
                     </div>
                   </div>
                   <div className="space-y-3">
-                    <span className="text-sm font-medium text-stone-800">Line 2 offset</span>
+                    <span className="text-sm font-medium text-stone-800">{tr("Line 2 offset")}</span>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">δ¹³C</span>
+                        <span className="mb-1 block text-stone-700">{tr("δ¹³C")}</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -5150,7 +5135,7 @@ export default function CalibrationPage() {
                         />
                       </label>
                       <label className="text-sm">
-                        <span className="mb-1 block text-stone-700">δ¹⁸O</span>
+                        <span className="mb-1 block text-stone-700">{tr("δ¹⁸O")}</span>
                         <input
                           type="text"
                           inputMode="decimal"
@@ -5167,31 +5152,31 @@ export default function CalibrationPage() {
                 </div>
                 {activeConfig.linearity.apply ? (
                   <div className="space-y-1 border-t border-stone-200 pt-2">
-                    <Tooltip label="Precision after applying the shared linearity correction to each selected standard." align="start">
-                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">Corrected precision</span>
+                    <Tooltip label={tr("Precision after applying the shared linearity correction to each selected standard.")} align="start">
+                      <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Corrected precision")}</span>
                     </Tooltip>
                     {standardPrecisionRows.length ? (
                       standardPrecisionRows.map((summary: CalibrationPrecisionSummary) => (
                         <div key={summary.standard} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-xs text-stone-700">
-                          <span className="font-medium text-stone-800">{summary.standard}</span>
-                          <span>δ¹³C: {formatMetricWithUnit(summary.d13_linearity_corrected_precision)}</span>
-                          <span>δ¹⁸O: {formatMetricWithUnit(summary.d18_linearity_corrected_precision)}</span>
+                          <span className="font-medium text-stone-800">{tr(summary.standard)}</span>
+                          <span>{tr("δ¹³C: ")}{tr(formatMetricWithUnit(summary.d13_linearity_corrected_precision))}</span>
+                          <span>{tr("δ¹⁸O: ")}{tr(formatMetricWithUnit(summary.d18_linearity_corrected_precision))}</span>
                         </div>
                       ))
                     ) : (
-                      <div className="text-xs text-stone-500">No selected standards available for precision.</div>
+                      <div className="text-xs text-stone-500">{tr("No selected standards available for precision.")}</div>
                     )}
                   </div>
                 ) : null}
               </div>
 
               <div className="space-y-3 border-t border-stone-200 pt-4">
-                <Tooltip label="Set how calibration outliers are identified before precision is calculated." align="start">
-                  <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">Outlier settings</span>
+                <Tooltip label={tr("Set how calibration outliers are identified before precision is calculated.")} align="start">
+                  <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Outlier settings")}</span>
                 </Tooltip>
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-2">
                   <label className="form-field">
-                    <span className="form-label">Sigma level</span>
+                    <span className="form-label">{tr("Sigma level")}</span>
                     <input
                       type="number"
                       min="0.1"
@@ -5203,7 +5188,7 @@ export default function CalibrationPage() {
                     />
                   </label>
                   <label className="form-field">
-                    <span className="form-label">IQR multiplier</span>
+                    <span className="form-label">{tr("IQR multiplier")}</span>
                     <input
                       type="number"
                       min="1"
@@ -5217,14 +5202,14 @@ export default function CalibrationPage() {
                 </div>
 
                 <label className="form-field">
-                  <span className="form-label">Outlier method</span>
+                  <span className="form-label">{tr("Outlier method")}</span>
                   <select
                     value={activeConfig.calibration_type}
                     onChange={(event) => updateConfig("calibration_type", event.target.value as CalibrationConfig["calibration_type"])}
                     className="form-control"
                   >
-                    <option value="Z-Score">Z-Score</option>
-                    <option value="IQR">IQR</option>
+                    <option value="Z-Score">{tr("Z-Score")}</option>
+                    <option value="IQR">{tr("IQR")}</option>
                   </select>
                 </label>
 
@@ -5236,21 +5221,21 @@ export default function CalibrationPage() {
                     className="h-4 w-4 accent-stone-900"
                   />
                   <span>
-                    <span className="text-sm font-medium tracking-normal text-stone-800">Independent isotope outliers</span>
+                    <span className="text-sm font-medium tracking-normal text-stone-800">{tr("Independent isotope outliers")}</span>
                   </span>
-                  <Tooltip label="Keep δ¹³C and δ¹⁸O outlier filtering independent for each standard row.">
-                    <span tabIndex={0} aria-label="More information about independent isotope outliers" className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">?</span>
+                  <Tooltip label={tr("Keep δ¹³C and δ¹⁸O outlier filtering independent for each standard row.")}>
+                    <span tabIndex={0} aria-label={tr("More information about independent isotope outliers")} className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-stone-300 text-[10px] font-semibold text-stone-500">?</span>
                   </Tooltip>
                 </label>
               </div>
 
               <div className="space-y-3 border-t border-stone-200 pt-4">
-                <Tooltip label="Limit the measurement dates included in the precision calculation." align="start">
-                  <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">Precision date range</span>
+                <Tooltip label={tr("Limit the measurement dates included in the precision calculation.")} align="start">
+                  <span tabIndex={0} className="inline-flex cursor-help text-xs font-medium text-stone-600 underline decoration-dotted underline-offset-4">{tr("Precision date range")}</span>
                 </Tooltip>
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
                   <label className="form-field">
-                    <span className="form-label">Start date</span>
+                    <span className="form-label">{tr("Start date")}</span>
                     <input
                       type="date"
                       min={minDate}
@@ -5263,7 +5248,7 @@ export default function CalibrationPage() {
                     />
                   </label>
                   <label className="form-field">
-                    <span className="form-label">End date</span>
+                    <span className="form-label">{tr("End date")}</span>
                     <input
                       type="date"
                       min={minDate}
@@ -5279,30 +5264,28 @@ export default function CalibrationPage() {
               </div>
 
               <div className="flex items-center justify-between border-t border-stone-200 pt-4">
-                <Tooltip label="Open the database values used in calibration equations." align="start">
-                  <span tabIndex={0} className="cursor-help text-sm font-medium text-stone-800 underline decoration-dotted underline-offset-4">Official standard values</span>
+                <Tooltip label={tr("Open the database values used in calibration equations.")} align="start">
+                  <span tabIndex={0} className="cursor-help text-sm font-medium text-stone-800 underline decoration-dotted underline-offset-4">{tr("Official standard values")}</span>
                 </Tooltip>
                 <Button asChild variant="outline" size="sm">
-                  <Link href="/settings">
-                    <Database className="h-4 w-4" />
-                    Settings
-                  </Link>
+                  <Link href={consultation ? "/metrology/materials" : "/settings"}>
+                    <Database className="h-4 w-4" />{tr("Settings")}</Link>
                 </Button>
               </div>
 
               <div className="flex flex-wrap gap-2">
                 <Button
                   onClick={() => runMutation.mutate(activeConfig)}
-                  disabled={runMutation.isPending || selectedStandards.length < 1 || selectedStandards.length > 2}
+                  disabled={consultation || runMutation.isPending || selectedStandards.length < 1 || selectedStandards.length > 2}
                 >
-                  {runMutation.isPending ? "Running..." : "Calibrate results"}
+                  {tr(runMutation.isPending ? "Running..." : "Calibrate results")}
                 </Button>
                 <Button
                   variant="outline"
                   onClick={() => resetCalibrationMutation.mutate()}
-                  disabled={runMutation.isPending || resetCalibrationMutation.isPending}
+                  disabled={consultation || runMutation.isPending || resetCalibrationMutation.isPending}
                 >
-                  {resetCalibrationMutation.isPending ? "Resetting..." : "Reset calibration"}
+                  {tr(resetCalibrationMutation.isPending ? "Resetting..." : "Reset calibration")}
                 </Button>
                 {calibrationJob?.cancellable ? (
                   <Button
@@ -5310,14 +5293,14 @@ export default function CalibrationPage() {
                     onClick={() => cancelCalibrationJobMutation.mutate(calibrationJob.job_id)}
                     disabled={cancelCalibrationJobMutation.isPending}
                   >
-                    {cancelCalibrationJobMutation.isPending ? "Cancelling..." : "Cancel run"}
+                    {tr(cancelCalibrationJobMutation.isPending ? "Cancelling..." : "Cancel run")}
                   </Button>
                 ) : null}
               </div>
               {calibrationJob ? (
                 <div className="space-y-2" aria-live="polite">
                   <div className="flex justify-between text-xs text-stone-600">
-                    <span>{calibrationJob.message || "Running calibration"}</span>
+                    <span>{tr(calibrationJob.message || "Running calibration")}</span>
                     <span>{Math.round(calibrationJob.progress)}%</span>
                   </div>
                   <div className="h-2 overflow-hidden rounded-full bg-stone-200" role="progressbar" aria-valuenow={calibrationJob.progress} aria-valuemin={0} aria-valuemax={100}>
@@ -5325,17 +5308,19 @@ export default function CalibrationPage() {
                   </div>
                 </div>
               ) : null}
-              <div className="text-xs text-stone-500">Select exactly one or two standards to run calibration.</div>
-              {runError ? <div className="text-xs text-red-600">Calibration error: {runError}</div> : null}
-              {resetError ? <div className="text-xs text-red-600">Reset error: {resetError}</div> : null}
+              <div className="text-xs text-stone-500">{tr("Select exactly one or two standards to run calibration.")}</div>
+              {runError ? <div className="text-xs text-red-600">{tr("Calibration error: ")}{tr(runError)}</div> : null}
+              {resetError ? <div className="text-xs text-red-600">{tr("Reset error: ")}{tr(resetError)}</div> : null}
             </CardContent>
           </Card>
+          </details>
         </aside>
 
         <ControlColumnToggle />
 
         <div className="space-y-6">
-          {precisionSummaries.length ? (
+          {station?.plots(stationInteractions)}
+          {!station && (precisionSummaries.length ? (
             <div className="grid gap-3">
               {precisionSummaries.map((summary) => (
                 <PrecisionCard key={summary.standard} summary={summary} linearityEnabled={Boolean(activeConfig.linearity.apply)} />
@@ -5344,24 +5329,24 @@ export default function CalibrationPage() {
           ) : (
             <Card>
               <CardHeader>
-                <CardTitle>No Standards Selected</CardTitle>
-                <CardDescription>Select one or two standards to populate calibration summaries and charts.</CardDescription>
+                <CardTitle>{tr("No Standards Selected")}</CardTitle>
+                <CardDescription>{tr("Select one or two standards to populate calibration summaries and charts.")}</CardDescription>
               </CardHeader>
             </Card>
-          )}
+          ))}
 
           {selectedStandards.length ? (
             <>
-              <div className="space-y-3">
+              {!station && <div className="space-y-3">
                 <div className="grid gap-6 2xl:grid-cols-2">
                 <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
-                    <CardTitle>δ¹³C Calibration</CardTitle>
+                    <CardTitle>{tr("δ¹³C Calibration")}</CardTitle>
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
                       figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VPDB(13C)"], "VPDB(13C)")))}
-                      className="h-[clamp(380px,42vw,620px)] w-full"
+                      className={consultation ? "h-[320px] w-full" : "h-[clamp(380px,42vw,620px)] w-full"}
                       fitContainer
                       uiRevision={`calibration:${sessionId}:VPDB(13C)`}
                       {...chartHoverProps("VPDB(13C)")}
@@ -5372,12 +5357,12 @@ export default function CalibrationPage() {
                 </Card>
                 <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
-                    <CardTitle>δ¹⁸O Calibration</CardTitle>
+                    <CardTitle>{tr("δ¹⁸O Calibration")}</CardTitle>
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
                       figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures["VSMOW(18O)"], "VSMOW(18O)")))}
-                      className="h-[clamp(380px,42vw,620px)] w-full"
+                      className={consultation ? "h-[320px] w-full" : "h-[clamp(380px,42vw,620px)] w-full"}
                       fitContainer
                       uiRevision={`calibration:${sessionId}:VSMOW(18O)`}
                       {...chartHoverProps("VSMOW(18O)")}
@@ -5387,18 +5372,18 @@ export default function CalibrationPage() {
                   </CardContent>
                 </Card>
                 </div>
-              </div>
+              </div>}
 
               <div className="grid gap-6 xl:grid-cols-2">
                 <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
-                    <CardTitle>Calibration 3D Chart</CardTitle>
-                    <CardDescription>Filtered standards in calibration space using the active color and Z-axis parameters.</CardDescription>
+                    <CardTitle>{tr("Calibration 3D Chart")}</CardTitle>
+                    <CardDescription>{tr("Filtered standards in calibration space using the active color and Z-axis parameters.")}</CardDescription>
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
                       figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.calibration_3d, "calibration_3d")))}
-                      className="h-[clamp(380px,42vw,620px)] w-full"
+                      className={consultation ? "h-[320px] w-full" : "h-[clamp(380px,42vw,620px)] w-full"}
                       fitContainer
                       uiRevision={`calibration:${sessionId}:calibration_3d`}
                       {...chartHoverProps("calibration_3d")}
@@ -5410,13 +5395,13 @@ export default function CalibrationPage() {
                 <div className="min-w-0">
                 <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
-                    <CardTitle>Calibration Crossplot</CardTitle>
-                    <CardDescription>δ¹³C vs δ¹⁸O crossplot for the filtered standards set.</CardDescription>
+                    <CardTitle>{tr("Calibration Crossplot")}</CardTitle>
+                    <CardDescription>{tr("δ¹³C vs δ¹⁸O crossplot for the filtered standards set.")}</CardDescription>
                   </CardHeader>
                   <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden p-0">
                     <PlotlyChart
                       figure={hideCalibrationEmbeddedColorbars(withColorScaleRange(withCalibrationPreview(displayedWorkspace.figures.crossplot, "crossplot")))}
-                      className="h-[clamp(380px,42vw,620px)] w-full"
+                      className={consultation ? "h-[320px] w-full" : "h-[clamp(380px,42vw,620px)] w-full"}
                       fitContainer
                       uiRevision={`calibration:${sessionId}:crossplot`}
                       {...chartHoverProps("crossplot")}
@@ -5428,22 +5413,20 @@ export default function CalibrationPage() {
                 </div>
               </div>
 
+              {!station && <>
               <Card className="overflow-hidden">
                 <CardHeader className="gap-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
-                    <CardTitle>Linearity Correction</CardTitle>
-                    <span className="rounded-md bg-stone-50 px-3 py-1.5 text-sm text-stone-700 ring-1 ring-stone-200">
-                      Basis: {selectedLinearityBasisLabel}
+                    <CardTitle>{tr("Linearity Correction")}</CardTitle>
+                    <span className="rounded-md bg-stone-50 px-3 py-1.5 text-sm text-stone-700 ring-1 ring-stone-200">{tr("Basis:")}{tr(selectedLinearityBasisLabel)}
                     </span>
                   </div>
-                  <CardDescription>
-                    Standards-only linearity fits built from the active precision date window and the selected basis used during calibration.
-                  </CardDescription>
+                  <CardDescription>{tr("Standards-only linearity fits built from the active precision date window and the selected basis used during calibration.")}</CardDescription>
                 </CardHeader>
                 <CardContent className="bg-stone-200 p-0">
                   <div className="grid min-w-0 gap-px 2xl:grid-cols-2">
                     <div className="min-w-0 bg-white">
-                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">δ¹³C · Raw</div>
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">{tr("δ¹³C · Raw")}</div>
                     <PlotlyChart
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_raw, "linearity|d13_raw"))}
                       className="h-[420px] w-full"
@@ -5455,7 +5438,7 @@ export default function CalibrationPage() {
                     />
                     </div>
                     <div className="min-w-0 bg-white">
-                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">δ¹³C · Linearity corrected</div>
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">{tr("δ¹³C · Linearity corrected")}</div>
                     <PlotlyChart
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d13_corrected, "linearity|d13_corrected"))}
                       className="h-[420px] w-full"
@@ -5467,7 +5450,7 @@ export default function CalibrationPage() {
                     />
                     </div>
                     <div className="min-w-0 bg-white">
-                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">δ¹⁸O · Raw</div>
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">{tr("δ¹⁸O · Raw")}</div>
                     <PlotlyChart
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_raw, "linearity|d18_raw"))}
                       className="h-[420px] w-full"
@@ -5479,7 +5462,7 @@ export default function CalibrationPage() {
                     />
                     </div>
                     <div className="min-w-0 bg-white">
-                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">δ¹⁸O · Linearity corrected</div>
+                    <div className="border-b border-stone-200 px-3 py-2 text-xs font-semibold text-stone-700">{tr("δ¹⁸O · Linearity corrected")}</div>
                     <PlotlyChart
                       figure={withLinearityFigure(withCalibrationPreview(displayedWorkspace.linearity_figures.d18_corrected, "linearity|d18_corrected"))}
                       className="h-[420px] w-full"
@@ -5499,16 +5482,16 @@ export default function CalibrationPage() {
                   <section
                     key={section.standard}
                     className="rounded-lg border border-stone-200 bg-white shadow-sm"
-                    aria-label={`${section.standard} calibration details`}
+                    aria-label={tr(`${section.standard} calibration details`)}
                   >
                     <h2 className="px-4 py-3 text-base font-semibold text-stone-900">
-                      {section.standard}
+                      {tr(section.standard)}
                     </h2>
                     <div className="space-y-6 p-6 pt-0">
                       <div className="grid gap-6">
                         <Card className="flex flex-col overflow-hidden">
                           <CardHeader>
-                            <CardTitle className="text-base">δ¹³C Outlier Trace</CardTitle>
+                            <CardTitle className="text-base">{tr("δ¹³C Outlier Trace")}</CardTitle>
                           </CardHeader>
                           <CardContent className="min-h-0 flex-1 p-0">
                             <PlotlyChart
@@ -5524,7 +5507,7 @@ export default function CalibrationPage() {
                         </Card>
                         <Card className="flex flex-col overflow-hidden">
                           <CardHeader>
-                            <CardTitle className="text-base">δ¹⁸O Outlier Trace</CardTitle>
+                            <CardTitle className="text-base">{tr("δ¹⁸O Outlier Trace")}</CardTitle>
                           </CardHeader>
                           <CardContent className="min-h-0 flex-1 p-0">
                             <PlotlyChart
@@ -5543,19 +5526,19 @@ export default function CalibrationPage() {
                         <details className="rounded-lg border border-stone-200 bg-white shadow-sm">
                           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold text-stone-900">
                             <ChevronRight className="h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
-                            <span>δ¹³C Outliers ({section.d13_outliers.length})</span>
+                            <span>{tr("δ¹³C Outliers (")}{section.d13_outliers.length})</span>
                           </summary>
                           <div className="px-6 pb-6">
-                            <DataTable rows={section.d13_outliers} emptyLabel="No δ¹³C outliers for this standard." />
+                            <DataTable rows={section.d13_outliers} emptyLabel={tr("No δ¹³C outliers for this standard.")} />
                           </div>
                         </details>
                         <details className="rounded-lg border border-stone-200 bg-white shadow-sm">
                           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold text-stone-900">
                             <ChevronRight className="h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
-                            <span>δ¹⁸O Outliers ({section.d18_outliers.length})</span>
+                            <span>{tr("δ¹⁸O Outliers (")}{section.d18_outliers.length})</span>
                           </summary>
                           <div className="px-6 pb-6">
-                            <DataTable rows={section.d18_outliers} emptyLabel="No δ¹⁸O outliers for this standard." />
+                            <DataTable rows={section.d18_outliers} emptyLabel={tr("No δ¹⁸O outliers for this standard.")} />
                           </div>
                         </details>
                       </div>
@@ -5563,12 +5546,13 @@ export default function CalibrationPage() {
                   </section>
                 ))}
               </div>
+              </>}
             </>
           ) : (
             <Card>
               <CardHeader>
-                <CardTitle>Calibration Preview</CardTitle>
-                <CardDescription>Select one or more standards to build the calibration figures, precision summaries, and linearity diagnostics.</CardDescription>
+                <CardTitle>{tr("Calibration Preview")}</CardTitle>
+                <CardDescription>{tr("Select one or more standards to build the calibration figures, precision summaries, and linearity diagnostics.")}</CardDescription>
               </CardHeader>
             </Card>
           )}
@@ -5576,26 +5560,34 @@ export default function CalibrationPage() {
       </div>
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
-          className="pointer-events-none fixed z-[80] w-[min(560px,calc(100vw-20px))] rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          role="tooltip"
+          className="fixed z-[80] max-h-[calc(100vh-20px)] w-[min(980px,calc(100vw-20px))] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
           style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
+          onMouseEnter={clearHoverPreviewHideTimer}
+          onMouseLeave={scheduleHoverPreviewHide}
         >
           <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
             <span className="font-medium text-stone-800">
-              {hoverPreview.target.identifier1 || "Sample"} | {hoverPreview.target.identifier2 || "N/A"}
+              {tr(hoverPreview.target.identifier1 || "Sample")} | {tr(hoverPreview.target.identifier2 || "N/A")}
             </span>
             <span className="rounded-md bg-stone-100 px-2 py-0.5 font-medium uppercase tracking-normal text-stone-700">
-              {hoverPreview.target.isotopeKey}
+              {tr(hoverPreview.target.isotopeKey)}
             </span>
           </div>
-          {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
-            <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">Loading hover preview...</div>
-          ) : hasHoverDiagnosticsFigureData ? (
-            <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
-          ) : (
-            <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">
-              Cycle-intensity preview unavailable for this point.
+          <div className="grid min-h-0 gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:items-stretch">
+            <div className="h-[390px] min-w-0">
+              <RawAnalysisInfoTable info={hoverDiagnosticsQuery.data?.analysis_info} layout="vertical" />
             </div>
-          )}
+            <div className="flex min-h-[390px] min-w-0 items-center">
+              {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
+                <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Loading hover preview...")}</div>
+              ) : hasHoverDiagnosticsFigureData ? (
+                <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
+              ) : (
+                <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Cycle-intensity preview unavailable for this point.")}</div>
+              )}
+            </div>
+          </div>
         </div>
       ) : null}
     </div>

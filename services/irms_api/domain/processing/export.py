@@ -142,6 +142,17 @@ def _client_output_source_series(data_sheet: pd.DataFrame, source: str) -> pd.Se
     return data_sheet.get(column, pd.Series("", index=data_sheet.index, dtype=object)).fillna("").astype(str)
 
 
+def _calibrated_output_series(
+    data_sheet: pd.DataFrame,
+    corrected_column: str,
+    calibrated_column: str,
+) -> pd.Series:
+    empty = pd.Series(float("nan"), index=data_sheet.index, dtype=float)
+    corrected = pd.to_numeric(data_sheet.get(corrected_column, empty), errors="coerce")
+    calibrated = pd.to_numeric(data_sheet.get(calibrated_column, empty), errors="coerce")
+    return corrected.combine_first(calibrated)
+
+
 def is_raw_client_output_source(source: str) -> bool:
     return str(source) in {"raw_identifier1", "raw_label", "raw_comment"}
 
@@ -180,13 +191,15 @@ def _build_client_output_frame(
             "d13C (\u2030, VPDB)  Std Dev": pd.to_numeric(data_sheet.get("d 13C/12C  Std Dev"), errors="coerce"),
             "d18O (\u2030, VPDB)  Mean": pd.to_numeric(data_sheet.get("d 18O/16O  Mean"), errors="coerce"),
             "d18O (\u2030, VPDB)  Std Dev": pd.to_numeric(data_sheet.get("d 18O/16O  Std Dev"), errors="coerce"),
-            "Corrected d13C (\u2030, VPDB)": pd.to_numeric(
-                data_sheet.get("d13C_calibrated_linearity_corrected", data_sheet.get("d13C_calibrated")),
-                errors="coerce",
+            "Corrected d13C (\u2030, VPDB)": _calibrated_output_series(
+                data_sheet,
+                "d13C_calibrated_linearity_corrected",
+                "d13C_calibrated",
             ),
-            "Corrected d18O (\u2030, VPDB)": pd.to_numeric(
-                data_sheet.get("d18O_calibrated_linearity_corrected", data_sheet.get("d18O_calibrated")),
-                errors="coerce",
+            "Corrected d18O (\u2030, VPDB)": _calibrated_output_series(
+                data_sheet,
+                "d18O_calibrated_linearity_corrected",
+                "d18O_calibrated",
             ),
             DUPLICATE_QUALITY_KEY_COLUMN: (
                 data_sheet.get("Collector Status", pd.Series("", index=data_sheet.index, dtype=object))

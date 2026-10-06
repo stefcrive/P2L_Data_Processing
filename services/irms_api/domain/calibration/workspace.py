@@ -914,7 +914,9 @@ def build_calibration_workspace(
         else {}
     )
     work_df = apply_identifier1_name_map(work_df, identifier1_name_map)
-    standards_repo = StandardsRepository.default()
+    frozen_references = metadata.get("metrology_reference_values")
+    standards_repo = (StandardsRepository(pd.DataFrame(frozen_references, columns=["Standard","Isotopic_Value_Type","Value","Source"]))
+                      if isinstance(frozen_references,list) else StandardsRepository.default())
     standards_reference = carbonate_adjusted_standards_reference(
         standards_repo.frame,
         config.carbonate_material,

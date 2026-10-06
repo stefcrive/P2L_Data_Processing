@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslation } from "@/components/layout/language-provider";
+import { FileInput } from "@/components/ui/file-input";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Database, FileJson, FolderOpen, Plus, RefreshCw, Table2, Upload, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
@@ -47,18 +49,19 @@ function humanizeKey(value: string): string {
 }
 
 function HumanReadableValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
+  const tr = useTranslation();
   if (value == null) {
-    return <span className="text-slate-400">None</span>;
+    return <span className="text-slate-400">{tr("None")}</span>;
   }
   if (typeof value === "boolean") {
-    return <Badge>{value ? "Yes" : "No"}</Badge>;
+    return <Badge>{tr(value ? "Yes" : "No")}</Badge>;
   }
   if (typeof value === "string" || typeof value === "number") {
-    return <span className="break-words text-slate-800">{formatScientificText(String(value))}</span>;
+    return <span className="break-words text-slate-800">{tr(formatScientificText(String(value)))}</span>;
   }
   if (Array.isArray(value)) {
     if (!value.length) {
-      return <span className="text-slate-400">Empty list</span>;
+      return <span className="text-slate-400">{tr("Empty list")}</span>;
     }
     return (
       <div className="space-y-1.5">
@@ -78,7 +81,7 @@ function HumanReadableValue({ value, depth = 0 }: { value: unknown; depth?: numb
             key={key}
             className={depth === 0 ? "grid gap-1 py-2.5 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-4" : "grid gap-1 sm:grid-cols-[140px_minmax(0,1fr)]"}
           >
-            <dt className="text-xs font-semibold text-slate-500">{humanizeKey(key)}</dt>
+            <dt className="text-xs font-semibold text-slate-500">{tr(humanizeKey(key))}</dt>
             <dd className="min-w-0 text-sm">
               <HumanReadableValue value={item} depth={depth + 1} />
             </dd>
@@ -87,10 +90,11 @@ function HumanReadableValue({ value, depth = 0 }: { value: unknown; depth?: numb
       </dl>
     );
   }
-  return <span className="text-slate-700">{String(value)}</span>;
+  return <span className="text-slate-700">{tr(String(value))}</span>;
 }
 
 function ArtifactViewer({ artifact }: { artifact: SessionArtifactPayload }) {
+  const tr = useTranslation();
   if (artifact.format === "table") {
     return (
       <div className="overflow-auto rounded-lg border border-slate-200">
@@ -99,7 +103,7 @@ function ArtifactViewer({ artifact }: { artifact: SessionArtifactPayload }) {
             <tr>
               {(artifact.columns ?? []).map((column) => (
                 <th key={column} className="border-b border-slate-200 px-3 py-2 font-semibold">
-                  {humanizeKey(column)}
+                  {tr(humanizeKey(column))}
                 </th>
               ))}
             </tr>
@@ -126,8 +130,8 @@ function ArtifactViewer({ artifact }: { artifact: SessionArtifactPayload }) {
         {[...items].reverse().map((item: JsonRecord, index) => (
           <li key={`${String(item.timestamp ?? "")}-${index}`} className="rounded-lg border border-slate-200 bg-white px-4 py-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="text-sm font-semibold text-slate-900">{humanizeKey(String(item.action ?? "Event"))}</span>
-              <time className="font-mono text-[10px] text-slate-500">{formatTimestamp(item.timestamp)}</time>
+              <span className="text-sm font-semibold text-slate-900">{tr(humanizeKey(String(item.action ?? "Event")))}</span>
+              <time className="font-mono text-[10px] text-slate-500">{tr(formatTimestamp(item.timestamp))}</time>
             </div>
             {item.payload && typeof item.payload === "object" && Object.keys(item.payload as JsonRecord).length ? (
               <div className="mt-2 border-t border-slate-100 pt-2">
@@ -385,28 +389,25 @@ function ParsingFieldEditor({
   rule: ImportFieldParsingRule;
   onChange: (next: ImportFieldParsingRule) => void;
 }) {
+  const tr = useTranslation();
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-3">
-      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-600">{label}</div>
+      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-600">{tr(label)}</div>
       <div className="grid gap-2 sm:grid-cols-2">
-        <label className="text-xs text-slate-600">
-          Source column
-          <select
+        <label className="text-xs text-slate-600">{tr("Source column")}<select
             value={rule.source_column ?? ""}
             onChange={(event) => onChange({ ...rule, source_column: event.target.value || null })}
             className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm text-slate-800"
           >
-            <option value="">Not available</option>
+            <option value="">{tr("Not available")}</option>
             {columns.map((column) => (
               <option key={column} value={column}>
-                {column}
+                {tr(column)}
               </option>
             ))}
           </select>
         </label>
-        <label className="text-xs text-slate-600">
-          Extraction
-          <select
+        <label className="text-xs text-slate-600">{tr("Extraction")}<select
             value={rule.mode}
             onChange={(event) =>
               onChange({
@@ -416,25 +417,21 @@ function ParsingFieldEditor({
             }
             className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm text-slate-800"
           >
-            <option value="direct">Use whole value</option>
-            <option value="split">Split into parts</option>
-            <option value="regex">Regular expression</option>
+            <option value="direct">{tr("Use whole value")}</option>
+            <option value="split">{tr("Split into parts")}</option>
+            <option value="regex">{tr("Regular expression")}</option>
           </select>
         </label>
         {rule.mode === "split" ? (
           <>
-            <label className="text-xs text-slate-600">
-              Delimiter
-              <input
+            <label className="text-xs text-slate-600">{tr("Delimiter")}<input
                 type="text"
                 value={rule.delimiter}
                 onChange={(event) => onChange({ ...rule, delimiter: event.target.value })}
                 className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 font-mono text-sm text-slate-800"
               />
             </label>
-            <label className="text-xs text-slate-600">
-              Part number
-              <input
+            <label className="text-xs text-slate-600">{tr("Part number")}<input
                 type="number"
                 min={1}
                 value={rule.part_index + 1}
@@ -451,19 +448,15 @@ function ParsingFieldEditor({
         ) : null}
         {rule.mode === "regex" ? (
           <>
-            <label className="text-xs text-slate-600 sm:col-span-2">
-              Regular expression
-              <input
+            <label className="text-xs text-slate-600 sm:col-span-2">{tr("Regular expression")}<input
                 type="text"
                 value={rule.regex_pattern}
                 onChange={(event) => onChange({ ...rule, regex_pattern: event.target.value })}
-                placeholder="Example: ^(.+?)\s+-\s+(.+)$"
+                placeholder={tr("Example: ^(.+?)\\s+-\\s+(.+)$")}
                 className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 font-mono text-sm text-slate-800"
               />
             </label>
-            <label className="text-xs text-slate-600">
-              Capture group
-              <input
+            <label className="text-xs text-slate-600">{tr("Capture group")}<input
                 type="number"
                 min={0}
                 value={Number(rule.regex_group)}
@@ -495,6 +488,7 @@ function NamingRows({
   disabled: boolean;
   onChange: (next: Record<string, string>) => void;
 }) {
+  const tr = useTranslation();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   useEffect(() => {
     setDrafts({});
@@ -504,7 +498,7 @@ function NamingRows({
   }
   return (
     <div className="divide-y divide-slate-100 border-t border-slate-200">
-      <div className="bg-slate-50 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">{title}</div>
+      <div className="bg-slate-50 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">{tr(title)}</div>
       {sources.map((source) => {
         const target = mapping[source] ?? source;
         const draft = drafts[source] ?? target;
@@ -514,9 +508,9 @@ function NamingRows({
         return (
           <div key={source} className="grid gap-2 px-4 py-2.5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-start">
             <div className="min-w-0">
-              <div className="text-xs font-medium text-slate-500">Source</div>
-              <div className="truncate text-sm text-slate-800" title={source}>
-                {source}
+              <div className="text-xs font-medium text-slate-500">{tr("Source")}</div>
+              <div className="truncate text-sm text-slate-800" title={tr(source)}>
+                {tr(source)}
               </div>
               {details.length ? (
                 <div className="mt-2 space-y-2 border-t border-slate-100 pt-2">
@@ -525,16 +519,15 @@ function NamingRows({
                     return (
                       <div key={`${detail.software}:${detail.source_file}:${detailIndex}`} className="text-[11px] leading-4 text-slate-600">
                         <div className="font-medium text-slate-500">
-                          {namingSoftwareLabel(detail.software)} raw input
-                          {detail.source_file ? ` · ${detail.source_file}` : ""}
-                          {detail.occurrences > 1 ? ` · ${detail.occurrences} matching rows` : ""}
+                          {tr(namingSoftwareLabel(detail.software))}{tr("raw input")}{tr(detail.source_file ? ` · ${detail.source_file}` : "")}
+                          {tr(detail.occurrences > 1 ? ` · ${detail.occurrences} matching rows` : "")}
                         </div>
                         {fields.length ? (
                           <dl className="mt-0.5 space-y-0.5">
                             {fields.map((field) => (
                               <div key={field.label} className="flex min-w-0 gap-1.5">
-                                <dt className="shrink-0 text-slate-500">{field.label}:</dt>
-                                <dd className="min-w-0 break-words text-slate-700" title={field.value}>{field.value}</dd>
+                                <dt className="shrink-0 text-slate-500">{tr(field.label)}:</dt>
+                                <dd className="min-w-0 break-words text-slate-700" title={tr(field.value)}>{tr(field.value)}</dd>
                               </div>
                             ))}
                           </dl>
@@ -546,7 +539,7 @@ function NamingRows({
               ) : null}
             </div>
             <label className="min-w-0 text-xs text-slate-600">
-              {definedLabel}
+              {tr(definedLabel)}
               <input
                 type="text"
                 value={draft}
@@ -585,9 +578,7 @@ function NamingRows({
                 onChange(nextNameMap(mapping, source, source));
               }}
             >
-              <X className="h-4 w-4" />
-              Reset
-            </Button>
+              <X className="h-4 w-4" />{tr("Reset")}</Button>
           </div>
         );
       })}
@@ -596,6 +587,7 @@ function NamingRows({
 }
 
 export default function ImportPage() {
+  const tr = useTranslation();
   const [files, setFiles] = useState<File[]>([]);
   const [parsingConfig, setParsingConfig] = useState<ImportParsingConfig | null>(null);
   const [namingDraft, setNamingDraft] = useState<ImportNamingWorkspace | null>(null);
@@ -765,6 +757,9 @@ export default function ImportPage() {
       await queryClient.invalidateQueries({ queryKey: ["session", result.session.session_id] });
       await queryClient.invalidateQueries({ queryKey: ["sessions"] });
       await queryClient.invalidateQueries({ queryKey: ["import-naming", result.session.session_id] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-workspace", result.session.session_id] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-species-section", result.session.session_id] });
+      await queryClient.invalidateQueries({ queryKey: ["processing-linearity-preview-data", result.session.session_id] });
       setFiles([]);
     },
     onSettled: () => setUploadProgress(null),
@@ -879,43 +874,35 @@ export default function ImportPage() {
   return (
     <div className="space-y-5">
       <PageHeader
-        eyebrow="Session workspace"
-        title="Import"
-        description="Create a session from workbooks or reopen an existing analysis."
-        actions={<span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-[10px] text-slate-600">{recentSessions.length} recent sessions</span>}
+        eyebrow={tr("Session workspace")}
+        title={tr("Import")}
+        description={tr("Create a session from workbooks or reopen an existing analysis.")}
+        actions={<span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-[10px] text-slate-600">{recentSessions.length}{tr(" recent sessions")}</span>}
       />
 
       <Card>
         <CardHeader>
-          <CardTitle>Import workbooks</CardTitle>
-          <CardDescription>Start a new session, add files to an open session, or reopen a saved session state file.</CardDescription>
+          <CardTitle>{tr("Import workbooks")}</CardTitle>
+          <CardDescription>{tr("Start a new session, add files to an open session, or reopen a saved session state file.")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
-          <input
-            type="file"
+          <FileInput
             multiple
             accept=".xls,.xlsx"
             onChange={(event) => setFiles(Array.from(event.target.files ?? []))}
-            className="form-control block w-full text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-stone-900 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-white hover:file:bg-stone-800"
           />
           {previewImportMutation.isPending ? (
-            <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">
-              Inspecting workbook columns and detecting ISODAT/Qtegra layouts...
-            </div>
+            <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">{tr("Inspecting workbook columns and detecting ISODAT/Qtegra layouts...")}</div>
           ) : null}
           {importPreview && parsingConfig ? (
             <div className="space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
-                  <div className="text-sm font-semibold text-slate-900">Identity-field parsing</div>
-                  <div className="text-xs text-slate-500">
-                    Configure only Identifier 1, Identifier 2, and Species. Cycle layouts are standardized automatically by software.
-                  </div>
+                  <div className="text-sm font-semibold text-slate-900">{tr("Identity-field parsing")}</div>
+                  <div className="text-xs text-slate-500">{tr("Configure only Identifier 1, Identifier 2, and Species. Cycle layouts are standardized automatically by software.")}</div>
                 </div>
                 <Button type="button" variant="outline" size="sm" onClick={() => previewImportMutation.mutate(files)}>
-                  <RefreshCw className="h-4 w-4" />
-                  Inspect again
-                </Button>
+                  <RefreshCw className="h-4 w-4" />{tr("Inspect again")}</Button>
               </div>
               {importPreview.files.map((filePreview) => {
                 const config = parsingConfig.files.find(
@@ -943,62 +930,59 @@ export default function ImportPage() {
                   <section key={filePreview.file_index} className="overflow-hidden rounded-lg border border-slate-200 bg-slate-50/60">
                     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-3">
                       <div className="min-w-0">
-                        <div className="truncate text-sm font-semibold text-slate-900" title={filePreview.file_name}>
-                          {filePreview.file_name}
+                        <div className="truncate text-sm font-semibold text-slate-900" title={tr(filePreview.file_name)}>
+                          {tr(filePreview.file_name)}
                         </div>
                         <div className="text-xs text-slate-500">
-                          {filePreview.row_count.toLocaleString()} source rows · {filePreview.columns.length} columns
-                        </div>
+                          {tr(filePreview.row_count.toLocaleString())}{tr(" source rows · ")}{filePreview.columns.length}{tr("columns")}</div>
                       </div>
-                      <Badge>{filePreview.software === "qtegra" ? "Qtegra" : filePreview.software === "isodat" ? "ISODAT" : "Generic Excel"}</Badge>
+                      <Badge>{tr(filePreview.software === "qtegra" ? "Qtegra" : filePreview.software === "isodat" ? "ISODAT" : "Generic Excel")}</Badge>
                     </div>
                     <div className="grid gap-3 p-3 xl:grid-cols-3">
                       <ParsingFieldEditor
-                        label="Identifier 1"
+                        label={tr("Identifier 1")}
                         columns={filePreview.columns}
                         rule={config.identifier1}
                         onChange={(rule) => updateParsingRule(filePreview.file_index, "identifier1", rule)}
                       />
                       <ParsingFieldEditor
-                        label="Identifier 2"
+                        label={tr("Identifier 2")}
                         columns={filePreview.columns}
                         rule={config.identifier2}
                         onChange={(rule) => updateParsingRule(filePreview.file_index, "identifier2", rule)}
                       />
                       <ParsingFieldEditor
-                        label="Species"
+                        label={tr("Species")}
                         columns={filePreview.columns}
                         rule={config.species}
                         onChange={(rule) => updateParsingRule(filePreview.file_index, "species", rule)}
                       />
                     </div>
                     <div className="border-t border-slate-200 bg-white px-4 py-3">
-                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Parsed preview</div>
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">{tr("Parsed preview")}</div>
                       {uniqueParsedRows.length ? (
                         <div className="overflow-auto rounded-md border border-slate-200">
                           <table className="min-w-full text-left text-xs">
                             <thead className="bg-slate-50 text-slate-600">
                               <tr>
-                                <th className="px-3 py-2 font-semibold">Identifier 1</th>
-                                <th className="px-3 py-2 font-semibold">Identifier 2</th>
-                                <th className="px-3 py-2 font-semibold">Species</th>
+                                <th className="px-3 py-2 font-semibold">{tr("Identifier 1")}</th>
+                                <th className="px-3 py-2 font-semibold">{tr("Identifier 2")}</th>
+                                <th className="px-3 py-2 font-semibold">{tr("Species")}</th>
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                               {uniqueParsedRows.map((row, index) => (
                                 <tr key={`${row.identifier1}-${row.identifier2}-${row.species}-${index}`}>
-                                  <td className="px-3 py-2 text-slate-800">{row.identifier1 || "—"}</td>
-                                  <td className="px-3 py-2 text-slate-800">{row.identifier2 || "—"}</td>
-                                  <td className="px-3 py-2 text-slate-800">{row.species || "—"}</td>
+                                  <td className="px-3 py-2 text-slate-800">{tr(row.identifier1 || "—")}</td>
+                                  <td className="px-3 py-2 text-slate-800">{tr(row.identifier2 || "—")}</td>
+                                  <td className="px-3 py-2 text-slate-800">{tr(row.species || "—")}</td>
                                 </tr>
                               ))}
                             </tbody>
                           </table>
                         </div>
                       ) : (
-                        <div className="rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs text-amber-800">
-                          No identity values could be parsed with this configuration.
-                        </div>
+                        <div className="rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs text-amber-800">{tr("No identity values could be parsed with this configuration.")}</div>
                       )}
                     </div>
                   </section>
@@ -1006,25 +990,22 @@ export default function ImportPage() {
               })}
               {importPreview.errors.length ? (
                 <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-                  {importPreview.errors.join("; ")}
+                  {tr(importPreview.errors.join("; "))}
                 </div>
               ) : null}
             </div>
           ) : null}
           {previewImportMutation.error ? (
-            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-              Unable to inspect the selected workbook(s): {String(previewImportMutation.error)}
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{tr("Unable to inspect the selected workbook(s):")}{tr(String(previewImportMutation.error))}
             </div>
           ) : null}
           {files.length > 0 && importPreview && !previewImportMutation.isPending && !parsingReady ? (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-              Choose a valid source and extraction rule for all three identity fields before importing.
-            </div>
+            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">{tr("Choose a valid source and extraction rule for all three identity fields before importing.")}</div>
           ) : null}
           <div className="flex flex-wrap gap-3">
             <Button onClick={() => importMutation.mutate()} disabled={!parsingReady || importMutation.isPending}>
               <Upload className="h-4 w-4" />
-              {importMutation.isPending ? "Importing..." : previewImportMutation.isPending ? "Inspecting..." : "Create session"}
+              {tr(importMutation.isPending ? "Importing..." : previewImportMutation.isPending ? "Inspecting..." : "Create session")}
             </Button>
             <Button
               variant="outline"
@@ -1032,18 +1013,18 @@ export default function ImportPage() {
               disabled={!sessionId || !parsingReady || appendMutation.isPending}
             >
               <Plus className="h-4 w-4" />
-              {appendMutation.isPending ? "Adding..." : previewImportMutation.isPending ? "Inspecting..." : "Add files"}
+              {tr(appendMutation.isPending ? "Adding..." : previewImportMutation.isPending ? "Inspecting..." : "Add files")}
             </Button>
           </div>
           {uploadProgress ? (
             <div className="space-y-2" aria-live="polite">
               <div className="flex items-center justify-between text-xs text-stone-600">
                 <span>
-                  {uploadProgress.phase === "uploading"
+                  {tr(uploadProgress.phase === "uploading"
                     ? "Uploading workbooks"
-                    : uploadProgress.message || "Processing workbooks on the server"}
+                    : uploadProgress.message || "Processing workbooks on the server")}
                 </span>
-                <span>{uploadProgress.percent == null ? "Working..." : `${uploadProgress.percent}%`}</span>
+                <span>{tr(uploadProgress.percent == null ? "Working..." : `${uploadProgress.percent}%`)}</span>
               </div>
               <div
                 className="h-2 overflow-hidden rounded-full bg-stone-200"
@@ -1064,19 +1045,19 @@ export default function ImportPage() {
                   onClick={() => cancelJobMutation.mutate(uploadProgress.jobId!)}
                   disabled={cancelJobMutation.isPending}
                 >
-                  {cancelJobMutation.isPending ? "Cancelling..." : "Cancel operation"}
+                  {tr(cancelJobMutation.isPending ? "Cancelling..." : "Cancel operation")}
                 </Button>
               ) : null}
             </div>
           ) : null}
           {files.length > 0 ? (
             <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-700">
-              {files.length} file(s) selected: {files.map((file) => file.name).join(", ")}
+              {files.length}{tr(" file(s) selected: ")}{tr(files.map((file) => file.name).join(", "))}
             </div>
           ) : null}
           {(importMutation.error || appendMutation.error) && (
             <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-              {String(importMutation.error ?? appendMutation.error)}
+              {tr(String(importMutation.error ?? appendMutation.error))}
             </div>
           )}
         </CardContent>
@@ -1086,33 +1067,28 @@ export default function ImportPage() {
         <Card>
           <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
-              <CardTitle>Species and Identifier 1 names</CardTitle>
-              <CardDescription>
-                Define corrected names after import. These names are used in processing groups, filters, charts, tables, and exports.
-              </CardDescription>
+              <CardTitle>{tr("Species and Identifier 1 names")}</CardTitle>
+              <CardDescription>{tr("Define corrected names after import. These names are used in processing groups, filters, charts, tables, and exports.")}</CardDescription>
             </div>
             {namingDraft ? (
               <div className="flex flex-wrap gap-1.5">
-                <Badge>{Object.keys(namingDraft.species_name_map).length} species renamed</Badge>
-                <Badge>{Object.keys(namingDraft.identifier1_name_map).length} identifiers renamed</Badge>
+                <Badge>{Object.keys(namingDraft.species_name_map).length}{tr(" species renamed")}</Badge>
+                <Badge>{Object.keys(namingDraft.identifier1_name_map).length}{tr(" identifiers renamed")}</Badge>
               </div>
             ) : null}
           </CardHeader>
           <CardContent className="space-y-4">
             {!sessionId ? (
-              <div className="rounded-lg border border-dashed border-slate-300 p-3 text-sm text-slate-500">
-                Create or open a session to define names.
-              </div>
+              <div className="rounded-lg border border-dashed border-slate-300 p-3 text-sm text-slate-500">{tr("Create or open a session to define names.")}</div>
             ) : namingQuery.error ? (
-              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                Unable to load imported names: {String(namingQuery.error)}
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{tr("Unable to load imported names:")}{tr(String(namingQuery.error))}
               </div>
             ) : namingQuery.isLoading || !namingDraft ? (
-              <div className="text-sm text-slate-500">Loading imported names...</div>
+              <div className="text-sm text-slate-500">{tr("Loading imported names...")}</div>
             ) : (
               <div className="overflow-hidden rounded-lg border border-slate-200">
                 <NamingRows
-                  title="Species name"
+                  title={tr("Species name")}
                   definedLabel="Defined species name"
                   sources={namingDraft.species_sources}
                   mapping={namingDraft.species_name_map}
@@ -1125,7 +1101,7 @@ export default function ImportPage() {
                   }
                 />
                 <NamingRows
-                  title="Identifier 1"
+                  title={tr("Identifier 1")}
                   definedLabel="Defined Identifier 1"
                   sources={namingDraft.identifier1_sources}
                   mapping={namingDraft.identifier1_name_map}
@@ -1145,24 +1121,21 @@ export default function ImportPage() {
                   onClick={() => saveNamingMutation.mutate(namingDraft)}
                   disabled={!namingDirty || saveNamingMutation.isPending}
                 >
-                  {saveNamingMutation.isPending ? "Saving names..." : "Save names"}
+                  {tr(saveNamingMutation.isPending ? "Saving names..." : "Save names")}
                 </Button>
                 <Button
                   type="button"
                   variant="outline"
                   disabled={!namingDirty || saveNamingMutation.isPending}
                   onClick={() => namingSaved && setNamingDraft(namingSaved)}
-                >
-                  Restore saved
-                </Button>
+                >{tr("Restore saved")}</Button>
                 <span className="text-xs text-slate-500">
-                  {namingDirty ? "Unsaved naming changes" : "Names are saved"}
+                  {tr(namingDirty ? "Unsaved naming changes" : "Names are saved")}
                 </span>
               </div>
             ) : null}
             {saveNamingMutation.error ? (
-              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                Unable to save names: {String(saveNamingMutation.error)}
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{tr("Unable to save names:")}{tr(String(saveNamingMutation.error))}
               </div>
             ) : null}
           </CardContent>
@@ -1171,27 +1144,26 @@ export default function ImportPage() {
         <Card>
           <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
-              <CardTitle>Session record</CardTitle>
-              <CardDescription>Review recovery artifacts and the workbooks attached to the active session.</CardDescription>
+              <CardTitle>{tr("Session record")}</CardTitle>
+              <CardDescription>{tr("Review recovery artifacts and the workbooks attached to the active session.")}</CardDescription>
             </div>
             <div className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-700">
               <span
                 className={`h-2.5 w-2.5 rounded-full ${autosaveEnabled ? "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.14)]" : "bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.12)]"}`}
                 aria-hidden="true"
-              />
-              Autosave {autosaveEnabled ? "on" : "off"}
+              />{tr("Autosave")} {tr(autosaveEnabled ? "on" : "off")}
             </div>
           </CardHeader>
           <CardContent className="space-y-4 text-sm text-stone-600">
             <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-4">
-              <Badge>{autosaveEventCount} events</Badge>
-              <Badge>{autosaveResumed ? "Resumed" : "New session"}</Badge>
-              <span className="font-mono text-[10px] text-slate-500">{sessionId ?? "No active session"}</span>
-              <span className="ml-auto text-xs text-slate-500">Last saved {formatTimestamp(autosave.last_saved_at)}</span>
+              <Badge>{autosaveEventCount}{tr(" events")}</Badge>
+              <Badge>{tr(autosaveResumed ? "Resumed" : "New session")}</Badge>
+              <span className="font-mono text-[10px] text-slate-500">{tr(sessionId ?? "No active session")}</span>
+              <span className="ml-auto text-xs text-slate-500">{tr("Last saved ")}{tr(formatTimestamp(autosave.last_saved_at))}</span>
             </div>
 
             <div>
-              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Record views</div>
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">{tr("Record views")}</div>
               <div className="grid gap-2 sm:grid-cols-2 2xl:grid-cols-3">
               {SESSION_ARTIFACTS.map((artifact) => {
                 const Icon =
@@ -1214,8 +1186,8 @@ export default function ImportPage() {
                       <Icon className="h-4 w-4" />
                     </span>
                     <span className="min-w-0">
-                      <span className="block text-xs font-semibold text-slate-900">{artifact.label}</span>
-                      <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">{artifact.description}</span>
+                      <span className="block text-xs font-semibold text-slate-900">{tr(artifact.label)}</span>
+                      <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">{tr(artifact.description)}</span>
                     </span>
                   </button>
                 );
@@ -1225,16 +1197,16 @@ export default function ImportPage() {
 
             <div className="border-t border-slate-200 pt-4">
               <div className="mb-2 flex items-center justify-between gap-3">
-                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Current session files</div>
-                <span className="font-mono text-[10px] text-slate-500">{sessionSourceFiles.length} files</span>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{tr("Current session files")}</div>
+                <span className="font-mono text-[10px] text-slate-500">{sessionSourceFiles.length}{tr(" files")}</span>
               </div>
               {!sessionId ? (
-                <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">No open session.</div>
+                <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">{tr("No open session.")}</div>
               ) : sessionSourceFiles.length > 0 ? (
                 <div className="grid gap-1.5 sm:grid-cols-2">
                   {sessionSourceFiles.map((sourceFile) => (
-                    <div key={sourceFile.key} className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700" title={sourceFile.name}>
-                      <span className="min-w-0 flex-1 truncate">{sourceFile.name}</span>
+                    <div key={sourceFile.key} className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700" title={tr(sourceFile.name)}>
+                      <span className="min-w-0 flex-1 truncate">{tr(sourceFile.name)}</span>
                       <Button
                         type="button"
                         variant="outline"
@@ -1242,8 +1214,8 @@ export default function ImportPage() {
                         className="h-7 shrink-0 px-2 text-red-600 hover:bg-red-50 hover:text-red-700"
                         onClick={() => excludeSessionFileMutation.mutate(sourceFile.index)}
                         disabled={excludeSessionFileMutation.isPending}
-                        aria-label={`Exclude ${sourceFile.name}`}
-                        title={`Exclude ${sourceFile.name}`}
+                        aria-label={tr(`Exclude ${sourceFile.name}`)}
+                        title={tr(`Exclude ${sourceFile.name}`)}
                       >
                         <X className="h-3.5 w-3.5" />
                       </Button>
@@ -1251,9 +1223,7 @@ export default function ImportPage() {
                   ))}
                 </div>
               ) : (
-                <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">
-                  Session has no loaded source files.
-                </div>
+                <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">{tr("Session has no loaded source files.")}</div>
               )}
             </div>
           </CardContent>
@@ -1263,8 +1233,8 @@ export default function ImportPage() {
       <Card>
         <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
-            <CardTitle>Recent sessions</CardTitle>
-            <CardDescription>Open a known session or recover one from a session folder or state file.</CardDescription>
+            <CardTitle>{tr("Recent sessions")}</CardTitle>
+            <CardDescription>{tr("Open a known session or recover one from a session folder or state file.")}</CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
             <Button
@@ -1272,29 +1242,25 @@ export default function ImportPage() {
               onClick={handleBrowseFolderClick}
               disabled={openMutation.isPending || openSessionFileMutation.isPending || openSessionFolderMutation.isPending}
             >
-              <FolderOpen className="h-4 w-4" />
-              Browse folder
-            </Button>
+              <FolderOpen className="h-4 w-4" />{tr("Browse folder")}</Button>
             <Button
               variant="outline"
               onClick={handleOpenSessionFileClick}
               disabled={openSessionFileMutation.isPending || openSessionFolderMutation.isPending}
             >
-              <FileJson className="h-4 w-4" />
-              Open state file
-            </Button>
+              <FileJson className="h-4 w-4" />{tr("Open state file")}</Button>
             <Button variant="secondary" onClick={() => sessionsQuery.refetch()} disabled={sessionsQuery.isFetching}>
               <RefreshCw className="h-4 w-4" />
-              {sessionsQuery.isFetching ? "Refreshing..." : "Refresh"}
+              {tr(sessionsQuery.isFetching ? "Refreshing..." : "Refresh")}
             </Button>
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
           <input ref={folderInputRef} type="file" multiple onChange={handleFolderSelected} className="hidden" />
           <input ref={sessionFileInputRef} type="file" accept=".json" onChange={handleSessionFileSelected} className="hidden" />
-          {browseInfo ? <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">{browseInfo}</div> : null}
-          {browseError ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{browseError}</div> : null}
-          {excludeSessionFileMutation.error ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">Unable to exclude file: {String(excludeSessionFileMutation.error)}</div> : null}
+          {browseInfo ? <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">{tr(browseInfo)}</div> : null}
+          {browseError ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{tr(browseError)}</div> : null}
+          {excludeSessionFileMutation.error ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{tr("Unable to exclude file: ")}{tr(String(excludeSessionFileMutation.error))}</div> : null}
           {recentSessions.length > 0 ? (
             <div className="divide-y divide-slate-100 rounded-lg border border-slate-200">
               {recentSessions.map((session) => {
@@ -1302,25 +1268,25 @@ export default function ImportPage() {
                 const isOpening = openMutation.isPending && openMutation.variables === session.session_id;
                 return (
                   <div key={session.session_id} className="flex flex-wrap items-center justify-between gap-3 px-3 py-2.5">
-                    <div className="text-sm text-stone-700">{describeSession(session)}</div>
+                    <div className="text-sm text-stone-700">{tr(describeSession(session))}</div>
                     <Button
                       variant={isActive ? "secondary" : "outline"}
                       size="sm"
                       onClick={() => openMutation.mutate(session.session_id)}
                       disabled={openMutation.isPending}
                     >
-                      {isOpening ? "Opening..." : isActive ? "Open again" : "Open"}
+                      {tr(isOpening ? "Opening..." : isActive ? "Open again" : "Open")}
                     </Button>
                   </div>
                 );
               })}
             </div>
           ) : (
-            <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">No saved sessions yet.</div>
+            <div className="rounded-lg border border-dashed border-stone-300 p-3 text-sm text-stone-500">{tr("No saved sessions yet.")}</div>
           )}
           {openMutation.error || openSessionFileMutation.error || openSessionFolderMutation.error ? (
             <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-              {String(openMutation.error ?? openSessionFileMutation.error ?? openSessionFolderMutation.error)}
+              {tr(String(openMutation.error ?? openSessionFileMutation.error ?? openSessionFolderMutation.error))}
             </div>
           ) : null}
         </CardContent>
@@ -1331,30 +1297,27 @@ export default function ImportPage() {
           <div
             role="dialog"
             aria-modal="true"
-            aria-label="Session record viewer"
+            aria-label={tr("Session record viewer")}
             className="flex max-h-[calc(100vh-3rem)] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-slate-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-4 py-3">
               <div>
                 <div className="text-base font-semibold text-slate-950">
-                  {artifactQuery.data?.label ?? SESSION_ARTIFACTS.find((item) => item.kind === activeArtifactKind)?.label}
+                  {tr(artifactQuery.data?.label ?? SESSION_ARTIFACTS.find((item) => item.kind === activeArtifactKind)?.label)}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-500">
-                  {artifactQuery.data?.row_count != null ? `${artifactQuery.data.row_count.toLocaleString()} records` : "Session record"}
-                  {artifactQuery.data?.truncated ? " · showing a preview" : ""}
+                  {tr(artifactQuery.data?.row_count != null ? `${artifactQuery.data.row_count.toLocaleString()} records` : "Session record")}
+                  {tr(artifactQuery.data?.truncated ? " · showing a preview" : "")}
                 </div>
               </div>
               <Button variant="outline" size="sm" onClick={() => setActiveArtifactKind(null)}>
-                <X className="h-4 w-4" />
-                Close
-              </Button>
+                <X className="h-4 w-4" />{tr("Close")}</Button>
             </div>
             <div className="min-h-0 overflow-auto bg-slate-50/60 p-4">
-              {artifactQuery.isLoading ? <div className="text-sm text-slate-500">Loading session record…</div> : null}
+              {artifactQuery.isLoading ? <div className="text-sm text-slate-500">{tr("Loading session record…")}</div> : null}
               {artifactQuery.error ? (
-                <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                  Unable to load this record: {String(artifactQuery.error)}
+                <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{tr("Unable to load this record:")}{tr(String(artifactQuery.error))}
                 </div>
               ) : null}
               {artifactQuery.data ? <ArtifactViewer artifact={artifactQuery.data} /> : null}

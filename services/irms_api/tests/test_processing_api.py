@@ -691,6 +691,35 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertIn("Original d 13C/12C  Mean", data_sheet.columns)
         self.assertIn("Statistics", workbook_with.sheet_names)
 
+    def test_client_output_falls_back_to_calibrated_values_when_linearity_columns_are_blank(self) -> None:
+        df = sample_processing_df().copy()
+        df["d13C_calibrated_linearity_corrected"] = np.nan
+        df["d18O_calibrated_linearity_corrected"] = np.nan
+        api_main.store.save_frames(self.session_id, df, sample_cycles_df())
+
+        metadata = api_main.store.load_metadata(self.session_id)
+        metadata["processing"]["apply_calibration"] = False
+        api_main.store.write_metadata(self.session_id, metadata)
+
+        request = ExportRequest(
+            include_outliers=True,
+            selected_ids=["All"],
+            interpolate_outliers=False,
+            output_type="client_output",
+        )
+        preview = api_main.preview_client_output(self.session_id, request)
+        preview_row = next(
+            row for row in preview.rows if row["Sample #"] == "ok"
+        )
+        self.assertEqual(preview_row["Corrected d13C (\u2030, VPDB)"], 1.5)
+        self.assertEqual(preview_row["Corrected d18O (\u2030, VPDB)"], 2.5)
+
+        exported = api_main.export_dataset(self.session_id, request)
+        sheet = pd.read_excel(io.BytesIO(exported.body), sheet_name="Client Output")
+        exported_row = sheet.loc[sheet["Sample #"] == "ok"].iloc[0]
+        self.assertEqual(float(exported_row["Corrected d13C (\u2030, VPDB)"]), 1.5)
+        self.assertEqual(float(exported_row["Corrected d18O (\u2030, VPDB)"]), 2.5)
+
     def test_cycle_diagnostics_includes_linearity_corrected_target_value(self) -> None:
         metadata = api_main.store.load_metadata(self.session_id)
         calibration = dict(metadata.get("calibration", {}))

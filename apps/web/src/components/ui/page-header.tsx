@@ -1,7 +1,11 @@
+"use client";
+
+import { useTranslation } from "@/components/layout/language-provider";
 import type { ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 import { formatScientificText } from "@/lib/scientific-notation";
+import { useMetrologyConsultation } from "@/components/metrology/consultation-context";
 
 export function PageHeader({
   eyebrow,
@@ -16,6 +20,9 @@ export function PageHeader({
   actions?: ReactNode;
   compact?: boolean;
 }) {
+  const tr = useTranslation();
+  const consultation = useMetrologyConsultation();
+  compact = compact || consultation;
   return (
     <section
       className={cn(
@@ -24,13 +31,13 @@ export function PageHeader({
       )}
     >
       <div className="min-w-0">
-        {eyebrow ? <div className="font-mono text-[10px] font-medium uppercase text-blue-700">{formatScientificText(eyebrow)}</div> : null}
+        {eyebrow && !consultation ? <div className="font-mono text-[10px] font-medium uppercase text-blue-700">{tr(formatScientificText(eyebrow))}</div> : null}
         <h1 className={cn("font-display font-semibold leading-tight text-slate-950", eyebrow ? "mt-1" : "", compact ? "text-xl" : "text-2xl")}>
-          {formatScientificText(title)}
+          {tr(formatScientificText(title))}
         </h1>
-        <p className={cn("mt-1 max-w-3xl text-slate-600", compact ? "text-xs leading-snug" : "text-sm leading-relaxed")}>{formatScientificText(description)}</p>
+        <p className={cn("mt-1 max-w-3xl text-slate-600", compact ? "text-xs leading-snug" : "text-sm leading-relaxed")}>{tr(formatScientificText(description))}</p>
       </div>
-      {actions ? <div className={cn("flex shrink-0 flex-wrap items-center", compact ? "gap-1.5 text-xs" : "gap-2")}>{actions}</div> : null}
+      {actions ? <div className={cn("flex shrink-0 flex-wrap items-center", compact ? "gap-1.5 text-xs" : "gap-2")}>{tr(actions)}</div> : null}
     </section>
   );
 }
