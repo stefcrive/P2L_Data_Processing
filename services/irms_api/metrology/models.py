@@ -352,7 +352,7 @@ class ResidualOverride(StrictModel):
 
 class ResidualOverrideCommand(Decision):
     material_id: str
-    effect: Literal["sample_reference_dependence", "intensity_dependence", "pressure_dependence", "pressure_residual", "mass_dependence", "drift", "memory"]
+    effect: Literal["sample_reference_dependence", "intensity_dependence", "pressure_adjusted_dependence", "pressure_dependence", "pressure_residual", "mass_dependence", "drift", "memory"]
     isotope: Literal["d13c", "d18o"]
     settings: ResidualOverride | None = None
 
@@ -369,6 +369,8 @@ class SessionChartSettingsCommand(Decision):
 
 class SessionExportCommand(Decision):
     format: Literal["csv", "json", "zip", "pdf", "xlsx"] = "zip"
+    output_type: Literal["combined", "client_output", "dataset"] = "combined"
+    include_outliers: bool = False
     group: str | None = None
     client_name: str | None = Field(default=None, max_length=180)
     series_name: str | None = Field(default=None, max_length=180)

@@ -1,7 +1,7 @@
 "use client";
 
 import { useTranslation } from "@/components/layout/language-provider";
-import { useMetrologyConsultation, MetrologyChartAppearance, MetrologyChartHeight } from "@/components/metrology/consultation-context";
+import { useMetrologyConsultation, MetrologyChartAppearance, MetrologyChartHeight, MetrologySymbolSize } from "@/components/metrology/consultation-context";
 import { useLanguage } from "@/components/layout/language-provider";
 import dynamic from "next/dynamic";
 import { createPortal } from "react-dom";
@@ -494,7 +494,12 @@ export function PlotlyChart({
   const metrologyConsultation = useMetrologyConsultation();
   const appearance = useContext(MetrologyChartAppearance);
   const stationHeight = useContext(MetrologyChartHeight);
-  const figure = useMemo(() => sourceFigure && appearance ? appearance(sourceFigure) : sourceFigure, [sourceFigure, appearance]);
+  const symbolSize = useContext(MetrologySymbolSize);
+  const figure = useMemo(() => {
+    const styled = sourceFigure && appearance ? appearance(sourceFigure) : sourceFigure;
+    if (!styled || symbolSize == null || !Array.isArray(styled.data)) return styled;
+    return {...styled, data:styled.data.map((trace:Record<string,unknown>) => String(trace.mode).includes("markers") ? {...trace,marker:{...(trace.marker as object ?? {}),size:symbolSize}} : trace)};
+  }, [sourceFigure, appearance, symbolSize]);
   const { language } = useLanguage();
   const plotConfig = useMemo(() => ({responsive:true,displaylogo:false,displayModeBar:"hover" as const,locale:language === "pt" ? "pt-BR" : "en-US"}), [language]);
   const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
@@ -542,7 +547,8 @@ export function PlotlyChart({
   const isLegendVisible = isLegendExpanded;
   const shouldFillContainer = fitContainer || verticallyResizable || hasCollapsibleLegend;
   useEffect(()=>{
-    const card=containerRef.current?.closest("[data-card]");
+    // Nested charts own their controls rather than filling an ancestor header.
+    const card=containerRef.current?.closest("[data-chart-panel], [data-card]");
     const header=card?.querySelector<HTMLElement>("[data-card-header]")??null;
     setHeaderHost(header);
     setLegendHost(header?.querySelector<HTMLElement>('[data-chart-display-menu="external"]') ?? null);
@@ -570,6 +576,13 @@ export function PlotlyChart({
     layout.plot_bgcolor = "#ffffff";
     layout.margin = { ...(layout.margin as object ?? {}), l: 54, r: secondaryAxis ? 58 : 18, t: isLegendVisible ? 28 : 8, b: 42, pad: 0, autoexpand: true };
     layout.legend = { ...(layout.legend as object ?? {}), orientation:"h", x:0, xanchor:"left", y:1.01, yanchor:"bottom", font:{size:legendFontSize}, itemsizing:"constant", tracegroupgap:0, borderwidth:0, entrywidth:undefined, entrywidthmode:"pixels" };
+    // Boundary markers already have named legend entries. Duplicate annotations
+    // at y=1 overlap the horizontal legend when its entries wrap.
+    const boundaryLabels = new Set(figureData.filter((trace): trace is Record<string, unknown> => !!trace && typeof trace === "object")
+      .map(trace => trace.name).filter(name => typeof name === "string" && /^(first|last) valid cycle$/i.test(name)));
+    if (boundaryLabels.size && Array.isArray(layout.annotations)) {
+      layout.annotations = layout.annotations.filter((annotation: Record<string, unknown>) => !boundaryLabels.has(annotation.text));
+    }
     for (const key of Object.keys(layout).filter(k => /^[xy]axis\d*$/.test(k))) {
       const axis=layout[key] as Record<string,unknown>;
       layout[key] = { ...axis, gridcolor: "#e8edf1", automargin: true, title: typeof axis.title === "string" ? {text:axis.title,standoff:6} : {...(axis.title as object??{}),standoff:6} };
@@ -627,7 +640,9 @@ export function PlotlyChart({
     } else if (typeof (layout as { uirevision?: unknown }).uirevision === "undefined") {
       layout.uirevision = buildDefaultUiRevision(compacted.data, layout);
     }
-    applyPersistedViewport(layout, uiRevision ? persistedViewports.get(uiRevision) : undefined);
+    const filteredViewport=(layout.meta as {filteredViewport?:string})?.filteredViewport;
+    if(filteredViewport!==undefined)layout.uirevision=`${layout.uirevision}:filtered:${filteredViewport}`;
+    else applyPersistedViewport(layout, uiRevision ? persistedViewports.get(uiRevision) : undefined);
     return {
       data: formatPlotlyDisplayText(compacted.data.map(value=>{if(!value || typeof value!=="object")return value; const trace=value as Record<string,unknown>; const name=trace.name; return {...trace,name:typeof name==="string"?name.replace(/^(Duplicat(?:e|ed) samples|Amostras duplicadas)$/i, "Duplicates").replace(/^(Final result ± U|Resultado final ± U)$/, "Final ± U").replace(/^(Before correction|Antes da correção)$/, "Before").replace(/^(After correction|Após a correção)$/, "After").replace(/^(Manual preview|Prévia manual)$/, "Preview"):name};}), text => tr(metrologyConsultation ? text.replace(/VSMOW/g, "VPDB") : text)) as never[],
       layout: formatPlotlyDisplayText(layout, text => tr(metrologyConsultation ? text.replace(/VSMOW/g, "VPDB") : text)) as never,
@@ -638,7 +653,7 @@ export function PlotlyChart({
   }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, tr, uiRevision, metrologyConsultation, stationHeight, legendFontSize]);
 
   useEffect(() => {
-    if ((!verticallyResizable && !(metrologyConsultation && stationHeight !== 280 && fitContainer)) || chartHeight !== null) {
+    if (!verticallyResizable || chartHeight !== null) {
       return;
     }
     const container = containerRef.current;
@@ -750,6 +765,14 @@ export function PlotlyChart({
   function refreshAfterInitialize(_figure?: unknown, graphDiv?: PlotlyGraphDiv) {
     graphDivRef.current = graphDiv ?? null;
     bindInteractions(graphDiv);
+    // A modal and its flex panels settle after the Plotly component mounts.
+    // Measure again on the next frame instead of keeping its initial SVG size.
+    window.requestAnimationFrame(() => {
+      if (!graphDiv?.isConnected || graphDiv.getBoundingClientRect().width === 0) return;
+      void import("@/lib/plotly-core").then(({ default: plotlyModule }) => {
+        if (graphDiv.isConnected) void (plotlyModule as unknown as PlotlyResizeApi).Plots.resize(graphDiv);
+      });
+    });
     syncStandardAxisScale(graphDiv, (active) => {
       isSynchronizingStandardAxisRef.current = active;
     });

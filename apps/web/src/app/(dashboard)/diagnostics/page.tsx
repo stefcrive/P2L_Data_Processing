@@ -1,6 +1,8 @@
 "use client";
-import { memo } from "react";
-import { useMetrologyConsultation } from "@/components/metrology/consultation-context";
+
+import { SelectionCycleDiagnostics } from "@/components/diagnostics/selection-cycle-diagnostics";
+import { useContext, memo } from "react";
+import { useMetrologyConsultation, MetrologyStationFilters } from "@/components/metrology/consultation-context";
 
 import { useTranslation } from "@/components/layout/language-provider";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -11,14 +13,7 @@ import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/compon
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import { RawAnalysisInfoTable } from "@/components/diagnostics/raw-analysis-info-table";
 import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
-import {
-  SATURATION_COLOR_AXIS_OPTIONS,
-  SaturationAxisHelpTooltip,
-  SaturationSharedColorbar,
-  SaturationFigureCard,
-  type SaturationAxisKey,
-  type SaturationColorAxisKey,
-} from "@/components/diagnostics/saturation-figure-card";
+
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { DecimalInput } from "@/components/ui/decimal-input";
@@ -28,6 +23,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import { buildDiagnosticStatisticsPreview } from "@/lib/diagnostic-statistics-preview";
+import { groupDiagnosticGridItems, matchDiagnosticMarkerStyles, withCycleSignalIntensity, type CycleSignalMode } from "@/lib/diagnostic-grid";
 import {
   applyLinearityPreviewToDiagnosticsFigure,
   buildLinearityPreviewValues,
@@ -1075,247 +1071,6 @@ function buildDiagnosticsHoverAnalysisInfo(diagnostics: CycleDiagnosticsPayload 
   return info;
 }
 
-function DiagnosticsPanel({
-  title,
-  diagnostics,
-  loading,
-  onPickDeltaValue,
-}: {
-  title: string;
-  diagnostics?: CycleDiagnosticsPayload;
-  loading: boolean;
-  onPickDeltaValue?: (value: number, stdev?: number | null) => void;
-}) {
-  const tr = useTranslation();
-  const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
-  const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
-  const cycleMean = diagnostics?.cycle_mean ?? {};
-  const validMean = toFiniteNumber(cycleMean.valid_mean);
-  const validStdDev = toFiniteNumber(cycleMean.valid_std_dev);
-  const validCycleCount = toFiniteNumber(cycleMean.valid_cycles);
-  const hasTooFewLinearityCycles = validCycleCount != null && validCycleCount < 4;
-  const firstValidCycle = toFiniteNumber(cycleMean.selected_value) ?? toFiniteNumber(cycleMean.mean);
-  const lastValidCycle = toFiniteNumber(cycleMean.last_valid_value);
-  const referenceGasCorrection = toFiniteNumber(cycleMean.saturation_reference_gas_value);
-  const firstCycleCorrection = toFiniteNumber(cycleMean.saturation_first_cycle_value);
-  const saturationCorrection =
-    diagnostics?.saturation_correction && typeof diagnostics.saturation_correction === "object"
-      ? (diagnostics.saturation_correction as Record<string, unknown>)
-      : {};
-  const cycleLinearityValue = (key: string) => {
-    const payload = saturationCorrection[key];
-    return payload && typeof payload === "object" ? toFiniteNumber((payload as Record<string, unknown>).value) : null;
-  };
-  const cycleLinearityStd = (key: string) => {
-    const payload = saturationCorrection[key];
-    return payload && typeof payload === "object" ? toFiniteNumber((payload as Record<string, unknown>).std_dev) : null;
-  };
-  const reason = asString(cycleMean.reason);
-  const diagnosticsFigure = ensureCollectorIntensityTraces(diagnostics?.figure, diagnostics?.table ?? []);
-  const saturationFiguresRaw =
-    Object.keys(saturationCorrection).length
-      ? (saturationCorrection.figures as Record<string, unknown> | undefined)
-      : undefined;
-  const targetIsotopeKey = asString((diagnostics?.target ?? {})["isotope_key"]);
-  const defaultSaturationYAxis: SaturationAxisKey = targetIsotopeKey === "d18O" ? "d18O" : "d13C";
-  useEffect(() => {
-    setSaturationYAxis(defaultSaturationYAxis);
-  }, [defaultSaturationYAxis]);
-  const saturationMethodDescriptions: Record<string, string> = {
-    reference_gas_intensity:
-      "Fits isotope value versus the reference-gas intensity from valid cycles, then predicts the value at the saturated cycle's reference intensity. Points are colored by cycle number.",
-    first_cycle:
-      "Fits a quadratic curve of isotope value versus cycle number from valid cycles, then predicts where the curve becomes horizontal.",
-    cycle_relative_mismatch:
-      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / Ref44, then predicts where that curve becomes horizontal.",
-    cycle_symmetric_mismatch:
-      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / ((Samp44 + Ref44) / 2), then predicts where that curve becomes horizontal.",
-    cycle_mean_intensity:
-      "Fits a quadratic curve of isotope value versus mean intensity, (Samp44 + Ref44) / 2, then predicts where that curve becomes horizontal.",
-    cycle_intensity_weighted_mismatch:
-      "Fits a quadratic curve of isotope value versus the cycle-level weighted mismatch term, then predicts where that curve becomes horizontal.",
-    cycle_two_term_mean_mismatch:
-      "Fits isotope value with two predictors: mean intensity and symmetric mismatch. The green line connects the model-fitted values for the valid cycles using each cycle's own mismatch; dot color also shows mismatch.",
-    cycle_plateau:
-      "Measures the signed cycle-to-cycle isotope change in the latest valid cycles, fits isotope value versus that change rate, then predicts the asymptote where the change rate reaches zero. The highlighted circles are the cycles used.",
-  };
-  const saturationFigureItems = [
-    ["reference_gas_intensity", "Reference-gas saturation correction"],
-    ["first_cycle", "Stabilized-cycle correction"],
-    ["cycle_relative_mismatch", "Cycle relative mismatch correction"],
-    ["cycle_symmetric_mismatch", "Cycle symmetric mismatch correction"],
-    ["cycle_mean_intensity", "Cycle mean intensity correction"],
-    ["cycle_intensity_weighted_mismatch", "Cycle intensity-weighted mismatch correction"],
-    ["cycle_two_term_mean_mismatch", "Cycle two-term mean + mismatch correction"],
-    ["cycle_plateau", "Cycle late-plateau correction"],
-  ]
-    .map(([key, itemTitle]) => ({
-      key,
-      title: itemTitle,
-      description: saturationMethodDescriptions[key],
-      figure:
-        saturationFiguresRaw?.[key] && typeof saturationFiguresRaw[key] === "object"
-          ? (saturationFiguresRaw[key] as Record<string, unknown>)
-          : undefined,
-    }))
-    .filter((item) => item.figure);
-  const suggestionCards = [
-    { label: "Cycle Mean", value: validMean, stdev: validStdDev, linearity: false },
-    { label: "First valid cycle", value: firstValidCycle, stdev: null, linearity: false },
-    { label: "Last valid cycle", value: lastValidCycle, stdev: null, linearity: false },
-    { label: "Lin. corr. to ref gas int", value: referenceGasCorrection, stdev: null, linearity: true },
-    { label: "Lin. corr. to first cycle", value: firstCycleCorrection, stdev: null, linearity: true },
-    { label: "Cycle relative mismatch", value: cycleLinearityValue("cycle_relative_mismatch"), stdev: null, linearity: true },
-    { label: "Cycle symmetric mismatch", value: cycleLinearityValue("cycle_symmetric_mismatch"), stdev: null, linearity: true },
-    { label: "Cycle mean intensity", value: cycleLinearityValue("cycle_mean_intensity"), stdev: null, linearity: true },
-    { label: "Cycle weighted mismatch", value: cycleLinearityValue("cycle_intensity_weighted_mismatch"), stdev: null, linearity: true },
-    { label: "Cycle two-term model", value: cycleLinearityValue("cycle_two_term_mean_mismatch"), stdev: null, linearity: true },
-    { label: "Cycle plateau", value: cycleLinearityValue("cycle_plateau"), stdev: cycleLinearityStd("cycle_plateau"), linearity: false },
-  ];
-
-  return (
-    <Card className="border-stone-300">
-      <CardHeader>
-        <CardTitle className="text-base">{tr(title)}</CardTitle>
-        <CardDescription>{tr("Cycle-level intensity and exclusion diagnostics for the active sample.")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {loading ? <div className="text-sm text-stone-500">{tr("Loading cycle diagnostics...")}</div> : null}
-
-        {diagnostics ? (
-          <>
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-              {suggestionCards.map((item) => {
-                const blockedByLinearityCycleCount = item.linearity && hasTooFewLinearityCycles && item.value != null;
-                const canPick = typeof onPickDeltaValue === "function" && item.value != null && !blockedByLinearityCycleCount;
-                const displayValue = formatDeltaValue(item.value);
-                const valueElement = (
-                  <span
-                    className={cn(
-                      "inline-block",
-                      blockedByLinearityCycleCount ? "cursor-help text-stone-400" : "text-stone-900",
-                    )}
-                  >
-                    {tr(displayValue)}
-                  </span>
-                );
-                return (
-                  <button
-                    key={item.label}
-                    type="button"
-                    onClick={() => {
-                      if (canPick && item.value != null) {
-                        onPickDeltaValue(item.value, item.stdev ?? null);
-                      }
-                    }}
-                    disabled={item.value == null}
-                    aria-disabled={!canPick}
-                    className={cn(
-                      "rounded-lg border border-stone-200 p-3 text-left transition",
-                      canPick ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
-                      blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
-                    )}
-                  >
-                    <div className="text-xs uppercase tracking-normal text-stone-500">{tr(formatScientificText(item.label))}</div>
-                    <div className="mt-1 text-lg font-semibold">
-                      {blockedByLinearityCycleCount ? (
-                        <Tooltip label={tr("not enough cycles for linearity calculation")} align="start">
-                          {valueElement}
-                        </Tooltip>
-                      ) : (
-                        valueElement
-                      )}
-                    </div>
-                    {item.stdev != null ? (
-                      <div className="mt-1 text-xs text-stone-500">{tr("Std dev: ")}{tr(formatDeltaValue(item.stdev))}</div>
-                    ) : null}
-                  </button>
-                );
-              })}
-              <div className="rounded-lg border border-stone-200 p-3">
-                <div className="text-xs uppercase tracking-normal text-stone-500">{tr("Method")}</div>
-                <div className="mt-1 text-sm font-medium text-stone-900">{tr(asString(cycleMean.method) || "N/A")}</div>
-              </div>
-            </div>
-
-            {reason ? <div className="text-sm text-stone-500">{tr("Diagnostics note: ")}{tr(reason)}</div> : null}
-
-            <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
-              <PlotlyChart
-                figure={diagnosticsFigure}
-                className="mx-auto h-[clamp(320px,42vw,560px)] w-full max-w-[560px]"
-                fitContainer
-                deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-              />
-              <div className="min-w-0">
-                <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
-              </div>
-            </div>
-
-            {saturationFigureItems.length ? (
-              <>
-                <div className="flex flex-wrap items-end gap-4">
-                  <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label={tr("Chart color axis")} />
-                    <select
-                      value={saturationColorAxis}
-                      onChange={(event) => setSaturationColorAxis(event.target.value as SaturationColorAxisKey)}
-                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                    >
-                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {tr(option.label)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label={tr("Chart y axis")} />
-                    <select
-                      value={saturationYAxis}
-                      onChange={(event) => setSaturationYAxis(event.target.value as SaturationAxisKey)}
-                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                    >
-                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {tr(option.label)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-                <div className="grid items-start gap-3 xl:grid-cols-[minmax(0,1fr)_6rem]">
-                  <div className="grid gap-4 xl:grid-cols-2">
-                    {saturationFigureItems.map((item) => (
-                      <SaturationFigureCard
-                        key={item.key}
-                        chartKey={item.key}
-                        title={tr(item.title)}
-                        description={tr(item.description)}
-                        figure={item.figure}
-                        colorAxis={saturationColorAxis}
-                        yAxis={saturationYAxis}
-                        deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                      />
-                    ))}
-                  </div>
-                  <SaturationSharedColorbar
-                    figures={saturationFigureItems.map((item) => item.figure)}
-                    colorAxis={saturationColorAxis}
-                    orientation="vertical"
-                  />
-                </div>
-              </>
-            ) : null}
-          </>
-        ) : loading ? null : (
-          <div className="text-sm text-stone-500">{tr("Cycle diagnostics appear here once a point is selected.")}</div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
 function coerceIndexedObjectToArray(value: unknown): unknown[] | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -1439,11 +1194,12 @@ function parseDiagnosticsSelectedTargets(points: PlotlyPoint[]): StoredSelectedT
       continue;
     }
     seen.add(rowLabel);
+    const identifierOffset = ["d13C", "d18O", "cross", "crossplot"].includes(String(customdata?.[1])) ? 2 : 1;
     targets.push({
       rowLabel,
       isotopeKey: "cross",
-      identifier1: String(customdata?.[1] ?? customObj?.identifier_1 ?? customObj?.identifier1 ?? "").trim(),
-      identifier2: String(customdata?.[2] ?? customObj?.identifier_2 ?? customObj?.identifier2 ?? "").trim(),
+      identifier1: String(customdata?.[identifierOffset] ?? customObj?.identifier_1 ?? customObj?.identifier1 ?? "").trim(),
+      identifier2: String(customdata?.[identifierOffset + 1] ?? customObj?.identifier_2 ?? customObj?.identifier2 ?? "").trim(),
       currentValue: null,
       currentD13: null,
       currentD18: null,
@@ -1928,11 +1684,13 @@ function RangeSliderControl({
 
 function DiagnosticsPage() {
   const consultation = useMetrologyConsultation();
+  const stationFilters = useContext(MetrologyStationFilters);
   const tr = useTranslation();
   const sessionId = useToolsSession();
   const queryClient = useQueryClient();
   const [colorParam, setColorParam] = useState("1  Cycle Int  Samp  44");
   const [symbolSize, setSymbolSize] = useState(8);
+  const [pressureSignalCycle, setPressureSignalCycle] = useState<CycleSignalMode>("average");
   const [identifierFilter, setIdentifierFilter] = useState<string[]>([]);
   const [d13Range, setD13Range] = useState<[number, number] | null>(null);
   const [d18Range, setD18Range] = useState<[number, number] | null>(null);
@@ -1970,13 +1728,18 @@ function DiagnosticsPage() {
       identifierFilter.join("|"),
       appliedD13Range ? `${appliedD13Range[0]}:${appliedD13Range[1]}` : "",
       appliedD18Range ? `${appliedD18Range[0]}:${appliedD18Range[1]}` : "",
+      JSON.stringify(stationFilters?.ranges ?? {}),
+      Boolean(stationFilters),
     ],
     queryFn: () =>
       api.getDiagnostics(sessionId!, {
         color_param: colorParam,
         identifier_filter: identifierFilter,
-        d13_range: appliedD13Range,
-        d18_range: appliedD18Range,
+        d13_range: stationFilters ? stationFilters.ranges.d13_raw : appliedD13Range,
+        d18_range: stationFilters ? stationFilters.ranges.d18_raw : appliedD18Range,
+        signal_range: stationFilters?.ranges.signal,
+        leak_range: stationFilters?.ranges.leak_rate,
+        include_cycle_signals: Boolean(stationFilters),
       }),
     enabled: Boolean(sessionId),
     placeholderData: (previousData, previousQuery) =>
@@ -2089,7 +1852,7 @@ function DiagnosticsPage() {
   const diagnosticsFigure = data?.figures?.diagnostics as Record<string, unknown> | undefined;
   const diagnosticGridItems = useMemo(() => {
     const rawItems = Array.isArray(summary.diagnostic_grid) ? summary.diagnostic_grid : [];
-    return rawItems.flatMap((item) => {
+    const items = rawItems.flatMap((item) => {
       if (!item || typeof item !== "object") {
         return [];
       }
@@ -2101,7 +1864,20 @@ function DiagnosticsPage() {
       const group = asString((item as Record<string, unknown>).group).trim() || "Other diagnostics";
       return [{ key, group, title: asString((item as Record<string, unknown>).title), figure }];
     });
-  }, [data?.figures, summary.diagnostic_grid]);
+    if (stationFilters) {
+      // The isotope crossplot already exists in Multivariate Overview.
+      const spatial = calibrationWorkspaceQuery.data?.figures.calibration_3d;
+      if (spatial) items.push({key:"calibration_3d",group:"Multivariate Overview",title:"Calibration 3D Chart",figure:matchDiagnosticMarkerStyles(spatial, diagnosticsFigure)});
+      const cycleLabel = pressureSignalCycle === "first_valid" ? "First valid cycle" : pressureSignalCycle === "last_valid" ? "Last valid cycle" : "Average of valid cycles";
+      items.push(...(stationFilters.supplementaryFigures??[]).map(item=>({...item,group:"Multivariate Overview",figure:matchDiagnosticMarkerStyles(
+        item.key === "session-intensity-pressure"
+          ? withCycleSignalIntensity(item.figure, summary.cycle_signal_intensities, pressureSignalCycle, `I44 / V · ${tr(cycleLabel)}`)
+          : item.figure,
+        diagnosticsFigure,
+      )})));
+    }
+    return items;
+  }, [data?.figures, summary.diagnostic_grid, summary.cycle_signal_intensities, pressureSignalCycle, tr, calibrationWorkspaceQuery.data?.figures, stationFilters, diagnosticsFigure]);
   const colorScaleBounds = useMemo(() => deriveColorScaleBounds(diagnosticsFigure), [diagnosticsFigure]);
   const colorSliderBounds: ColorScaleBounds = colorScaleBounds ?? { min: 0, max: 1 };
   const effectiveColorScaleRange = normalizeColorScaleRange(
@@ -2136,18 +1912,7 @@ function DiagnosticsPage() {
       })),
     [diagnosticGridItems, diagnosticStatisticsPreview, effectiveColorScaleRange, linearityPreviewValues, symbolSize],
   );
-  const diagnosticGridGroups = useMemo(() => {
-    const groups: Array<{ name: string; items: typeof displayedDiagnosticGridItems }> = [];
-    for (const item of displayedDiagnosticGridItems) {
-      const currentGroup = groups[groups.length - 1];
-      if (!currentGroup || currentGroup.name !== item.group) {
-        groups.push({ name: item.group, items: [item] });
-      } else {
-        currentGroup.items.push(item);
-      }
-    }
-    return groups;
-  }, [displayedDiagnosticGridItems]);
+  const diagnosticGridGroups = useMemo(() => groupDiagnosticGridItems(displayedDiagnosticGridItems), [displayedDiagnosticGridItems]);
   const selectedLinearityIntensityCol = activeLinearity
     ? LINEARITY_INTENSITY_OPTIONS.includes(activeLinearity.intensity_col as (typeof LINEARITY_INTENSITY_OPTIONS)[number])
       ? activeLinearity.intensity_col
@@ -2657,7 +2422,7 @@ function DiagnosticsPage() {
       return;
     }
 
-    const targets = parseDiagnosticsSelectedTargets(payload.points);
+    const targets = parseDiagnosticsSelectedTargets(payload.points.filter(point => traceForPoint(point,sourceFigure)?.type !== "bar"));
     if (!targets.length) {
       clearHoverPreviewShowTimer();
       pendingHoverPreviewRef.current = null;
@@ -2707,7 +2472,7 @@ function DiagnosticsPage() {
     if (correlationPreviewMeta(points[0], sourceFigure)) {
       return;
     }
-    const targets = parseDiagnosticsSelectedTargets(points);
+    const targets = parseDiagnosticsSelectedTargets(points.filter(point => traceForPoint(point,sourceFigure)?.type !== "bar"));
     if (!targets.length) {
       return;
     }
@@ -2800,6 +2565,7 @@ function DiagnosticsPage() {
                 />
               </div>
 
+              {stationFilters?.controls}
               {!consultation && <>
               <div className="space-y-4">
                 <div className="form-section-title">{tr("Value Ranges")}</div>
@@ -3086,13 +2852,33 @@ function DiagnosticsPage() {
                           {group.items.map((item) => (
                             <div
                               key={item.key}
+                              data-chart-panel
                               className="min-w-0 self-start overflow-hidden rounded-lg border border-stone-200 bg-white"
                             >
+                              {item.key === "session-intensity-pressure" && (
+                                <header data-card-header className="analytical-panel-header">
+                                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                                    <h3>{tr(item.title)}</h3>
+                                    <label className="flex min-w-0 flex-wrap items-center gap-1 text-xs text-stone-600">
+                                      {tr("Signal cycle")}
+                                      <select
+                                        className="max-w-full rounded border border-stone-300 bg-white px-2 py-1 text-xs text-stone-800"
+                                        value={pressureSignalCycle}
+                                        onChange={event => setPressureSignalCycle(event.target.value as CycleSignalMode)}
+                                      >
+                                        <option value="first_valid">{tr("First valid cycle")}</option>
+                                        <option value="last_valid">{tr("Last valid cycle")}</option>
+                                        <option value="average">{tr("Average of valid cycles")}</option>
+                                      </select>
+                                    </label>
+                                  </div>
+                                </header>
+                              )}
                               <PlotlyChart
                                 figure={item.figure}
                                 className="h-full w-full"
                                 fitContainer
-                                uiRevision={`diagnostics:${sessionId}:grid:${item.key}`}
+                                uiRevision={`diagnostics:${sessionId}:grid:${item.key}${item.key === "session-intensity-pressure" ? `:${pressureSignalCycle}` : ""}`}
                                 onPointClick={(points) => handleDiagnosticsPointClick(points, item.figure)}
                                 onPointHover={(payload) => handleDiagnosticsPointHover(payload, item.figure)}
                                 onHoverEnd={scheduleHoverPreviewHide}
@@ -3113,9 +2899,12 @@ function DiagnosticsPage() {
       </div>
 
       {isSelectionEditorOpen ? (
-        <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={closeSelectionEditor}>
+        <div className="selection-editor-backdrop fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40" onClick={closeSelectionEditor}>
           <div
-            className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-label={tr("Selection Editor")}
+            className="selection-editor flex w-full flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
@@ -3127,7 +2916,7 @@ function DiagnosticsPage() {
                 <X className="h-4 w-4" />{tr("Close")}</Button>
             </div>
 
-            <div className="min-h-0 space-y-4 overflow-y-auto p-4">
+            <div className="selection-editor-body min-h-0 space-y-4 overflow-y-auto p-4">
               {selectionTarget ? (
                 <>
                   <div className="rounded-lg border border-stone-200 bg-stone-50/60 p-4">
@@ -3163,6 +2952,10 @@ function DiagnosticsPage() {
                     ) : null}
                   </div>
 
+                  <SelectionCycleDiagnostics d13={sampleD13DiagnosticsQuery.data} d18={sampleD18DiagnosticsQuery.data}
+                    loadingD13={sampleD13DiagnosticsQuery.isLoading} loadingD18={sampleD18DiagnosticsQuery.isLoading}
+                    onPick={(isotope, value, stdev) => { setSelectionEditorTab(isotope); setSingleValues(current => ({...current, [isotope]: roundDeltaValue(value)})); setSingleStdevs(current => ({...current, [isotope]: stdev})); }} />
+
                   <div className="inline-flex rounded-lg border border-stone-300 bg-white p-1 shadow-sm">
                     {ISOTOPE_KEYS.map((isotopeKey) => {
                       const isActive = selectionEditorTab === isotopeKey;
@@ -3185,6 +2978,7 @@ function DiagnosticsPage() {
                     })}
                   </div>
 
+                  <details className="selection-cycle-table"><summary>{tr("Isotope method details")}</summary>
                   <div className="space-y-2">
                     <div className="text-xs font-semibold uppercase tracking-normal text-stone-500">{tr("Details")}</div>
                     <div className="grid gap-3 md:grid-cols-2">
@@ -3205,6 +2999,7 @@ function DiagnosticsPage() {
                     </div>
                   </div>
 
+                  </details>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <label className="text-sm">
                       <span className="mb-1 block text-stone-700">{tr("Set value (")}{tr(formatScientificText(selectionEditorTab))})</span>
@@ -3253,15 +3048,7 @@ function DiagnosticsPage() {
                     >{tr("Clear")}</Button>
                   </div>
 
-                  <DiagnosticsPanel
-                    title={tr(`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`)}
-                    diagnostics={activeSelectionDiagnostics}
-                    loading={activeSelectionLoading}
-                    onPickDeltaValue={(value, stdev = null) => {
-                      setSingleValues((current) => ({ ...current, [selectionEditorTab]: roundDeltaValue(value) }));
-                      setSingleStdevs((current) => ({ ...current, [selectionEditorTab]: stdev }));
-                    }}
-                  />
+
                 </>
               ) : (
                 <div className="rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("No active selection.")}</div>
@@ -3274,12 +3061,12 @@ function DiagnosticsPage() {
         <div
           role="tooltip"
           className={cn(
-            "fixed z-[80] max-h-[calc(100vh-20px)] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]",
+            "fixed z-[80] flex flex-col max-h-[calc(100vh-20px)] overflow-y-auto rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]",
             hoverPreview.kind === "correlation"
               ? "w-[min(480px,calc(100vw-20px))]"
               : "w-[min(980px,calc(100vw-20px))]",
           )}
-          style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px` }}
+          style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px`, height:hoverPreview.kind==="cycle"?`min(480px,calc(100dvh - ${hoverPreviewPosition.top+10}px))`:undefined,maxHeight:`calc(100dvh - ${hoverPreviewPosition.top+10}px)` }}
           onPointerEnter={handleHoverPreviewPointerEnter}
           onPointerLeave={handleHoverPreviewPointerLeave}
         >
@@ -3318,14 +3105,14 @@ function DiagnosticsPage() {
                 </span>
               </div>
               <div className={cn(
-                "grid min-h-0 gap-3 md:items-stretch",
+                "grid flex-1 min-h-0 overflow-auto gap-3 md:items-stretch",
                 hoverPreviewPosition.tableSide === "left"
                   ? "md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)]"
                   : "md:grid-cols-[minmax(0,1fr)_minmax(240px,320px)]",
               )}>
                 <div
                   className={cn(
-                    "h-[390px] min-w-0",
+                    "h-full min-h-0 min-w-0 overflow-auto",
                     hoverPreviewPosition.tableSide === "left" ? "md:order-1" : "md:order-2",
                   )}
                 >
@@ -3333,14 +3120,14 @@ function DiagnosticsPage() {
                 </div>
                 <div
                   className={cn(
-                    "flex min-h-[390px] min-w-0 items-center",
+                    "flex min-h-full min-h-0 min-w-0 overflow-auto items-center",
                     hoverPreviewPosition.tableSide === "left" ? "md:order-2" : "md:order-1",
                   )}
                 >
                   {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
                     <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Loading hover preview...")}</div>
                   ) : hasHoverDiagnosticsFigureData ? (
-                    <PlotlyChart figure={hoverDiagnosticsFigure} className="w-full" />
+                    <PlotlyChart figure={hoverDiagnosticsFigure} fitContainer minHeight={200} verticallyResizable={false} className="h-full w-full" />
                   ) : (
                     <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Cycle-intensity preview unavailable for this point.")}</div>
                   )}

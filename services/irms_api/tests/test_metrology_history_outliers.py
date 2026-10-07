@@ -16,6 +16,20 @@ class HistoryOutlierTests(unittest.TestCase):
         self.assertEqual(len([f for f in flags if f["category"]=="failed"]),2)
         self.assertFalse(any(f["measurement_id"]=="sample" for f in flags))
 
+    def test_missing_metadata_does_not_hide_available_qc_measurements(self):
+        from services.irms_api.metrology.qc_screening import qc_review_flags
+        base = {"id": "qc", "run_id": "run", "role": "qc", "mass_ug": None, "pressure_mismatch_v": None,
+                "isotopes": {"d13c": {"value": -.7}, "d18o": {"value": -6}},
+                "issues": ["mass_ug missing or outside validated range", "pressure_mismatch_v missing or outside validated range"]}
+        flags = qc_review_flags([base])
+        self.assertEqual(len(flags), 2)
+        self.assertTrue(all(flag["metadata_only"] for flag in flags))
+        self.assertTrue(all(flag["reasons"] == base["issues"] for flag in flags))
+        actual_range = {**base, "i44_v": 90, "issues": [*base["issues"], "i44_v missing or outside validated range"]}
+        self.assertTrue(all(not flag["metadata_only"] for flag in qc_review_flags([actual_range])))
+        failed = {**base, "issues": [*base["issues"], "Qtegra reports an acquisition failure"]}
+        self.assertTrue(all(not flag["metadata_only"] for flag in qc_review_flags([failed]) if flag["category"] == "failed"))
+
     def test_individual_outlier_removed_from_statistics_but_not_points_or_flags(self):
         points = [{"id": str(i), "value": v} for i, v in enumerate([-.1, 0, .1, 9])]
         actual = control_summary(points, 0, .1, exclude_outliers=True)

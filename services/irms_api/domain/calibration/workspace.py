@@ -972,6 +972,12 @@ def build_calibration_workspace(
         use_diff_intensity=config.linearity.use_diff_intensity,
         selected_intensity_col=manual_override_intensity_col,
     )
+    standards_display_df = standards_adjusted_df
+    if config.fit_excluded_rows:
+        standards_adjusted_df = standards_adjusted_df.copy()
+        for isotope, column in (("d13C", "d 13C/12C  Mean"), ("d18O", "d 18O/16O  Mean")):
+            if column in standards_adjusted_df:
+                standards_adjusted_df.loc[standards_adjusted_df.index.astype(str).isin(config.fit_excluded_rows.get(isotope, [])), column] = np.nan
     standards_for_outliers_df = standards_adjusted_df
     outlier_reference_df = standards_adjusted_df
     if linearity_enabled and not standards_adjusted_df.empty and "Identifier 1" in standards_adjusted_df.columns:
@@ -1100,8 +1106,8 @@ def build_calibration_workspace(
     # display visibility. Keep the existing cleaned population for every fit.
     spatial_src = chart_src
     if metadata.get("metrology_link"):
-        selected_mask = standards_for_outliers_df["Identifier 1"].astype(str).isin({str(item) for item in selected_standards})
-        spatial_src = _apply_precision_date_range(standards_for_outliers_df.loc[selected_mask], config)
+        selected_mask = standards_display_df["Identifier 1"].astype(str).isin({str(item) for item in selected_standards})
+        spatial_src = _apply_precision_date_range(standards_display_df.loc[selected_mask], config)
     main_figures: dict[str, dict[str, Any]] = {}
     if include_figures and chart_src is not None and not chart_src.empty:
         calibration_figs = create_calibration_plots(standards_reference, chart_src, selected_standards, config.color_param)

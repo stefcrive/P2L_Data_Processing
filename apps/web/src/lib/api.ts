@@ -60,11 +60,14 @@ const API_BASE =
   ).replace(/\/+$/, "");
 
 type DiagnosticsParams = {
+  include_cycle_signals?: boolean;
   color_param?: string;
   z_axis?: string | null;
   identifier_filter?: string[];
   d13_range?: [number, number] | null;
   d18_range?: [number, number] | null;
+  signal_range?: [number, number] | null;
+  leak_range?: [number, number] | null;
 };
 
 type LinearityOptions = {
@@ -455,6 +458,7 @@ export const api = {
 
   getDiagnostics: (sessionId: string, options: DiagnosticsParams = {}) => {
     const params = new URLSearchParams();
+    if (options.include_cycle_signals) params.set("include_cycle_signals", "true");
     if (options.color_param) params.set("color_param", options.color_param);
     if (options.z_axis) params.set("z_axis", options.z_axis);
     for (const identifier of options.identifier_filter ?? []) {
@@ -467,6 +471,9 @@ export const api = {
     if (options.d18_range) {
       params.set("d18_min", String(options.d18_range[0]));
       params.set("d18_max", String(options.d18_range[1]));
+    }
+    for (const [key, range] of [["signal",options.signal_range],["leak",options.leak_range]] as const) {
+      if(range){params.set(`${key}_min`,String(range[0]));params.set(`${key}_max`,String(range[1]));}
     }
     return requestJson<ChartBundle>(`/sessions/${encodeURIComponent(sessionId)}/diagnostics`, undefined, params);
   },

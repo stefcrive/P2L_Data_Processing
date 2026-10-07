@@ -94,9 +94,9 @@ def normalize_processing_config(raw: dict[str, Any] | None) -> ProcessingWorkspa
             "show_statistical_outliers": bool(payload.pop("show_statistical_outliers", False)),
             "show_range_outliers": bool(payload.pop("show_range_outliers", False)),
             "show_manual_outliers": bool(payload.pop("show_manual_outliers", False)),
-            "show_saturated_collectors": bool(payload.pop("show_saturated_collectors", True)),
-            "show_saturated_samples": bool(payload.pop("show_saturated_samples", True)),
-            "show_failed_samples": bool(payload.pop("show_failed_samples", True)),
+            "show_saturated_collectors": bool(payload.pop("show_saturated_collectors", False)),
+            "show_saturated_samples": bool(payload.pop("show_saturated_samples", False)),
+            "show_failed_samples": bool(payload.pop("show_failed_samples", False)),
         }
     if "manual_linearity_override" not in payload:
         payload["manual_linearity_override"] = {

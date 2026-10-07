@@ -1,6 +1,9 @@
 "use client";
 
-import { qcOutlierDisplay } from "@/lib/qc-outlier-display";
+import { SelectionCycleDiagnostics } from "@/components/diagnostics/selection-cycle-diagnostics";
+
+import { filterStationFigure, fitVisibleMarkers, scopeColorRows, stationMarkerColors } from "@/lib/station-chart-filters";
+import { qcOutlierDisplay, partiallySaturatedOverlay } from "@/lib/qc-outlier-display";
 import { memo } from "react";
 
 import { useTranslation } from "@/components/layout/language-provider";
@@ -21,14 +24,7 @@ import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/compon
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import { RawAnalysisInfoTable } from "@/components/diagnostics/raw-analysis-info-table";
 import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
-import {
-  SATURATION_COLOR_AXIS_OPTIONS,
-  SaturationAxisHelpTooltip,
-  SaturationSharedColorbar,
-  SaturationFigureCard,
-  type SaturationAxisKey,
-  type SaturationColorAxisKey,
-} from "@/components/diagnostics/saturation-figure-card";
+
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -50,7 +46,7 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { formatScientificText } from "@/lib/scientific-notation";
-import { MetrologyChartWorkspace, MetrologyChartAppearance, useMetrologyConsultation } from "@/components/metrology/consultation-context";
+import { MetrologyStationFilters, MetrologyChartWorkspace, MetrologyChartAppearance, useMetrologyConsultation } from "@/components/metrology/consultation-context";
 import { useToolsSession } from "@/components/metrology/consultation-context";
 
 type SelectedTarget = {
@@ -2571,240 +2567,6 @@ function diagnosticsTargetPayload(target: SelectedTarget, isotopeKey?: "d13C" | 
   };
 }
 
-function DiagnosticsPanel({
-  title,
-  diagnostics,
-  loading,
-  onPickDeltaValue,
-}: {
-  title: string;
-  diagnostics?: CycleDiagnosticsPayload;
-  loading: boolean;
-  onPickDeltaValue?: (value: number, stdev?: number | null) => void;
-}) {
-  const tr = useTranslation();
-  const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
-  const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
-  const cycleMean = diagnostics?.cycle_mean ?? {};
-  const validMean = asNumber(cycleMean.valid_mean);
-  const validStdDev = asNumber(cycleMean.valid_std_dev);
-  const validCycleCount = asNumber(cycleMean.valid_cycles);
-  const hasTooFewLinearityCycles = validCycleCount != null && validCycleCount < 4;
-  const firstValidCycle = asNumber(cycleMean.selected_value) ?? asNumber(cycleMean.mean);
-  const lastValidCycle = asNumber(cycleMean.last_valid_value);
-  const referenceGasCorrection = asNumber(cycleMean.saturation_reference_gas_value);
-  const firstCycleCorrection = asNumber(cycleMean.saturation_first_cycle_value);
-  const saturationCorrection =
-    diagnostics?.saturation_correction && typeof diagnostics.saturation_correction === "object"
-      ? (diagnostics.saturation_correction as Record<string, unknown>)
-      : {};
-  const cycleLinearityValue = (key: string) => {
-    const payload = saturationCorrection[key];
-    return payload && typeof payload === "object" ? asNumber((payload as Record<string, unknown>).value) : null;
-  };
-  const cycleLinearityStd = (key: string) => {
-    const payload = saturationCorrection[key];
-    return payload && typeof payload === "object" ? asNumber((payload as Record<string, unknown>).std_dev) : null;
-  };
-  const reason = asString(cycleMean.reason);
-  const diagnosticsFigure = ensureCollectorIntensityTraces(diagnostics?.figure, diagnostics?.table ?? []);
-  const saturationFiguresRaw =
-    Object.keys(saturationCorrection).length
-      ? (saturationCorrection.figures as Record<string, unknown> | undefined)
-      : undefined;
-  const targetIsotopeKey = asString((diagnostics?.target ?? {})["isotope_key"]);
-  const defaultSaturationYAxis: SaturationAxisKey = targetIsotopeKey === "d18O" ? "d18O" : "d13C";
-  useEffect(() => {
-    setSaturationYAxis(defaultSaturationYAxis);
-  }, [defaultSaturationYAxis]);
-  const saturationMethodDescriptions: Record<string, string> = {
-    reference_gas_intensity:
-      "Fits isotope value versus the reference-gas intensity from valid cycles, then predicts the value at the saturated cycle's reference intensity. Points are colored by cycle number.",
-    first_cycle:
-      "Fits a quadratic curve of isotope value versus cycle number from valid cycles, then predicts where the curve becomes horizontal.",
-    cycle_relative_mismatch:
-      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / Ref44, then predicts where that curve becomes horizontal.",
-    cycle_symmetric_mismatch:
-      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / ((Samp44 + Ref44) / 2), then predicts where that curve becomes horizontal.",
-    cycle_mean_intensity:
-      "Fits a quadratic curve of isotope value versus mean intensity, (Samp44 + Ref44) / 2, then predicts where that curve becomes horizontal.",
-    cycle_intensity_weighted_mismatch:
-      "Fits a quadratic curve of isotope value versus the cycle-level weighted mismatch term, then predicts where that curve becomes horizontal.",
-    cycle_two_term_mean_mismatch:
-      "Fits isotope value with two predictors: mean intensity and symmetric mismatch. The green line connects the model-fitted values for the valid cycles using each cycle's own mismatch; dot color also shows mismatch.",
-    cycle_plateau:
-      "Measures the signed cycle-to-cycle isotope change in the latest valid cycles, fits isotope value versus that change rate, then predicts the asymptote where the change rate reaches zero. The highlighted circles are the cycles used.",
-  };
-  const saturationFigureItems = [
-    ["reference_gas_intensity", "Reference-gas saturation correction"],
-    ["first_cycle", "Stabilized-cycle correction"],
-    ["cycle_relative_mismatch", "Cycle relative mismatch correction"],
-    ["cycle_symmetric_mismatch", "Cycle symmetric mismatch correction"],
-    ["cycle_mean_intensity", "Cycle mean intensity correction"],
-    ["cycle_intensity_weighted_mismatch", "Cycle intensity-weighted mismatch correction"],
-    ["cycle_two_term_mean_mismatch", "Cycle two-term mean + mismatch correction"],
-    ["cycle_plateau", "Cycle late-plateau correction"],
-  ]
-    .map(([key, itemTitle]) => ({
-      key,
-      title: itemTitle,
-      description: saturationMethodDescriptions[key],
-      figure:
-        saturationFiguresRaw?.[key] && typeof saturationFiguresRaw[key] === "object"
-          ? (saturationFiguresRaw[key] as Record<string, unknown>)
-          : undefined,
-    }))
-    .filter((item) => item.figure);
-  const suggestionCards = [
-    { label: "Cycle Mean", value: validMean, stdev: validStdDev, linearity: false },
-    { label: "First valid cycle", value: firstValidCycle, stdev: null, linearity: false },
-    { label: "Last valid cycle", value: lastValidCycle, stdev: null, linearity: false },
-    { label: "Lin. corr. to ref gas int", value: referenceGasCorrection, stdev: null, linearity: true },
-    { label: "Lin. corr. to first cycle", value: firstCycleCorrection, stdev: null, linearity: true },
-    { label: "Cycle relative mismatch", value: cycleLinearityValue("cycle_relative_mismatch"), stdev: null, linearity: true },
-    { label: "Cycle symmetric mismatch", value: cycleLinearityValue("cycle_symmetric_mismatch"), stdev: null, linearity: true },
-    { label: "Cycle mean intensity", value: cycleLinearityValue("cycle_mean_intensity"), stdev: null, linearity: true },
-    { label: "Cycle weighted mismatch", value: cycleLinearityValue("cycle_intensity_weighted_mismatch"), stdev: null, linearity: true },
-    { label: "Cycle two-term model", value: cycleLinearityValue("cycle_two_term_mean_mismatch"), stdev: null, linearity: true },
-    { label: "Cycle plateau", value: cycleLinearityValue("cycle_plateau"), stdev: cycleLinearityStd("cycle_plateau"), linearity: false },
-  ];
-
-  return (
-    <Card className="border-stone-300">
-      <CardHeader>
-        <CardTitle className="text-base">{tr(title)}</CardTitle>
-        <CardDescription>{tr("Cycle-level intensity and exclusion diagnostics for the active sample.")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {loading ? <div className="text-sm text-stone-500">{tr("Loading cycle diagnostics...")}</div> : null}
-
-        {diagnostics ? (
-          <>
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-              {suggestionCards.map((item) => {
-                const blockedByLinearityCycleCount = item.linearity && hasTooFewLinearityCycles && item.value != null;
-                const canPick = typeof onPickDeltaValue === "function" && item.value != null && !blockedByLinearityCycleCount;
-                const displayValue = formatDeltaValue(item.value);
-                const valueElement = (
-                  <span
-                    className={cn(
-                      "inline-block",
-                      blockedByLinearityCycleCount ? "cursor-help text-stone-400" : "text-stone-900",
-                    )}
-                  >
-                    {tr(displayValue)}
-                  </span>
-                );
-                return (
-                  <button
-                    key={item.label}
-                    type="button"
-                    onClick={() => {
-                      if (canPick && item.value != null) {
-                        onPickDeltaValue(item.value, item.stdev ?? null);
-                      }
-                    }}
-                    disabled={item.value == null}
-                    aria-disabled={!canPick}
-                    className={cn(
-                      "rounded-lg border border-stone-200 p-3 text-left transition",
-                      canPick ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
-                      blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
-                    )}
-                  >
-                    <div className="text-xs uppercase tracking-normal text-stone-500">{tr(formatScientificText(item.label))}</div>
-                    <div className="mt-1 text-lg font-semibold">
-                      {blockedByLinearityCycleCount ? (
-                        <Tooltip label={tr("not enough cycles for linearity calculation")} align="start">
-                          {valueElement}
-                        </Tooltip>
-                      ) : (
-                        valueElement
-                      )}
-                    </div>
-                    {item.stdev != null ? (
-                      <div className="mt-1 text-xs text-stone-500">{tr("Std dev: ")}{tr(formatDeltaValue(item.stdev))}</div>
-                    ) : null}
-                  </button>
-                );
-              })}
-              <div className="rounded-lg border border-stone-200 p-3">
-                <div className="text-xs uppercase tracking-normal text-stone-500">{tr("Method")}</div>
-                <div className="mt-1 text-sm font-medium text-stone-900">{tr(asString(cycleMean.method) || "N/A")}</div>
-              </div>
-            </div>
-
-            {reason ? <div className="text-sm text-stone-500">{tr("Diagnostics note: ")}{tr(reason)}</div> : null}
-
-            <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
-              <PlotlyChart
-                figure={ensureFigureUiRevision(diagnosticsFigure, "calibration:selection-cycle")}
-                className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
-                deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-              />
-              <div className="min-w-0">
-                <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
-              </div>
-            </div>
-
-            {saturationFigureItems.length ? (
-              <>
-                <div className="flex flex-wrap items-end gap-4">
-                  <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label={tr("Chart color axis")} />
-                    <select
-                      value={saturationColorAxis}
-                      onChange={(event) => setSaturationColorAxis(event.target.value as SaturationColorAxisKey)}
-                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                    >
-                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {tr(option.label)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label={tr("Chart y axis")} />
-                    <select
-                      value={saturationYAxis}
-                      onChange={(event) => setSaturationYAxis(event.target.value as SaturationAxisKey)}
-                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                    >
-                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {tr(option.label)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <SaturationSharedColorbar figures={saturationFigureItems.map((item) => item.figure)} colorAxis={saturationColorAxis} />
-                </div>
-                <div className="grid gap-4 xl:grid-cols-2">
-                  {saturationFigureItems.map((item) => (
-                    <SaturationFigureCard
-                      key={item.key}
-                      chartKey={item.key}
-                      title={tr(item.title)}
-                      description={tr(item.description)}
-                      figure={item.figure}
-                      colorAxis={saturationColorAxis}
-                      yAxis={saturationYAxis}
-                      deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                    />
-                  ))}
-                </div>
-              </>
-            ) : null}
-          </>
-        ) : loading ? null : (
-          <div className="text-sm text-stone-500">{tr("Cycle diagnostics appear here once a point is selected.")}</div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
 function formatMetric(value?: number | null, digits = 3) {
   if (typeof value !== "number" || Number.isNaN(value)) {
     return "N/A";
@@ -3017,6 +2779,7 @@ function PrecisionCard({ summary, linearityEnabled }: { summary: CalibrationPrec
 
 function CalibrationPage() {
   const station = useContext(MetrologyChartWorkspace);
+  const stationFilters = useContext(MetrologyStationFilters);
   const consultation = useMetrologyConsultation();
   const tr = useTranslation();
   const sessionId = useToolsSession();
@@ -3183,15 +2946,15 @@ function CalibrationPage() {
   });
 
   const crossD13DiagnosticsQuery = useQuery({
-    queryKey: ["processing-diagnostics-cross-d13", sessionId, activeCrossTarget?.rowLabel],
-    queryFn: () => api.getProcessingCycleDiagnostics(sessionId!, diagnosticsTargetPayload(activeCrossTarget!, "d13C")),
-    enabled: Boolean(sessionId && activeCrossTarget),
+    queryKey: ["processing-diagnostics-cross-d13", sessionId, activeTarget?.rowLabel],
+    queryFn: () => api.getProcessingCycleDiagnostics(sessionId!, diagnosticsTargetPayload(activeTarget!, "d13C")),
+    enabled: Boolean(sessionId && activeTarget),
   });
 
   const crossD18DiagnosticsQuery = useQuery({
-    queryKey: ["processing-diagnostics-cross-d18", sessionId, activeCrossTarget?.rowLabel],
-    queryFn: () => api.getProcessingCycleDiagnostics(sessionId!, diagnosticsTargetPayload(activeCrossTarget!, "d18O")),
-    enabled: Boolean(sessionId && activeCrossTarget),
+    queryKey: ["processing-diagnostics-cross-d18", sessionId, activeTarget?.rowLabel],
+    queryFn: () => api.getProcessingCycleDiagnostics(sessionId!, diagnosticsTargetPayload(activeTarget!, "d18O")),
+    enabled: Boolean(sessionId && activeTarget),
   });
 
   const hoverDiagnosticsQuery = useQuery({
@@ -3361,7 +3124,8 @@ function CalibrationPage() {
 
   const persistedWorkspace = workspaceQuery.data as CalibrationWorkspace | undefined;
   const baseDraftConfig = config ?? persistedWorkspace?.config ?? null;
-  const activeDraftConfig = useMemo(() => baseDraftConfig && station ? {...baseDraftConfig,selected_standards:station.materialLabels?.length?station.materialLabels:baseDraftConfig.selected_standards,carbonate_material:(station.carbonateMaterial??"calcite") as CalibrationConfig["carbonate_material"],calibration_type:(station.outliers?.method==="iqr"?"IQR":"Z-Score") as CalibrationConfig["calibration_type"],sigma_level:station.outliers?.threshold??3,iqr_multiplier:station.outliers?.threshold??1.5} : baseDraftConfig, [baseDraftConfig,station?.carbonateMaterial,station?.materialLabels?.join("|"),station?.outliers?.method,station?.outliers?.threshold]);
+  const stationFitExclusionKey=JSON.stringify(Object.fromEntries(["d13C","d18O"].map(isotope=>[isotope,[...new Set((stationFilters?.flags??[]).filter(flag=>flag.isotope===isotope&&flag.row&&flag.excludeFromFit!==false).map(flag=>flag.row))].sort()])));
+  const activeDraftConfig = useMemo(() => baseDraftConfig && station ? {...baseDraftConfig,fit_excluded_rows:JSON.parse(stationFitExclusionKey),selected_standards:station.materialLabels?.length?station.materialLabels:baseDraftConfig.selected_standards,carbonate_material:(station.carbonateMaterial??"calcite") as CalibrationConfig["carbonate_material"],calibration_type:(station.outliers?.method==="iqr"?"IQR":"Z-Score") as CalibrationConfig["calibration_type"],sigma_level:station.outliers?.threshold??3,iqr_multiplier:station.outliers?.threshold??1.5} : baseDraftConfig, [baseDraftConfig,station?.carbonateMaterial,station?.materialLabels?.join("|"),station?.outliers?.method,station?.outliers?.threshold,stationFitExclusionKey]);
   const activeDraftConfigSignature = activeDraftConfig ? JSON.stringify(activeDraftConfig) : "";
   const persistedConfigSignature = persistedWorkspace?.config ? JSON.stringify(persistedWorkspace.config) : "";
   const hasDraftConfigChanges = Boolean(
@@ -3384,11 +3148,28 @@ function CalibrationPage() {
     enabled: Boolean(sessionId),
     staleTime: 60_000,
   });
+  const stationPreviewRows = useMemo<CalibrationPreviewRowState[]>(() =>
+    scopeColorRows(linearityPreviewDataQuery.data?.rows ?? [],station?.colorRowLabels).map(row => ({
+      rowLabel: String(row.row_label), identifier1: String(row.identifier1 ?? ""),
+      identifier2: String(row.identifier2 ?? ""), species: String(row.species ?? row.identifier1 ?? ""),
+      line: finiteNumber(row.line), d13: finiteNumber(row.d13_raw), d18: finiteNumber(row.d18_raw),
+      attributes: row.attributes ?? {}, intensities: row.intensities ?? {},
+    })), [linearityPreviewDataQuery.data,station?.colorRowLabels]);
+  const partiallySaturatedRows = useMemo(() => new Set(
+    (linearityPreviewDataQuery.data?.rows ?? []).filter(row => isPartiallySaturatedCollectorStatus(row.collector_status)).map(row => String(row.row_label)),
+  ), [linearityPreviewDataQuery.data]);
   const calibrationPreviewMasks = useMemo(() => {
     const masks=buildCalibrationPreviewMasks(linearityPreviewDataQuery.data, activeDraftConfig);
     // The station uses persisted final QC flags, never the legacy raw-value filter.
-    return station&&masks?{...masks,baseD13:masks.selectedRows,baseD18:masks.selectedRows,baseCross:masks.selectedRows}:masks;
-  },[activeDraftConfig,linearityPreviewDataQuery.data,Boolean(station)]);
+    return station&&masks?{...masks,baseD13:masks.selectedRows,baseD18:masks.selectedRows,baseCross:masks.selectedRows,color:buildCalibrationPreviewColorState(stationPreviewRows,activeDraftConfig?.color_param??"")}:masks;
+  },[activeDraftConfig,linearityPreviewDataQuery.data,Boolean(station),stationPreviewRows]);
+  const stationScaleColor = useMemo(()=>{
+    const color=calibrationPreviewMasks?.color;
+    if(!station||!color)return null;
+    if(!station.colorScaleRowLabels)return color;
+    const labels=new Set(station.colorScaleRowLabels);
+    return {...color,valuesByRow:new Map([...color.valuesByRow].filter(([label])=>labels.has(label)))};
+  },[station?.colorScaleRowLabels,calibrationPreviewMasks?.color,Boolean(station)]);
   const activeColorParam = activeDraftConfig?.color_param ?? persistedWorkspace?.config.color_param ?? null;
   const colorCompatiblePreviewWorkspace =
     calibrationPreviewWorkspaceQuery.data &&
@@ -3408,15 +3189,16 @@ function CalibrationPage() {
     return [];
   }, [activeColorParam, activeDraftConfig, calibrationPreviewMasks, colorCompatiblePreviewWorkspace, persistedWorkspace]);
   const colorScaleBounds = useMemo(
-    () => deriveColorScaleBounds(colorScaleFigures) ?? deriveColorScaleBoundsFromState(calibrationPreviewMasks?.color),
-    [calibrationPreviewMasks?.color, colorScaleFigures],
+    () => (station ? deriveColorScaleBoundsFromState(stationScaleColor??calibrationPreviewMasks?.color) : null) ?? deriveColorScaleBounds(colorScaleFigures) ?? deriveColorScaleBoundsFromState(calibrationPreviewMasks?.color),
+    [calibrationPreviewMasks?.color,stationScaleColor, colorScaleFigures, Boolean(station)],
   );
   const colorScaleTwoSigmaRange = useMemo(() => {
     if (!colorScaleBounds) {
       return null;
     }
+    if(station)return [colorScaleBounds.min,colorScaleBounds.max] as [number,number];
     return deriveTwoSigmaColorScaleRange(colorScaleFigures, colorScaleBounds);
-  }, [colorScaleBounds, colorScaleFigures]);
+  }, [colorScaleBounds, colorScaleFigures, Boolean(station)]);
 
   useEffect(() => {
     if (!activeColorParam || !colorScaleBounds) {
@@ -3425,7 +3207,8 @@ function CalibrationPage() {
     const bounds = colorScaleBounds;
     const fullRange: [number, number] = [bounds.min, bounds.max];
     const defaultRange = colorScaleTwoSigmaRange ?? fullRange;
-    const parameterChanged = colorScaleRangeParam !== activeColorParam;
+    const colorScope=station?.colorRowLabels?.join("|")??"all";
+    const parameterChanged = colorScaleRangeParam !== `${activeColorParam}:${colorScope}`;
     setColorScaleRange((current) => {
       if (!current || parameterChanged) {
         return defaultRange;
@@ -3441,9 +3224,9 @@ function CalibrationPage() {
       return normalized;
     });
     if (parameterChanged) {
-      setColorScaleRangeParam(activeColorParam);
+      setColorScaleRangeParam(`${activeColorParam}:${colorScope}`);
     }
-  }, [activeColorParam, colorScaleBounds, colorScaleRangeParam, colorScaleTwoSigmaRange]);
+  }, [activeColorParam, colorScaleBounds, colorScaleRangeParam, colorScaleTwoSigmaRange,station?.colorRowLabels]);
 
   const runMutation = useMutation({
     mutationFn: (payload: CalibrationConfig) => api.runCalibration(sessionId!, payload, setCalibrationJob),
@@ -3780,6 +3563,8 @@ function CalibrationPage() {
   }
 
   function chartHoverProps(chartKey: string) {
+    // In the calibration station, only residual-effect names open hover previews.
+    if (station) return {};
     return {
       onPointHover: (payload: PlotlyHoverPayload) => handleChartPointHover(chartKey, payload),
       onHoverEnd: scheduleHoverPreviewHide,
@@ -4224,7 +4009,7 @@ function CalibrationPage() {
       ((hoverDiagnosticsFigure as FigureShape).data as Array<Record<string, unknown>>).length > 0,
   );
   const shouldShowHoverPreview =
-    Boolean(hoverPreview) &&
+    !station && Boolean(hoverPreview) &&
     !isSelectionEditorOpen &&
     !isOfficialValuesModalOpen &&
     hoverPreviewPosition != null;
@@ -4581,10 +4366,8 @@ function CalibrationPage() {
   const stationAppearance = (figure: Record<string, unknown>): Record<string, unknown> => {
     const colorState = calibrationPreviewMasks?.color;
     const data = (Array.isArray(figure.data) ? figure.data : []).map((trace: Record<string, unknown>) => {
-      if (!Array.isArray(trace.customdata) || !String(trace.mode ?? "").includes("markers")) return trace;
-      const values = trace.customdata.map((point: unknown) => Array.isArray(point) ? colorState?.valuesByRow.get(String(point[0])) ?? null : null);
-      const marker = trace.marker as Record<string,unknown> ?? {};
-      return qcOutlierDisplay({...trace, marker: {...marker,...(values.some(value=>value!=null)?{color:values,coloraxis:"coloraxis"}:{})}},station?.outliers?.rows??[]);
+      if (!Array.isArray(trace.customdata) || !String(trace.mode ?? "").includes("markers")) return {...trace};
+      return qcOutlierDisplay(stationMarkerColors(trace,colorState?.valuesByRow,effectiveColorScaleRange),station?.outliers?.rows??[]);
     });
     // Scalar legend markers make before/after readable with per-point colors and symbols.
     const stageLegends=new Map<string,Record<string,unknown>>();
@@ -4596,17 +4379,26 @@ function CalibrationPage() {
       if(!String(trace.mode).includes("markers"))continue;
       const symbols=(trace.marker as {symbol?:unknown})?.symbol;
       const uniqueSymbols=new Set(Array.isArray(symbols)?symbols:[symbols]);
-      const legendSymbol=uniqueSymbols.size===1?[...uniqueSymbols][0]:stage==="before"?"x-thin":stage==="preview"?"diamond":"circle";
-      if(!stageLegends.has(group))stageLegends.set(group,{type:trace.type??"scatter",mode:"markers",name:trace.name,legendgroup:group,x:[null],y:[null],...(trace.type==="scatter3d"?{z:[null]}:{}),marker:{size:stage==="before"?9:7,symbol:legendSymbol,color:"#475569",opacity:stage==="before"?.72:.94},hoverinfo:"skip",showlegend:true});
+      const legendSymbol=uniqueSymbols.size===1?[...uniqueSymbols][0]:stage==="before"?"circle-open":stage==="preview"?"diamond":"circle";
+      const traceMarker=trace.marker as Record<string,unknown>??{};
+      const legendColor=stage==="before"?"#c4c4c4":Array.isArray(traceMarker.color)?traceMarker.color.find(value=>value!=null)??"#475569":traceMarker.color??"#475569";
+      if(!stageLegends.has(group))stageLegends.set(group,{type:trace.type??"scatter",mode:"markers",name:trace.name,legendgroup:group,x:[null],y:[null],...(trace.type==="scatter3d"?{z:[null]}:{}),marker:{size:stage==="before"?11:7,symbol:legendSymbol,color:legendColor,...(stage!=="before"&&traceMarker.coloraxis?{coloraxis:traceMarker.coloraxis}:{}),opacity:stage==="before"?.9:.94,line:{width:stage==="before"?1.8:.7}},hoverinfo:"skip",showlegend:true});
     }
-    data.push(...stageLegends.values());
+    const partialOverlays = data.map(trace => partiallySaturatedOverlay(trace, partiallySaturatedRows)).filter((trace): trace is Record<string, unknown> => trace != null);
+    data.push(...partialOverlays, ...stageLegends.values());
     const layout = {...(figure.layout as Record<string,unknown> ?? {})};
     layout.title = {...(typeof layout.title==="object"?layout.title as object:{text:layout.title??""}),font:{size:13},x:.02,xanchor:"left"};
     layout.font = {family:"Segoe UI, sans-serif",size:12,color:"#475569"};
     layout.coloraxis = {...(layout.coloraxis as object ?? {}), ...colorAxisLayout(colorState ?? null), cmin:effectiveColorScaleRange[0], cmax:effectiveColorScaleRange[1], showscale:false};
     const scene = layout.scene as Record<string,unknown> | undefined;
     if (scene) layout.scene = {...scene, bgcolor:"transparent", ...Object.fromEntries(["xaxis","yaxis","zaxis"].map(key=>[key,{...(scene[key] as object??{}),gridcolor:"#e8edf1",zerolinecolor:"#a7b6bf",showbackground:false}]))};
-    return {...figure, data, layout};
+    const result:Record<string,unknown>=filterStationFigure({...figure,data,layout},stationFilters?.flags??[]);
+    const markerTraces=(Array.isArray(result.data)?result.data:[]).filter((trace:Record<string,unknown>)=>Array.isArray(trace.customdata)&&String(trace.mode).includes("markers"));
+    if(markerTraces.length&&markerTraces.every((trace:Record<string,unknown>)=>!coerceVector(trace.y)?.some(value=>value!=null))) {
+      const resultLayout=result.layout as Record<string,unknown>;
+      resultLayout.annotations=[...(Array.isArray(resultLayout.annotations)?resultLayout.annotations:[]),{text:tr("All observations are hidden by filters. Enable outlier categories or reset range filters.").replace(". ",".<br>"),xref:"paper",yref:"paper",x:.5,y:1.08,showarrow:false,font:{size:12,color:"#64748b"}}];
+    }
+    return station?.outliers?.rows.some(flag=>flag.hidden)?fitVisibleMarkers(result):result;
   };
   return (
     <div className="space-y-5">
@@ -4837,13 +4629,13 @@ function CalibrationPage() {
       ) : null}
 
       {isSelectionEditorOpen ? (
-        <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={closeSelectionEditor}>
+        <div className="selection-editor-backdrop fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40" onClick={closeSelectionEditor}>
           <div
             ref={selectionDialogRef}
             role="dialog"
             aria-modal="true"
             aria-label={tr("Selection Editor")}
-            className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
+            className="selection-editor flex w-full flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
@@ -4863,28 +4655,12 @@ function CalibrationPage() {
               >
                 <X className="h-4 w-4" />{tr("Close")}</Button>
             </div>
-            <div className="min-h-0 space-y-4 overflow-y-auto p-4">
-              {selectionSourceChart?.figure ? (
-                <Card className="border-stone-300">
-                  <CardHeader>
-                    <CardTitle className="text-base">{tr("Selection Source Chart")}</CardTitle>
-                    <CardDescription>
-                      {tr(selectionSourceChart.title)} {tr(selectionSourceChart.description)}
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent className="min-w-0 overflow-hidden">
-                    <PlotlyChart
-                      figure={selectionSourceChart.figure}
-                      className="pointer-events-none h-[360px] w-full"
-                      fitContainer
-                      deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                    />
-                  </CardContent>
-                </Card>
-              ) : null}
+            <div className="selection-editor-body min-h-0 space-y-4 overflow-y-auto p-4">
+
 
               {selectedTargets.length ? (
                 <>
+                  <div className="selection-summary-grid">
                   <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/50 p-4">
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="space-y-1">
@@ -4942,8 +4718,20 @@ function CalibrationPage() {
                       ))}
                     </div>
                   </div>
+                  {station?.review(selectedTargets.map(target => target.rowLabel), "summary")}
+                  </div>
 
-                  {station?.review(selectedTargets.map(target => target.rowLabel))}
+                  <SelectionCycleDiagnostics d13={crossD13DiagnosticsQuery.data} d18={crossD18DiagnosticsQuery.data}
+                    loadingD13={crossD13DiagnosticsQuery.isLoading} loadingD18={crossD18DiagnosticsQuery.isLoading}
+                    pickableIsotope={activeIsotopeTarget?.isotopeKey as "d13C" | "d18O" | undefined}
+                    onPick={(isotope, value, stdev) => {
+                      if (activeCrossTarget) { if (isotope === "d13C") setCrossD13Value(roundDeltaValue(value)); else setCrossD18Value(roundDeltaValue(value)); }
+                      else setSingleValueFromSuggestion(value, stdev);
+                    }}/>
+                  {selectionSourceChart?.figure ? <details className="selection-cycle-table"><summary>{tr("Selection Source Chart")}</summary>
+                    <div data-chart-panel><PlotlyChart figure={selectionSourceChart.figure} initialHeight={280} minHeight={240}/></div>
+                  </details> : null}
+                  {station?.review(selectedTargets.map(target => target.rowLabel), "details")}
                   {activeIsotopeTarget ? (
                     <div className="space-y-4">
                       {!consultation && <>
@@ -4990,12 +4778,7 @@ function CalibrationPage() {
                         <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>{tr("Force keep")}</Button>
                       </div>
                       </>}
-                      <DiagnosticsPanel
-                        title={tr(`${activeIsotopeTarget.isotopeKey} cycle diagnostics`)}
-                        diagnostics={singleDiagnosticsQuery.data}
-                        loading={singleDiagnosticsQuery.isLoading}
-                        onPickDeltaValue={setSingleValueFromSuggestion}
-                      />
+
                     </div>
                   ) : null}
 
@@ -5065,11 +4848,7 @@ function CalibrationPage() {
                           </div>
                         </div>
                       </div>
-                      <DiagnosticsPanel
-                        title={tr("Crossplot cycle diagnostics, shared intensity chart and table, δ¹⁸O")}
-                        diagnostics={crossSharedDiagnostics}
-                        loading={crossSharedDiagnosticsLoading}
-                      />
+
                     </div>
                   ) : null}
 
@@ -5425,7 +5204,7 @@ function CalibrationPage() {
                 </div>
               </div>}
 
-              <div className="grid gap-6 xl:grid-cols-2">
+              {!station && <div className="grid gap-6 xl:grid-cols-2">
                 <Card className="flex min-w-0 flex-col overflow-hidden">
                   <CardHeader>
                     <CardTitle>{tr("Calibration 3D Chart")}</CardTitle>
@@ -5462,7 +5241,7 @@ function CalibrationPage() {
                   </CardContent>
                 </Card>
                 </div>
-              </div>
+              </div>}
 
               {!station && <>
               <Card className="overflow-hidden">
@@ -5614,12 +5393,12 @@ function CalibrationPage() {
       {shouldShowHoverPreview && hoverPreview && hoverPreviewPosition ? (
         <div
           role="tooltip"
-          className="fixed z-[80] flex max-h-[calc(100vh-20px)] w-[min(1120px,calc(100vw-20px))] flex-col overflow-hidden rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
-          style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px`, height: "min(620px, calc(100vh - 20px))" }}
+          className="sample-hover-preview fixed z-[80] flex max-h-[calc(100vh-20px)] w-[min(1120px,calc(100vw-20px))] flex-col overflow-hidden rounded-lg border border-stone-300 bg-white/95 p-3 shadow-2xl backdrop-blur-[1px]"
+          style={{ left: `${hoverPreviewPosition.left}px`, top: `${hoverPreviewPosition.top}px`, height: `min(480px, calc(100dvh - ${hoverPreviewPosition.top+10}px))` }}
           onMouseEnter={clearHoverPreviewHideTimer}
           onMouseLeave={scheduleHoverPreviewHide}
         >
-          <div className="mb-2 flex items-center justify-between gap-2 text-xs text-stone-600">
+          <div className="mb-2 flex shrink-0 items-center justify-between gap-2 text-xs text-stone-600">
             <span className="font-medium text-stone-800">
               {tr(hoverPreview.target.identifier1 || "Sample")} | {tr(hoverPreview.target.identifier2 || "N/A")}
             </span>
@@ -5627,8 +5406,8 @@ function CalibrationPage() {
               {tr(hoverPreview.target.isotopeKey)}
             </span>
           </div>
-          <div className="grid min-h-0 flex-1 gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:items-stretch">
-            <div className="h-full min-w-0">
+          <div className="grid min-h-0 flex-1 overflow-y-auto gap-3 md:grid-cols-[minmax(240px,320px)_minmax(0,1fr)] md:grid-rows-[minmax(0,1fr)] md:items-stretch">
+            <div className="h-full min-h-0 min-w-0 overflow-auto">
               <RawAnalysisInfoTable info={hoverDiagnosticsQuery.data?.analysis_info} layout="vertical" />
             </div>
             <div className="flex h-full min-h-0 min-w-0 items-center">

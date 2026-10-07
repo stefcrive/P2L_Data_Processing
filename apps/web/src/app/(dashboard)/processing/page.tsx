@@ -1,6 +1,9 @@
 "use client";
+
+import { SelectionCycleDiagnostics } from "@/components/diagnostics/selection-cycle-diagnostics";
 import { orderTraceByX } from "@/lib/plotly-order";
 import { useContext } from "react";
+import { filterStationFigure, fitVisibleMarkers } from "@/lib/station-chart-filters";
 import { withSessionUncertainty } from "@/lib/metrology-envelopes";
 
 import { useTranslation } from "@/components/layout/language-provider";
@@ -23,14 +26,7 @@ import { PlotlyChart, type PlotlyHoverPayload, type PlotlyPoint } from "@/compon
 import { SharedCycleDiagnosticsTable } from "@/components/diagnostics/cycle-diagnostics-table";
 import { RawAnalysisInfoTable } from "@/components/diagnostics/raw-analysis-info-table";
 import { ControlColumnToggle } from "@/components/layout/control-column-toggle";
-import {
-  SATURATION_COLOR_AXIS_OPTIONS,
-  SaturationAxisHelpTooltip,
-  SaturationSharedColorbar,
-  SaturationFigureCard,
-  type SaturationAxisKey,
-  type SaturationColorAxisKey,
-} from "@/components/diagnostics/saturation-figure-card";
+
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { DecimalInput } from "@/components/ui/decimal-input";
@@ -59,7 +55,7 @@ import type {
 import { formatScientificText } from "@/lib/scientific-notation";
 import { uniqueOutlierTables } from "@/lib/outlier-tables";
 import { cn } from "@/lib/utils";
-import { MetrologyProcessingResults, useMetrologyConsultation } from "@/components/metrology/consultation-context";
+import { MetrologyProcessingResults, MetrologyToolActive, MetrologyStationFilters, useMetrologyConsultation } from "@/components/metrology/consultation-context";
 import { useToolsSession } from "@/components/metrology/consultation-context";
 
 type SelectedTarget = {
@@ -2235,7 +2231,8 @@ function applyProcessingConfigPreviewToFigure(
     }
     changed = true;
   }
-  return changed ? { ...cloned, data: config.x_axis_option === "By Identifier 2" ? nextData.map(orderTraceByX) : nextData, layout: nextLayout } : figure;
+  const result = changed ? { ...cloned, data: config.x_axis_option === "By Identifier 2" ? nextData.map(orderTraceByX) : nextData, layout: nextLayout } : figure;
+  return masks ? fitVisibleMarkers(result) : result;
 }
 
 function formatPrecisionMetric(value?: number | null): string {
@@ -3325,6 +3322,17 @@ function reconcileProcessingConfigDraft(
   incoming: ProcessingConfig,
   previousSaved: ProcessingConfig | null,
 ): ProcessingConfig {
+  if (!previousSaved) {
+    return {
+      ...incoming,
+      overlays: {
+        ...incoming.overlays,
+        show_saturated_collectors: false,
+        show_saturated_samples: false,
+        show_failed_samples: false,
+      },
+    };
+  }
   const hasUnsavedDraft = Boolean(current && previousSaved && !configEquals(current, previousSaved));
   return hasUnsavedDraft && current ? current : incoming;
 }
@@ -4428,392 +4436,6 @@ function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }
   );
 }
 
-function DiagnosticsPanel({
-  title,
-  diagnostics,
-  loading,
-  displayDelta = 0,
-  onPickDeltaValue,
-  showCycleEvidence = true,
-  legendCollapsed = false,
-}: {
-  title: string;
-  diagnostics?: CycleDiagnosticsPayload;
-  loading: boolean;
-  displayDelta?: number;
-  onPickDeltaValue?: (value: number, valueSpace?: "raw" | "display", stdev?: number | null) => void;
-  showCycleEvidence?: boolean;
-  legendCollapsed?: boolean;
-}) {
-  const tr = useTranslation();
-  const [saturationColorAxis, setSaturationColorAxis] = useState<SaturationColorAxisKey>("mean44");
-  const [saturationYAxis, setSaturationYAxis] = useState<SaturationAxisKey>("d13C");
-  const cycleMean = diagnostics?.cycle_mean ?? {};
-  const validMean = asNumber(cycleMean.valid_mean);
-  const validStdDev = asNumber(cycleMean.valid_std_dev);
-  const validCycleCount = asNumber(cycleMean.valid_cycles);
-  const hasTooFewLinearityCycles = validCycleCount != null && validCycleCount < 4;
-  const firstValidCycleRaw = asNumber(cycleMean.selected_value) ?? asNumber(cycleMean.mean);
-  const lastValidCycleRaw = asNumber(cycleMean.last_valid_value);
-  const referenceGasCorrectionRaw = asNumber(cycleMean.saturation_reference_gas_value);
-  const firstCycleCorrectionRaw = asNumber(cycleMean.saturation_first_cycle_value);
-  const saturationCorrection =
-    diagnostics?.saturation_correction && typeof diagnostics.saturation_correction === "object"
-      ? (diagnostics.saturation_correction as Record<string, unknown>)
-      : {};
-  const cycleLinearityValue = (key: string) => {
-    const payload = saturationCorrection[key];
-    return payload && typeof payload === "object" ? asNumber((payload as Record<string, unknown>).value) : null;
-  };
-  const cycleRelativeMismatchRaw = cycleLinearityValue("cycle_relative_mismatch");
-  const cycleSymmetricMismatchRaw = cycleLinearityValue("cycle_symmetric_mismatch");
-  const cycleMeanIntensityRaw = cycleLinearityValue("cycle_mean_intensity");
-  const cycleIntensityWeightedMismatchRaw = cycleLinearityValue("cycle_intensity_weighted_mismatch");
-  const cycleTwoTermRaw = cycleLinearityValue("cycle_two_term_mean_mismatch");
-  const cyclePlateauPayload =
-    saturationCorrection.cycle_plateau && typeof saturationCorrection.cycle_plateau === "object"
-      ? (saturationCorrection.cycle_plateau as Record<string, unknown>)
-      : {};
-  const cyclePlateauRaw = asNumber(cyclePlateauPayload.value);
-  const cyclePlateauStd = asNumber(cyclePlateauPayload.std_dev);
-  const collectorStatus = asString((diagnostics?.target ?? {})["collector_status"]);
-  const isPartiallySaturated = isPartiallySaturatedCollectorStatus(collectorStatus);
-  const validMeanDisplay = validMean == null ? null : validMean + displayDelta;
-  const validMeanCardValue = isPartiallySaturated ? validMean : validMeanDisplay;
-  const firstValidCycleDisplay = firstValidCycleRaw == null ? null : firstValidCycleRaw + displayDelta;
-  const firstValidCycleCardValue = isPartiallySaturated ? firstValidCycleRaw : firstValidCycleDisplay;
-  const lastValidCycleDisplay = lastValidCycleRaw == null ? null : lastValidCycleRaw + displayDelta;
-  const lastValidCycleCardValue = isPartiallySaturated ? lastValidCycleRaw : lastValidCycleDisplay;
-  const reason = asString(cycleMean.reason);
-  const intensityLinearity =
-    diagnostics?.intensity_linearity && typeof diagnostics.intensity_linearity === "object"
-      ? diagnostics.intensity_linearity
-      : {};
-  const linearityIssueIndex = asNumber(intensityLinearity.issue_index);
-  const linearitySlopePer10v = asNumber(intensityLinearity.slope_per_10v);
-  const linearityRSquared = asNumber(intensityLinearity.r_squared);
-  const linearitySeverity = asString(intensityLinearity.severity);
-  const usesSignalProxy =
-    cycleMean.value_source &&
-    typeof cycleMean.value_source === "object" &&
-    Boolean((cycleMean.value_source as Record<string, unknown>).is_proxy);
-  const diagnosticsFigure = ensureCollectorIntensityTraces(diagnostics?.figure, diagnostics?.table ?? []);
-  const saturationFiguresRaw =
-    Object.keys(saturationCorrection).length
-      ? (saturationCorrection.figures as Record<string, unknown> | undefined)
-      : undefined;
-  const targetIsotopeKey = asString((diagnostics?.target ?? {})["isotope_key"]);
-  const defaultSaturationYAxis: SaturationAxisKey = targetIsotopeKey === "d18O" ? "d18O" : "d13C";
-  useEffect(() => {
-    setSaturationYAxis(defaultSaturationYAxis);
-  }, [defaultSaturationYAxis]);
-  const saturationMethodDescriptions: Record<string, string> = {
-    reference_gas_intensity:
-      "Fits isotope value versus the reference-gas intensity from valid cycles, then predicts the value at the saturated cycle's reference intensity. Points are colored by cycle number.",
-    first_cycle:
-      "Fits a quadratic curve of isotope value versus cycle number from valid cycles, then predicts where the curve becomes horizontal.",
-    cycle_relative_mismatch:
-      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / Ref44, then predicts where that curve becomes horizontal.",
-    cycle_symmetric_mismatch:
-      "Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / ((Samp44 + Ref44) / 2), then predicts where that curve becomes horizontal.",
-    cycle_mean_intensity:
-      "Fits a quadratic curve of isotope value versus mean intensity, (Samp44 + Ref44) / 2, then predicts where that curve becomes horizontal.",
-    cycle_intensity_weighted_mismatch:
-      "Fits a quadratic curve of isotope value versus the cycle-level weighted mismatch term, then predicts where that curve becomes horizontal.",
-    cycle_two_term_mean_mismatch:
-      "Fits isotope value with two predictors: mean intensity and symmetric mismatch. The green line connects the model-fitted values for the valid cycles using each cycle's own mismatch; dot color also shows mismatch.",
-    cycle_plateau:
-      "Measures the signed cycle-to-cycle isotope change in the latest valid cycles, fits isotope value versus that change rate, then predicts the asymptote where the change rate reaches zero. The highlighted circles are the cycles used.",
-  };
-  const saturationFigureItems = [
-    {
-      key: "reference_gas_intensity",
-      title: "Reference-gas saturation correction",
-      description: saturationMethodDescriptions.reference_gas_intensity,
-      figure:
-        saturationFiguresRaw?.reference_gas_intensity && typeof saturationFiguresRaw.reference_gas_intensity === "object"
-          ? (saturationFiguresRaw.reference_gas_intensity as Record<string, unknown>)
-          : undefined,
-    },
-    {
-      key: "first_cycle",
-      title: "Stabilized-cycle correction",
-      description: saturationMethodDescriptions.first_cycle,
-      figure:
-        saturationFiguresRaw?.first_cycle && typeof saturationFiguresRaw.first_cycle === "object"
-          ? (saturationFiguresRaw.first_cycle as Record<string, unknown>)
-          : undefined,
-    },
-    {
-      key: "cycle_relative_mismatch",
-      title: "Cycle relative mismatch correction",
-      description: saturationMethodDescriptions.cycle_relative_mismatch,
-      figure:
-        saturationFiguresRaw?.cycle_relative_mismatch && typeof saturationFiguresRaw.cycle_relative_mismatch === "object"
-          ? (saturationFiguresRaw.cycle_relative_mismatch as Record<string, unknown>)
-          : undefined,
-    },
-    {
-      key: "cycle_symmetric_mismatch",
-      title: "Cycle symmetric mismatch correction",
-      description: saturationMethodDescriptions.cycle_symmetric_mismatch,
-      figure:
-        saturationFiguresRaw?.cycle_symmetric_mismatch && typeof saturationFiguresRaw.cycle_symmetric_mismatch === "object"
-          ? (saturationFiguresRaw.cycle_symmetric_mismatch as Record<string, unknown>)
-          : undefined,
-    },
-    {
-      key: "cycle_mean_intensity",
-      title: "Cycle mean intensity correction",
-      description: saturationMethodDescriptions.cycle_mean_intensity,
-      figure:
-        saturationFiguresRaw?.cycle_mean_intensity && typeof saturationFiguresRaw.cycle_mean_intensity === "object"
-          ? (saturationFiguresRaw.cycle_mean_intensity as Record<string, unknown>)
-          : undefined,
-    },
-    {
-      key: "cycle_intensity_weighted_mismatch",
-      title: "Cycle intensity-weighted mismatch correction",
-      description: saturationMethodDescriptions.cycle_intensity_weighted_mismatch,
-      figure:
-        saturationFiguresRaw?.cycle_intensity_weighted_mismatch &&
-        typeof saturationFiguresRaw.cycle_intensity_weighted_mismatch === "object"
-          ? (saturationFiguresRaw.cycle_intensity_weighted_mismatch as Record<string, unknown>)
-          : undefined,
-    },
-    {
-      key: "cycle_two_term_mean_mismatch",
-      title: "Cycle two-term mean + mismatch correction",
-      description: saturationMethodDescriptions.cycle_two_term_mean_mismatch,
-      figure:
-        saturationFiguresRaw?.cycle_two_term_mean_mismatch &&
-        typeof saturationFiguresRaw.cycle_two_term_mean_mismatch === "object"
-          ? (saturationFiguresRaw.cycle_two_term_mean_mismatch as Record<string, unknown>)
-          : undefined,
-    },
-    {
-      key: "cycle_plateau",
-      title: "Cycle late-plateau correction",
-      description: saturationMethodDescriptions.cycle_plateau,
-      figure:
-        saturationFiguresRaw?.cycle_plateau && typeof saturationFiguresRaw.cycle_plateau === "object"
-          ? (saturationFiguresRaw.cycle_plateau as Record<string, unknown>)
-          : undefined,
-    },
-  ].filter((item) => item.figure);
-  const suggestionCards = [
-    { label: "Cycle mean", value: validMeanCardValue, stdev: validStdDev, linearity: false },
-    { label: "First valid cycle", value: firstValidCycleCardValue, stdev: null, linearity: false },
-    { label: "Last valid cycle", value: lastValidCycleCardValue, stdev: null, linearity: false },
-    { label: "Lin. corr. to ref gas int", value: referenceGasCorrectionRaw, stdev: null, linearity: true },
-    { label: "Lin. corr. to first cycle", value: firstCycleCorrectionRaw, stdev: null, linearity: true },
-    { label: "Cycle relative mismatch", value: cycleRelativeMismatchRaw, stdev: null, linearity: true },
-    { label: "Cycle symmetric mismatch", value: cycleSymmetricMismatchRaw, stdev: null, linearity: true },
-    { label: "Cycle mean intensity", value: cycleMeanIntensityRaw, stdev: null, linearity: true },
-    { label: "Cycle weighted mismatch", value: cycleIntensityWeightedMismatchRaw, stdev: null, linearity: true },
-    { label: "Cycle two-term model", value: cycleTwoTermRaw, stdev: null, linearity: true },
-    { label: "Cycle plateau", value: cyclePlateauRaw, stdev: cyclePlateauStd, linearity: false },
-  ];
-
-  return (
-    <Card className="border-stone-300">
-      <CardHeader className="px-3 py-2.5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="min-w-0">
-            <CardTitle className="truncate text-sm">{tr(title)}</CardTitle>
-            <CardDescription>{tr("Cycle intensity, precision, and correction evidence.")}</CardDescription>
-          </div>
-          {diagnostics ? (
-            <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-stone-600">
-              <span className="rounded-md bg-stone-100 px-2 py-1">{validCycleCount ?? 0}{tr(" valid cycles")}</span>
-              {usesSignalProxy ? <span className="rounded-md bg-blue-50 px-2 py-1 text-blue-700">{tr("Internal signal proxy")}</span> : null}
-            </div>
-          ) : null}
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-3 p-3">
-        {loading ? <div className="text-sm text-stone-500">{tr("Loading cycle diagnostics...")}</div> : null}
-
-        {diagnostics ? (
-          <>
-            <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-stone-50/60 sm:grid-cols-3 sm:divide-x sm:divide-stone-200">
-              <div className="px-3 py-2.5">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr("Valid-cycle mean")}</div>
-                <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
-                  {tr(validMeanCardValue == null ? "N/A" : formatDeltaValue(validMeanCardValue))}
-                </div>
-              </div>
-              <div className="border-t border-stone-200 px-3 py-2.5 sm:border-t-0">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr("Valid-cycle spread")}</div>
-                <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
-                  {tr(validStdDev == null ? "N/A" : formatDeltaValue(validStdDev))}
-                </div>
-              </div>
-              <div className="border-t border-stone-200 px-3 py-2.5 sm:border-t-0">
-                <div className="flex items-center justify-between gap-2">
-                  <Tooltip
-                    label={tr("Fitted isotope-signal movement across the observed mean m/z 44 intensity range, divided by the instrument's internal standard deviation. Below 1× σ is low, 1–2× σ is a watch, and 2× σ or more is high.")}
-                    align="start"
-                    contentClassName="w-80"
-                  >
-                    <span tabIndex={0} className="text-[10px] font-semibold uppercase tracking-wide text-stone-500 underline decoration-dotted underline-offset-2">{tr("Intensity-linearity drift")}</span>
-                  </Tooltip>
-                  {linearitySeverity && linearitySeverity !== "unavailable" ? (
-                    <span
-                      className={cn(
-                        "rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase",
-                        linearitySeverity === "high"
-                          ? "bg-red-100 text-red-700"
-                          : linearitySeverity === "watch"
-                            ? "bg-amber-100 text-amber-700"
-                            : "bg-emerald-100 text-emerald-700",
-                      )}
-                    >
-                      {tr(linearitySeverity)}
-                    </span>
-                  ) : null}
-                </div>
-                <div className="mt-0.5 text-2xl font-semibold tabular-nums text-stone-950">
-                  {tr(linearityIssueIndex == null ? "N/A" : `${linearityIssueIndex.toFixed(2)}× σ`)}
-                </div>
-                <div className="mt-0.5 text-[11px] text-stone-500">
-                  {tr(linearitySlopePer10v == null || linearityRSquared == null
-                    ? "Needs at least three varying valid cycles."
-                    : `${linearitySlopePer10v >= 0 ? "+" : ""}${linearitySlopePer10v.toFixed(3)}‰ / 10 V · R² ${linearityRSquared.toFixed(2)}`)}
-                </div>
-              </div>
-            </div>
-
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
-              {suggestionCards.map((item) => {
-                const value = item.value;
-                const blockedByLinearityCycleCount = item.linearity && hasTooFewLinearityCycles && value != null;
-                const canPick = typeof onPickDeltaValue === "function" && value != null && !blockedByLinearityCycleCount;
-                const displayValue = value == null ? "N/A" : formatDeltaValue(value);
-                const valueElement = (
-                  <span
-                    className={cn(
-                      "inline-block",
-                      blockedByLinearityCycleCount ? "cursor-help text-stone-400" : "text-stone-900",
-                    )}
-                  >
-                    {tr(displayValue)}
-                  </span>
-                );
-                return (
-                  <button
-                    key={item.label}
-                    type="button"
-                    onClick={() => {
-                      if (canPick && value != null) {
-                        onPickDeltaValue(value, "raw", item.stdev ?? null);
-                      }
-                    }}
-                    disabled={value == null}
-                    aria-disabled={!canPick}
-                    className={cn(
-                      "rounded-lg border border-stone-200 p-2 text-left transition",
-                      canPick ? "cursor-pointer hover:border-fuchsia-400 hover:bg-fuchsia-50" : "",
-                      blockedByLinearityCycleCount ? "cursor-help bg-stone-50/70" : "",
-                    )}
-                  >
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr(formatScientificText(item.label))}</div>
-                    <div className="mt-0.5 text-base font-semibold">
-                      {blockedByLinearityCycleCount ? (
-                        <Tooltip label={tr("not enough cycles for linearity calculation")} align="start">
-                          {valueElement}
-                        </Tooltip>
-                      ) : (
-                        valueElement
-                      )}
-                    </div>
-                    {item.stdev != null ? (
-                      <div className="mt-0.5 text-[11px] text-stone-500">σ {tr(formatDeltaValue(item.stdev))}</div>
-                    ) : null}
-                  </button>
-                );
-              })}
-            </div>
-
-            {reason ? <div className="text-sm text-stone-500">{tr("Diagnostics note: ")}{tr(reason)}</div> : null}
-
-            {showCycleEvidence ? (
-              <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
-                <PlotlyChart
-                  figure={diagnosticsFigure}
-                  className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
-                  collapsibleLegend
-                  legendCollapsed={legendCollapsed}
-                  verticallyResizable
-                  deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                />
-                <div className="min-w-0">
-                  <SharedCycleDiagnosticsTable rows={diagnostics.table ?? []} />
-                </div>
-              </div>
-            ) : null}
-
-            {saturationFigureItems.length ? (
-              <>
-                <div className="flex flex-wrap items-end gap-4">
-                  <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label={tr("Chart color axis")} />
-                    <select
-                      value={saturationColorAxis}
-                      onChange={(event) => setSaturationColorAxis(event.target.value as SaturationColorAxisKey)}
-                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                    >
-                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {tr(option.label)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block w-full max-w-xs text-sm">
-                    <SaturationAxisHelpTooltip label={tr("Chart y axis")} />
-                    <select
-                      value={saturationYAxis}
-                      onChange={(event) => setSaturationYAxis(event.target.value as SaturationAxisKey)}
-                      className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2"
-                    >
-                      {SATURATION_COLOR_AXIS_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {tr(option.label)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <SaturationSharedColorbar figures={saturationFigureItems.map((item) => item.figure)} colorAxis={saturationColorAxis} />
-                </div>
-                <div className="grid gap-4 xl:grid-cols-2">
-                  {saturationFigureItems.map((item) => (
-                    <SaturationFigureCard
-                      key={item.key}
-                      chartKey={item.key}
-                      title={tr(item.title)}
-                      description={tr(item.description)}
-                      figure={item.figure}
-                      colorAxis={saturationColorAxis}
-                      yAxis={saturationYAxis}
-                      collapsibleLegend
-                      legendCollapsed={legendCollapsed}
-                      verticallyResizable
-                      deferRenderMs={SELECTION_EDITOR_CHART_DEFER_MS}
-                    />
-                  ))}
-                </div>
-              </>
-            ) : null}
-          </>
-        ) : loading ? null : (
-          <div className="text-sm text-stone-500">{tr("Cycle diagnostics appear here once a point is selected.")}</div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
 function DuplicateCycleDiagnostics({
   sessionId,
   targets,
@@ -4910,7 +4532,9 @@ function DuplicateCycleDiagnostics({
                 ) : diagnostics ? (
                   <PlotlyChart
                     figure={ensureCollectorIntensityTraces(diagnostics.figure, diagnostics.table ?? [])}
-                    className="mx-auto aspect-square min-h-[320px] w-full max-w-[560px]"
+                    className="w-full"
+                    initialHeight={300}
+                    minHeight={240}
                     collapsibleLegend
                     legendCollapsed={legendCollapsed}
                     verticallyResizable
@@ -4993,6 +4617,8 @@ function FigureCard({
 function ProcessingPage() {
   const consultation = useMetrologyConsultation();
   const metrologyResults = useContext(MetrologyProcessingResults);
+  const toolActive = useContext(MetrologyToolActive);
+  const stationFilters = useContext(MetrologyStationFilters);
   const tr = useTranslation();
   const sessionId = useToolsSession();
   const queryClient = useQueryClient();
@@ -5004,7 +4630,7 @@ function ProcessingPage() {
   const [selectedTargets, setSelectedTargets] = useState<SelectedTarget[]>([]);
   const [activeTargetIndex, setActiveTargetIndex] = useState(0);
   const [displayState, setDisplayState] = useState<DisplayStateMap>({});
-  const [hideDuplicateSymbologyAndCollapseLegends, setHideDuplicateSymbologyAndCollapseLegends] = useState(false);
+  const [hideDuplicateSymbology, setHideDuplicateSymbology] = useState(false);
   const [selectionEditorTab, setSelectionEditorTab] = useState<IsotopeKey>("d13C");
   const [singleValues, setSingleValues] = useState<IsotopeNumericMap>({ d13C: 0, d18O: 0 });
   const [singleValueSpaces, setSingleValueSpaces] = useState<Record<IsotopeKey, "raw" | "display">>({
@@ -5567,7 +5193,7 @@ function ProcessingPage() {
   );
 
   useEffect(() => {
-    if (!hasUnsavedNavigationChanges || typeof window === "undefined") {
+    if (consultation || !toolActive || !hasUnsavedNavigationChanges || typeof window === "undefined") {
       return;
     }
     const message = "You have unsaved processing changes. Leave without saving?";
@@ -5602,7 +5228,7 @@ function ProcessingPage() {
       window.removeEventListener("beforeunload", onBeforeUnload);
       document.removeEventListener("click", onDocumentClick, true);
     };
-  }, [hasUnsavedNavigationChanges]);
+  }, [hasUnsavedNavigationChanges, consultation, toolActive, tr]);
 
   const colorScaleFigures = useMemo<Array<Record<string, unknown> | undefined>>(() => {
     if (!workspace) {
@@ -6689,7 +6315,7 @@ function ProcessingPage() {
     workspace, activeConfig, linearityPreviewDataQuery.data, sharedLinearityConfig, linearityPreviewConfig,
     linearityPreviewStale, linearityPreviewValues, calibrationWorkspaceQuery.data, selectionDraftEdits,
     selectionDraftValues, selectionDraftIdentifier1, selectionDraftIdentifier2, selectionDraftSpecies,
-    hideDuplicateSymbologyAndCollapseLegends, metrologyResults, tr,
+    hideDuplicateSymbology, metrologyResults, stationFilters, tr,
   ]);
 
   if (!sessionId) {
@@ -6756,6 +6382,9 @@ function ProcessingPage() {
   if (!previewFigureCache.masks.has("processing")) previewFigureCache.masks.set("processing",hasPendingProcessingConfigChanges
     ? buildProcessingPreviewMasks(linearityPreviewDataQuery.data, previewLinearity, activeConfig, workspace.edit_state) : null);
   const processingPreviewMasks = previewFigureCache.masks.get("processing") ?? null;
+  if (!previewFigureCache.masks.has("standards")) previewFigureCache.masks.set("standards",
+    buildProcessingPreviewMasks(linearityPreviewDataQuery.data, previewLinearity, {...activeConfig,selected_identifier:"All"}, workspace.edit_state));
+  const standardMasks = previewFigureCache.masks.get("standards");
   const displayedDataOutlierTables = applyPreviewMasksToOutlierTables(
     workspace.outlier_tables,
     processingPreviewMasks,
@@ -6801,10 +6430,17 @@ function ProcessingPage() {
     const draftFigure = hasPendingSelectionDrafts
       ? applySelectionDraftPreviewToFigure(processingFigure, selectionDraftValues, activeConfig, selectionDraftRowLabels)
       : processingFigure;
-    const displayed = hideDuplicateSymbologyAndCollapseLegends
+    const displayed = hideDuplicateSymbology
       ? draftFigure
       : applyDuplicateHighlightsToFigure(draftFigure, duplicateSampleState.rowLabels);
-    const result = withSessionUncertainty(displayed, metrologyResults, tr("Final result ± U"));
+    const standardFlags = standardMasks ? [...standardMasks.rowsByLabel.keys()].flatMap(row=>ISOTOPE_KEYS.flatMap(isotope=>{
+      const keep=isotope==="d13C"?standardMasks.baseD13:standardMasks.baseD18;
+      return !keep.has(row)&&metrologyResults[row]?.role==="qc"?[{row,isotope,hidden:true}]:[];
+    })) : [];
+    const flags=[...(stationFilters?.flags??[]).map(flag=>({...flag,hidden:flag.hidden || (flag.category==="statistical"?!activeConfig.overlays.show_statistical_outliers:flag.category==="range"?!activeConfig.overlays.show_range_outliers:flag.category==="manual"?!activeConfig.overlays.show_manual_outliers:flag.category==="failed"?!activeConfig.overlays.show_failed_samples:false)})),...standardFlags];
+    const withUncertainty = withSessionUncertainty(displayed, metrologyResults, tr("Final result ± U"), flags);
+    const filtered = withUncertainty ? filterStationFigure(withUncertainty,flags,true) : withUncertainty;
+    const result = filtered && (!activeConfig.overlays.show_statistical_outliers || !activeConfig.overlays.show_range_outliers || !activeConfig.overlays.show_manual_outliers) ? fitVisibleMarkers(filtered) : filtered;
     if (result) previewFigureCache.set(figure, result);
     return result;
   };
@@ -7162,13 +6798,6 @@ function ProcessingPage() {
     !isSelectionEditorOpen &&
     !isExportModalOpen &&
     hoverPreviewPosition != null;
-  const diagnosticsByIsotope: Record<IsotopeKey, CycleDiagnosticsPayload | undefined> = {
-    d13C: sampleD13DiagnosticsQuery.data,
-    d18O: sampleD18DiagnosticsQuery.data,
-  };
-  const activeDiagnostics = diagnosticsByIsotope[selectionEditorTab];
-  const activeDiagnosticsLoading =
-    selectionEditorTab === "d13C" ? sampleD13DiagnosticsQuery.isLoading : sampleD18DiagnosticsQuery.isLoading;
   const selectedPointD13 = selectedTargetPointValue(activeSampleTarget, "d13C");
   const selectedPointD18 = selectedTargetPointValue(activeSampleTarget, "d18O");
   const activeTargetDiagnostics = (sampleD18DiagnosticsQuery.data ?? sampleD13DiagnosticsQuery.data) ?? null;
@@ -7242,8 +6871,6 @@ function ProcessingPage() {
   const d18CurrentDisplayValue = d18DraftCurrentValue ?? d18CurrentRawValue ?? selectedPointD18;
   const d13LinearityCorrectedDisplayValue = d13LinearityCorrectedRawValue;
   const d18LinearityCorrectedDisplayValue = d18LinearityCorrectedRawValue;
-  const activeCurrentDelta = selectionEditorTab === "d13C" ? d13CurrentDisplayValue : d18CurrentDisplayValue;
-  const activeInternalStdDev = selectionEditorTab === "d13C" ? d13InternalStdDev : d18InternalStdDev;
   const effectiveOutlier =
     typeof sampleD18DiagnosticsQuery.data?.target?.effective_outlier === "boolean"
       ? (sampleD18DiagnosticsQuery.data.target.effective_outlier as boolean)
@@ -7723,10 +7350,10 @@ function ProcessingPage() {
               <ScientificControlGroup title={tr("Show on chart")}>
                 <div className="scientific-controls__checks">
                 <CheckboxField
-                  checked={hideDuplicateSymbologyAndCollapseLegends}
-                  label={tr("Hide duplicate symbols and collapse legends")}
+                  checked={hideDuplicateSymbology}
+                  label={tr("Hide duplicate symbols")}
                   description={tr("Removes the duplicate-sample diamond overlay and closes every chart legend. Duplicate detection and editing stay active.")}
-                  onChange={setHideDuplicateSymbologyAndCollapseLegends}
+                  onChange={setHideDuplicateSymbology}
                 />
                 <CheckboxField checked={activeConfig.overlays.show_statistical_outliers} label={tr("Statistical outliers")} onChange={(checked) => updateOverlay("show_statistical_outliers", checked)} />
                 <CheckboxField checked={activeConfig.overlays.show_range_outliers} label={tr("Range outliers")} onChange={(checked) => updateOverlay("show_range_outliers", checked)} />
@@ -8100,7 +7727,7 @@ function ProcessingPage() {
                 title={tr(overviewCards.processing3d.title)}
                 description={tr(overviewCards.processing3d.description)}
                 figure={hideEmbeddedColorbars(overviewCards.processing3d.figure)}
-                legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                legendCollapsed={false}
                 chartClassName="h-[clamp(380px,42vw,620px)] w-full"
                 fitContainer
                 {...chartHoverProps(overviewCards.processing3d.key)}
@@ -8114,7 +7741,7 @@ function ProcessingPage() {
                   title={tr(overviewCards.crossplot.title)}
                   description={tr(overviewCards.crossplot.description)}
                   figure={hideEmbeddedColorbars(overviewCards.crossplot.figure)}
-                  legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                  legendCollapsed={false}
                   chartClassName="h-[clamp(380px,42vw,620px)] w-full"
                   fitContainer
                   {...chartHoverProps(overviewCards.crossplot.key)}
@@ -8677,9 +8304,12 @@ function ProcessingPage() {
           ) : null}
 
           {isSelectionEditorOpen ? (
-            <div className="fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40 p-3 pt-4 sm:p-6 sm:pt-8" onClick={closeSelectionEditor}>
+            <div className="selection-editor-backdrop fixed inset-0 z-50 flex items-start justify-center bg-stone-950/40" onClick={closeSelectionEditor}>
               <div
-                className="flex max-h-[calc(100vh-2rem)] w-full max-w-7xl flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
+                role="dialog"
+            aria-modal="true"
+            aria-label={tr("Selection Editor")}
+            className="selection-editor flex w-full flex-col overflow-hidden rounded-lg border border-stone-300 bg-white shadow-2xl"
                 onClick={(event) => event.stopPropagation()}
               >
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-3 py-2">
@@ -8706,7 +8336,7 @@ function ProcessingPage() {
                     <span className="hidden sm:inline">{tr("Close")}</span>
                   </Button>
                 </div>
-                <div className="min-h-0 space-y-3 overflow-y-auto p-3">
+                <div className="selection-editor-body min-h-0 space-y-3 overflow-y-auto p-3">
                   {selectedTargets.length ? (
                     <>
                       <div className="space-y-2 rounded-lg border border-stone-200 bg-stone-50/50 px-3 py-2.5">
@@ -8814,30 +8444,10 @@ function ProcessingPage() {
                         <datalist id="selection-species-options">
                           {speciesSources.map((source) => <option key={source} value={source} />)}
                         </datalist>
-                        <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-white sm:grid-cols-[1.2fr_1fr_1fr] sm:divide-x sm:divide-stone-200">
-                          <div className="px-3 py-2">
-                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr(formatScientificText(selectionEditorTab))}{tr(" delta")}</div>
-                            <div className="mt-0.5 text-3xl font-semibold leading-none tabular-nums text-stone-950">
-                              {tr(activeCurrentDelta == null ? "N/A" : formatDeltaValue(activeCurrentDelta))}
-                            </div>
-                          </div>
-                          <div className="border-t border-stone-200 px-3 py-2 sm:border-t-0">
-                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">{tr("Internal standard deviation")}</div>
-                            <div className="mt-0.5 text-2xl font-semibold leading-none tabular-nums text-stone-950">
-                              {tr(activeInternalStdDev == null ? "N/A" : formatDeltaValue(activeInternalStdDev))}
-                            </div>
-                          </div>
-                          <div className="border-t border-stone-200 px-3 py-2 sm:border-t-0">
-                            <div className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
-                              {tr(selectionEditorTab === "d13C" ? "δ¹⁸O delta" : "δ¹³C delta")}
-                            </div>
-                            <div className="mt-0.5 text-2xl font-semibold leading-none tabular-nums text-stone-800">
-                              {tr((selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue) == null
-                                ? "N/A"
-                                : formatDeltaValue(selectionEditorTab === "d13C" ? d18CurrentDisplayValue : d13CurrentDisplayValue))}
-                            </div>
-                          </div>
-                        </div>
+                        <table className="selection-current-values"><thead><tr><th>{tr("Parameter")}</th><th>δ¹³C / ‰</th><th>δ¹⁸O / ‰</th></tr></thead><tbody>
+                          <tr><th>{tr("Current")}</th><td>{formatDeltaValue(d13CurrentDisplayValue)}</td><td>{formatDeltaValue(d18CurrentDisplayValue)}</td></tr>
+                          <tr><th>{tr("Internal standard deviation")}</th><td>{formatDeltaValue(d13InternalStdDev)}</td><td>{formatDeltaValue(d18InternalStdDev)}</td></tr>
+                        </tbody></table>
                         {activeTargetMetadataItems.length ? (
                           <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-stone-600">
                             {activeTargetMetadataItems.map((item, index) => (
@@ -8929,6 +8539,85 @@ function ProcessingPage() {
                         ) : null}
                       </div>
 
+                      {activeTarget ? (
+                          <section className="selection-edit-controls">
+                          <div className="inline-flex rounded-lg border border-stone-300 bg-white p-1 shadow-sm">
+                            {ISOTOPE_KEYS.map((isotopeKey) => {
+                              const isActive = selectionEditorTab === isotopeKey;
+                              return (
+                                <button
+                                  key={isotopeKey}
+                                  type="button"
+                                  aria-pressed={isActive}
+                                  onClick={() => setSelectionEditorTab(isotopeKey)}
+                                  disabled={busy}
+                                  className={cn(
+                                    "min-w-[92px] rounded-lg px-4 py-2 text-sm font-semibold transition",
+                                    isActive ? "bg-stone-900 text-white shadow-sm" : "text-stone-700 hover:bg-stone-100",
+                                  )}
+                                >
+                                  {tr(formatScientificText(isotopeKey))}
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            <label className="text-sm">
+                              <span className="mb-1 block text-stone-700">{tr("Set value (")}{tr(formatScientificText(selectionEditorTab))})</span>
+                              <input
+                                type="number"
+                                step="0.001"
+                                value={singleValues[selectionEditorTab]}
+                                onChange={(event) => {
+                                  setSingleValues((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }));
+                                  setSingleStdevs((current) => ({ ...current, [selectionEditorTab]: null }));
+                                }}
+                                className={cn(
+                                  "w-full rounded-lg border px-3 py-2 transition-all duration-200",
+                                  isSetValueInputHighlighted
+                                    ? "border-fuchsia-500 bg-fuchsia-50 ring-2 ring-fuchsia-300"
+                                    : "border-stone-300",
+                                )}
+                              />
+                            </label>
+                            <label className="text-sm">
+                              <span className="mb-1 block text-stone-700">{tr("Offset (")}{tr(formatScientificText(selectionEditorTab))})</span>
+                              <input
+                                type="number"
+                                step="0.001"
+                                value={singleOffsets[selectionEditorTab]}
+                                onChange={(event) =>
+                                  setSingleOffsets((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }))
+                                }
+                                className="w-full rounded-lg border border-stone-300 px-3 py-2"
+                              />
+                            </label>
+                          </div>
+
+                          <div className="flex flex-wrap gap-2">
+                            <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>{tr("Set")}{tr(formatScientificText(selectionEditorTab))}
+                            </Button>
+                            <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>{tr("Offset")}{tr(formatScientificText(selectionEditorTab))}
+                            </Button>
+                            <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
+                              {tr(singleInterpolateLabel)}
+                            </Button>
+                            <Button variant="outline" onClick={resetSelected} disabled={busy}>{tr("Reset selected")}</Button>
+                            <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>{tr("Clear selection")}</Button>
+                            <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>{tr("Force outlier")}</Button>
+                            <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>{tr("Force keep")}</Button>
+                          </div>
+                          </section>
+                      ) : null}
+
+                      {activeTarget ? <SelectionCycleDiagnostics
+                        d13={sampleD13DiagnosticsQuery.data} d18={sampleD18DiagnosticsQuery.data}
+                        loadingD13={sampleD13DiagnosticsQuery.isLoading} loadingD18={sampleD18DiagnosticsQuery.isLoading}
+                        displayDelta={rawToDisplayDelta}
+                        onPick={(isotope, value, stdev) => { setSelectionEditorTab(isotope); setSingleValueFromSuggestion(isotope, value, "raw", stdev); }}
+                      /> : null}
+
                       {duplicateGroupTargets.length > 1 && activeTarget && sessionId ? (
                         <DuplicateCycleDiagnostics
                           sessionId={sessionId}
@@ -8936,7 +8625,7 @@ function ProcessingPage() {
                           isotopeKey={selectionEditorTab}
                           activeRowLabel={activeTarget.rowLabel}
                           onInspect={(target) => setTargets([{ ...target, isotopeKey: selectionEditorTab }])}
-                          legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                          legendCollapsed={false}
                         />
                       ) : null}
 
@@ -9018,86 +8707,9 @@ function ProcessingPage() {
                             </details>
                           ) : null}
 
-                          <div className="inline-flex rounded-lg border border-stone-300 bg-white p-1 shadow-sm">
-                            {ISOTOPE_KEYS.map((isotopeKey) => {
-                              const isActive = selectionEditorTab === isotopeKey;
-                              return (
-                                <button
-                                  key={isotopeKey}
-                                  type="button"
-                                  aria-pressed={isActive}
-                                  onClick={() => setSelectionEditorTab(isotopeKey)}
-                                  disabled={busy}
-                                  className={cn(
-                                    "min-w-[92px] rounded-lg px-4 py-2 text-sm font-semibold transition",
-                                    isActive ? "bg-stone-900 text-white shadow-sm" : "text-stone-700 hover:bg-stone-100",
-                                  )}
-                                >
-                                  {tr(formatScientificText(isotopeKey))}
-                                </button>
-                              );
-                            })}
-                          </div>
 
-                          <div className="grid gap-3 sm:grid-cols-2">
-                            <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">{tr("Set value (")}{tr(formatScientificText(selectionEditorTab))})</span>
-                              <input
-                                type="number"
-                                step="0.001"
-                                value={singleValues[selectionEditorTab]}
-                                onChange={(event) => {
-                                  setSingleValues((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }));
-                                  setSingleStdevs((current) => ({ ...current, [selectionEditorTab]: null }));
-                                }}
-                                className={cn(
-                                  "w-full rounded-lg border px-3 py-2 transition-all duration-200",
-                                  isSetValueInputHighlighted
-                                    ? "border-fuchsia-500 bg-fuchsia-50 ring-2 ring-fuchsia-300"
-                                    : "border-stone-300",
-                                )}
-                              />
-                            </label>
-                            <label className="text-sm">
-                              <span className="mb-1 block text-stone-700">{tr("Offset (")}{tr(formatScientificText(selectionEditorTab))})</span>
-                              <input
-                                type="number"
-                                step="0.001"
-                                value={singleOffsets[selectionEditorTab]}
-                                onChange={(event) =>
-                                  setSingleOffsets((current) => ({ ...current, [selectionEditorTab]: Number(event.target.value) }))
-                                }
-                                className="w-full rounded-lg border border-stone-300 px-3 py-2"
-                              />
-                            </label>
-                          </div>
 
-                          <div className="flex flex-wrap gap-2">
-                            <Button onClick={() => applySingleValue(selectionEditorTab)} disabled={busy}>{tr("Set")}{tr(formatScientificText(selectionEditorTab))}
-                            </Button>
-                            <Button variant="outline" onClick={() => applySingleOffset(selectionEditorTab)} disabled={busy}>{tr("Offset")}{tr(formatScientificText(selectionEditorTab))}
-                            </Button>
-                            <Button variant="outline" onClick={() => applySingleInterpolate(selectionEditorTab)} disabled={busy}>
-                              {tr(singleInterpolateLabel)}
-                            </Button>
-                            <Button variant="outline" onClick={resetSelected} disabled={busy}>{tr("Reset selected")}</Button>
-                            <Button variant="outline" onClick={() => setTargets([])} disabled={busy}>{tr("Clear selection")}</Button>
-                            <Button variant={effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(true)} disabled={busy}>{tr("Force outlier")}</Button>
-                            <Button variant={!effectiveOutlier ? "secondary" : "outline"} onClick={() => applyOutlierOverride(false)} disabled={busy}>{tr("Force keep")}</Button>
-                          </div>
 
-                          {duplicateGroupTargets.length <= 1 ? (
-                            <DiagnosticsPanel
-                              title={tr(`${selectionEditorTab} cycle diagnostics (shared intensity chart/table)`)}
-                              diagnostics={activeDiagnostics}
-                              loading={activeDiagnosticsLoading}
-                              displayDelta={rawToDisplayDelta(selectionEditorTab)}
-                              legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
-                              onPickDeltaValue={(value, valueSpace = "raw", stdev = null) =>
-                                setSingleValueFromSuggestion(selectionEditorTab, value, valueSpace, stdev)
-                              }
-                            />
-                          ) : null}
                         </div>
                       ) : null}
 
@@ -9150,7 +8762,7 @@ function ProcessingPage() {
                 title={tr(overviewCards.d13Summary.title)}
                 description={tr(overviewCards.d13Summary.description)}
                 figure={hideEmbeddedColorbars(d13SummaryFigure)}
-                legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                legendCollapsed={false}
                 headerActions={
                   <TraceModeControl
                     state={d13SummaryState}
@@ -9170,7 +8782,7 @@ function ProcessingPage() {
                 title={tr(overviewCards.d18Summary.title)}
                 description={tr(overviewCards.d18Summary.description)}
                 figure={hideEmbeddedColorbars(d18SummaryFigure)}
-                legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                legendCollapsed={false}
                 headerActions={
                   <TraceModeControl
                     state={d18SummaryState}
@@ -9251,7 +8863,7 @@ function ProcessingPage() {
                                   className="h-[380px] w-full"
                                   fitContainer
                                   collapsibleLegend
-                                  legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                                  legendCollapsed={false}
                                   verticallyResizable
                                   uiRevision={`processing:${d13Key}`}
                                   {...chartHoverProps(d13Key)}
@@ -9280,7 +8892,7 @@ function ProcessingPage() {
                                   className="h-[380px] w-full"
                                   fitContainer
                                   collapsibleLegend
-                                  legendCollapsed={hideDuplicateSymbologyAndCollapseLegends}
+                                  legendCollapsed={false}
                                   verticallyResizable
                                   uiRevision={`processing:${d18Key}`}
                                   {...chartHoverProps(d18Key)}
@@ -9314,11 +8926,11 @@ function ProcessingPage() {
         <div
           role="dialog"
           aria-label={tr("Sample preview")}
-          className="sample-hover-preview fixed z-[80] overflow-y-auto rounded-lg border border-stone-300 bg-white p-3 shadow-2xl"
+          className="sample-hover-preview fixed z-[80] flex flex-col overflow-hidden rounded-lg border border-stone-300 bg-white p-3 shadow-2xl"
           tabIndex={0}
           onClick={event=>{if (!(event.target as HTMLElement).closest("button,input,summary,a,.modebar")) {setTargets([hoverPreview.target]);setHoverPreview(null);}}}
           onKeyDown={event=>{if(event.key==="Enter"&&event.target===event.currentTarget){setTargets([hoverPreview.target]);setHoverPreview(null);}}}
-          style={{left:hoverPreviewPosition.left,top:hoverPreviewPosition.top,width:hoverPreviewPosition.width,maxHeight:hoverPreviewPosition.height}}
+          style={{left:hoverPreviewPosition.left,top:hoverPreviewPosition.top,width:hoverPreviewPosition.width,height:Math.min(480,hoverPreviewPosition.height),maxHeight:`calc(100dvh - ${hoverPreviewPosition.top+10}px)`}}
           onMouseEnter={clearHoverPreviewHideTimer}
           onMouseLeave={scheduleHoverPreviewHide}
         >
@@ -9328,15 +8940,15 @@ function ProcessingPage() {
             </span>
             <button type="button" className="text-blue-700 underline" onClick={()=>{setTargets([hoverPreview.target]);setHoverPreview(null);}}>{tr("Open sample editor")}</button>
           </div>
-          <div className="grid min-h-0 gap-3 md:grid-cols-[minmax(260px,340px)_minmax(0,1fr)] md:items-stretch">
-            <div className="h-[480px] min-w-0">
+          <div className="grid flex-1 min-h-0 overflow-auto gap-3 md:grid-cols-[minmax(260px,340px)_minmax(0,1fr)] md:items-stretch">
+            <div className="h-full min-h-0 min-w-0 overflow-auto">
               <RawAnalysisInfoTable info={hoverAnalysisInfo} layout="vertical" />
             </div>
-            <div className="flex min-h-[480px] min-w-0 items-center">
+            <div className="flex h-full min-h-0 min-w-0 items-center">
               {hoverDiagnosticsQuery.isLoading || hoverDiagnosticsQuery.isFetching ? (
                 <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Loading hover preview...")}</div>
               ) : hasHoverDiagnosticsFigureData ? (
-                <PlotlyChart figure={hoverDiagnosticsFigure} initialHeight={480} legendFontSize={10} className="w-full" />
+                <PlotlyChart figure={hoverDiagnosticsFigure} fitContainer minHeight={200} verticallyResizable={false} legendFontSize={10} className="h-full w-full" />
               ) : (
                 <div className="w-full rounded-lg border border-dashed border-stone-300 p-4 text-sm text-stone-500">{tr("Cycle-intensity preview unavailable for this point.")}</div>
               )}

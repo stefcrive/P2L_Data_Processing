@@ -1,6 +1,7 @@
 "use client";
 
 import { useTranslation } from "@/components/layout/language-provider";
+import { useId } from "react";
 import { cn } from "@/lib/utils";
 import { formatScientificText } from "@/lib/scientific-notation";
 
@@ -31,12 +32,15 @@ export function RawAnalysisInfoTable({
   info,
   layout = "horizontal",
   className,
+  showHeading = true,
 }: {
   info?: Record<string, unknown>;
   layout?: "horizontal" | "vertical";
   className?: string;
+  showHeading?: boolean;
 }) {
   const tr = useTranslation();
+  const headingId = useId();
   const entries = Object.entries(info ?? {});
   if (!entries.length) {
     return null;
@@ -46,10 +50,10 @@ export function RawAnalysisInfoTable({
     return (
       <section
         className={cn("raw-analysis-info flex h-full min-h-0 flex-col overflow-hidden rounded-md border border-slate-200 bg-white", className)}
-        aria-labelledby="hover-raw-analysis-heading"
+        aria-labelledby={headingId}
       >
-        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-2 py-1.5">
-          <h3 id="hover-raw-analysis-heading" className="text-[11px] font-semibold text-slate-800">{tr("Raw analysis data")}</h3>
+        <div className={cn("flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-2 py-1.5", !showHeading && "sr-only")}>
+          <h3 id={headingId} className="text-[11px] font-semibold text-slate-800">{tr("Raw analysis data")}</h3>
           <span className="text-[10px] tabular-nums text-slate-500">{entries.length}</span>
         </div>
         <div className="min-h-0 flex-1 overflow-auto" tabIndex={0} aria-label={tr("Scroll raw analysis parameters")}>
@@ -86,9 +90,9 @@ export function RawAnalysisInfoTable({
   }
 
   return (
-    <section className={cn("mb-2 border-y border-slate-200 py-2", className)} aria-labelledby="hover-raw-analysis-heading">
-      <div className="mb-1.5 flex items-center justify-between gap-3">
-        <h3 id="hover-raw-analysis-heading" className="text-[11px] font-semibold text-slate-800">{tr("Raw analysis data")}</h3>
+    <section className={cn("mb-2 border-y border-slate-200 py-2", className)} aria-labelledby={headingId}>
+      <div className={cn("mb-1.5 flex items-center justify-between gap-3", !showHeading && "sr-only")}>
+        <h3 id={headingId} className="text-[11px] font-semibold text-slate-800">{tr("Raw analysis data")}</h3>
         <span className="text-[10px] tabular-nums text-slate-500">{entries.length}{tr(" parameters")}</span>
       </div>
       <div className="overflow-x-auto rounded-md border border-slate-200 bg-white" tabIndex={0} aria-label={tr("Scroll raw analysis parameters horizontally")}>

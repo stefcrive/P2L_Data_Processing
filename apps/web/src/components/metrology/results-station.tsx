@@ -9,14 +9,14 @@ import { normalizationEnvelope } from "@/lib/metrology-envelopes";
 
 const colors = ["#1f5fbf", "#6478ba", "#c38835", "#c04d65"];
 const axis = (text: string) => ({ title: { text }, automargin: true, gridcolor: "#e8edf1", zerolinecolor: "#a7b6bf" });
-export function Chart({ data, title, x, y, shapes = [], date = false, height = 340, annotations = [], layout = {}, interactions = {} }: { data: unknown[]; title: string; x: string; y: string; shapes?: unknown[]; date?: boolean; height?: number; annotations?: unknown[]; layout?: Record<string, unknown>; interactions?: Pick<PlotlyChartProps,"onPointClick"|"onSelection"|"onPointHover"|"onHoverEnd"> }) {
+export function Chart({ data, title, x, y, shapes = [], date = false, height = 340, annotations = [], layout = {}, interactions = {}, legendCollapsed = false }: { data: unknown[]; title: string; x: string; y: string; shapes?: unknown[]; date?: boolean; height?: number; annotations?: unknown[]; layout?: Record<string, unknown>; interactions?: Pick<PlotlyChartProps,"onPointClick"|"onSelection"|"onPointHover"|"onHoverEnd">; legendCollapsed?: boolean }) {
   const tr = useTranslation();
   const hasPoints = data.some(trace => {
     const t = trace as { x?: unknown[]; y?: unknown[] };
     return t.y?.some((v, i) => typeof v === "number" && Number.isFinite(v) && t.x?.[i] != null && (!date || Number.isFinite(Date.parse(String(t.x[i])))));
   });
   if (!hasPoints) return <div className="station-empty-chart"><h3>{title}</h3><Empty>{tr("No acquisitions available for this chart. Import data or select another population.")}</Empty></div>;
-  return <div className="metro-plot"><PlotlyChart {...interactions} minHeight={200} maxHeight={960} verticallyResizable collapsibleLegend figure={{ data, layout: {
+  return <div className="metro-plot"><PlotlyChart {...interactions} minHeight={200} maxHeight={960} verticallyResizable collapsibleLegend legendCollapsed={legendCollapsed} figure={{ data, layout: {
     title: { text: title, font: { size: 13 }, x: .02, xanchor: "left" }, height, margin: { l: 54, r: 14, t: 49, b: 43 },
     paper_bgcolor: "transparent", plot_bgcolor: "transparent", font: { family: "var(--font-sans), Segoe UI, sans-serif", size: 12, color: "#475569" },
     xaxis: { ...axis(x), ...(date ? { type: "date" } : {}) }, yaxis: axis(y), shapes, annotations,
@@ -153,13 +153,14 @@ export function LongTermCharts({ state, openRun, highlightRunIds = [] }: { state
   const active=history.find(h=>h.method_id===state.active_method?.id);
   const qcHistoryTraces=history.flatMap((h,i)=>{
     const s=h.isotopes[iso],flags=new Set(s.flags.map(f=>f.id));
-    const points=s.points.filter(p=>Number.isFinite(p.value)&&Number.isFinite(Date.parse(p.at)));
+    const omitted=new Set(s.outlier_ids??[]);
+    const points=s.points.filter(p=>!omitted.has(p.id)&&Number.isFinite(p.value)&&Number.isFinite(Date.parse(p.at)));
     if(!points.length)return [];
     const x=[points[0].at,points.at(-1)!.at],target=s.target,residualTarget=target??0;
     const mean=s.mean==null||target==null?null:s.mean-target;
     const reference=(name:string,value:number|null,dash:string,width=1.4,showlegend=true,legendgroup?:string)=>value==null?[]:[{type:"scatter",mode:"lines",name:`${h.population_label??`v${h.method_version}`} · ${tr(name)}`,legendgroup,showlegend,x,y:[value,value],line:{color:colors[i%colors.length],dash,width}}];
     return [
-      {type:"scatter",mode:"markers",name:h.population_label??`v${h.method_version}`,x:points.map(p=>p.at),y:points.map(p=>p.value-residualTarget),text:points.map(p=>`${p.at}<br>Method v${h.method_version}${!p.qc_passed?" · failed run QC":""}`),marker:{color:points.map(p=>flags.has(p.id)||!p.qc_passed?"#bd4356":colors[i%colors.length]),size:points.map(p=>highlightRunIds.includes(p.run_id)?9:5)}},
+      {type:"scatter",mode:"markers",name:h.population_label??`v${h.method_version}`,x:points.map(p=>p.at),y:points.map(p=>p.value-residualTarget),text:points.map(p=>`${p.at}<br>Method v${h.method_version}${!p.qc_passed?" · failed run QC":""}`),marker:{color:points.map(p=>flags.has(p.id)||!p.qc_passed?"#bd4356":colors[i%colors.length]),size:points.map(p=>highlightRunIds.includes(p.run_id)?13:9)}},
       ...reference("True value",target==null?null:0,"dash",1.6),
       ...reference("Average",mean,"solid",2),
       ...reference("Average ±1σ",mean!=null&&s.sd!=null?mean+s.sd:null,"dot",1.2,true,`sigma${i}`),
@@ -172,14 +173,14 @@ export function LongTermCharts({ state, openRun, highlightRunIds = [] }: { state
     <Field label={tr("QC isotope")}><select value={iso} onChange={e=>setIso(e.target.value as Isotope)}>{isotopes.map(i=><option key={i} value={i}>{isotopeLabel[i]}</option>)}</select></Field>
     {openRun && history.filter(h=>h.isotopes[iso].flags.length).slice(0,1).map(h=>{const p=h.isotopes[iso].points.find(p=>h.isotopes[iso].flags.some(f=>f.id===p.id));return p&&<button className="metro-btn" key={h.key} onClick={()=>openRun(p.run_id)}>{tr("Inspect control signal")}</button>;})}
     </div><div className="station-qc-layout"><div>
-    <Chart title={`${isotopeLabel[iso]} · SHP2L`} x={tr("Acquisition date")} y="QC − assigned / ‰" date data={qcHistoryTraces}/>
+    <Chart title={`${isotopeLabel[iso]} · SHP2L`} x={tr("Acquisition date")} y="QC − assigned / ‰" date legendCollapsed data={qcHistoryTraces}/>
     </div><aside className="station-qc-statistics"><dl>
       <div><dt>{tr("Individual SHP2L observations")}</dt><dd>{count}</dd></div>
       <div><dt>{tr("Outliers omitted from SD")}</dt><dd>{history.reduce((n,h)=>n+(h.isotopes[iso].outlier_ids?.length??0),0)}</dd></div><div><dt>{tr("Routine runs")}</dt><dd>{new Set(history.flatMap(h=>h.isotopes[iso].points.map(p=>p.run_id))).size}</dd></div>
       <div><dt>{tr("Method populations")}</dt><dd>{history.length}</dd></div>
       <div><dt>{tr("Active frozen u_prec")}</dt><dd>{numberText(state.active_method?.config.precision[iso],4)} ‰</dd></div>
       <div><dt>{tr("Current population SD without outliers")}</dt><dd>{numberText(active?.isotopes[iso].sd,4)} ‰</dd></div>
-    </dl><p className="metro-muted">{tr(selectedOrigin==="synthetic"?"Mock QC history":"Observed QC from raw exports")} · {tr("SD excludes saved session outliers and points outside the frozen target ±3 SD limits. All observations remain plotted.")}</p></aside></div>
+    </dl><p className="metro-muted">{tr(selectedOrigin==="synthetic"?"Mock QC history":"Observed QC from raw exports")} · {tr("Saved outliers and points outside the frozen target ±3 SD limits are excluded from the chart and SD.")}</p></aside></div>
     <details className="station-help"><summary>{tr("QC interpretation and evidence")}</summary><p className="metro-muted">{tr(active?.value_basis??"Corrected and normalized results")}. {tr("Observed and mock QC are kept in separate populations.")}</p><p className="metro-muted">{tr("Each method retains its own frozen ±3 SD limits. Qualification carousels are excluded from routine history. Red points mark failed run QC or control signals; no failed data are silently removed.")}</p><p className="metro-muted">{tr("Historical SD is adopted only through a reviewed period and a new method version.")}</p>
     {openRun && <div className="metro-actions">{history.filter(h=>h.isotopes[iso].flags.length).map(h=>{const p=h.isotopes[iso].points.find(p=>h.isotopes[iso].flags.some(f=>f.id===p.id));return p&&<button className="metro-btn" key={h.key} onClick={()=>openRun(p.run_id)}>{tr("Inspect control signal")} · {h.population_label??`v${h.method_version}`}</button>;})}</div>}</details>
   </Panel>;

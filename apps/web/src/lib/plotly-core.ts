@@ -6,6 +6,11 @@ import heatmap from "plotly.js/lib/heatmap";
 import scatter from "plotly.js/lib/scatter";
 import scatter3d from "plotly.js/lib/scatter3d";
 import portuguese from "plotly.js/lib/locales/pt-br";
+import unhover from "plotly.js/src/components/dragelement/unhover";
+import dragElement from "plotly.js/src/components/dragelement";
+import { guardPlotlyUnhover } from "@/lib/plotly-lifecycle";
+
+guardPlotlyUnhover(unhover, dragElement);
 
 const registeredPlotly = Plotly as typeof Plotly & { __irmsRegistrationVersion?: string };
 const registrationVersion = "scatter-scatter3d-bar-box-heatmap-calendars-pt-br-v2";

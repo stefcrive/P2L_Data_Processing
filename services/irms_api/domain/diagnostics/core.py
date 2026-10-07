@@ -829,6 +829,7 @@ DIAGNOSTIC_GRID_SPECS: tuple[tuple[str, str, int], ...] = (
     ("Multivariate Overview", "Parameter Contributions to Variability", 26),
     ("Multivariate Overview", "Explained Variance by Component", 27),
     ("Multivariate Overview", "Spearman Correlation Matrix", 28),
+    ("Multivariate Overview", "d18O vs d13C", 22),
     ("d13C", "d13C vs Leak Rate", 1),
     ("d13C", "d13C vs P no Acid", 3),
     ("d13C", "d13C vs Total CO2", 5),
@@ -853,7 +854,6 @@ DIAGNOSTIC_GRID_SPECS: tuple[tuple[str, str, int], ...] = (
     ("Line", "P no Acid vs Line", 23),
     ("Line", "P Gasses vs Line", 24),
     ("Line", "Initial Sample Intensity vs Line", 25),
-    ("Isotope Comparison", "d18O vs d13C", 22),
 )
 
 MULTIVARIATE_PLOT_SUBTITLES: dict[str, str] = {

@@ -38,8 +38,18 @@ def detect_qc_outliers(rows, method="sigma", threshold=3.0):
             "basis": "Final session QC, separate material and isotope populations; excluded from long-term QC statistics, retained in source results"}
 
 
-def qc_review_flags(rows):
+def qc_review_flags(rows, config=None):
     """Expose recorded review categories; do not reinterpret them as statistical tests."""
+    def missing_metadata(row, reason, iso):
+        if " missing or outside validated range" in reason:
+            return row.get(reason.split(" missing or outside validated range")[0]) is None
+        if reason == f"{iso} internal SD missing or at/above limit":
+            return row.get(iso + "_sd") is None
+        if "correction predictor" in reason.lower() and config is not None:
+            correction = config.corrections.get(iso)
+            return correction is not None and row.get(correction.predictor) is None
+        return False
+
     flags = []
     for row in rows:
         if row.get("role") != "qc":
@@ -54,7 +64,7 @@ def qc_review_flags(rows):
             }
             flags.extend({"measurement_id": row["id"], "run_id": row["run_id"], "evaluation_id": row.get("evaluation_id"),
                           "isotope": iso, "category": category, "value": row.get("isotopes", {}).get(iso, {}).get("value"),
-                          "reasons": reasons}
+                          "reasons": reasons, "metadata_only": category == "range" and all(missing_metadata(row, reason, iso) for reason in reasons)}
                          for category, reasons in categories.items() if reasons)
     return flags
 

@@ -9,7 +9,8 @@ import zipfile
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-from ..domain.processing.export import _build_client_filename, _sanitize_filename, _build_client_output_frame
+from ..domain.processing.export import (_build_client_filename, _sanitize_filename, _build_client_output_frame,
+                                       build_client_output_workbook_bytes, build_dataset_workbook_bytes)
 from .reports import build_session_dossier
 
 from .models import Decision
@@ -18,6 +19,26 @@ from .importer import measurement_identity
 
 
 class ResultsSessions:
+    def set_workbook_inclusion(self, session_id, run_id, included, command):
+        """Change consultation membership while preserving imports and evaluations."""
+        with self.repo.connect(write=True) as db:
+            session = self.repo.get(db, "results_sessions", session_id)
+            active = list(session["run_ids"])
+            detached = list(session.get("detached_run_ids", []))
+            if run_id not in active + detached:
+                raise ValueError("Choose a workbook imported into this session")
+            if included and run_id in detached:
+                detached.remove(run_id)
+                active.append(run_id)
+            elif not included and run_id in active:
+                active.remove(run_id)
+                detached.append(run_id)
+            session.update(run_ids=active, detached_run_ids=detached)
+            self.repo.update(db, "results_sessions", session_id, session)
+            self.repo.audit(db, "session_workbook_inclusion", session_id, command.actor, command.reason,
+                            after={"run_id": run_id, "included": included})
+            return session
+
     def save_outlier_screening(self, session_id, command):
         from .qc_screening import stored_qc_screening
         with self.repo.connect(write=True) as db:
@@ -31,19 +52,33 @@ class ResultsSessions:
                 self.repo.audit(db, "qc_screening_settings_saved", session_id, command.actor, command.reason, before, settings)
             return result
 
-    def results_session_analysis(self, session_id, outlier_method=None, threshold=None):
+    def results_session_analysis(self, session_id, outlier_method=None, threshold=None, range_exclusions=None, include_all_data=False):
         from .qc_screening import stored_qc_screening
         from .session_analysis import session_analysis
         detail = self.results_session_detail(session_id)
+        # Linearity uses the first acquired cycle, as in the original IRMS charts.
+        # Evaluation and uncertainty records retain their recorded intensity basis.
+        from .analysis_evidence import analysis_evidence
+        with self.repo.connect() as db:
+            for run in detail["runs"]:
+                initial = {}
+                for record in self.repo.list(db, "measurements", run_id=run["id"]):
+                    cycles = analysis_evidence(record, run["source"])["cycles"]
+                    if cycles:
+                        initial[record["id"]] = cycles[0]
+                for row in (run.get("evaluation") or {}).get("results", []):
+                    cycle = initial.get(row["id"], {})
+                    row["initial_i44_v"] = cycle.get("i44_v", row.get("i44_v"))
+                    row["initial_reference_i44_v"] = cycle.get("reference_i44_v", row.get("reference_i44_v"))
         # Explicit query parameters remain a non-persistent preview for existing clients.
         if outlier_method is not None or threshold is not None:
             settings = detail.get("outlier_screening", {"method": "sigma", "threshold": 3.0})
             return session_analysis(detail, outlier_method=outlier_method or settings["method"],
-                                    threshold=threshold if threshold is not None else settings["threshold"])
+                                    threshold=threshold if threshold is not None else settings["threshold"], range_exclusions=range_exclusions, include_all_data=include_all_data)
         with self.repo.connect(write=True) as db:
             session = self.repo.get(db, "results_sessions", session_id)
             outliers = stored_qc_screening(self.repo, db, session, detail["runs"])
-        return session_analysis(detail, outliers=outliers)
+        return session_analysis(detail, outliers=outliers, range_exclusions=range_exclusions, include_all_data=include_all_data)
 
     def save_chart_settings(self, session_id, command):
         with self.repo.connect(write=True) as db:
@@ -59,7 +94,7 @@ class ResultsSessions:
     def save_residual_override(self, session_id, command):
         with self.repo.connect(write=True) as db:
             session = self.repo.get(db, "results_sessions", session_id)
-            if command.material_id not in self.material_map(db, self.repo.get(db, "methods", session["method_id"])):
+            if command.material_id != "__all__" and command.material_id not in self.material_map(db, self.repo.get(db, "methods", session["method_id"])):
                 raise ValueError("Choose a material belonging to the session method")
             key = f"{command.material_id}:{command.effect}:{command.isotope}"
             overrides = session.setdefault("residual_overrides", {})
@@ -130,12 +165,13 @@ class ResultsSessions:
     def attach_session_run(self, db, session, run, command):
         if run["id"] in session["run_ids"]:
             return
-        owner=next((s for s in self.repo.list(db,"results_sessions") if run["id"] in s["run_ids"]),None)
-        if owner:
+        owner=next((s for s in self.repo.list(db,"results_sessions") if run["id"] in [*s["run_ids"], *s.get("detached_run_ids", [])]),None)
+        if owner and owner["id"] != session["id"]:
             raise ValueError(f"Workbook already belongs to results session '{owner['name']}' for client '{owner['client']}'")
         if run["method_id"]!=session["method_id"] or run["context"]!=session["context"]:
             raise ValueError("Existing import has a different method or workflow")
         session["run_ids"].append(run["id"])
+        session["detached_run_ids"] = [rid for rid in session.get("detached_run_ids", []) if rid != run["id"]]
         for row in self.repo.list(db,"measurements",run_id=run["id"]):
             session["groups"][row["id"]]=command.sample_group.strip() or "Main batch"
         self.repo.update(db,"results_sessions",session["id"],session)
@@ -166,7 +202,9 @@ class ResultsSessions:
             sources=[a for a in self.repo.list(db,"session_sources") if a["session_id"]==session_id]
             exports=[e for e in self.repo.list(db,"session_exports") if e["session_id"]==session_id]
         return {**session,"method":method,"qualification":q,"qualification_run_id":reference_run,
-                "runs":[self.run_detail(r) for r in session["run_ids"]],"history":history,"exports":exports,"sources":sources}
+                "runs":[self.run_detail(r) for r in session["run_ids"]],
+                "detached_runs":[self.run_detail(r) for r in session.get("detached_run_ids", [])],
+                "history":history,"exports":exports,"sources":sources}
 
     def archive_session_source(self, session_id, filename, content, command, *, relative_path, disposition, run_id=None):
         """Archive only original acquisition files, including superseded raw exports."""
@@ -198,16 +236,16 @@ class ResultsSessions:
 
     def export_results_session(self, session_id, command):
         detail=self.results_session_detail(session_id)
-        rows=[]
+        analysis=self.results_session_analysis(session_id)
+        flagged={flag["measurement_id"] for flag in analysis["outliers"]["flags"]}
+        rows, whole_rows = [], []
         for run in detail["runs"]:
             evaluation=run["evaluation"]
             if not evaluation:
                 continue
             for row in evaluation["results"]:
-                if row["role"]!="unknown" or row["excluded"]:
-                    continue
                 group=detail["groups"].get(row["id"],"Main batch")
-                if command.group is not None and command.group!=group:
+                if row["role"]=="unknown" and command.group is not None and command.group!=group:
                     continue
                 item={"client":detail["client"],"project":detail["project"],"session":detail["name"],"session_id":session_id,
                       "sample_group":group,"sample":row["label"],"analysis":row["source_index"],"run_id":run["id"],
@@ -221,6 +259,9 @@ class ResultsSessions:
                       "data_origin":"synthetic" if run.get("synthetic") else "observed","source_kind":run.get("source_kind","qtegra_raw"),
                       "calibration_verification":run.get("calibration_verification","documented"),"sample_identifier":row.get("comment","")}
                 item.update(measurement_identity(row, run.get("source_kind", "qtegra_raw")))
+                item.update(measurement_id=row["id"],role=row["role"], excluded=bool(row["excluded"] or row["id"] in flagged),
+                            outlier_isotopes=", ".join(f["isotope"] for f in analysis["outliers"]["flags"] if f["measurement_id"]==row["id"]))
+                if item["excluded"]: item["decision"]="excluded"
                 item.update(d13c_internal_sd=row.get("d13c_sd"), d18o_internal_sd=row.get("d18o_sd"))
                 for iso in ("d13c","d18o"):
                     value=row["isotopes"].get(iso,{})
@@ -228,8 +269,12 @@ class ResultsSessions:
                     item.update({f"{iso}_{key}":number for key,number in {
                         "raw":row[iso],"value":value.get("value"),"u_prec":value.get("u_prec"),"u_norm":value.get("u_norm"),
                         "u_corr":value.get("u_corr"),"u_combined":budget.get("u_combined"),"U":budget.get("expanded_uncertainty"),"k":budget.get("k")}.items()})
-                rows.append(item)
+                whole_rows.append(item)
+                if row["role"]=="unknown" and (command.include_outliers or not item["excluded"]):
+                    rows.append(item)
         rows.sort(key=lambda row: (row["identifier1"], row["identifier2"], row["species"], row.get("acquired_at") or "", str(row["analysis"])))
+        if not rows and command.format == "xlsx" and command.output_type == "dataset":
+            rows = list(whole_rows)
         if not rows:
             raise ValueError("No evaluated unknown samples in this session/group")
         buffer=io.StringIO(newline="")
@@ -296,6 +341,22 @@ class ResultsSessions:
                 for cell in values:
                     if isinstance(cell.value,float):cell.number_format="0.0000"
             buffer_xlsx=io.BytesIO(); book.save(buffer_xlsx); xlsx_bytes=buffer_xlsx.getvalue()
+            # Reuse the original IRMS export writers, including numeric/species
+            # formatting, duplicate highlighting and the separate outlier sheet.
+            safe=lambda v: "'"+v if isinstance(v,str) and v.lstrip().startswith(("=","+","-","@")) else v
+            clean_client=client_frame.map(safe)
+            clean_client["__identifier_2_key"]=[safe(r["identifier2"]) for r in rows]
+            stats=analysis["qc_statistics"]
+            precision=(stats["d13c"]["final"]["sd"] or 0,stats["d18o"]["final"]["sd"] or 0,
+                       stats["d13c"]["final"]["n"],stats["d18o"]["final"]["n"])
+            client_bytes,_=build_client_output_workbook_bytes(source_frame,client_name=client_name,
+                client_output_df=clean_client,precision_override=precision)
+            all_frame=pd.DataFrame(whole_rows).map(safe)
+            outlier_frame=all_frame.loc[all_frame["excluded"]].copy()
+            retained=all_frame if command.include_outliers else all_frame.loc[~all_frame["excluded"]]
+            dataset_bytes,_=build_dataset_workbook_bytes(retained,outliers=outlier_frame,client_name=client_name)
+            if command.output_type=="client_output": xlsx_bytes=client_bytes
+            elif command.output_type=="dataset": xlsx_bytes=dataset_bytes
         if command.format=="pdf": content=pdf_bytes
         if command.format=="xlsx": content=xlsx_bytes
         if command.format=="zip":
@@ -303,11 +364,15 @@ class ResultsSessions:
             with zipfile.ZipFile(archive,"w",zipfile.ZIP_DEFLATED) as z:
                 z.writestr("results.csv",csv_bytes); z.writestr("calculation-dossier.json",json_bytes)
                 z.writestr(f"{stem}.xlsx", xlsx_bytes)
+                z.writestr("client-output.xlsx", client_bytes)
+                z.writestr("whole-results.xlsx", dataset_bytes)
                 z.writestr("calculation-certificate.pdf", pdf_bytes)
                 z.writestr("README.txt","IRMS Metrology Station\n"+("SIMULATED QUALIFICATION: observations may be real; see data_origin and calibration_verification per row.\n" if self.repo.demo else "")+"Decision is recorded per result. Review/blocked rows are not released results. All isotope values and uncertainties are in per mille VPDB. u_prec is individual QC SD; u_norm is sample-specific; u_corr propagates the shared correction coefficient. U=k*u_combined.\n")
             content=archive.getvalue()
+        if command.format == "xlsx" and command.output_type == "dataset":
+            stem += " - all data"
         sha=self.repo.blob(content)
         with self.repo.connect(write=True) as db:
-            record=self.repo.insert(db,"session_exports",{"session_id":session_id,"sha256":sha,"filename":f"{stem}.{command.format}","format":command.format,"group":command.group,"rows":len(rows),"simulation":self.repo.demo})
+            record=self.repo.insert(db,"session_exports",{"session_id":session_id,"sha256":sha,"filename":f"{stem}.{command.format}","format":command.format,"group":command.group,"rows":len(retained) if command.format=="xlsx" and command.output_type=="dataset" else len(rows),"output_type":command.output_type,"simulation":self.repo.demo})
             self.repo.audit(db,"session_results_exported",session_id,command.actor,command.reason,after=record)
         return record

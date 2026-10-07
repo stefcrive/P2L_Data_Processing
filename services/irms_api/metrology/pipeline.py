@@ -7,7 +7,7 @@ import numpy as np
 
 from ..domain.calibration.core import CARBONATE_ACID_FRACTIONATION_FACTORS, convert_d18o_carbonate_material
 from .models import ISOTOPES, Material, MethodConfig
-from .science import anchor_model, budget, corrected_normalize, regression, summary
+from .science import anchor_model, budget, corrected_normalize, regression, partial_regression, summary
 from .correction_review import comparison_rows, correction_review, screen_effects
 
 
@@ -34,25 +34,54 @@ def identify(record: dict, config: MethodConfig, materials: dict) -> tuple[str, 
     return "unknown", None
 
 
-def pair_fit(rows: list[dict], x: str, y: str) -> dict:
-    valid = [r for r in rows if r.get(x) is not None and r.get(y) is not None]
-    fit = regression([r[x] for r in valid], [r[y] for r in valid])
-    for point, row in zip(fit.get("points", []), valid):
-        point["id"] = row.get("id")
+def pair_fit(rows: list[dict], x: str, y: str, excluded_ids=None) -> dict:
+    valid = [r for r in rows if r.get(x) is not None and r.get(y) is not None
+             and math.isfinite(r[x]) and math.isfinite(r[y])]
+    excluded_ids = excluded_ids or set()
+    retained = [r for r in valid if r.get("id") not in excluded_ids]
+    fit = regression([r[x] for r in retained], [r[y] for r in retained])
+    fit["points"] = [{"x": r[x], "y": r[y], "id": r.get("id"),
+                      "excluded_from_fit": r.get("id") in excluded_ids} for r in valid]
     return fit
 
 
-def diagnostics(rows: list[dict]) -> dict:
+def partial_pair_fit(rows, x, y, control, excluded_ids):
+    valid = [r for r in rows if all(isinstance(r.get(k), (int, float)) and math.isfinite(r[k]) for k in (x, y, control))]
+    retained = [r for r in valid if r.get("id") not in excluded_ids]
+    fit = partial_regression([r[x] for r in retained], [r[y] for r in retained], [r[control] for r in retained])
+    if fit["status"] == "estimated":
+        mx, my = fit["detrending"]["x"], fit["detrending"]["y"]
+        fit["points"] = [{"id": r.get("id"), "x": r[x]-mx["intercept"]-mx["slope"]*r[control],
+                          "y": r[y]-my["intercept"]-my["slope"]*r[control], "control": r[control],
+                          "excluded_from_fit": r.get("id") in excluded_ids} for r in valid]
+    return fit
+
+
+def diagnostics(rows: list[dict], excluded_outlier_ids=None, *, include_all_data=False) -> dict:
+    excluded_outlier_ids = excluded_outlier_ids or {}
+    from ..domain.shared.dataframe import _ensure_cycle1_pressure_weighted_mismatch_column
+    from ..domain.constants import CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL
+    import pandas as pd
+    frame = pd.DataFrame({"1  Cycle Int  Samp  44": [r.get("i44_v") for r in rows],
+                          "1  Cycle Int  Ref  44": [r.get("reference_i44_v") for r in rows],
+                          "1  Cycle Int  Diff Samp-Ref  44": [r.get("sample_reference_difference_v") for r in rows]})
+    _ensure_cycle1_pressure_weighted_mismatch_column(frame)
+    rows = [{**row, "pressure_weighted_mismatch": float(value) if pd.notna(value) else None}
+            for row, value in zip(rows, frame[CYCLE1_SIGNAL_PRESSURE_WEIGHTED_MISMATCH44_COL])]
     groups = defaultdict(list)
     by_sequence = {r["sequence"]: r for r in rows}
     for r in rows:
         if r.get("excluded") or r["role"] not in ("anchor", "qc"):
             continue
         groups[r.get("material_id") or r["label"]].append(r)
+    if include_all_data:
+        groups["__all__"] = [r for r in rows if not r.get("excluded") and r.get("role") in ("unknown", "qc", "anchor")]
     result = {"materials": [], "automatic_corrections": False,
               "note": "Fits use one material at a time. Associations are evidence for review, not proof of causation or a correction."}
     for material_id, points in groups.items():
-        item = {"material_id": material_id, "label": points[0]["label"], "n": len(points),
+        if not points:
+            continue
+        item = {"material_id": material_id, "label": "All available data" if material_id == "__all__" else points[0]["label"], "n": len(points),
                 "mass_to_co2_pressure": pair_fit(points, "mass_ug", "co2_pressure_ubar"),
                 "co2_pressure_to_i44": pair_fit(points, "co2_pressure_ubar", "i44_v"),
                 "mass_to_i44": pair_fit(points, "mass_ug", "i44_v"), "isotopes": {}}
@@ -66,38 +95,37 @@ def diagnostics(rows: list[dict]) -> dict:
         item["intensity_pressure_correlation"] = correlation
         item["collinearity_warning"] = correlation is not None and abs(correlation) >= .9
         for iso in ISOTOPES:
-            intensity = pair_fit(points, "i44_v", iso)
-            residual_rows = []
-            if intensity["status"] == "estimated":
-                for point in points:
-                    if point[iso] is not None and point["i44_v"] is not None:
-                        residual_rows.append({**point, "residual": point[iso] - intensity["intercept"] - intensity["slope"] * point["i44_v"]})
+            excluded_ids = set(excluded_outlier_ids.get(iso, ()))
+            retained = [p for p in points if p.get("id") not in excluded_ids]
+            intensity = pair_fit(points, "i44_v", iso, excluded_ids)
             qc = [p for p in points if p["role"] == "qc"]
             # Use the QC group's fixed mean, not each QC value, to avoid mathematical coupling.
-            mean = summary([p[iso] for p in qc if p[iso] is not None])["mean"]
+            mean = summary([p[iso] for p in qc if p[iso] is not None and p.get("id") not in excluded_ids])["mean"]
             memory_rows = []
             for point in qc:
                 previous = by_sequence.get(point["sequence"] - 1)
-                if previous and not previous.get("excluded") and previous.get(iso) is not None and point.get(iso) is not None:
+                if mean is not None and previous and not previous.get("excluded") and previous.get("id") not in excluded_ids and previous.get(iso) is not None and point.get(iso) is not None:
                     memory_rows.append({"id": point["id"], "contrast": previous[iso] - mean, "response": point[iso]})
-            memory = pair_fit(memory_rows, "contrast", "response") if len(memory_rows) >= 6 else {"status": "insufficient_evidence", "n": len(memory_rows)}
+            memory_n = sum(p.get("id") not in excluded_ids for p in memory_rows)
+            memory = pair_fit(memory_rows, "contrast", "response", excluded_ids) if memory_n >= 6 else {"status": "insufficient_evidence", "n": memory_n}
             memory["interpretation"] = "Screening against the immediately preceding analysis. A designed contrasting sequence and independent confirmation are required before attributing memory."
             mass_groups = defaultdict(list)
-            for point in points:
+            for point in retained:
                 if point.get("mass_ug") is not None and point.get(iso) is not None:
                     mass_groups[point["mass_ug"]].append(point[iso])
             strata = [{"mass_ug": mass, **summary(values)} for mass, values in sorted(mass_groups.items())]
             pooled_df = sum(s["n"] - 1 for s in strata if s["sd"] is not None)
             pooled_sd = math.sqrt(sum((s["n"] - 1) * s["sd"] ** 2 for s in strata if s["sd"] is not None) / pooled_df) if pooled_df else None
             item["isotopes"][iso] = {
-                "repeatability": summary([p[iso] for p in points if p[iso] is not None]),
+                "repeatability": summary([p[iso] for p in retained if p[iso] is not None]),
                 "repeatability_by_mass": strata, "within_mass_pooled_sd": pooled_sd,
                 "repeatability_note": "Overall dispersion can include deliberate mass effects. Use within-mass replicate SD to assess repeatability at a fixed mass.",
-                "mass_dependence": pair_fit(points, "mass_ug", iso), "intensity_dependence": intensity,
-                "pressure_residual": pair_fit(residual_rows, "pressure_mismatch_v", "residual"),
-                "pressure_dependence": pair_fit(points, "pressure_mismatch_v", iso),
-                "sample_reference_dependence": pair_fit(points, "sample_reference_difference_v", iso),
-                "drift": pair_fit(qc, "sequence", iso), "memory": memory,
+                "mass_dependence": pair_fit(points, "mass_ug", iso, excluded_ids), "intensity_dependence": intensity,
+                "pressure_residual": partial_pair_fit(points, "pressure_mismatch_v", iso, "i44_v", excluded_ids),
+                "pressure_dependence": pair_fit(points, "pressure_mismatch_v", iso, excluded_ids),
+                "sample_reference_dependence": pair_fit(points, "sample_reference_difference_v", iso, excluded_ids),
+                "pressure_adjusted_dependence": pair_fit(points, "pressure_weighted_mismatch", iso, excluded_ids),
+                "drift": pair_fit(qc, "sequence", iso, excluded_ids), "memory": memory,
             }
         result["materials"].append(item)
     return result
@@ -137,7 +165,7 @@ def evaluate(run: dict, method: dict, materials: dict, measurements: list[dict],
             issues.append("Qtegra reports an acquisition failure")
         if status == "running" and not run.get("acquisition_complete"):
             issues.append("Acquisition completion needs confirmation")
-        for key in ("mass_ug", "i44_v", "pressure_mismatch_v"):
+        for key in ("i44_v", "pressure_mismatch_v"):
             limits = config.ranges.get(key)
             value = result.get(key)
             if key != "pressure_mismatch_v" and limits is None:

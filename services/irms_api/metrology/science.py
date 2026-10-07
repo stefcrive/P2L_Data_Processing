@@ -53,6 +53,53 @@ def regression(x: list[float], y: list[float]) -> dict[str, Any]:
             "interpretation": "Association only. No correction is automatically applied."}
 
 
+def partial_regression(x: list[float], y: list[float], control: list[float]) -> dict:
+    """Pressure effect conditional on intensity, using Frisch-Waugh-Lovell.
+
+    Both axes are residualized on the same complete-case population. Slope
+    covariance and leverage come from the full three-parameter model.
+    """
+    x, y, control = (np.asarray(values, dtype=float) for values in (x, y, control))
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(control)
+    x, y, control = x[finite], y[finite], control[finite]
+    n = len(x)
+    if n < 4 or np.ptp(control) <= 1e-12:
+        return {"status": "insufficient_evidence", "n": n, "points": []}
+    x_model, y_model = regression(control.tolist(), x.tolist()), regression(control.tolist(), y.tolist())
+    xr = x - x_model["intercept"] - x_model["slope"] * control
+    yr = y - y_model["intercept"] - y_model["slope"] * control
+    if np.ptp(xr) <= max(1e-12, float(np.ptp(x))*1e-10):
+        return {"status": "insufficient_evidence", "n": n, "points": [],
+                "reason": "Pressure and intensity do not identify independent effects"}
+    design = np.column_stack((np.ones(n), control-control.mean(), xr))
+    beta, _, rank, _ = np.linalg.lstsq(design, yr, rcond=None)
+    if rank != 3:
+        return {"status": "insufficient_evidence", "n": n, "points": []}
+    inverse = np.linalg.pinv(design)
+    residual = yr-design@beta
+    df = n-3
+    variance = float(residual@residual)/df
+    cov = inverse@inverse.T*variance
+    leverage = np.sum(design*inverse.T, axis=1)
+    weights = (residual/np.maximum(1-leverage, 1e-10))**2
+    robust = (inverse*weights)@inverse.T
+    result = regression(xr.tolist(), yr.tolist())
+    se = math.sqrt(max(0., cov[2, 2]))
+    t = float(stats.t.ppf(.975, df))
+    result.update(slope=float(beta[2]), slope_se=se,
+                  slope_ci95=[float(beta[2]-t*se), float(beta[2]+t*se)],
+                  intercept=float(beta[0]), intercept_se=math.sqrt(max(0., cov[0, 0])),
+                  covariance=cov[np.ix_([0, 2], [0, 2])].tolist(),
+                  hc3_covariance=robust[np.ix_([0, 2], [0, 2])].tolist(),
+                  residuals=residual.tolist(), residual_standard_error=math.sqrt(variance),
+                  residual_degrees_of_freedom=df, nuisance_parameters=1,
+                  effect_span=float(beta[2]*np.ptp(xr)),
+                  detrending={"x": {k: x_model[k] for k in ("intercept", "slope")},
+                              "y": {k: y_model[k] for k in ("intercept", "slope")}},
+                  interpretation="Partial pressure effect after removing intensity from both axes")
+    return result
+
+
 def covariance_matrix(matrix: list[list[float]], n: int) -> np.ndarray:
     cov = np.asarray(matrix, dtype=float)
     if cov.shape != (n, n) or not np.isfinite(cov).all():

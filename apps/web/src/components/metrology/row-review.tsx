@@ -1,27 +1,29 @@
 "use client";
 
-import { AnalysisEvidence } from "./analysis-evidence";
+import { AnalysisEvidence, type EvidenceSection } from "./analysis-evidence";
 import { useState } from "react";
 import { useTranslation } from "@/components/layout/language-provider";
 import type { Measurement, RunDetail } from "@/lib/metrology";
 import { Field, Status, type WorkspaceProps } from "./shared";
 
-export function RowReview({ row, run, ...props }: WorkspaceProps & { row: Measurement; run: RunDetail }) {
+export function RowReview({ row, run, section="all", ...props }: WorkspaceProps & { row: Measurement; run: RunDetail; section?:EvidenceSection }) {
   const tr = useTranslation();
   const [reason, setReason] = useState("");
   const [mass, setMass] = useState("");
   const locked = run.status === "released" || props.state.qualifications.find(q => q.id === run.qualification_id)?.status === "approved";
-  const eligible = (row.issues ?? []).filter(issue => /internal SD|extrapolates beyond|outside validated isotope range/.test(issue) || issue.endsWith("missing or outside validated range"));
+  const reviewIssues=(row.issues??[]).filter(issue=>!issue.startsWith("mass_ug "));
+  const eligible = reviewIssues.filter(issue => /internal SD|extrapolates beyond|outside validated isotope range/.test(issue) || issue.endsWith("missing or outside validated range"));
   const calculated = !!row.isotopes?.d13c?.budget && !!row.isotopes?.d18o?.budget;
   const decision = { actor: props.decision.actor, reason };
   async function refresh(path: string, body: unknown) {
     const result = await props.act(path, body);
     if (result) await props.act(`/runs/${run.id}/evaluate`, { ...decision, method_id: run.method_id });
   }
+  if(section==="summary") return <AnalysisEvidence row={row} run={run} method={props.state.methods.find(m=>m.id===run.method_id)} section="summary"/>;
   return <div className="station-row-review">
-    <div className="metro-actions"><b>{row.label} · {row.source_index}</b><Status value={row.excluded ? "excluded" : row.issues?.length ? "review_required" : "pass"}/></div>
-    <AnalysisEvidence row={row} run={run} method={props.state.methods.find(m=>m.id===run.method_id)}/>
-    {!!row.issues?.length && <details><summary>{tr("Review flags")}</summary><ul className="station-issue-list">{row.issues.map(issue => <li key={issue}>{tr(issue)}</li>)}</ul></details>}
+    <div className="metro-actions"><b>{row.label} · {row.source_index}</b><Status value={row.excluded ? "excluded" : reviewIssues.length ? "review_required" : "pass"}/></div>
+    <AnalysisEvidence row={row} run={run} method={props.state.methods.find(m=>m.id===run.method_id)} section={section}/>
+    {!!reviewIssues.length && <details><summary>{tr("Review flags")}</summary><ul className="station-issue-list">{reviewIssues.map(issue => <li key={issue}>{tr(issue)}</li>)}</ul></details>}
     {!!row.accepted_issues?.length && <p className="station-exception-note">{tr("Accepted exceptions")}: {row.accepted_issues.map(tr).join("; ")}</p>}
     {row.reviews?.map((review, i) => <p className="metro-muted" key={i}>{review.actor} · {review.at.slice(0,16)} · {review.reason}</p>)}
     {!locked && !row.excluded && <form className="metro-stack" onSubmit={event => event.preventDefault()}>

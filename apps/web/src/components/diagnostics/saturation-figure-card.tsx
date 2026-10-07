@@ -371,7 +371,7 @@ export function SaturationFigureCard({
   const swappedMessage = `X is set to ${axisLabel(colorAxis)}; fit and prediction traces are hidden in this view.`;
 
   return (
-    <div className="rounded-lg border border-stone-200 p-2">
+    <div data-chart-panel className="saturation-figure-panel rounded-lg border border-stone-200 p-2">
       <div className="flex flex-wrap items-start justify-end gap-2 px-1 pb-2">
         <Button
           type="button"
@@ -386,7 +386,9 @@ export function SaturationFigureCard({
       <PlotlyChart
         key={`${chartKey}:${colorAxis}:${yAxis}:${swapped ? "swapped" : "normal"}`}
         figure={displayedFigure}
-        className="h-[320px] w-full"
+        className="h-[280px] w-full"
+        initialHeight={280}
+        minHeight={220}
         fitContainer
         collapsibleLegend={collapsibleLegend}
         legendCollapsed={legendCollapsed}

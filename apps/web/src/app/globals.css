@@ -266,3 +266,102 @@ textarea {
 
 .metro .chart-display-menu { padding:0; margin:0; border:0; }
 .raw-analysis-info thead { top:0 !important; }
+
+/* Shared density for sample inspection and editing, using the station palette. */
+.selection-editor-backdrop {
+  --editor-outer: clamp(12px, 3dvh, 32px);
+  --editor-gap: 8px;
+  --editor-panel: 10px;
+  padding: var(--editor-outer);
+  align-items: center;
+  overflow: hidden;
+}
+.selection-editor { width:94%; max-width:1560px; min-width:0; max-height:min(92dvh,calc(100dvh - 2 * var(--editor-outer))); color:var(--foreground); font-size:13px; container-type:inline-size; }
+.selection-editor > :first-child { flex-shrink:0; gap:8px; }
+.selection-editor-body { min-width:0; padding:var(--editor-panel); scroll-padding:10px; overscroll-behavior:contain; overflow-x:hidden; }
+.selection-editor-body > *, .selection-summary-grid > * { min-width:0; }
+.selection-summary-grid { display:grid; grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr); gap:var(--editor-gap); align-items:start; }
+.selection-summary-grid > :only-child { grid-column:1/-1; }
+.selection-summary-grid > :first-child > .grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.selection-editor .station-analysis-evidence.evidence-summary { display:grid; grid-template-columns:minmax(0,1fr); gap:6px; margin:0; grid-row:auto; grid-column:auto; }
+.selection-editor .evidence-summary > .metro-form-grid { order:2; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 10px; }
+.selection-editor .evidence-summary .metro-form-grid > div { min-width:0; overflow-wrap:anywhere; font-size:11px; }
+.selection-editor .evidence-summary .station-validity :is(th,td) { position:static; padding:3px 6px; font-size:11px; line-height:16px; vertical-align:middle; white-space:normal; }
+.selection-editor .station-analysis-evidence.evidence-details { display:block; grid-row:auto; margin:0; }
+.selection-editor .evidence-details .station-cycle-evidence { grid-row:auto; }
+.selection-editor-body > * + * { margin-top:var(--editor-gap); }
+.selection-editor :is(button,input:not([type=checkbox]),select) { min-height:30px; font-size:12px; border-radius:4px; }
+.selection-editor :is(input:not([type=checkbox]),select) { height:30px; padding:3px 7px; }
+.selection-editor button { padding:4px 8px; }
+.selection-editor :is(.text-xl,.text-2xl,.text-3xl) { font-size:15px; line-height:1.35; }
+.selection-editor :is(.p-4,.p-3) { padding:var(--editor-panel); }
+.selection-editor .space-y-4 > * + * { margin-top:var(--editor-gap); }
+.selection-editor [class*="min-h-[88px]"] { min-height:0; display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0; border:0; border-radius:0; background:transparent; }
+.selection-editor [class*="min-h-[88px]"] > * { margin:0; font-size:12px; }
+.selection-editor [class*="min-h-[88px]"] > :last-child { font-variant-numeric:tabular-nums; font-weight:600; }
+.selection-cycle-diagnostics { display:grid; gap:var(--editor-gap,8px); min-width:0; }
+.selection-cycle-overview { display:grid; grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr); gap:var(--editor-gap,8px); align-items:start; }
+.selection-cycle-overview > * { min-width:0; }
+.selection-cycle-chart { min-width:0; border:1px solid var(--border); border-radius:5px; padding:4px; }
+.cycle-signal-chart { min-width:0; }
+.cycle-signal-heading { display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:6px 10px; }
+.cycle-signal-heading-controls { display:flex; flex:1; min-width:0; flex-wrap:wrap; align-items:center; gap:6px 10px; }
+.cycle-signal-heading h3, .selection-editor .cycle-signal-heading h3 { margin:0; font-size:13px; }
+.cycle-signal-heading .cycle-signal-toggle { border:1px solid var(--input); background:var(--card); color:var(--primary); padding:3px 8px; font-size:11px; line-height:20px; border-radius:4px; }
+.cycle-signal-toggle:hover { background:var(--muted); }
+.cycle-signal-toggle:focus-visible { outline:2px solid var(--ring); outline-offset:2px; }
+.cycle-isotope-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--editor-gap,8px); align-items:start; }
+.cycle-isotope-diagnostics { min-width:0; padding:var(--editor-panel,10px); border:1px solid var(--border); border-radius:5px; }
+.cycle-isotope-heading { display:flex; align-items:baseline; justify-content:space-between; gap:8px; margin-bottom:6px; }
+.cycle-isotope-heading h3 { font-size:15px; font-weight:600; color:var(--foreground); }
+.selection-editor .cycle-isotope-heading h3 { margin:0; }
+.cycle-isotope-heading span,.cycle-diagnostics-note { font-size:11px; color:var(--muted-foreground); }
+.cycle-values,.selection-current-values { width:100%; border-collapse:collapse; font-size:12px; }
+.selection-editor .cycle-values { table-layout:fixed; }
+.selection-editor .cycle-values :is(th,td) { position:static; height:30px; padding:4px 7px; line-height:20px; vertical-align:middle; }
+.selection-editor .cycle-values th:first-child { width:64%; }
+.selection-editor .cycle-values th:nth-child(2) { width:22%; }
+.selection-editor .cycle-values tbody th { background:transparent; white-space:normal; overflow-wrap:anywhere; }
+.selection-editor .cycle-values td button { display:inline; min-height:0; height:auto; margin:0; padding:0; line-height:20px; font:inherit; border:0; background:transparent; }
+.cycle-values :is(th,td),.selection-current-values :is(th,td) { padding:4px 7px; border-bottom:1px solid var(--border); line-height:20px; }
+.cycle-values th,.selection-current-values th { text-align:left; font-weight:400; color:var(--muted-foreground); }
+.cycle-values thead th,.selection-current-values thead th { font-size:11px; background:var(--muted); }
+.cycle-values :is(td,th):not(:first-child),.selection-current-values :is(td,th):not(:first-child) { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.cycle-values td { font-weight:600; }
+.cycle-values td button { min-height:24px; padding:1px 5px; color:var(--primary); text-decoration:underline; text-underline-offset:3px; }
+.cycle-values td button:disabled { color:var(--muted-foreground); cursor:default; text-decoration:none; }
+.cycle-drift-values { display:grid; gap:4px; margin-block:8px; font-size:11px; color:var(--muted-foreground); }
+.cycle-drift-values > div { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 8px; }
+.cycle-drift-values dd { font-variant-numeric:tabular-nums; color:var(--foreground); }
+.cycle-color-control { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin:6px 0; font-size:11px; color:var(--muted-foreground); }
+.cycle-color-control select { max-width:180px; border:1px solid var(--input); background:var(--card); }
+.cycle-isotope-diagnostics .saturation-figure-panel { border:0; padding:0; }
+.cycle-isotope-diagnostics .saturation-figure-panel > :last-child { padding-top:2px; }
+.cycle-isotope-diagnostics .saturation-figure-panel > :last-child :is(button,div) { font-size:11px; }
+.selection-cycle-table { border:1px solid var(--border); border-radius:5px; padding:6px 10px; font-size:12px; }
+.selection-cycle-table summary { cursor:pointer; font-weight:500; }
+.selection-editor .selection-cycle-table h3 { margin:0 0 6px; font-size:12px; font-weight:600; }
+.selection-cycle-overview .cycle-diagnostics-table { max-height:460px; }
+.selection-editor .cycle-diagnostics-table thead { position:sticky; top:0; z-index:2; }
+.selection-editor .cycle-diagnostics-table th { position:static; min-width:70px; max-width:110px; padding:4px 6px; white-space:normal; font-size:10px; line-height:14px; vertical-align:middle; }
+.selection-editor .cycle-diagnostics-table td { padding:4px 6px; line-height:20px; vertical-align:middle; }
+.selection-cycle-table[open] summary { margin-bottom:8px; }
+.cycle-diagnostics-table :is(td,th) { line-height:20px; }
+.selection-edit-controls { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:end; gap:8px; border-block:1px solid var(--border); padding:8px 0; }
+.selection-edit-controls > :first-child { align-self:end; padding:0; box-shadow:none; }
+.selection-edit-controls > :last-child { grid-column:1/-1; }
+.selection-edit-controls .grid { gap:8px; }
+.selection-editor :is(button,input,select,summary):focus-visible { outline:2px solid var(--ring); outline-offset:2px; }
+.analytical-chart-header { flex-shrink:0; }
+.sample-hover-preview { padding:10px; }
+.sample-hover-preview .analytical-chart { align-self:stretch; }
+@media(max-width:800px) {
+  .cycle-isotope-grid { grid-template-columns:minmax(0,1fr); }
+  .selection-edit-controls { grid-template-columns:minmax(0,1fr); }
+}
+@container(max-width:1000px) {
+  .selection-summary-grid, .selection-cycle-overview { grid-template-columns:minmax(0,1fr); }
+}
+@container(max-width:740px) {
+  .cycle-isotope-grid { grid-template-columns:minmax(0,1fr); }
+}

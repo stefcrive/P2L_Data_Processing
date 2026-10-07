@@ -7,7 +7,7 @@ from functools import lru_cache
 from typing import Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Body
 from fastapi.responses import Response
 from pydantic import ValidationError
 
@@ -120,8 +120,20 @@ def exported_results(id_: str, s: Service = Depends(get_service)):
 
 
 @router.get("/results-sessions/{id_}/analysis")
-def session_analysis_view(id_: str, outlier_method: str | None = None, threshold: float | None = None, s: Service = Depends(get_service)):
-    return invoke(s.results_session_analysis, id_, outlier_method, threshold)
+def session_analysis_view(id_: str, outlier_method: str | None = None, threshold: float | None = None, include_all_data: bool = False, s: Service = Depends(get_service)):
+    return invoke(s.results_session_analysis, id_, outlier_method, threshold, None, include_all_data)
+
+
+@router.post("/results-sessions/{id_}/workbooks/{run_id}")
+def session_workbook_inclusion(id_: str, run_id: str, command: Decision, included: bool = True, s: Service = Depends(get_service)):
+    return invoke(s.set_workbook_inclusion, id_, run_id, included, command)
+
+
+@router.post("/results-sessions/{id_}/analysis-preview")
+def session_analysis_preview(id_: str, range_exclusions: dict[str, list[str]] = Body(...), include_all_data: bool = False, s: Service = Depends(get_service)):
+    if set(range_exclusions) - {"d13c", "d18o"}:
+        raise HTTPException(422, "Choose d13c or d18o exclusions")
+    return invoke(s.results_session_analysis, id_, None, None, range_exclusions, include_all_data)
 
 
 @router.put("/results-sessions/{id_}/outlier-screening")

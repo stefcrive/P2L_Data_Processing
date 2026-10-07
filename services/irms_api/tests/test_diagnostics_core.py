@@ -114,11 +114,12 @@ class DiagnosticPlotTests(unittest.TestCase):
         )
         grid_items = split_diagnostic_plot_grid(figure)
         self.assertEqual(
-            [(group, title) for group, title, _ in grid_items[:3]],
+            [(group, title) for group, title, _ in grid_items[:4]],
             [
                 ("Multivariate Overview", "Parameter Contributions to Variability"),
                 ("Multivariate Overview", "Explained Variance by Component"),
                 ("Multivariate Overview", "Spearman Correlation Matrix"),
+                ("Multivariate Overview", "d18O vs d13C"),
             ],
         )
         grid = {title: chart for _, title, chart in grid_items}

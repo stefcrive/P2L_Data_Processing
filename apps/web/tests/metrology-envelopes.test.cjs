@@ -8,6 +8,15 @@ const compiled = { exports: {} };
 new Function('require', 'module', 'exports', outputText)(require, compiled, compiled.exports);
 const { uncertaintyEnvelope, normalizationEnvelope, withSessionUncertainty } = compiled.exports;
 
+test('flagged QC cannot return through uncertainty overlays or envelopes',()=>{
+ const rows={a:{id:'first',role:'qc',run_id:'r',isotopes:{d13c:{value:1,budget:{expanded_uncertainty:.1}}}},b:{id:'bad',role:'qc',run_id:'r',isotopes:{d13c:{value:99,budget:{expanded_uncertainty:.1}}}}};
+ const result=withSessionUncertainty({data:[{x:[1,2],y:[1,99],customdata:[['a','d13C'],['b','d13C']]}]},rows,'Final',[{row:'b',isotope:'d13C',hidden:false}]);
+ assert.deepEqual(result.data.at(-1).y,[1,null]);
+ assert.ok(result.data[1].y.every(y=>y===null||y<2));
+ const warning=withSessionUncertainty({data:[{x:[1,2],y:[1,99],customdata:[['a','d13C'],['b','d13C']]}]},rows,'Final',[{row:'b',isotope:'d13C',hidden:false,excludeFromFit:false}]);
+ assert.deepEqual(warning.data.at(-1).y,[1,99]);
+});
+
 test('binary Plotly vectors receive canonical uncertainty and excluded rows break envelopes', () => {
   const x = new Float64Array([1,2,3]);
   const rows = Object.fromEntries(['a','b','c'].map((id,i)=>[id,{run_id:'r',excluded:i===1,isotopes:{d13c:{value:i,budget:{expanded_uncertainty:.1}}}}]));

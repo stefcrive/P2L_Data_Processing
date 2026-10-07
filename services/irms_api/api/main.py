@@ -105,6 +105,7 @@ from ..domain.processing.cycles import (
     build_target_info,
     resolve_saturation_correction_value_for_target,
     saturation_correction_method_for_isotope,
+    summarize_cycle_signal_intensities,
 )
 from ..domain.processing.edits import apply_edit_action
 from ..domain.processing.export import (
@@ -1973,6 +1974,11 @@ def diagnostics(
     d13_max: float | None = Query(None),
     d18_min: float | None = Query(None),
     d18_max: float | None = Query(None),
+    signal_min: float | None = None,
+    signal_max: float | None = None,
+    leak_min: float | None = None,
+    leak_max: float | None = None,
+    include_cycle_signals: bool = False,
 ) -> ChartBundle:
     _session_exists_or_404(session_id)
     df = store.load_frame(session_id)
@@ -2000,6 +2006,10 @@ def diagnostics(
         else:
             z_axis = "1  Cycle Int  Samp  44"
     filtered_df = _apply_diagnostics_filters(diagnostics_df, identifier_filter, d13_min, d13_max, d18_min, d18_max)
+    for column, low, high in ((CYCLE1_SIGNAL_SAMP44_COL, signal_min, signal_max), ("leak_rate", leak_min, leak_max)):
+        if column in filtered_df and (low is not None or high is not None):
+            values = pd.to_numeric(filtered_df[column], errors="coerce")
+            filtered_df = filtered_df.loc[values.between(low if low is not None else float("-inf"), high if high is not None else float("inf"))].copy()
     calibration_meta = metadata.get("calibration", {}) if isinstance(metadata.get("calibration"), dict) else {}
     calibration_config = calibration_meta.get("config", {}) if isinstance(calibration_meta.get("config"), dict) else {}
     selected_standards_raw = calibration_config.get(
@@ -2014,13 +2024,15 @@ def diagnostics(
     fig = create_diagnostic_plots(filtered_df, color_param, selected_standards=selected_standards)
     diagnostic_grid = split_diagnostic_plot_grid(fig)
     fig_3d, _ = _build_isotope_3d_scatter(
-        diagnostics_df,
+        filtered_df,
         z_col=z_axis,
         z_label=z_axis,
         color_col=color_param,
         color_label=color_param,
         title="Diagnostics 3D Chart",
         open_circle_identifier="SHP2L",
+        include_row_metadata=True,
+        isotope_key="cross",
     )
     identifiers = (
         sorted(
@@ -2056,11 +2068,16 @@ def diagnostics(
                 "d13_max": d13_max,
                 "d18_min": d18_min,
                 "d18_max": d18_max,
+                "signal_min": signal_min,
+                "signal_max": signal_max,
+                "leak_min": leak_min,
+                "leak_max": leak_max,
             },
             "row_count_before": int(len(diagnostics_df)),
             "row_count_after": int(len(filtered_df)),
             "diagnostic_grid": diagnostic_grid_meta,
             "selected_standards": selected_standards,
+            **({"cycle_signal_intensities": summarize_cycle_signal_intensities(df.loc[filtered_df.index], cycles_df)} if include_cycle_signals else {}),
         },
     )
 

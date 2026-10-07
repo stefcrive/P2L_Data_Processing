@@ -249,12 +249,15 @@ def _build_sample_gas_escape_mask(
     abrupt_drop_ratio: float = 0.40,
     sample_reference_ratio: float = 0.35,
     minimum_previous_signal: float = 1.0,
+    group_col: str | None = None,
 ) -> pd.Series:
     if cycles is None or cycles.empty or not intensity_cols:
         index = cycles.index if isinstance(cycles, pd.DataFrame) else pd.Index([], dtype=int)
         return pd.Series(False, index=index, dtype=bool)
 
-    ordered = cycles.sort_values("_cycle_order", kind="mergesort") if "_cycle_order" in cycles.columns else cycles
+    order_cols = ([group_col] if group_col else []) + (["_cycle_order"] if "_cycle_order" in cycles.columns else [])
+    ordered = cycles.sort_values(order_cols, kind="mergesort") if order_cols else cycles
+    groups = ordered[group_col] if group_col else None
     escape_candidates = pd.Series(0, index=ordered.index, dtype=int)
     mass44_candidates = pd.Series(False, index=ordered.index, dtype=bool)
     masses_with_sample_signal = 0
@@ -269,8 +272,12 @@ def _build_sample_gas_escape_mask(
             continue
 
         masses_with_sample_signal += 1
-        previous_sample = sample.shift(1)
-        previous_peak = sample.where(sample > 0).cummax().shift(1)
+        if groups is not None:
+            previous_sample = sample.groupby(groups).shift(1)
+            previous_peak = sample.where(sample > 0).groupby(groups).cummax().groupby(groups).shift(1)
+        else:
+            previous_sample = sample.shift(1)
+            previous_peak = sample.where(sample > 0).cummax().shift(1)
         has_signal_history = previous_peak.notna() & (previous_peak >= float(minimum_previous_signal))
         collapsed_from_peak = sample.notna() & (sample <= previous_peak * float(collapse_ratio))
         dropped_abruptly = (
@@ -301,7 +308,9 @@ def _build_sample_gas_escape_mask(
         combined_candidates = (escape_candidates >= 2) | mass44_candidates
 
     escape_mask = pd.Series(False, index=ordered.index, dtype=bool)
-    if bool(combined_candidates.any()):
+    if groups is not None:
+        escape_mask = combined_candidates.groupby(groups).cummax().astype(bool)
+    elif bool(combined_candidates.any()):
         first_escape_idx = combined_candidates[combined_candidates].index[0]
         first_pos = ordered.index.get_loc(first_escape_idx)
         if isinstance(first_pos, slice):
@@ -468,6 +477,66 @@ def get_cycles_for_selected_point(
         return None, None
     cycles = cycles.sort_values("_cycle_order")
     return cycles, selected_pre
+
+
+def summarize_cycle_signal_intensities(
+    df: pd.DataFrame,
+    cycles_df: pd.DataFrame | None,
+) -> dict[str, dict[str, float | None]]:
+    """Summarize sample I44 over successful cycles, excluding Pre and invalid signals."""
+    summaries: dict[str, dict[str, float | None]] = {}
+    if df is None or df.empty or cycles_df is None or cycles_df.empty:
+        return summaries
+    if "Cycle Number" not in cycles_df.columns:
+        return summaries
+    prepared = _prepare_cycles_lookup_frame(cycles_df)
+    pre_rows = prepared.loc[prepared["_cycle_order"].eq(0)]
+    identity_cols = [col for col in ("Excel File", "Identifier 1", "Identifier 2", "Run ID", "Line", "Date") if col in df.columns and col in pre_rows.columns]
+
+    def identity(row: pd.Series) -> tuple[str, ...]:
+        return tuple(str(row[col]).strip() if pd.notna(row[col]) else "" for col in identity_cols)
+
+    pre_by_identity: dict[tuple[str, ...], list[pd.Series]] = {}
+    for _, pre in pre_rows.iterrows():
+        pre_by_identity.setdefault(identity(pre), []).append(pre)
+    by_group: dict[Any, dict[str, float | None]] = {}
+    cycle_rows = prepared.loc[prepared["_cycle_order"].gt(0)].sort_values(["_cycle_group", "_cycle_order"])
+    intensity_cols = _find_cycle_intensity_columns(cycle_rows)
+    # Collector column roles are stable within each workbook. Normalize and
+    # calculate validity for all acquisitions together, keeping gas history local.
+    partitions = cycle_rows.groupby("Excel File", sort=False, dropna=False) if "Excel File" in cycle_rows.columns else [(None, cycle_rows)]
+    for _, partition in partitions:
+        sample_col, _ = _pick_mass_role_columns(partition, intensity_cols, 44)
+        if sample_col is None:
+            continue
+        intensities = pd.DataFrame({col: _normalize_signal_intensity(partition[col]) for col in intensity_cols}, index=partition.index)
+        saturated = _build_saturation_mask_from_intensity_df(intensities, [44, 45, 46])
+        escaped = _build_sample_gas_escape_mask(partition, intensity_cols, [44, 45, 46], group_col="_cycle_group")
+        sample = intensities[sample_col]
+        valid = sample.where(np.isfinite(sample) & ~saturated & ~escaped)
+        aggregates = valid.groupby(partition["_cycle_group"], sort=False).agg(["first", "last", "mean"])
+        for group, values in aggregates.iterrows():
+            by_group[group] = {key: float(values[col]) if np.isfinite(values[col]) else None for key, col in (("first_valid", "first"), ("last_valid", "last"), ("average", "mean"))}
+    for row_label, row in df.iterrows():
+        candidates = pre_by_identity.get(identity(row), [])
+        if len(candidates) == 1:
+            pre = candidates[0]
+        else:
+            _, pre = get_cycles_for_selected_point(df, cycles_df, row_label, "d 13C/12C  Mean")
+        if pre is None:
+            continue
+        # Result-only acquisitions must not inherit another sample's cycles.
+        if any(
+            pd.notna(row.get(column)) and pd.notna(pre.get(column))
+            and str(row[column]).strip() and str(pre[column]).strip()
+            and str(row[column]).strip() != str(pre[column]).strip()
+            for column in ("Identifier 2", "Run ID")
+        ):
+            continue
+        group = pre.get("_cycle_group")
+        if group in by_group:
+            summaries[str(row_label)] = by_group[group]
+    return summaries
 
 
 def _pick_cycle_sample_intensity_column(

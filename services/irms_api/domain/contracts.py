@@ -202,6 +202,7 @@ class CalibrationLinearityUpdateRequest(BaseModel):
 
 
 class CalibrationConfig(BaseModel):
+    fit_excluded_rows: dict[str, list[str]] = Field(default_factory=dict)
     selected_standards: list[str] = Field(default_factory=list)
     calibration_type: Literal["Z-Score", "IQR"] = "IQR"
     carbonate_material: Literal["calcite", "aragonite"] = "calcite"
@@ -282,9 +283,9 @@ class ProcessingOverlayConfig(BaseModel):
     show_statistical_outliers: bool = False
     show_range_outliers: bool = False
     show_manual_outliers: bool = False
-    show_saturated_collectors: bool = True
-    show_saturated_samples: bool = True
-    show_failed_samples: bool = True
+    show_saturated_collectors: bool = False
+    show_saturated_samples: bool = False
+    show_failed_samples: bool = False
 
 
 class ProcessingLinearityOverrideConfig(BaseModel):

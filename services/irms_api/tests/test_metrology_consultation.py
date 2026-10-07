@@ -5,6 +5,43 @@ from services.irms_api.metrology.science import anchor_model
 from services.irms_api.metrology.analysis_evidence import analysis_evidence
 
 class ConsultationTests(unittest.TestCase):
+    def test_original_linearity_algorithm_honors_session_exclusions(self):
+        import pandas as pd
+        from services.irms_api.domain.calibration.workspace import build_calibration_workspace
+        frame = pd.DataFrame({"Identifier 1": ["SHP2L"]*8, "Identifier 2": [""]*8,
+                              "d 13C/12C  Mean": [float(i)*.1 for i in range(7)]+[30.],
+                              "d 18O/16O  Mean": [float(i)*.2 for i in range(8)],
+                              "1  Cycle Int  Samp  44": [float(i+1) for i in range(8)]})
+        config = {"selected_standards": ["SHP2L"], "calibration_type": "Z-Score", "sigma_level": 99,
+                  "fit_excluded_rows": {"d13C": ["7"]}}
+        workspace = build_calibration_workspace("test", frame, {"metrology_link": {"results_session_id": "test"}}, config)
+        self.assertAlmostEqual(workspace.linearity_fits["d13C"]["slope"], .1)
+        self.assertEqual(workspace.linearity_fits["d13C"]["n"], 7)
+        self.assertEqual(workspace.linearity_fits["d18O"]["n"], 8)
+        self.assertEqual(sum(len(t.get("customdata", [])) for t in workspace.figures["crossplot"]["data"]), 8)
+
+    def test_linearity_and_manual_preview_exclude_flags_per_isotope(self):
+        from services.irms_api.metrology.residual_preview import residual_previews
+        rows = [dict(id=str(i), sequence=i, role="qc", material_id="m", label="QC",
+                     d13c=2*i+4, d18o=3*i-2, i44_v=i+1, sample_reference_difference_v=i,
+                     pressure_mismatch_v=10*i, mass_ug=100, co2_pressure_ubar=None)
+                for i in range(1, 9)]
+        rows[-1]["d13c"] = 1000
+        before = copy.deepcopy(rows)
+        result = diagnostics(rows, {"d13c": {"8"}})
+        carbon = result["materials"][0]["isotopes"]["d13c"]
+        oxygen = result["materials"][0]["isotopes"]["d18o"]
+        self.assertAlmostEqual(carbon["intensity_dependence"]["slope"], 2)
+        self.assertEqual(carbon["intensity_dependence"]["n"], 7)
+        self.assertEqual(oxygen["intensity_dependence"]["n"], 8)
+        self.assertEqual(len(carbon["intensity_dependence"]["points"]), 8)
+        self.assertTrue(carbon["intensity_dependence"]["points"][-1]["excluded_from_fit"])
+        preview = residual_previews(result, {"m:intensity_dependence:d13c": {"enabled": True}})["m:intensity_dependence:d13c"]
+        self.assertAlmostEqual(preview["model"]["slope"], 2)
+        self.assertAlmostEqual(preview["after"]["sd"], 0, places=10)
+        self.assertEqual(preview["n"], 7)
+        self.assertEqual(rows, before)
+
     def test_consultation_spatial_charts_keep_outliers_without_changing_fits(self):
         import pandas as pd
         from services.irms_api.domain.calibration.workspace import build_calibration_workspace

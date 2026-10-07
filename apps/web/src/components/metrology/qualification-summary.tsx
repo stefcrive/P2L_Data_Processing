@@ -25,9 +25,9 @@ export function AnchorPair({ method }: { method: Method | null | undefined }) {
   return <div className="metro-grid station-anchor-pair">{isotopes.map(iso => {
     const model = method.normalization?.[iso];
     return <section key={iso} className="metro-panel">{model ? <>
-      <Chart height={220} title={`${isotopeLabel[iso]} · ${tr("Dual-point anchors")}`} x={tr("Corrected instrument delta / ‰")} y={`${isotopeLabel[iso]} / ‰ VPDB`} data={[...normalizationEnvelope(model, method.config.coverage_factor, `${tr("Normalization envelope")} · k=${method.config.coverage_factor}`, "rgba(31,95,191,0.16)"), {
+      <Chart height={220} legendCollapsed title={`${isotopeLabel[iso]} · ${tr("Dual-point anchors")}`} x={tr("Corrected instrument delta / ‰")} y={`${isotopeLabel[iso]} / ‰ VPDB`} data={[...normalizationEnvelope(model, method.config.coverage_factor, `${tr("Normalization envelope")} · k=${method.config.coverage_factor}`, "rgba(31,95,191,0.16)"), {
         type: "scatter", mode: "lines+markers", name: tr("Anchor means"), x: model.measured, y: model.assigned,
-        line: { color: "#1f5fbf", width: 1.5 }, marker: { size: 7, color: "#1f5fbf" },
+        line: { color: "#1f5fbf", width: 1.5 }, marker: { size: 11, color: "#1f5fbf" },
         error_x: { type: "data", array: [2, 3].map(i => Math.sqrt(model.input_covariance[i][i])), visible: true },
         error_y: { type: "data", array: [0, 1].map(i => Math.sqrt(model.input_covariance[i][i])), visible: true },
       }]} />

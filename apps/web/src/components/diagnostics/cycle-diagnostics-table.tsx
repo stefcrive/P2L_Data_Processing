@@ -115,19 +115,19 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
         <span className="rounded-md bg-rose-100 px-2 py-1 text-rose-800">{tr("Saturated cycle")}</span>
         <span className="rounded-md bg-orange-100 px-2 py-1 text-orange-800">{tr("Sample gas escape")}</span>
       </div>
-      <div className="max-h-[560px] overflow-auto rounded-lg border border-stone-200">
+      <div className="cycle-diagnostics-table max-h-[360px] overflow-auto rounded-md border border-stone-200" tabIndex={0} aria-label={tr("Cycle intensity, precision, and correction evidence.")}>
         <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
-          <thead className="bg-stone-50">
+          <thead className="sticky top-0 z-10 bg-stone-50">
             <tr>
               {columns.map((column) => (
-                <th key={column} className="px-3 py-2 font-medium text-stone-700">
+                <th key={column} scope="col" className="whitespace-nowrap px-2 py-1 font-medium text-stone-700">
                   {tr(formatScientificText(column))}
                 </th>
               ))}
             </tr>
           </thead>
           <tbody className="divide-y divide-stone-100">
-            {statusRows.slice(0, 25).map((row, rowIndex) => {
+            {statusRows.map((row, rowIndex) => {
               const saturated = String(row["Cycle status"]) === "Saturated";
               const sampleGasEscape = String(row["Cycle status"]) === "Sample gas escape";
               const firstValidCycle = asBoolean(row["First Valid Cycle"]);
@@ -159,7 +159,8 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
                       <td
                         key={column}
                         className={cn(
-                          "px-3 py-2",
+                          "whitespace-nowrap px-2 py-1 text-xs tabular-nums",
+                          typeof cellValue === "number" && "text-right",
                           validCycleColumn
                             ? validCycleColumnValue
                               ? "font-semibold text-stone-900"
@@ -181,7 +182,6 @@ export function SharedCycleDiagnosticsTable({ rows }: { rows: Array<Record<strin
             })}
           </tbody>
         </table>
-        {rows.length > 25 ? <div className="border-t border-stone-200 px-3 py-2 text-xs text-stone-500">{tr("Showing first 25 of ")}{rows.length}{tr(" rows.")}</div> : null}
       </div>
     </div>
   );

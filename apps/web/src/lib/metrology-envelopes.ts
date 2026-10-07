@@ -51,11 +51,14 @@ export function uncertaintyEnvelope(points: EnvelopePoint[], name: string, fillc
 }
 
 /** Add canonical final results to the reused processing figures; raw traces stay unchanged. */
-export function withSessionUncertainty(figure: Record<string, unknown> | undefined, rows: Record<string, SessionRow>, label: string) {
+export function withSessionUncertainty(figure: Record<string, unknown> | undefined, rows: Record<string, SessionRow>, label: string,
+  exclusions: {row:string;isotope:string;hidden?:boolean;excludeFromFit?:boolean}[] = []) {
   if (!figure || !Array.isArray(figure.data) || !Object.keys(rows).length) return figure;
   const data = figure.data as Record<string, unknown>[];
   if (data.some(trace => (trace.meta as Record<string, unknown>)?.sessionUncertainty)) return figure;
   const seen = new Set<string>(), overlays: Record<string, unknown>[] = [];
+  const excluded = new Set(exclusions.filter(flag=>flag.hidden || (rows[flag.row]?.role === "qc" && flag.excludeFromFit !== false))
+    .map(flag=>`${rows[flag.row]?.id}:${flag.isotope.toLowerCase()}`));
   for (const trace of data) {
     const traceX=vector(trace.x), traceY=vector(trace.y), traceZ=vector(trace.z);
     if (!Array.isArray(trace.customdata) || !traceX || !traceY) continue;
@@ -73,7 +76,7 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
     const selected = indices.map(i => rows[String(custom[i][0])]);
     const usable = (row: SessionRow, isotope: Isotope) => {
       const result = row.isotopes?.[isotope];
-      return !row.excluded && result?.budget && finite(result.budget.expanded_uncertainty) && finite(result.value) ? result : undefined;
+      return !row.excluded && !excluded.has(`${row.id}:${isotope}`) && result?.budget && finite(result.budget.expanded_uncertainty) && finite(result.value) ? result : undefined;
     };
     const x = indices.map((i, n) => cross ? usable(selected[n], "d18o")?.value ?? null : traceX[i] as number|string);
     const y = selected.map(row => usable(row, iso)?.value ?? null);

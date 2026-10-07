@@ -19,6 +19,16 @@ declare module "plotly.js/lib/core" {
   export default Plotly;
 }
 
+declare module "plotly.js/src/components/dragelement/unhover" {
+  const unhover: Parameters<typeof import("@/lib/plotly-lifecycle").guardPlotlyUnhover>[0];
+  export default unhover;
+}
+
+declare module "plotly.js/src/components/dragelement" {
+  const dragElement: Parameters<typeof import("@/lib/plotly-lifecycle").guardPlotlyUnhover>[1];
+  export default dragElement;
+}
+
 declare module "plotly.js/lib/bar" {
   const bar: unknown;
   export default bar;

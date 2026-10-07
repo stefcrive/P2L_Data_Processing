@@ -374,10 +374,11 @@ class WorkflowTests(unittest.TestCase):
 
     def test_out_of_range_and_stale_evaluation_block_release(self):
         self.activate()
-        run = self.routine(mass=170)
+        run = self.routine(mass=250)
         ev = self.service.run_detail(run["id"])["evaluation"]
         self.assertFalse(ev["ready"])
-        self.assertTrue(any("mass_ug" in e for e in ev["blockers"]))
+        self.assertTrue(any("i44_v" in e for e in ev["blockers"]))
+        self.assertFalse(any("mass_ug" in e for e in ev["blockers"]))
         self.service.annotate(run["id"], AnnotationCommand(**DECISION, acquisition_complete=True))
         with self.assertRaisesRegex(Conflict, "stale"):
             self.service.release(run["id"], ReleaseCommand(**DECISION, evaluation_id=ev["id"]))

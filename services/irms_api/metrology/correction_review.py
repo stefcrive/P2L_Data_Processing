@@ -86,7 +86,7 @@ def correction_review(results, models, config, run, qc, excluded_outlier_ids=Non
 def screen_effects(diagnostics, practical):
     for material in diagnostics["materials"]:
         for iso, fits in material["isotopes"].items():
-            for key in ("sample_reference_dependence","mass_dependence","intensity_dependence","pressure_dependence","pressure_residual","drift","memory"):
+            for key in ("sample_reference_dependence","mass_dependence","intensity_dependence","pressure_adjusted_dependence","pressure_dependence","pressure_residual","drift","memory"):
                 fit=fits[key]
                 interval=fit.get("slope_ci95")
                 resolved=bool(interval and (interval[0]>0 or interval[1]<0))

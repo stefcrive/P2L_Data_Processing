@@ -748,6 +748,21 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertAlmostEqual(float(diagnostics.target["current_value"]), 50.0, places=6)
         self.assertAlmostEqual(float(diagnostics.target["linearity_corrected_value"]), 49.975, places=6)
 
+    def test_diagnostics_cycle_signal_summary_is_opt_in_and_matches_acquisitions(self) -> None:
+        frame = sample_processing_df().copy()
+        frame["p_no_acid"] = [101., 102., 103., 104.]
+        frame["total_co2"] = [1., 1.1, 1.2, 1.3]
+        frame["p_gases"] = [201., 202., 203., 204.]
+        api_main.store.save_frames(self.session_id, frame, sample_cycles_df())
+        with TestClient(api_main.app) as client:
+            response = client.get(f"/sessions/{self.session_id}/diagnostics?include_cycle_signals=true")
+            default_response = client.get(f"/sessions/{self.session_id}/diagnostics")
+        self.assertEqual(response.status_code, 200)
+        signals = response.json()["summary"]["cycle_signal_intensities"]
+        self.assertEqual(signals["0"], {"first_valid": 15.1, "last_valid": 14.9, "average": 15.0})
+        self.assertNotIn("1", signals)
+        self.assertNotIn("cycle_signal_intensities", default_response.json()["summary"])
+
     def test_diagnostics_endpoint_uses_linearity_corrected_values_when_enabled(self) -> None:
         df = sample_processing_df().copy()
         df["p_no_acid"] = [101.0, 102.0, 103.0, 104.0]
@@ -824,6 +839,20 @@ class ProcessingApiTests(unittest.TestCase):
 
         self.assertEqual(bundle.summary["available_color_params"][:2], ["Date", SAMPLE_SEQUENCE_COL])
         self.assertEqual(bundle.summary["active_filters"]["color_param"], SAMPLE_SEQUENCE_COL)
+
+    def test_diagnostics_signal_and_leak_filters_also_limit_3d_points(self) -> None:
+        frame = sample_processing_df().copy()
+        frame["leak_rate"] = [5., 30., 5., 5.]
+        frame["p_no_acid"] = [101., 102., 103., 104.]
+        frame["total_co2"] = [1., 1.1, 1.2, 1.3]
+        frame["p_gases"] = [201., 202., 203., 204.]
+        api_main.store.save_frames(self.session_id, frame, sample_cycles_df())
+        bundle = api_main.diagnostics(self.session_id, color_param="Date", z_axis="1  Cycle Int  Samp  44",
+            identifier_filter=[], d13_min=None, d13_max=None, d18_min=None, d18_max=None,
+            signal_min=14., leak_max=10.)
+        self.assertEqual(bundle.summary["row_count_before"], 4)
+        self.assertEqual(bundle.summary["row_count_after"], 2)
+        self.assertEqual(sum(len(trace.get("customdata", [])) for trace in bundle.figures["diagnostics_3d"]["data"]), 2)
 
     def test_diagnostics_endpoint_includes_diff_signal_vs_isotope_scatter_plots(self) -> None:
         df = sample_processing_df().copy()
@@ -905,13 +934,12 @@ class ProcessingApiTests(unittest.TestCase):
         self.assertEqual(
             ordered_groups,
             [
+                "Multivariate Overview",
                 "d13C",
                 "d18O",
                 "Leak Rate",
                 "Total CO2",
                 "Line",
-                "Isotope Comparison",
-                "Multivariate Overview",
             ],
         )
 
@@ -971,10 +999,10 @@ class ProcessingApiTests(unittest.TestCase):
 
         grid_meta = bundle.summary.get("diagnostic_grid", [])
         self.assertEqual(len(grid_meta), 28)
-        self.assertEqual(grid_meta[0]["group"], "d13C")
+        self.assertEqual(grid_meta[0]["group"], "Multivariate Overview")
         self.assertEqual(bundle.summary.get("selected_standards"), ["SampleA"])
 
-        first_key = grid_meta[0]["key"]
+        first_key = next(item["key"] for item in grid_meta if item["group"] == "d13C")
         first_figure = bundle.figures[first_key]
         first_trace = first_figure["data"][0]
         self.assertEqual(

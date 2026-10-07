@@ -70,7 +70,8 @@ class DemoWorkflowTests(unittest.TestCase):
             self.assertEqual(state["status"],"valid")
             self.assertEqual(len(state["runs"]),44)
             self.assertEqual(len(state["reports"]),3)
-            self.assertEqual(sum(h["isotopes"]["d13c"]["n"] for h in state["history"]),234)
+            self.assertEqual(sum(h["isotopes"]["d13c"]["total_n"] for h in state["history"]),234)
+            self.assertEqual(sum(h["isotopes"]["d13c"]["n"] + len(h["isotopes"]["d13c"]["outlier_ids"]) for h in state["history"]),234)
             self.assertEqual(state["active_method"]["version"],4)
             self.assertEqual(len([q for q in state["qualifications"] if q["status"]=="approved"]),4)
             before_audit=state["audit"]

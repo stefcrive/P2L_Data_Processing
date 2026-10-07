@@ -26,13 +26,13 @@
 .scientific-select[data-disabled] { opacity: .55; }
 .scientific-controls .scientific-select > select { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 100%; opacity: 0; cursor: pointer; }
 .scientific-control-column .scientific-controls .range-field--compact { min-width: 0; padding: 0; border: 0; background: transparent; border-radius: 0; }
-.scientific-control-column .scientific-controls .range-field--compact .range-field__controls { display: grid; grid-template-columns: minmax(80px,1fr) minmax(38px,.7fr) minmax(80px,1fr); align-items: center; gap: 5px; margin-top: 2px; }
+.scientific-control-column .scientific-controls .range-field--compact .range-field__controls { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); align-items: center; gap: 5px; margin-top: 2px; }
 .scientific-control-column .scientific-controls .range-field--compact .range-field__number { display: block; grid-row: 1; min-width: 0; }
 .scientific-control-column .scientific-controls .range-field--compact .range-field__number:first-child { grid-column: 1; }
-.scientific-control-column .scientific-controls .range-field--compact .range-field__number:last-child { grid-column: 3; }
+.scientific-control-column .scientific-controls .range-field--compact .range-field__number:last-child { grid-column: 2; }
 .scientific-control-column .scientific-controls .range-field--compact .range-field__number > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .scientific-control-column .scientific-controls .range-field--compact .range-field__number input { font-variant-numeric: tabular-nums; font-family: inherit; font-size: 12px; text-align: right; padding-inline: 4px; }
-.scientific-control-column .scientific-controls .range-field--compact .dual-range { grid-column: 2; grid-row: 1; height: 28px; margin: 0; min-width: 0; }
+.scientific-control-column .scientific-controls .range-field--compact .dual-range { grid-column: 1/-1; grid-row: 2; height: 23px; margin: 0; min-width: 0; }
 .scientific-control-column .scientific-controls .range-field--wide-values .range-field__controls { grid-template-columns: minmax(0,1fr) minmax(0,1fr); }
 .scientific-control-column .scientific-controls .range-field--wide-values .range-field__number:last-child { grid-column: 2; }
 .scientific-control-column .scientific-controls .range-field--wide-values .dual-range { grid-column: 1/-1; grid-row: 2; height: 18px; }

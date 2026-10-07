@@ -27,7 +27,7 @@ def open_plot_bridge(service, session_id, scope, command):
         reuse_parsed = False
         if bridge and legacy.store.session_exists(bridge):
             link = legacy.store.load_metadata(bridge).get("metrology_link", {})
-            if link.get("bridge_version") == 8 and link.get("fingerprint") == fingerprint:
+            if link.get("bridge_version") == 9 and link.get("fingerprint") == fingerprint:
                 return {"session_id": bridge, "run_id": scope, "row_mapping": link.get("row_mapping", {})}
             # Upgrade an unchanged, frozen v7 consultation from its parsed cache.
             # Scientific revisions still create a fresh bridge below.
@@ -76,15 +76,13 @@ def open_plot_bridge(service, session_id, scope, command):
                 # and use the authoritative exported analysis values in result plots.
                 for field, column in (("d13c", "d 13C/12C  Mean"), ("d18o", "d 18O/16O  Mean"),
                                       ("d13c_sd", "d 13C/12C  Std Dev"), ("d18o_sd", "d 18O/16O  Std Dev"),
-                                      ("i44_v", "1  Cycle Int  Samp  44"),
-                                      ("reference_i44_v", "1  Cycle Int  Ref  44"),
-                                      ("sample_reference_difference_v", "1  Cycle Int  Diff Samp-Ref  44")):
+                                      ):
                     frame.loc[index, "IRMS cycle summary: " + column] = row.get(column)
                     frame.loc[index, column] = original.get(field)
         metadata = legacy.store.load_metadata(bridge)
         metadata["session_name"] = f"{session['client']} / {session['name']}"
         metadata["metrology_link"] = {"results_session_id": session_id, "run_id": scope, "run_ids": run_ids,
-            "method_id": session["method_id"], "qualification_id": session["qualification_id"], "bridge_version": 8,
+            "method_id": session["method_id"], "qualification_id": session["qualification_id"], "bridge_version": 9,
             "fingerprint": fingerprint, "row_mapping": mapping}
         method = service.repo.get(db, "methods", session["method_id"])
         materials = service.material_map(db, method)

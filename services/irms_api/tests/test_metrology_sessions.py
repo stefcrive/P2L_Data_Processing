@@ -18,6 +18,71 @@ D = fixtures.DECISION
 
 
 class ResultsSessionTests(unittest.TestCase):
+    def test_review_warnings_do_not_erase_linearity_and_all_data_is_opt_in(self):
+        from services.irms_api.metrology.session_analysis import session_analysis
+        session=self.create(); self.import_batch(session)
+        detail=self.service.results_session_detail(session["id"])
+        for row in detail["runs"][0]["evaluation"]["results"]:
+            row["issues"]=["mass_ug missing or outside validated range", "d13c internal SD missing or at/above limit"]
+            row["initial_i44_v"] = row["sequence"] * 2
+        analysis=session_analysis(detail)
+        self.assertEqual(analysis["correction_review"]["d13c"]["paired_n"],3)
+        self.assertEqual(analysis["diagnostics_after"]["materials"][0]["isotopes"]["d13c"]["intensity_dependence"]["n"],3)
+        qc=[r for r in detail["runs"][0]["evaluation"]["results"] if r["role"]=="qc"]
+        self.assertEqual([p["x"] for p in analysis["diagnostics_after"]["materials"][0]["isotopes"]["d13c"]["intensity_dependence"]["points"]], [r["initial_i44_v"] for r in qc])
+        self.assertFalse(any(m["material_id"]=="__all__" for m in analysis["diagnostics_after"]["materials"]))
+        all_data=self.client.get(f"/metrology/results-sessions/{session['id']}/analysis?include_all_data=true")
+        self.assertEqual(all_data.status_code,200,all_data.text)
+        pooled=next(m for m in all_data.json()["diagnostics_after"]["materials"] if m["material_id"]=="__all__")
+        self.assertEqual(pooled["isotopes"]["d13c"]["intensity_dependence"]["n"],6)
+
+    def test_workbook_inclusion_is_reversible_and_preserves_evaluation(self):
+        session=self.create();run,_=self.import_batch(session)
+        before=self.service.run_detail(run["id"])["evaluation"]
+        url=f"/metrology/results-sessions/{session['id']}/workbooks/{run['id']}"
+        removed=self.client.post(url+"?included=false",json=D)
+        self.assertEqual(removed.status_code,200,removed.text)
+        detail=self.service.results_session_detail(session["id"])
+        self.assertEqual(detail["runs"],[])
+        self.assertEqual(detail["detached_runs"][0]["evaluation"],before)
+        self.assertEqual(self.client.post(url+"?included=true",json=D).status_code,200)
+        self.assertEqual(self.service.results_session_detail(session["id"])["runs"][0]["evaluation"],before)
+        other=self.create("Other client")
+        self.assertEqual(self.client.post(f"/metrology/results-sessions/{other['id']}/workbooks/{run['id']}",json=D).status_code,422)
+
+    def test_original_excel_writers_export_whole_population_and_outliers(self):
+        from openpyxl import load_workbook
+        session=self.create();self.import_batch(session)
+        client=self.service.export_results_session(session["id"],SessionExportCommand(**D,format="xlsx",output_type="client_output"))
+        book=load_workbook(io.BytesIO(self.repo.read_blob(client["sha256"])))
+        self.assertEqual(book.sheetnames,["Client Output"])
+        headers=[c.value for c in book.active[1]]
+        corrected=next(i+1 for i,h in enumerate(headers) if h and h.startswith("Corrected d13C"))
+        self.assertEqual(book.active.cell(2,corrected).number_format,"0.00")
+        self.assertEqual(book.active.cell(2,1).data_type,"s")
+        whole=self.service.export_results_session(session["id"],SessionExportCommand(**D,format="xlsx",output_type="dataset"))
+        book=load_workbook(io.BytesIO(self.repo.read_blob(whole["sha256"])))
+        self.assertEqual(book["Data"].max_row,7)  # Three QC and three unknowns.
+        self.assertIn("Statistics",book.sheetnames)
+        qc=[fixtures.row(i+1,"SHP2L",v,sample_type="QC Standard") for i,v in enumerate([0,.001,.002,.003,.004,.005,.006,1])]
+        self.service.import_run("extra-qc.xlsx",fixtures.workbook(qc),RunCommand(**D,results_session_id=session["id"]))
+        self.client.put(f"/metrology/results-sessions/{session['id']}/outlier-screening",json={**D,"method":"iqr","threshold":1.5})
+        for include in (False,True):
+            exported=self.service.export_results_session(session["id"],SessionExportCommand(**D,format="xlsx",output_type="dataset",include_outliers=include))
+            book=load_workbook(io.BytesIO(self.repo.read_blob(exported["sha256"])))
+            self.assertIn("Outliers",book.sheetnames)
+            self.assertGreater(book["Outliers"].max_row,1)
+            self.assertEqual(book["Data"].max_row-1+(0 if include else book["Outliers"].max_row-1),14)
+
+    def test_missing_mass_does_not_gate_valid_signals(self):
+        session=self.create()
+        rows=[fixtures.row(i+1,"SHP2L",v,sample_type="QC Standard") for i,v in enumerate([-.01,0,.01])]
+        for row in rows: row["mass_ug"]=None
+        run=self.service.import_run("no-mass.xlsx",fixtures.workbook(rows),RunCommand(**D,results_session_id=session["id"]))
+        evaluation=self.service.run_detail(run["id"])["evaluation"]
+        self.assertTrue(evaluation["qc"]["passed"])
+        self.assertFalse(any("mass_ug" in issue for r in evaluation["results"] for issue in r["issues"]))
+
     def test_residual_overrides_are_audited_previews_and_can_be_restored(self):
         session = self.create()
         run, _ = self.import_batch(session)
@@ -62,6 +127,14 @@ class ResultsSessionTests(unittest.TestCase):
         self.assertEqual(analysis["outliers"]["id"], screening["id"])
         self.assertEqual(analysis["correction_review"]["d13c"]["paired_n"], 7)
         self.assertEqual(analysis["correction_review"]["d18o"]["paired_n"], 8)
+        material = analysis["diagnostics_after"]["materials"][0]
+        self.assertEqual(material["isotopes"]["d13c"]["drift"]["n"], 7)
+        self.assertEqual(material["isotopes"]["d18o"]["drift"]["n"], 8)
+        retained_id = next(p["id"] for p in material["isotopes"]["d13c"]["drift"]["points"] if not p["excluded_from_fit"])
+        preview = self.client.post(endpoint+"/analysis-preview", json={"d13c": [retained_id]}).json()
+        self.assertEqual(preview["diagnostics_after"]["materials"][0]["isotopes"]["d13c"]["drift"]["n"], 6)
+        self.assertEqual(preview["diagnostics_after"]["materials"][0]["isotopes"]["d18o"]["drift"]["n"], 8)
+        self.assertEqual(restarted.results_session_analysis(session["id"])["diagnostics_after"]["materials"][0]["isotopes"]["d13c"]["drift"]["n"], 7)
         self.assertEqual(restarted.results_session_analysis(session["id"])["outliers"]["id"], screening["id"])
         detail = restarted.results_session_detail(session["id"])
         carbon, oxygen = (detail["history"][0]["isotopes"][iso] for iso in ("d13c", "d18o"))
