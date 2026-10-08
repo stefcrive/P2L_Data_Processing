@@ -15,7 +15,7 @@ from .models import (
     AnnotationCommand, ApproveCommand, Decision, EffectCommand, EvaluateCommand, ExclusionCommand,
     InterventionCommand, MaterialCommand, MethodCommand, PeriodCommand, QualificationCommand,
     ReleaseCommand, RunCommand, TestCommand,
-    OutlierScreeningCommand, ResultsSessionCommand, SessionGroupsCommand, SessionExportCommand, RowReviewCommand, ResidualOverrideCommand, SessionChartSettingsCommand,
+    OutlierScreeningCommand, ResultsSessionCommand, SessionGroupsCommand, SessionExportCommand, RowReviewCommand, ResidualOverrideCommand, SessionChartSettingsCommand, SessionUncertaintyCommand, SessionFailedCorrectionCommand,
 )
 from .repository import Repository, encode
 from .reports import build_report
@@ -96,9 +96,19 @@ def results_groups(id_: str, command: SessionGroupsCommand, s: Service = Depends
     return invoke(s.save_session_groups,id_,command)
 
 
+@router.put("/results-sessions/{id_}/uncertainty")
+def session_uncertainty(id_: str, command: SessionUncertaintyCommand, s: Service = Depends(get_service)):
+    return invoke(s.save_session_uncertainty, id_, command)
+
+
 @router.put("/results-sessions/{id_}/chart-settings")
 def session_chart_settings(id_: str, command: SessionChartSettingsCommand, s: Service = Depends(get_service)):
     return invoke(s.save_chart_settings, id_, command)
+
+
+@router.put("/results-sessions/{id_}/failed-correction")
+def session_failed_correction(id_: str, command: SessionFailedCorrectionCommand, s: Service = Depends(get_service)):
+    return invoke(s.save_failed_correction, id_, command)
 
 
 @router.put("/results-sessions/{id_}/residual-overrides")

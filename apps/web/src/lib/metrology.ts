@@ -24,9 +24,9 @@ export type MethodConfig = {
 export type Normalization = { assigned: number[]; measured: number[]; slope: number; intercept: number; formula: string; input_covariance: number[][]; parameter_covariance: number[][] };
 export type Method = { id: string; status: string; version: number; revision: number; config: MethodConfig; normalization?: Pair<Normalization>; approval?: Decision & { at: string } };
 export type Stats = { n: number; mean: number | null; sd: number | null; se_mean: number | null };
-export type Fit = { screening_status?:string; practical_threshold?:number; status: string; n: number; slope?: number; intercept?: number; slope_se?: number | null; residual_standard_error?: number; covariance?: number[][] | null; effect_span?: number; r_squared?: number; slope_ci95?: number[] | null; interpretation?: string; points?: { id?: string; excluded_from_fit?: boolean; adjustment?:number; u_correction?:number|null; extrapolated?:boolean; x: number; y: number }[]; residuals?: number[] };
+export type Fit = { screening_status?:string; practical_threshold?:number; status: string; n: number; slope?: number; intercept?: number; slope_se?: number | null; residual_standard_error?: number; covariance?: number[][] | null; effect_span?: number; r_squared?: number; slope_ci95?: number[] | null; interpretation?: string; points?: { id?: string; excluded_from_fit?: boolean; correction_applied?:boolean; adjustment?:number; u_correction?:number|null; extrapolated?:boolean; x: number; y: number }[]; residuals?: number[] };
 export type Diagnostics = { materials: { material_id: string; label: string; n: number; intensity_pressure_correlation: number | null; collinearity_warning: boolean; mass_to_co2_pressure: Fit; co2_pressure_to_i44: Fit; mass_to_i44: Fit; isotopes: Pair<{ repeatability: Stats; repeatability_by_mass?: (Stats & { mass_ug: number })[]; within_mass_pooled_sd?: number | null; mass_dependence: Fit; intensity_dependence: Fit; pressure_residual: Fit; pressure_dependence?: Fit; pressure_adjusted_dependence?: Fit; sample_reference_dependence?: Fit; drift: Fit; memory: Fit }> }[]; note: string };
-export type IsotopeResult = { u_prec?: number; u_corr?: number; residual_to_assigned?: number; processing?: Record<string, unknown>; value: number; u_norm: number; extrapolated: boolean; budget?: { components: Component[]; u_combined: number; expanded_uncertainty: number; k: number } };
+export type IsotopeResult = {session_qc_admitted?:boolean;budget_issue?:string;u_residual?:number;residual_correction?:{effect:string;adjustment:number;u:number}; u_prec?: number; u_corr?: number; residual_to_assigned?: number; processing?: Record<string, unknown>; value: number; u_norm: number; extrapolated: boolean; budget?: { components: Component[]; u_combined: number; expanded_uncertainty: number; k: number } };
 export type Measurement = { identifier1?: string; identifier2?: string; species?: string; material_id?: string; pressure_mismatch_v?: number; sample_reference_difference_v?: number; reference_i44_v?: number; status?: string; id: string; sequence: number; source_index: string; label: string; comment: string; reference: string; sample_type: string; source_role: string; d13c: number | null; d18o: number | null; d13c_sd: number | null; d18o_sd: number | null; i44_v: number | null; mass_ug: number | null; acquired_at: string | null; cycle_count: number; role?: string; issues?: string[]; accepted_issues?: string[]; reviews?: {actor: string; reason: string; at: string; issues: string[]}[]; excluded?: boolean; isotopes?: Partial<Pair<IsotopeResult>> };
 export type CorrectionReview = { status:string; before:Stats; after:Stats; paired_n:number; total_qc:number; excluded_outlier_n?:number; sd_reduction_fraction:number|null; reduction_interval95:number[]|null; reasons:string[]; criteria:{minimum_qc:number; minimum_sd_reduction_fraction:number}; points:{id:string;sequence:number;before:number;after:number;i44_v:number|null;pressure_mismatch_v:number|null}[] };
 export type Evaluation = { correction_review?:Pair<CorrectionReview>; diagnostics_comparable?:Diagnostics; id: string; run_id: string; method_id: string; ready: boolean; blockers: string[]; warnings: string[]; diagnostics_after?: Diagnostics; diagnostics: Diagnostics; results: Measurement[]; normalization: Partial<Pair<Normalization>>; qc: { n: number; passed: boolean; isotopes: Pair<Stats & { bias: number | null; target: number | null; passed: boolean; imported?:Stats }> } };
@@ -52,10 +52,12 @@ export const fmt = (value: number | null | undefined, digits = 3) => value == nu
 export const human = (value: string) => value.replaceAll("_", " ");
 
 export type ResultsSession = {
+  correct_failed_analyses?: boolean;
+  coverage_factor?: number;
   chart_settings?: {carbonate_material: "calcite" | "aragonite"; diagnostic_material_id?: string | null};
   residual_overrides?: Record<string, ResidualOverride>;
-  outlier_screening?: {method:"sigma"|"iqr";threshold:number};
-  id: string; name: string; client: string; project: string; context: "routine" | "qualification";
+  outlier_screening?: {method:"sigma"|"iqr";threshold:number;pressure_adjustment_as_outlier?:boolean};
+  id: string; identity_revision?:number; identity_overrides?:Record<string,Record<string,string>>; name: string; client: string; project: string; context: "routine" | "qualification";
   method_id: string; qualification_id: string | null; method_name: string; intended_use: string;
   input_basis: "already_vpdb" | "instrument_delta"; preapplied_corrections: Isotope[]; processing_evidence: string;
   calibration_verification?:string; notes: string; run_ids: string[]; groups: Record<string,string>; status: string; analysis_count: number;
@@ -65,14 +67,19 @@ export type SessionExport = { id: string; filename: string; format: string; grou
 export type ResultsSessionDetail = ResultsSession & { runs: RunDetail[]; detached_runs?:RunDetail[]; method: Method | null; qualification: Qualification | null;
   qualification_run_id: string | null; history: HistoryGroup[]; exports: SessionExport[]; sources?:{id:string;filename:string;relative_path:string;sha256:string;size:number;disposition:string;run_id:string|null}[] };
 
-export type SessionRow = Measurement & { run_id: string; run_label: string; workbook_sequence: number; sample_group: string; evaluation_id: string | null; accepted_issues?: string[] };
-export type QcFlagCategory = "statistical"|"range"|"manual"|"failed";
-export type QcFlag = {measurement_id:string;run_id:string;evaluation_id?:string;isotope:Isotope;category?:QcFlagCategory;value:number|null;lower?:number;upper?:number;population_n?:number;reasons?:string[];metadata_only?:boolean};
+export type SessionRow = Measurement & { failure_categories?:Partial<Record<Isotope,"pressure_adjustment"|"no_signal"|null>>;run_id: string; run_label: string; workbook_sequence: number; sample_group: string; evaluation_id: string | null; accepted_issues?: string[];calculation_issues?:Partial<Record<Isotope,string>> };
+export type QcFlagCategory = "statistical"|"range"|"manual"|"failed"|"pressure_adjustment"|"no_signal";
+export type QcFlag = {measurement_id:string;run_id:string;evaluation_id?:string;isotope:Isotope;category?:QcFlagCategory;value:number|null;lower?:number;upper?:number;population_n?:number;reasons?:string[];metadata_only?:boolean;session_qc_admitted?:boolean};
+export type ResidualDecision = {status:string;n:number;before?:Stats;after?:Stats;sd_reduction_fraction?:number;applied_n?:number;extrapolated_n?:number;unknown_applied_n?:number;
+  training_population?:"pressure_failed_qc"|"nonfailed_qc_fallback";fit_excluded_ids?:string[];
+  intensity_before?:{slope?:number|null};intensity_after?:{slope?:number|null};
+  qc_pool?:{status:string;before:Stats;after:Stats;candidate_ids:string[];admitted_ids:string[]};
+  model?:{slope:number;u_slope:number|null;quad:number;degree:number;x_ref:number;intensity_slope?:number;u_intensity_slope?:number;intensity_ref?:number}};
 export type SessionAnalysis = { rows: SessionRow[]; diagnostics_before: Diagnostics; diagnostics_after: Diagnostics; correction_review: Pair<CorrectionReview>; workbooks: number;
-  residual_previews?: Record<string, Fit & {model?:{slope:number;quad:number;degree:number;x_ref:number;u_slope?:number|null;u_quad?:number|null;residual_degrees_of_freedom?:number;coefficient_covariance?:number[][]|null};uncertainty?:{status:string;formula:string;assumptions:string;limitation:string};before?:Stats;after?:Stats}>;
-  residual_linearity_views?: Record<string, Fit>;
-  outliers: { id?:string; created_at?:string; method: string; threshold: number; flags: QcFlag[] };
+  residual_qc_id?: string;residual_corrections?:Pair<Record<string,ResidualDecision>>;
+  failed_analysis_corrections?: Partial<Pair<ResidualDecision>>;
+  outliers: { id?:string; created_at?:string; method: string; threshold: number; pressure_adjustment_as_outlier?:boolean;flags: QcFlag[] };
   qc_review_flags?: QcFlag[];
   qc_statistics: Pair<{ imported: Stats; final: Stats }> };
 
-export type ResidualOverride = {enabled:boolean;algorithm:"linear"|"quadratic";slope:number|null;quadratic:number|null;center:number|null;offset:number;practical_threshold:number};
+export type ResidualOverride = {enabled:boolean;algorithm:"linear"|"quadratic";slope:number|null;quadratic:number|null;center:number|null;offset:number;practical_threshold:number;application_scope?:"fit_population"|"all_data";extrapolate?:boolean;include_statistical_outliers?:boolean;u_slope?:number|null;u_quadratic?:number|null};

@@ -67,8 +67,34 @@ def build_session_dossier(snapshot: dict) -> bytes:
           number(r["d13c_value"]), number(r["d13c_U"]), number(r["d18o_value"]), number(r["d18o_U"]), r["decision"]]
          for r in snapshot["results"]], [29, 8, 14, 12, 14, 12, 16])
     heading("Calculation model and uncertainty")
-    story.extend([p("z = x - c(p - p0); y = A1 + (z - M1)(A2 - A1)/(M2 - M1). Already normalized Qtegra values retain the documented normalization. Only remaining validated corrections are applied."),
+    story.extend([p("z = x - c(p - p0); y = A1 + (z - M1)(A2 - A1)/(M2 - M1). Already normalized Qtegra values retain the documented normalization. The session residual correction, when selected below, is applied after the registered method."),
         p("u_norm² = Jᵀ Σ_anchors J. u_c² = u_prec² + u_norm² + u_corr² + sum(u_j²), for independent components; U = k × u_c. u_prec is an individual QC standard deviation, not the standard error of its mean. Correction sensitivity includes its shared contribution to sample and anchors."), Spacer(1, 10)])
+    if snapshot.get("session_residual_corrections"):
+        heading("Session residual correction decision")
+        story.extend([p("One predictor per isotope is selected by the greatest QC SD reduction. The selected correction is applied across the session, including outside the fitted range. The SD comparison uses fitting QC and is not independent validation."),
+                      p("y_final = y - b(x - x_ref) - q(x² - x_ref²) + offset. u_residual² = g Cov(beta) gᵀ. The coefficient component is added to the result budget; u_corr combines registered-method and session-residual contributions."), Spacer(1, 6)])
+        labels = {"intensity_dependence": "Sample intensity", "sample_reference_dependence": "Sample-reference difference", "pressure_adjusted_dependence": "Pressure-adjusted difference"}
+        table(["Isotope / predictor", "QC n", "SD before", "SD after", "Decision"],
+              [[f"{iso} / {labels.get(effect, effect)}", fit.get("n", 0), number(fit.get("before", {}).get("sd")),
+                number(fit.get("after", {}).get("sd")), fit["status"].replace("_", " ")]
+               for iso, effects in snapshot["session_residual_corrections"].items() for effect, fit in effects.items()], [34, 8, 16, 16, 26])
+    if snapshot.get("correct_failed_analyses"):
+        heading("Failed-analysis pressure correction")
+        story.extend([p("Pressure-failed QC estimates one joint pressure-and-initial-intensity model after Huber initialization and iterative 3-MAD residual screening. y_final = y - b*pressure - c*(initial_intensity-I0), where I0 is the median initial intensity of retained nonfailed QC. Unknown samples never estimate coefficients. If the joint model is unavailable, the nonfailed-QC pressure-only model is labeled as a fallback. Only Qtegra pressure-flagged analyses receive this correction; ordinary session linearity is never stacked with it. Original review flags and observations remain. Corrected QC joins the session pool only if pooled SD decreases. A flat fitted trend is an in-sample result, not independent validation. The complete coefficient covariance contributes g Cov(beta) gT to the budget once; extrapolation is recorded."), Spacer(1, 6)])
+        table(["Isotope", "QC n", "Slope", "Corrected", "Extrapolated", "Decision"],
+              [[iso, fit.get("n", 0), number(fit.get("model", {}).get("slope")), fit.get("applied_n", 0),
+                fit.get("extrapolated_n", 0), fit["status"].replace("_", " ")]
+               for iso, fit in snapshot.get("failed_analysis_corrections", {}).items()], [14, 10, 20, 14, 14, 28])
+        table(["Isotope", "Training population", "Intensity slope", "QC fit exclusions", "Intensity slope after"],
+              [[iso, fit.get("training_population", "nonfailed_qc_fallback").replace("_", " "),
+                number(fit.get("model", {}).get("intensity_slope")), len(fit.get("fit_excluded_ids", [])),
+                number(fit.get("intensity_after", {}).get("slope"))]
+               for iso, fit in snapshot.get("failed_analysis_corrections", {}).items()], [12, 30, 18, 20, 20])
+        table(["Isotope", "Unknowns corrected", "QC admitted", "Pool SD before", "Pool SD with candidates", "Admission"],
+              [[iso, fit.get("unknown_applied_n", 0), len(fit.get("qc_pool", {}).get("admitted_ids", [])),
+                number(fit.get("qc_pool", {}).get("before", {}).get("sd")), number(fit.get("qc_pool", {}).get("after", {}).get("sd")),
+                fit.get("qc_pool", {}).get("status", "unavailable").replace("_", " ")]
+               for iso, fit in snapshot.get("failed_analysis_corrections", {}).items()], [10, 15, 13, 18, 20, 24])
     for calc in snapshot["calculations"]:
         if not calc["results"]:
             continue
@@ -89,7 +115,8 @@ def build_session_dossier(snapshot: dict) -> bytes:
             components = next((r["isotopes"][iso]["budget"]["components"] for r in calc["results"] if r.get("isotopes", {}).get(iso, {}).get("budget")), [])
             for component in components:
                 story.append(p(f"{component['name']}: {component['rationale']}"))
-    heading("QC correction validation")
+    heading("Recorded method QC comparison")
+    story.extend([p("The following comparison is retained from the original run evaluation, before the session residual correction."), Spacer(1, 6)])
     included_runs = {r["run_id"] for r in snapshot["results"]}
     for item in snapshot.get("correction_verification", []):
         if item["run_id"] not in included_runs or not item.get("review"):

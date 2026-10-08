@@ -18,7 +18,34 @@ from .repository import encode
 from .importer import measurement_identity
 
 
+def imported_sample_group(row, source_kind="qtegra_raw"):
+    """Group imported observations by the same identities shown in processing."""
+    identity = measurement_identity(row, source_kind)
+    identifier = str(identity.get("identifier1") or row.get("label") or "").strip()
+    species = str(identity.get("species") or "").strip()
+    return " · ".join(part for part in (identifier, species) if part) or "Main batch"
+
+
 class ResultsSessions:
+    def edit_session_identities(self, session_id, changes):
+        """Correct displayed identities without changing acquisition or material IDs."""
+        allowed = {"identifier1", "identifier2", "species"}
+        with self.repo.connect(write=True) as db:
+            session = self.repo.get(db, "results_sessions", session_id)
+            members = {r["id"] for rid in session["run_ids"] for r in self.repo.list(db, "measurements", run_id=rid)}
+            if not set(changes).issubset(members):
+                raise ValueError("Choose observations belonging to this results session")
+            if any(not set(values).issubset(allowed) or any(not isinstance(v, str) or len(v)>500 for v in values.values()) for values in changes.values()):
+                raise ValueError("Only identifiers and species labels can be edited here")
+            overrides = session.setdefault("identity_overrides", {})
+            before = {mid: dict(overrides.get(mid, {})) for mid in changes}
+            for mid, values in changes.items():
+                overrides.setdefault(mid, {}).update(values)
+            session["identity_revision"] = session.get("identity_revision", 0)+1
+            self.repo.update(db, "results_sessions", session_id, session)
+            self.repo.audit(db, "result_identity_corrected", session_id, "Processing controls", "Correct result identifiers or species labels", before, changes)
+            return session
+
     def set_workbook_inclusion(self, session_id, run_id, included, command):
         """Change consultation membership while preserving imports and evaluations."""
         with self.repo.connect(write=True) as db:
@@ -56,29 +83,36 @@ class ResultsSessions:
         from .qc_screening import stored_qc_screening
         from .session_analysis import session_analysis
         detail = self.results_session_detail(session_id)
-        # Linearity uses the first acquired cycle, as in the original IRMS charts.
-        # Evaluation and uncertainty records retain their recorded intensity basis.
-        from .analysis_evidence import analysis_evidence
-        with self.repo.connect() as db:
-            for run in detail["runs"]:
-                initial = {}
-                for record in self.repo.list(db, "measurements", run_id=run["id"]):
-                    cycles = analysis_evidence(record, run["source"])["cycles"]
-                    if cycles:
-                        initial[record["id"]] = cycles[0]
-                for row in (run.get("evaluation") or {}).get("results", []):
-                    cycle = initial.get(row["id"], {})
-                    row["initial_i44_v"] = cycle.get("i44_v", row.get("i44_v"))
-                    row["initial_reference_i44_v"] = cycle.get("reference_i44_v", row.get("reference_i44_v"))
         # Explicit query parameters remain a non-persistent preview for existing clients.
         if outlier_method is not None or threshold is not None:
             settings = detail.get("outlier_screening", {"method": "sigma", "threshold": 3.0})
             return session_analysis(detail, outlier_method=outlier_method or settings["method"],
                                     threshold=threshold if threshold is not None else settings["threshold"], range_exclusions=range_exclusions, include_all_data=include_all_data)
+        return session_analysis(detail, outliers=detail.get("residual_outliers"), range_exclusions=range_exclusions, include_all_data=include_all_data)
+
+    def save_failed_correction(self, session_id, command):
         with self.repo.connect(write=True) as db:
             session = self.repo.get(db, "results_sessions", session_id)
-            outliers = stored_qc_screening(self.repo, db, session, detail["runs"])
-        return session_analysis(detail, outliers=outliers, range_exclusions=range_exclusions, include_all_data=include_all_data)
+            if any(self.repo.get(db, "runs", run_id)["status"] == "released" for run_id in session["run_ids"]):
+                raise ValueError("Correction settings in released results are frozen")
+            before = bool(session.get("correct_failed_analyses", False))
+            session["correct_failed_analyses"] = command.enabled
+            self.repo.update(db, "results_sessions", session_id, session)
+            self.repo.audit(db, "session_failed_correction_saved", session_id, command.actor, command.reason,
+                            {"correct_failed_analyses": before}, {"correct_failed_analyses": command.enabled})
+            return session
+
+    def save_session_uncertainty(self, session_id, command):
+        with self.repo.connect(write=True) as db:
+            session = self.repo.get(db, "results_sessions", session_id)
+            if any(self.repo.get(db, "runs", run_id)["status"] == "released" for run_id in session["run_ids"]):
+                raise ValueError("Uncertainty settings in released results are frozen")
+            before = session.get("coverage_factor")
+            session["coverage_factor"] = command.coverage_factor
+            self.repo.update(db, "results_sessions", session_id, session)
+            self.repo.audit(db, "session_coverage_factor_saved", session_id, command.actor, command.reason,
+                            {"coverage_factor": before}, {"coverage_factor": command.coverage_factor})
+            return session
 
     def save_chart_settings(self, session_id, command):
         with self.repo.connect(write=True) as db:
@@ -94,8 +128,10 @@ class ResultsSessions:
     def save_residual_override(self, session_id, command):
         with self.repo.connect(write=True) as db:
             session = self.repo.get(db, "results_sessions", session_id)
-            if command.material_id != "__all__" and command.material_id not in self.material_map(db, self.repo.get(db, "methods", session["method_id"])):
-                raise ValueError("Choose a material belonging to the session method")
+            from .session_processing import SIGNAL_EFFECTS
+            method = self.repo.get(db, "methods", session["method_id"])
+            if command.settings is not None and (command.material_id != method["config"]["qc_id"] or command.effect not in SIGNAL_EFFECTS):
+                raise ValueError("Choose the session QC and a signal-linearity predictor")
             key = f"{command.material_id}:{command.effect}:{command.isotope}"
             overrides = session.setdefault("residual_overrides", {})
             before = overrides.get(key)
@@ -104,8 +140,8 @@ class ResultsSessions:
             else:
                 overrides[key] = command.settings.model_dump()
             self.repo.update(db, "results_sessions", session_id, session)
-            self.repo.audit(db, "residual_preview_override_saved", session_id, command.actor, command.reason,
-                            {"key": key, "settings": before}, {"key": key, "settings": overrides.get(key), "scope": "review_preview"})
+            self.repo.audit(db, "residual_correction_override_saved", session_id, command.actor, command.reason,
+                            {"key": key, "settings": before}, {"key": key, "settings": overrides.get(key), "scope": "session_results"})
             return session
 
     def save_results_session(self, command, session_id=None):
@@ -173,9 +209,9 @@ class ResultsSessions:
         session["run_ids"].append(run["id"])
         session["detached_run_ids"] = [rid for rid in session.get("detached_run_ids", []) if rid != run["id"]]
         for row in self.repo.list(db,"measurements",run_id=run["id"]):
-            session["groups"][row["id"]]=command.sample_group.strip() or "Main batch"
+            session["groups"].setdefault(row["id"], command.sample_group.strip() or imported_sample_group(row, run.get("source_kind", "qtegra_raw")))
         self.repo.update(db,"results_sessions",session["id"],session)
-        self.repo.audit(db,"workbook_attached_to_session",session["id"],command.actor,command.reason,after={"run_id":run["id"],"sample_group":command.sample_group})
+        self.repo.audit(db,"workbook_attached_to_session",session["id"],command.actor,command.reason,after={"run_id":run["id"],"sample_group":command.sample_group,"grouping":"explicit" if command.sample_group.strip() else "identifier1_species"})
 
     def session_catalog(self, db):
         runs={r["id"]:r for r in self.repo.list(db,"runs")}
@@ -201,10 +237,39 @@ class ResultsSessions:
                 history=[h for h in history if h.get("data_origin")=="observed" and h.get("results_session_id")==session_id]
             sources=[a for a in self.repo.list(db,"session_sources") if a["session_id"]==session_id]
             exports=[e for e in self.repo.list(db,"session_exports") if e["session_id"]==session_id]
-        return {**session,"method":method,"qualification":q,"qualification_run_id":reference_run,
-                "runs":[self.run_detail(r) for r in session["run_ids"]],
+        runs = [self.run_detail(r) for r in session["run_ids"]]
+        from .analysis_evidence import analysis_evidence
+        with self.repo.connect() as db:
+            for run in runs:
+                initial = {}
+                for record in self.repo.list(db, "measurements", run_id=run["id"]):
+                    cycles = analysis_evidence(record, run["source"])["cycles"]
+                    if cycles:
+                        initial[record["id"]] = cycles[0]
+                for row in (run.get("evaluation") or {}).get("results", []):
+                    cycle = initial.get(row["id"], {})
+                    row["initial_i44_v"] = cycle.get("i44_v", row.get("i44_v"))
+                    row["initial_reference_i44_v"] = cycle.get("reference_i44_v", row.get("reference_i44_v"))
+        if session.get("coverage_factor") is not None:
+            for run in runs:
+                for row in (run.get("evaluation") or {}).get("results", []):
+                    for result in row.get("isotopes", {}).values():
+                        budget = result.get("budget")
+                        if budget:
+                            budget["k"] = session["coverage_factor"]
+                            budget["expanded_uncertainty"] = budget["u_combined"] * budget["k"]
+        detail = {**session,"method":method,"qualification":q,"qualification_run_id":reference_run,
+                "runs":runs,
                 "detached_runs":[self.run_detail(r) for r in session.get("detached_run_ids", [])],
                 "history":history,"exports":exports,"sources":sources}
+        if method:
+            from .qc_screening import stored_qc_screening
+            with self.repo.connect(write=True) as db:
+                detail["saved_outliers"] = stored_qc_screening(self.repo, db, session)
+            from .session_processing import process_session_results
+            process_session_results(detail)
+            detail.pop("saved_outliers", None)
+        return detail
 
     def archive_session_source(self, session_id, filename, content, command, *, relative_path, disposition, run_id=None):
         """Archive only original acquisition files, including superseded raw exports."""
@@ -248,7 +313,8 @@ class ResultsSessions:
                 if row["role"]=="unknown" and command.group is not None and command.group!=group:
                     continue
                 item={"client":detail["client"],"project":detail["project"],"session":detail["name"],"session_id":session_id,
-                      "sample_group":group,"sample":row["label"],"analysis":row["source_index"],"run_id":run["id"],
+                      "sample_group":group,"sample":detail.get("identity_overrides",{}).get(row["id"],{}).get("identifier1",row["label"]),"analysis":row["source_index"],"run_id":run["id"],
+                      "raw_label":row["label"],"raw_comment":row.get("comment",""),
                       "acquired_at":row.get("acquired_at"),"worksheet_row":row.get("sheet_row"),"mass_ug":row.get("mass_ug"),
                       "sample_i44_v":row.get("i44_v"),"pressure_adjustment_difference_v":row.get("pressure_mismatch_v"),
                       "evaluation_id":evaluation["id"],"method_id":run["method_id"],"method_version":detail["method"]["version"],
@@ -257,7 +323,7 @@ class ResultsSessions:
                       "issues":"; ".join(dict.fromkeys(row["issues"]+[issue for issue in evaluation["blockers"]+([] if run["status"]=="released" else run["release_blockers"]) if not issue.startswith("Analysis ") ])),"simulation":self.repo.demo,
                       "accepted_exceptions":"; ".join(row.get("accepted_issues", [])),
                       "data_origin":"synthetic" if run.get("synthetic") else "observed","source_kind":run.get("source_kind","qtegra_raw"),
-                      "calibration_verification":run.get("calibration_verification","documented"),"sample_identifier":row.get("comment","")}
+                      "calibration_verification":run.get("calibration_verification","documented"),"sample_identifier":row.get("identifier2",row.get("comment",""))}
                 item.update(measurement_identity(row, run.get("source_kind", "qtegra_raw")))
                 item.update(measurement_id=row["id"],role=row["role"], excluded=bool(row["excluded"] or row["id"] in flagged),
                             outlier_isotopes=", ".join(f["isotope"] for f in analysis["outliers"]["flags"] if f["measurement_id"]==row["id"]))
@@ -266,9 +332,14 @@ class ResultsSessions:
                 for iso in ("d13c","d18o"):
                     value=row["isotopes"].get(iso,{})
                     budget=value.get("budget",{})
+                    # A historical release covers its recorded values, not a later
+                    # session fit. Applying a correction does not confer release.
+                    if item["decision"] == "released" and value.get("residual_correction"):
+                        item["decision"] = "review"
                     item.update({f"{iso}_{key}":number for key,number in {
                         "raw":row[iso],"value":value.get("value"),"u_prec":value.get("u_prec"),"u_norm":value.get("u_norm"),
-                        "u_corr":value.get("u_corr"),"u_combined":budget.get("u_combined"),"U":budget.get("expanded_uncertainty"),"k":budget.get("k")}.items()})
+                        "u_corr":value.get("u_corr"),"u_combined":budget.get("u_combined"),"U":budget.get("expanded_uncertainty"),"k":budget.get("k"),
+                        "session_qc_admitted":bool(value.get("session_qc_admitted", False))}.items()})
                 whole_rows.append(item)
                 if row["role"]=="unknown" and (command.include_outliers or not item["excluded"]):
                     rows.append(item)
@@ -289,7 +360,14 @@ class ResultsSessions:
             for r in detail["runs"] if r["evaluation"]]
         payload={"simulation":self.repo.demo,"exported_at":self.repo.timestamp(),"review":command.model_dump(),
                  "session":{k:detail[k] for k in ("id","name","client","project","method_name","intended_use","qualification_id","processing_evidence")},
+                 "coverage_factor":detail.get("coverage_factor", detail["method"]["config"]["coverage_factor"]),
                  "method":detail["method"],"qualification":detail["qualification"],"results":rows,"calculations":calculations,
+                 "session_residual_corrections": detail.get("residual_corrections", {}),
+                 "correct_failed_analyses": bool(detail.get("correct_failed_analyses", False)),
+                 "failed_analysis_corrections": detail.get("failed_analysis_corrections", {}),
+                 "session_processing_version": detail.get("residual_processing_version"),
+                 "outlier_screening": analysis["outliers"],
+                 "identity_revision": detail.get("identity_revision", 0),
                  "correction_verification":[{"run_id":r["id"],"review":r["evaluation"].get("correction_review")} for r in detail["runs"] if r["evaluation"]],
                  "raw_source_inventory":detail["sources"]}
         json_bytes=json.dumps(payload,ensure_ascii=False,indent=2,allow_nan=False).encode("utf-8")

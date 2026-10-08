@@ -2,7 +2,7 @@ const assert=require('node:assert/strict');
 const {test}=require('node:test');
 const fs=require('node:fs'),path=require('node:path'),ts=require('typescript');
 function load(name){const compiled={exports:{}};new Function('module','exports','require',ts.transpileModule(fs.readFileSync(path.join(__dirname,`../src/lib/${name}.ts`),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS}}).outputText)(compiled,compiled.exports,key=>load(key.replace('./','')));return compiled.exports;}
-const {qcOutlierDisplay,partiallySaturatedOverlay}=load('qc-outlier-display');
+const {qcOutlierDisplay,partiallySaturatedOverlay,correctionStageLegends}=load('qc-outlier-display');
 const encode=values=>({dtype:'f8',bdata:Buffer.from(new Float64Array(values).buffer).toString('base64')});
 test('isotope filters break lines without deleting observations or uncertainties',()=>{
  const trace={mode:'lines+markers',x:[1,2,3],y:encode([.1,.9,.2]),customdata:[['a','d13C'],['b','d13C'],['c','d13C']],marker:{symbol:'circle-open',color:[1,2,3]},error_y:{array:[.01,.02,.03]},visible:'legendonly'};
@@ -79,4 +79,40 @@ test('before markers detach from the shared color axis without hiding QC points'
  assert.equal(result.marker.coloraxis,undefined);
  assert.deepEqual(result.y,[3,4]);
  assert.equal(trace.marker.coloraxis,'coloraxis');
+});
+
+test('legend entries match every visible marker shape and correction state',()=>{
+ const base={mode:'markers',meta:{correctionStage:'after'},name:'Applied',x:[1,2,3],y:[4,5,6],customdata:[['a','d13C'],['b','d13C'],['c','d13C']],marker:{color:['red','blue','green'],symbol:'circle'}};
+ const flags=[{row:'a',isotope:'d13C',category:'range'},{row:'b',isotope:'d13C',category:'statistical'},{row:'c',isotope:'d13C',category:'failed'}];
+ const corrected=qcOutlierDisplay({...base,y:[4,5,null]},flags);
+ const failed=qcOutlierDisplay({...base,name:'Uncorrected',y:[null,null,6],meta:{correctionStage:'after',correctionApplied:false}},flags);
+ const result=correctionStageLegends([corrected,failed],v=>v);
+ assert.deepEqual(result.slice(2).map(t=>t.marker.symbol),['diamond','square','triangle-down']);
+ assert.deepEqual(result.slice(2).map(t=>t.marker.color),['red','blue','green']);
+ assert.equal(result[2].name,'Applied<br>Validity-range flags');
+ assert.equal(result[3].name,'Statistical outliers');
+ assert.equal(result[3].legendgrouptitle,undefined);
+ assert.equal(result.at(-1).name,'Uncorrected<br>Failed analyses');
+ assert.equal(result[0].legendgroup,result[2].legendgroup);
+ assert.equal(result[1].legendgroup,result.at(-1).legendgroup);
+ assert.notEqual(result[0].legendgroup,result[1].legendgroup);
+ assert.equal(corrected.showlegend,undefined);
+});
+
+test('a failed acquisition keeps the failure shape even when statistically flagged',()=>{
+ const trace={mode:'markers',x:[1],y:[2],customdata:[['a','d13C']]};
+ const result=qcOutlierDisplay(trace,[{row:'a',isotope:'d13C',category:'statistical'},{row:'a',isotope:'d13C',category:'failed'}]);
+ assert.deepEqual(result.marker.symbol,['triangle-down']);
+ assert.deepEqual(result.meta.qcCategories,['Failed analyses']);
+});
+
+test('poor pressure and no-signal samples have distinct symbols and legend labels',()=>{
+ const trace={mode:'markers',meta:{correctionStage:'after'},name:'Final',x:[1,2],y:[3,4],customdata:[['p','d13C'],['s','d13C']],marker:{color:['blue','red']}};
+ const flags=[{row:'p',isotope:'d13C',category:'pressure_adjustment'},{row:'s',isotope:'d13C',category:'pressure_adjustment'},{row:'s',isotope:'d13C',category:'no_signal'}];
+ const result=qcOutlierDisplay(trace,flags);
+ assert.deepEqual(result.marker.symbol,['triangle-up','x']);
+ assert.deepEqual(result.meta.qcCategories,['Poor pressure adjustment samples','No-signal samples']);
+ assert.deepEqual(result.marker.color,['blue','red']);
+ const legends=correctionStageLegends([result],v=>v).slice(1);
+ assert.deepEqual(legends.map(t=>t.name),['Final<br>Poor pressure adjustment samples','No-signal samples']);
 });

@@ -9,9 +9,9 @@ export type WorkspaceProps = {
   act: (path: string, body?: unknown, method?: string) => Promise<unknown>;
   upload: (path: string, data: FormData) => Promise<unknown>;
 };
-export function Panel({ title, children }: { title?: string; children: ReactNode }) {
+export function Panel({ title, children, chartPanel = false }: { title?: string; children: ReactNode; chartPanel?: boolean }) {
   const tr = useTranslation();
-  return <section className="metro-panel">{tr(title && <h2>{tr(title)}</h2>)}{tr(children)}</section>;
+  return <section className="metro-panel" data-chart-panel={chartPanel ? "" : undefined}>{tr(title && (chartPanel ? <div data-card-header><h2>{tr(title)}</h2></div> : <h2>{tr(title)}</h2>))}{tr(children)}</section>;
 }
 export function Field({ label, children, wide = false }: { label: string; children: ReactNode; wide?: boolean }) {
   const tr = useTranslation();

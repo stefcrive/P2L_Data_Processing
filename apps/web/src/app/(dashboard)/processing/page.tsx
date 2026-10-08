@@ -1,5 +1,7 @@
 "use client";
 
+import { parseNumericToken } from "@/lib/numeric-token";
+
 import { SelectionCycleDiagnostics } from "@/components/diagnostics/selection-cycle-diagnostics";
 import { orderTraceByX } from "@/lib/plotly-order";
 import { useContext } from "react";
@@ -199,6 +201,7 @@ type HoverPreviewState = {
   clientY: number;
 };
 type ProcessingPreviewRowState = {
+  poorPressure?: boolean;
   rowLabel: string;
   identifier1: string;
   identifier2: string;
@@ -212,6 +215,7 @@ type ProcessingPreviewRowState = {
   d18CyclesExcluded: number | null;
 };
 type ProcessingPreviewMasks = {
+  poorPressure: Set<string>;
   rowsByLabel: Map<string, ProcessingPreviewRowState>;
   baseD13: Set<string>;
   baseD18: Set<string>;
@@ -1066,62 +1070,6 @@ function buildHoverAnalysisInfo(
   return info;
 }
 
-function parseNumericToken(value: unknown): number | null {
-  if (value == null) {
-    return null;
-  }
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : null;
-  }
-  const normalized = String(value)
-    .trim()
-    .replace(/[\u2212\u2010\u2011\u2012\u2013\u2014]/g, "-");
-  if (!normalized) {
-    return null;
-  }
-  const match = normalized.match(/[-+]?[\d.,]+/);
-  if (!match) {
-    return null;
-  }
-  let token = match[0].replace(/[\s\u00A0\u2009]/g, "");
-  if (token.includes(",") && token.includes(".")) {
-    if (token.lastIndexOf(",") > token.lastIndexOf(".")) {
-      token = token.replace(/\./g, "").replace(",", ".");
-    } else {
-      token = token.replace(/,/g, "");
-    }
-  } else if (token.includes(",")) {
-    const parts = token.split(",");
-    if (parts.length > 2) {
-      token = token.replace(/,/g, "");
-    } else {
-      const [left, right] = parts;
-      if (/^\d+$/.test(right ?? "")) {
-        if ((right ?? "").length === 1 || (right ?? "").length === 2) {
-          token = `${left}.${right}`;
-        } else if ((right ?? "").length === 3 && /^\d+$/.test(left ?? "") && !["0", "+0", "-0"].includes(left ?? "")) {
-          token = `${left}${right}`;
-        } else {
-          token = `${left}.${right}`;
-        }
-      } else {
-        token = `${left}${right}`;
-      }
-    }
-  } else if (token.includes(".")) {
-    const parts = token.split(".");
-    if (parts.length > 2) {
-      token = token.replace(/\./g, "");
-    } else {
-      const [left, right] = parts;
-      if (/^\d+$/.test(right ?? "") && (right ?? "").length === 3 && /^\d+$/.test(left ?? "") && (left ?? "").length <= 3) {
-        token = `${left}${right}`;
-      }
-    }
-  }
-  const parsed = Number(token);
-  return Number.isFinite(parsed) ? parsed : null;
-}
 
 function pythonOrdinalFromDate(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -1280,6 +1228,7 @@ function axisRangeForValues(values: number[]): [number, number] | null {
 function isProcessingOverlayTrace(traceName: string): boolean {
   return [
     "Statistical Outliers",
+    "Poor Pressure Adjustment",
     "Signal Intensity Range",
     "Leak Rate Range",
     "d13C Range",
@@ -1890,6 +1839,7 @@ function buildProcessingPreviewMasks(
       signal: finiteNumber(row.signal),
       leakRate: finiteNumber(row.leak_rate),
       status: String(row.collector_status ?? "").trim(),
+      poorPressure: ["true","1","1.0","yes"].includes(String(row.attributes?.["Pressure Adjust failed with Target Intensity"]??"").trim().toLowerCase()) && row.collector_status!=="Failed Sample",
       d13CyclesExcluded: finiteNumber(row.d13_cycles_excluded),
       d18CyclesExcluded: finiteNumber(row.d18_cycles_excluded),
     };
@@ -1914,6 +1864,7 @@ function buildProcessingPreviewMasks(
     partialExcluded: new Set(),
     full: new Set(),
     failed: new Set(),
+    poorPressure: new Set(),
   };
 
   const rowsByGroup = new Map<string, ProcessingPreviewRowState[]>();
@@ -1928,6 +1879,7 @@ function buildProcessingPreviewMasks(
     const signalRange = !isEdited && applyOverrideFalse(rowLabel, row.signal != null && !rowInRange(row.signal, config.signal_range), overrides);
     const leakRange = !isEdited && applyOverrideFalse(rowLabel, row.leakRate != null && !rowInRange(row.leakRate, config.leak_range), overrides);
     const failed = !isEdited && applyOverrideFalse(rowLabel, row.status === "Failed Sample", overrides);
+    const poorPressure = !isEdited && applyOverrideFalse(rowLabel, Boolean(row.poorPressure && config.pressure_adjustment_as_outlier), overrides);
     const full = !isEdited && applyOverrideFalse(rowLabel, row.status === "Fully Saturated Collectors", overrides);
     const partialStatus = !isEdited && row.status === "Partially Saturated Collectors";
     const partialExcluded = partialStatus && applyOverrideBoth(rowLabel, !Boolean(config.overlays.show_saturated_collectors), overrides);
@@ -1936,6 +1888,7 @@ function buildProcessingPreviewMasks(
     if (signalRange) masks.signal.add(rowLabel);
     if (leakRange) masks.leak.add(rowLabel);
     if (failed) masks.failed.add(rowLabel);
+    if (poorPressure) masks.poorPressure.add(rowLabel);
     if (full) masks.full.add(rowLabel);
     if (partialStatus) masks.partial.add(rowLabel);
     if (partialExcluded) masks.partialExcluded.add(rowLabel);
@@ -1943,8 +1896,8 @@ function buildProcessingPreviewMasks(
     if (manualOutlierOverride(rowLabel, overrides, "d18O") === true) masks.manualD18.add(rowLabel);
     if (masks.manualD13.has(rowLabel) || masks.manualD18.has(rowLabel)) masks.manual.add(rowLabel);
 
-    const commonRangeOrStatus = d13Range || d18Range || signalRange || leakRange || failed || full || partialExcluded;
-    if (!commonRangeOrStatus) {
+    const commonRangeOrStatus = d13Range || d18Range || signalRange || leakRange || failed || poorPressure || full || partialExcluded;
+    if (!commonRangeOrStatus && !row.poorPressure) {
       const groupKey = `${row.identifier1}\u0000${row.species}`;
       const groupRows = rowsByGroup.get(groupKey) ?? [];
       groupRows.push(row);
@@ -1988,6 +1941,7 @@ function buildProcessingPreviewMasks(
       masks.signal.has(rowLabel) ||
       masks.leak.has(rowLabel) ||
       masks.failed.has(rowLabel) ||
+      masks.poorPressure.has(rowLabel) ||
       masks.full.has(rowLabel) ||
       masks.partialExcluded.has(rowLabel);
     if (!commonRangeOrStatus && !masks.statisticalD13.has(rowLabel)) {
@@ -2013,6 +1967,7 @@ function previewMaskForOutlierTable(name: string, masks: ProcessingPreviewMasks)
     "Partially Saturated Collectors": masks.partialExcluded,
     "Fully Saturated Collectors": masks.full,
     "Failed Sample": masks.failed,
+    "Poor Pressure Adjustment": masks.poorPressure,
     "Manual Override": masks.manual,
   };
   return maskByName[name] ?? null;
@@ -2093,6 +2048,9 @@ function traceOverlayRowSet(name: string, masks: ProcessingPreviewMasks, config:
   }
   if (name.includes("Signal Intensity Range")) {
     return config.overlays.show_range_outliers ? masks.signal : new Set();
+  }
+  if (name.includes("Poor Pressure Adjustment")) {
+    return config.overlays.show_range_outliers ? masks.poorPressure : new Set();
   }
   if (name.includes("Leak Rate Range")) {
     return config.overlays.show_range_outliers ? masks.leak : new Set();
@@ -3458,11 +3416,13 @@ function DataTable({
   emptyLabel,
   selectedRowLabels = [],
   onSelectedRowLabelsChange,
+  renderIdentifier2,
 }: {
   rows: Array<Record<string, unknown>>;
   emptyLabel: string;
   selectedRowLabels?: string[];
   onSelectedRowLabelsChange?: (next: string[]) => void;
+  renderIdentifier2?: (row: Record<string, unknown>, value: string) => ReactNode;
 }) {
   const tr = useTranslation();
   if (!rows.length) {
@@ -3539,7 +3499,9 @@ function DataTable({
                 ) : null}
               {columns.map((column) => (
                 <td key={column} className="px-3 py-2 text-stone-600">
-                  {tr(formatScientificText(formatValue(row[column], column)))}
+                  {column === "Identifier 2" && renderIdentifier2
+                    ? renderIdentifier2(row, formatValue(row[column], column))
+                    : tr(formatScientificText(formatValue(row[column], column)))}
                 </td>
               ))}
             </tr>
@@ -4250,12 +4212,14 @@ function OutlierTablesPanel({
   title,
   tables,
   renderTableControls,
+  renderIdentifier2,
   defaultOpen = false,
   isPreview = false,
 }: {
   title: string;
   tables: OutlierTable[];
   renderTableControls?: (table: OutlierTable, context: { selectedRowLabels: string[] }) => ReactNode;
+  renderIdentifier2?: (table: OutlierTable, row: Record<string, unknown>, value: string) => ReactNode;
   defaultOpen?: boolean;
   isPreview?: boolean;
 }) {
@@ -4316,6 +4280,7 @@ function OutlierTablesPanel({
                 <div className="mt-3">
                   <DataTable
                     rows={table.rows}
+                    renderIdentifier2={renderIdentifier2 ? (row, value) => renderIdentifier2(table, row, value) : undefined}
                     emptyLabel={tr("No rows in this outlier category.")}
                     selectedRowLabels={failedSampleTable ? selectedRowLabels : undefined}
                     onSelectedRowLabelsChange={
@@ -4933,6 +4898,7 @@ function ProcessingPage() {
   const editMutation = useMutation({
     mutationFn: (payload: EditAction) => api.editProcessing(sessionId!, payload, []),
     onSuccess: (workspace) => {
+      if (consultation) window.dispatchEvent(new Event("metrology-identities-updated"));
       storeBaseProcessingWorkspace(workspace);
       queryClient.invalidateQueries({ queryKey: ["processing-diagnostics", sessionId] });
       setLinearityPreviewStale(false);
@@ -4951,6 +4917,7 @@ function ProcessingPage() {
   const commitSelectionDraftsMutation = useMutation({
     mutationFn: (drafts: EditAction[]) => api.editProcessingBatchJob(sessionId!, drafts, setActiveBackgroundJob),
     onSuccess: (workspace) => {
+      if (consultation) window.dispatchEvent(new Event("metrology-identities-updated"));
       if (workspace) {
         storeBaseProcessingWorkspace(workspace);
       }
@@ -5730,6 +5697,49 @@ function ProcessingPage() {
     }, HOVER_PREVIEW_SHOW_DELAY_MS);
   }
 
+  function renderOutlierIdentifier2(table: OutlierTable, row: Record<string, unknown>, value: string) {
+    const rowLabel = extractOutlierRowLabel(row);
+    if (rowLabel == null) return tr(value);
+    const sample = processingPreviewRowLookup.get(rowLabel);
+    const isotopeKey: IsotopeKey = /d18|18O/.test(table.name + " " + (table.title ?? "")) ? "d18O" : "d13C";
+    const target: SelectedTarget = {
+      rowLabel,
+      isotopeKey,
+      identifier1: sample?.identifier1 ?? String(row["Identifier 1"] ?? ""),
+      identifier2: sample?.identifier2 ?? value,
+      species: sample?.species ?? String(row.Species ?? ""),
+      chartKey: `outlier-table|${table.name}|${isotopeKey}`,
+    };
+    function showPreview(element: HTMLElement) {
+      if (isSelectionEditorOpen || isExportModalOpen) return;
+      clearHoverPreviewHideTimer();
+      clearHoverPreviewShowTimer();
+      const rect = element.getBoundingClientRect();
+      pendingHoverPreviewRef.current = { target, clientX: rect.right, clientY: rect.top };
+      hoverPreviewShowTimerRef.current = setTimeout(() => {
+        setHoverPreview(pendingHoverPreviewRef.current);
+      }, HOVER_PREVIEW_SHOW_DELAY_MS);
+    }
+    return (
+      <button
+        type="button"
+        className="cursor-pointer text-left text-blue-700 underline decoration-dotted underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600"
+        aria-label={`${tr("Open sample editor")}: ${target.identifier1} | ${value || tr("No Identifier 2")}`}
+        onMouseEnter={(event) => showPreview(event.currentTarget)}
+        onMouseLeave={scheduleHoverPreviewHide}
+        onFocus={(event) => showPreview(event.currentTarget)}
+        onBlur={scheduleHoverPreviewHide}
+        onClick={() => {
+          scheduleHoverPreviewHide();
+          setHoverPreview(null);
+          setTargets([target]);
+        }}
+      >
+        {tr(value || "No Identifier 2")}
+      </button>
+    );
+  }
+
   function chartHoverProps(chartKey: string) {
     return {
       onPointHover: (payload: PlotlyHoverPayload) => handleChartPointHover(chartKey, payload),
@@ -5912,9 +5922,6 @@ function ProcessingPage() {
 
   function queueSpeciesOverride(target: SelectedTarget, species: string) {
     const nextSpecies = species.trim();
-    if (!nextSpecies) {
-      return;
-    }
     const targets = buildTargetsForAction([target]);
     if (!targets.length) {
       return;
@@ -6437,8 +6444,8 @@ function ProcessingPage() {
       const keep=isotope==="d13C"?standardMasks.baseD13:standardMasks.baseD18;
       return !keep.has(row)&&metrologyResults[row]?.role==="qc"?[{row,isotope,hidden:true}]:[];
     })) : [];
-    const flags=[...(stationFilters?.flags??[]).map(flag=>({...flag,hidden:flag.hidden || (flag.category==="statistical"?!activeConfig.overlays.show_statistical_outliers:flag.category==="range"?!activeConfig.overlays.show_range_outliers:flag.category==="manual"?!activeConfig.overlays.show_manual_outliers:flag.category==="failed"?!activeConfig.overlays.show_failed_samples:false)})),...standardFlags];
-    const withUncertainty = withSessionUncertainty(displayed, metrologyResults, tr("Final result ± U"), flags);
+    const flags=[...(stationFilters?.flags??[]).map(flag=>({...flag,hidden:flag.hidden || (flag.category==="statistical"?!activeConfig.overlays.show_statistical_outliers:flag.category==="range"?!activeConfig.overlays.show_range_outliers:flag.category==="manual"?!activeConfig.overlays.show_manual_outliers:flag.category==="failed"||flag.category==="no_signal"?!activeConfig.overlays.show_failed_samples:false)})),...standardFlags];
+    const withUncertainty = withSessionUncertainty(displayed, metrologyResults, tr("Final"), flags);
     const filtered = withUncertainty ? filterStationFigure(withUncertainty,flags,true) : withUncertainty;
     const result = filtered && (!activeConfig.overlays.show_statistical_outliers || !activeConfig.overlays.show_range_outliers || !activeConfig.overlays.show_manual_outliers) ? fitVisibleMarkers(filtered) : filtered;
     if (result) previewFigureCache.set(figure, result);
@@ -7106,9 +7113,7 @@ function ProcessingPage() {
             }}
             onBlur={(event) => {
               const value = event.currentTarget.value.trim();
-              if (!value) {
-                event.currentTarget.value = speciesSource;
-              } else if (value !== speciesSource) {
+              if (value !== speciesSource) {
                 queueSpeciesOverride(target, value);
               }
             }}
@@ -7312,6 +7317,7 @@ function ProcessingPage() {
                 </div>
               </ScientificControlGroup>
               <ScientificControlGroup title={tr("Outlier detection")}>
+                <CheckboxField checked={stationFilters?.pressureAdjustmentAsOutlier??activeConfig.pressure_adjustment_as_outlier??false} label={tr("Treat poor pressure adjustment as outliers")} onChange={(checked)=>{updateConfig("pressure_adjustment_as_outlier",checked);stationFilters?.onPressureAdjustmentOutlierChange?.(checked);}} />
                 <label className="text-sm">
                   <span className="mb-1 block text-stone-700">{tr("Statistical outlier method")}</span>
                   <ScientificSelect
@@ -7365,7 +7371,7 @@ function ProcessingPage() {
                   onChange={(checked) => updateOverlay("show_saturated_collectors", checked)}
                 />
                 <CheckboxField checked={activeConfig.overlays.show_saturated_samples} label={tr("Fully saturated samples")} onChange={(checked) => updateOverlay("show_saturated_samples", checked)} />
-                <CheckboxField checked={activeConfig.overlays.show_failed_samples} label={tr("Failed samples")} onChange={(checked) => updateOverlay("show_failed_samples", checked)} />
+                <CheckboxField checked={activeConfig.overlays.show_failed_samples} label={tr("No-signal samples")} onChange={(checked) => updateOverlay("show_failed_samples", checked)} />
                 </div>
                 <Button
                   variant="outline"
@@ -8322,19 +8328,25 @@ function ProcessingPage() {
                       ) : null}
                     </div>
                   </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      closeSelectionEditor();
-                    }}
-                  >
-                    <X className="h-4 w-4" />
-                    <span className="hidden sm:inline">{tr("Close")}</span>
-                  </Button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {selectedTargets.length ? <>
+                      <Button type="button" variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>{tr("Prev")}</Button>
+                      <Button type="button" variant="outline" size="sm" onClick={() => moveSelectionTarget("next")} disabled={!canMoveToNextTarget}>{tr("Next")}</Button>
+                    </> : null}
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        closeSelectionEditor();
+                      }}
+                    >
+                      <X className="h-4 w-4" />
+                      <span className="hidden sm:inline">{tr("Close")}</span>
+                    </Button>
+                  </div>
                 </div>
                 <div className="selection-editor-body min-h-0 space-y-3 overflow-y-auto p-3">
                   {selectedTargets.length ? (
@@ -8364,15 +8376,6 @@ function ProcessingPage() {
                                   : "Duplicate resolved in draft")}
                               </span>
                             ) : null}
-                          </div>
-                          <div className="flex gap-2">
-                            <Button variant="outline" size="sm" onClick={() => moveSelectionTarget("prev")} disabled={!canMoveToPrevTarget}>{tr("Prev")}</Button>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => moveSelectionTarget("next")}
-                              disabled={!canMoveToNextTarget}
-                            >{tr("Next")}</Button>
                           </div>
                         </div>
                         {duplicateGroupTargets.length > 1 ? (
@@ -8804,6 +8807,7 @@ function ProcessingPage() {
             tables={displayedDataOutlierTables}
             isPreview={Boolean(processingPreviewMasks)}
             renderTableControls={renderFailedSampleTableControls}
+            renderIdentifier2={renderOutlierIdentifier2}
           />
 
           <div className="space-y-3">
@@ -8912,6 +8916,7 @@ function ProcessingPage() {
                     tables={displayedSpeciesOutlierTables.get(section.species) ?? section.outlier_tables}
                     isPreview={Boolean(processingPreviewMasks)}
                     renderTableControls={renderFailedSampleTableControls}
+                    renderIdentifier2={renderOutlierIdentifier2}
                     defaultOpen
                   />
                     </div>

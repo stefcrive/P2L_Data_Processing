@@ -10,7 +10,6 @@ import type { ChartInteractions } from "./consultation-context";
 import { MetrologyChartHeight } from "./consultation-context";
 import { ResidualControls } from "./residual-controls";
 import { uncertaintyEnvelope } from "@/lib/metrology-envelopes";
-import { residualEffectSummary, qcSdEvidence, correctionUncertaintyRange } from "@/lib/residual-summary";
 
 const carbon = "#215ec5", oxygen = "#167d87", beforeColor = "#94a3b8";
 const color = (iso: Isotope) => iso === "d13c" ? carbon : oxygen;
@@ -32,7 +31,7 @@ export const SessionProcessing = memo(function SessionProcessing({ analysis, gro
         return [
           ...uncertaintyEnvelope(selected.map(row => ({x:row.sequence, value:row.excluded ? null : row.isotopes?.[iso]?.value, uncertainty:row.isotopes?.[iso]?.budget?.expanded_uncertainty, segment:row.run_id})), `${tr(role)} · U`, role==="qc"?"rgba(186,129,59,0.18)":iso==="d13c"?"rgba(33,94,197,0.18)":"rgba(22,125,135,0.18)", role==="qc"?"y2":"y").map(trace=>({...trace,showlegend:false})),
           {type:"scatter",mode:"markers",name:`${tr(role)} · ${tr("Imported")}`,visible:showImported,x:selected.map(r=>r.sequence),y:selected.map(r=>r[iso]),customdata:selected.map(r=>custom(r,iso)),text:selected.map(r=>`${r.label} · ${r.comment} · ${r.run_label}`),marker:{color:beforeColor,size:selected.map(r=>r.id===selectedId?13:6),symbol:selected.map(r=>r.excluded?"x":"circle-open")},yaxis:role==="qc"?"y2":"y",hovertemplate:"%{text}<br>%{y:.3f} ‰<extra>%{fullData.name}</extra>"},
-          {type:"scatter",mode:"markers",name:`${tr(role)} · ${tr("Final ± U")}`,x:selected.map(r=>r.sequence),y:selected.map(r=>r.isotopes?.[iso]?.value??null),customdata:selected.map(r=>custom(r,iso)),text:selected.map(r=>`${r.label} · ${r.comment} · ${r.run_label}`),marker:{color:role==="qc"?"#ba813b":color(iso),size:selected.map(r=>r.id===selectedId?13:7),symbol:selected.map(r=>r.excluded?"x":"circle")},yaxis:role==="qc"?"y2":"y",error_y:{type:"data",array:selected.map(r=>r.isotopes?.[iso]?.budget?.expanded_uncertainty??null),visible:true,thickness:1,width:2},hovertemplate:"%{text}<br>%{y:.3f} ‰<extra>%{fullData.name}</extra>"},
+          {type:"scatter",mode:"markers",name:`${tr(role)} · ${tr("Final")}`,x:selected.map(r=>r.sequence),y:selected.map(r=>r.isotopes?.[iso]?.value??null),customdata:selected.map(r=>custom(r,iso)),text:selected.map(r=>`${r.label} · ${r.comment} · ${r.run_label}`),marker:{color:role==="qc"?"#ba813b":color(iso),size:selected.map(r=>r.id===selectedId?13:7),symbol:selected.map(r=>r.excluded?"x":"circle")},yaxis:role==="qc"?"y2":"y",error_y:{type:"data",array:selected.map(r=>r.isotopes?.[iso]?.budget?.expanded_uncertainty??null),visible:true,thickness:1,width:2,color:role==="qc"?"#ba813b":color(iso)},hovertemplate:"%{text}<br>%{y:.3f} ‰<extra>%{fullData.name}</extra>"},
         ];
       }),
     ]}/>)}</div>
@@ -40,22 +39,6 @@ export const SessionProcessing = memo(function SessionProcessing({ analysis, gro
     {!chartsOnly&&<div className="metro-table-wrap station-results-table"><table><thead><tr><th>{tr("Identifier 1")}</th><th>{tr("Identifier 2")}</th><th>{tr("Species")}</th><th>{tr("Workbook / group")}</th><th>δ¹³C ± U / ‰</th><th>δ¹⁸O ± U / ‰</th><th>{tr("Review")}</th></tr></thead><tbody>{organized.map(row=><tr key={row.id} className={row.issues?.length?"station-row-problem":""}><td>{row.identifier1||row.label}<small className="station-cell-subtitle">{row.source_index}</small></td><td>{row.identifier2||"—"}</td><td>{row.species||"—"}</td><td>{row.run_label}<small className="station-cell-subtitle">{row.sample_group}</small></td>{isotopes.map(iso=><td className="num" key={iso}>{readable(row.isotopes?.[iso]?.value)} ± {readable(row.isotopes?.[iso]?.budget?.expanded_uncertainty)}</td>)}<td><Status value={row.excluded?"excluded":row.issues?.length?"review_required":row.accepted_issues?.length?"accepted_exception":"within_criteria"}/></td></tr>)}</tbody></table></div>}
   </div>;
 });
-
-export function CorrectionValidation({ analysis }: { analysis: SessionAnalysis }) {
-  const tr=useTranslation();
-  return <Panel title={tr("Correction validation")}>
-    <div className="metro-table-wrap"><table className="station-validation-table"><thead><tr><th>{tr("Isotope")}</th><th>{tr("Paired QC SD / ‰")}</th><th>{tr("SD reduction")}</th><th>{tr("Correction validation")}</th></tr></thead><tbody>{isotopes.map(iso=>{
-      const review=analysis.correction_review[iso];
-      return <tr key={iso}><th scope="row">{isotopeLabel[iso]}</th>
-        <td><strong>{readable(review.before.sd,4)} → {readable(review.after.sd,4)}</strong><small>{review.paired_n}/{review.total_qc} {tr("paired QC observations")}{review.excluded_outlier_n?` · ${review.excluded_outlier_n} ${tr("outliers excluded")}`:""}</small></td>
-        <td><strong>{review.sd_reduction_fraction==null?"—":`${(100*review.sd_reduction_fraction).toFixed(1)}%`} · {tr(qcSdEvidence(review))}</strong><small>{tr("95% interval for reduction")}: {review.reduction_interval95?.map(v=>`${(100*v).toFixed(1)}%`).join(" … ")??"—"}</small></td>
-        <td><Status value={review.status}/><small>{tr("Required")}: ≥ {review.criteria.minimum_qc} QC · ≥ {(100*review.criteria.minimum_sd_reduction_fraction).toFixed(0)}% {tr("SD reduction")}</small></td>
-      </tr>;
-    })}</tbody></table></div>
-    {isotopes.map(iso=>{const review=analysis.correction_review[iso];return !!review.reasons.length&&<details key={iso} className="station-validation-findings"><summary>{isotopeLabel[iso]} · {tr("Validation criteria")} · {review.reasons.length}</summary><ul className="station-issue-list">{review.reasons.map(reason=><li key={reason}>{tr(reason)}</li>)}</ul></details>;})}
-    <p className="metro-muted">{tr("Session QC only; detected outliers are excluded, and the remaining paired aliquots are compared on the same VPDB scale. A smaller SD supports review but does not activate a correction.")}</p>
-  </Panel>;
-}
 
 export function SessionQcSequence({ analysis, mapping, interact, target }: { analysis: SessionAnalysis; mapping: Record<string,string>; interact: ChartInteractions; target: Record<Isotope,number|null> }) {
   const tr=useTranslation();
@@ -78,14 +61,14 @@ export function SessionQcSequence({ analysis, mapping, interact, target }: { ana
       reference("Average ±1σ",stats.mean!=null&&stats.sd!=null?stats.mean-stats.sd:null,"#c38835","dot",false,"one-sigma"),
     ].filter(Boolean);
     return <Chart key={iso} title={`${isotopeLabel[iso]} · ${tr("Session QC sequence")}`} x={tr("Session acquisition sequence")} y={`${isotopeLabel[iso]} / ‰ VPDB`} interactions={interact(`session-qc-${iso}`)} data={[
-      ...(["before","after"] as const).map(stage=>({type:"scatter",mode:"lines+markers",connectgaps:false,name:tr(stage==="before"?"Before correction":"After recorded method"),meta:{correctionStage:stage},x:sequence.map(r=>r?.sequence??null),y:sequence.map(r=>r?(stage==="before"?paired.get(r.id)??null:r.isotopes?.[iso]?.value??null):null),customdata:sequence.map(r=>r?custom(r):null),text:sequence.map(r=>r?`${r.label} · ${r.source_index} · ${r.run_label}`:""),marker:{size:6,color:stage==="before"?beforeColor:color(iso),symbol:stage==="before"?"circle-open":"circle"},line:{width:1,color:stage==="before"?beforeColor:color(iso)},hovertemplate:"%{text}<br>%{y:.4f} ‰<extra>%{fullData.name}</extra>"})),
+      ...(["before","after"] as const).map(stage=>({type:"scatter",mode:"lines+markers",connectgaps:false,name:tr(stage==="before"?"Before residual correction":"Corrected results"),meta:{correctionStage:stage},x:sequence.map(r=>r?.sequence??null),y:sequence.map(r=>r?(stage==="before"?paired.get(r.id)??null:r.isotopes?.[iso]?.value??null):null),customdata:sequence.map(r=>r?custom(r):null),text:sequence.map(r=>r?`${r.label} · ${r.source_index} · ${r.run_label}`:""),marker:{size:6,color:stage==="before"?beforeColor:color(iso),symbol:stage==="before"?"circle-open":"circle"},line:{width:1,color:stage==="before"?beforeColor:color(iso)},hovertemplate:"%{text}<br>%{y:.4f} ‰<extra>%{fullData.name}</extra>"})),
       {type:"scatter",mode:"markers",name:`${tr("Detected outliers")} · ${isotopeLabel[iso]}`,x:outliers.map(r=>r.sequence),y:outliers.map(r=>r.isotopes?.[iso]?.value??null),customdata:outliers.map(custom),text:outliers.map(r=>`${r.label} · ${r.source_index} · ${r.run_label}`),marker:{size:10,symbol:"x",color:color(iso),line:{width:1}},hovertemplate:"%{text}<br>%{y:.4f} ‰<extra>%{fullData.name}</extra>"},
       ...references,
     ]}/>;
   })}</div>;
 }
 
-const qcCategories: [QcFlagCategory,string][] = [["statistical","Statistical outliers"],["range","Validity-range flags"],["manual","Manual exclusions"],["failed","Failed analyses"]];
+const qcCategories: [QcFlagCategory,string][] = [["statistical","Statistical outliers"],["range","Validity-range flags"],["manual","Manual exclusions"],["pressure_adjustment","Poor pressure adjustment samples"],["no_signal","No-signal samples"]];
 export function SessionOutlierTable({analysis,review}:{analysis:SessionAnalysis;review:(measurementId:string,runId:string)=>ReactNode}) {
   const tr=useTranslation();
   const [selected,setSelected]=useState<{measurementId:string;runId:string}|null>(null);
@@ -117,71 +100,64 @@ const effects = [
   ["memory","QC memory screening","Preceding sample − QC mean / ‰"],
 ] as const;
 
-export function SessionResiduals({ analysis, materialId, mapping, interact, manualControls, overrides, busy, saveOverride }: {
-  analysis:SessionAnalysis; materialId:string; mapping:Record<string,string>; interact:ChartInteractions; manualControls:ReactNode;
-  overrides:Record<string,ResidualOverride>; busy:boolean;
+export function SessionResiduals({analysis,materialId,mapping,interact,overrides,busy,saveOverride}: {
+  analysis:SessionAnalysis;materialId:string;mapping:Record<string,string>;interact:ChartInteractions;
+  overrides:Record<string,ResidualOverride>;busy:boolean;
   saveOverride:(materialId:string,effect:string,isotope:Isotope,settings:ResidualOverride|null)=>Promise<unknown>;
 }) {
   const tr=useTranslation();
-  const [active,setActive]=useState<string>(effects[0][0]);
-  const [showResidual,setShowResidual]=useState(true);
   const [editing,setEditing]=useState<string|null>(null);
-  const [hoverPreview,setHoverPreview]=useState<{left:number;top:number}|null>(null);
-  const hoverTimer=useRef<ReturnType<typeof setTimeout>|null>(null);
-  const clearHoverTimer=()=>{if(hoverTimer.current)clearTimeout(hoverTimer.current);};
-  const closeHover=()=>{clearHoverTimer();hoverTimer.current=setTimeout(()=>setHoverPreview(null),180);};
-  useEffect(()=>{
-    const dismiss=(event:KeyboardEvent)=>{if(event.key==="Escape"){if(hoverTimer.current)clearTimeout(hoverTimer.current);setHoverPreview(null);}};
-    window.addEventListener("keydown",dismiss);
-    return ()=>{window.removeEventListener("keydown",dismiss);if(hoverTimer.current)clearTimeout(hoverTimer.current);};
-  },[]);
-
-  const material=analysis.diagnostics_before.materials.find(m=>m.material_id===materialId);
-  const final=analysis.diagnostics_after.materials.find(m=>m.material_id===material?.material_id);
+  const material=analysis.diagnostics_after.materials.find(m=>m.material_id===materialId);
+  const before=analysis.diagnostics_before.materials.find(m=>m.material_id===materialId);
+  const qcId=analysis.residual_qc_id??materialId;
+  const resultRows=new Map(analysis.rows.map(row=>[row.id,row]));
   if(!material)return <Empty>{tr("No identified QC or anchor observations for residual diagnostics.")}</Empty>;
-  const rowsById=new Map(analysis.rows.map(row=>[row.id,row]));
-  const custom=(id:string|undefined,iso:Isotope)=>{const row=id?rowsById.get(id):undefined;return id&&mapping[id]?[mapping[id],iso==="d13c"?"d13C":"d18O",row?.identifier1??row?.label,row?.identifier2??row?.comment]:null;};
-  const preview=(key:string,iso:Isotope)=>analysis.residual_previews?.[`${material.material_id}:${key}:${iso}`];
-  const displayedLinearity=(effect:typeof effects[number][0],iso:Isotope)=>{
-    const corrected=analysis.residual_linearity_views?.[`${material.material_id}:${effect}:${iso}`];
-    return showResidual&&corrected ? {fit:corrected,stage:"Manual preview"} : {fit:final?.isotopes[iso][effect],stage:"After correction"};
-  };
-  const effectCell=(fit:Fit|undefined,stage:string)=>{
-    const summary=residualEffectSummary(fit);
-    const evidence=`${tr("Linear fit")}: y = ${readable(fit?.intercept,5)} + ${readable(fit?.slope,6)} x; n=${fit?.n??0}. ${tr("95% confidence interval for effect span")}: ${summary.interval?.map(v=>readable(v)).join(" … ")??"—"}`;
-    return <td title={evidence} className={`station-effect-value ${stage} ${summary.relevant==null?"":summary.relevant?"effect-relevant":"effect-small"}`}>
-      <strong>Δ = {readable(summary.effect)} <span>± {readable(summary.uncertainty)} ‰</span></strong>
-      <small>b = {readable(fit?.slope,5)} ± {readable(fit?.slope_se,5)} · R² {readable(fit?.r_squared,2)}</small>
-    </td>;
-  };
-  const traces=(fit:Fit|undefined,iso:Isotope,stage:string)=>{
+  const decision=(iso:Isotope,effect:string)=>effect==="pressure_dependence"?analysis.failed_analysis_corrections?.[iso]:analysis.residual_corrections?.[iso]?.[effect];
+  const statusLabel=(status?:string)=>tr(status==="applied"?"Applied":status==="not_improved"?"Not applied: QC SD did not improve":status==="not_selected"?"Not applied: another predictor improves QC SD more":status==="disabled"?"Disabled":status==="uncertainty_required"?"Enter coefficient uncertainty":status==="insufficient_evidence"?"Insufficient QC for fitting":status==="unavailable_results"?"No eligible results with complete budgets":"Diagnostic only");
+  const traces=(fit:Fit|undefined,iso:Isotope,stage:"before"|"after")=>{
     if(!fit?.points?.length)return [];
-    const xx=fit.points.map(p=>p.x),retained=fit.points.filter(p=>!p.excluded_from_fit).map(p=>p.x),span=[Math.min(...retained),Math.max(...retained)];
-    return [{type:"scatter",mode:"markers",name:tr(stage==="After correction"?"After recorded method":stage==="Manual preview"?"Residual correction preview":stage),meta:{correctionStage:stage==="Before correction"?"before":stage==="After correction"?"after":"preview"},x:xx,y:fit.points.map(p=>p.y),customdata:fit.points.map(p=>custom(p.id,iso)),marker:{size:7,color:stage==="Before correction"?beforeColor:color(iso),symbol:fit.points.map(p=>analysis.outliers.flags.some(f=>f.measurement_id===p.id&&f.isotope===iso)?"x":stage==="Before correction"?"circle-open":stage==="Manual preview"?"diamond":"circle")}},...(fit.slope==null||fit.intercept==null?[]:[{type:"scatter",mode:"lines",name:tr(stage==="After correction"?"After recorded method":stage==="Manual preview"?"Residual correction preview":stage),meta:{correctionStage:stage==="Before correction"?"before":stage==="After correction"?"after":"preview"},showlegend:false,x:span,y:span.map(x=>fit.intercept!+fit.slope!*x),line:{width:1.5,dash:stage==="Before correction"?"dot":stage==="Manual preview"?"dash":"solid",color:stage==="Before correction"?beforeColor:color(iso)}}])];
+    const allPoints=fit.points;
+    const groups=stage==="before"?[true]:[true,false];
+    const pointTraces=groups.flatMap(applied=>{
+      const points=allPoints.filter(p=>Boolean(resultRows.get(p.id??"")?.isotopes?.[iso]?.residual_correction)===applied);
+      if(!points.length)return [];
+      return [{type:"scatter",mode:"markers",name:tr(stage==="before"?"Before residual correction":applied?"Residual correction applied":"Uncorrected observations"),
+        meta:{correctionStage:stage,correctionApplied:applied},x:points.map(p=>p.x),y:points.map(p=>p.y),
+        customdata:points.map(p=>[mapping[p.id??""]??p.id,iso==="d13c"?"d13C":"d18O"]),
+        marker:{size:7,color:stage==="before"?beforeColor:color(iso),symbol:stage==="before"?"circle-open":"circle"}}];
+    });
+    const retained=allPoints.filter(p=>!p.excluded_from_fit&&Number.isFinite(p.x));
+    const bounds=retained.length?[Math.min(...retained.map(p=>p.x)),Math.max(...retained.map(p=>p.x))]:[];
+    if(fit.slope==null||fit.intercept==null||bounds.length!==2||bounds[0]===bounds[1])return pointTraces;
+    return [...pointTraces,{type:"scatter",mode:"lines",name:tr(stage==="before"?"Before correction fit":"After correction fit"),showlegend:true,hoverinfo:"skip",x:bounds,y:bounds.map(x=>fit.intercept!+fit.slope!*x),line:{color:stage==="before"?beforeColor:color(iso),width:2,dash:stage==="before"?"dash":"solid"}}];
   };
-  const [key,label,x]=effects.find(effect=>effect[0]===active)??effects[0];
   return <div className="metro-stack station-residual-workspace">
-    {hoverPreview&&<div id="station-effect-tooltip" role="dialog" aria-label={tr(label)} className="station-effect-tooltip" style={hoverPreview} onMouseEnter={clearHoverTimer} onMouseLeave={closeHover} onKeyDown={e=>{if(e.key==="Escape")setHoverPreview(null);}}><div className="station-panel-toolbar"><h3>{tr(label)}</h3><button type="button" className="metro-btn" onClick={()=>{clearHoverTimer();setHoverPreview(null);}} aria-label={tr("Close")}>×</button></div><MetrologyChartHeight.Provider value={360}><div className="metro-grid station-isotope-pair">{isotopes.map(iso=><Chart key={iso} title={isotopeLabel[iso]} x={tr(x)} y="‰" data={[...traces(material.isotopes[iso][key],iso,"Before correction"),...traces(final?.isotopes[iso][key],iso,"After correction"),...traces(preview(key,iso),iso,"Manual preview")]} />)}</div></MetrologyChartHeight.Provider></div>}
-    <p className="metro-muted station-residual-legend">{material.label} · {tr("Δ: effect across the observed range; b: fitted slope per predictor unit; ±: standard uncertainty.")} {tr("Practical threshold / ‰")}: δ¹³C {readable(material.isotopes.d13c.intensity_dependence.practical_threshold)} / δ¹⁸O {readable(material.isotopes.d18o.intensity_dependence.practical_threshold)}. {tr("Amber: effect above the practical threshold. Green: below. Gray: no estimate.")}</p>
-    <div className="metro-table-wrap"><table className="station-residual-table"><thead><tr><th rowSpan={2}>{tr("Residual effect")}</th><th colSpan={2}>δ¹³C · {tr(materialId==="__all__"?"Effect / ‰":"QC effect / ‰")}</th><th colSpan={2}>δ¹⁸O · {tr(materialId==="__all__"?"Effect / ‰":"QC effect / ‰")}</th><th rowSpan={2}>{tr("Adjust")}</th></tr><tr>{isotopes.map(iso=><Fragment key={iso}><th className="before">{tr("Before")}</th><th className="after">{tr("After recorded method")}</th></Fragment>)}</tr></thead><tbody>{effects.map(([effect,title])=><Fragment key={effect}><tr data-active={active===effect}>
-      <th scope="row"><button type="button" className="station-effect-link" title={`${tr(title)}; x: ${tr(effects.find(item=>item[0]===effect)![2])}`} onMouseEnter={()=>{clearHoverTimer();setActive(effect);if(window.innerWidth>=1100)hoverTimer.current=setTimeout(()=>setHoverPreview({left:Math.max(16,(window.innerWidth-1060)/2),top:Math.max(60,(window.innerHeight-440)/2)}),600);}} onMouseLeave={closeHover} onFocus={()=>setActive(effect)} onKeyDown={e=>{if(e.key==="Escape")setHoverPreview(null);}} aria-pressed={active===effect} aria-controls={`residual-${effect}`} onClick={()=>{clearHoverTimer();setHoverPreview(null);document.getElementById(`residual-${effect}`)?.scrollIntoView({behavior:"smooth",block:"start"});}}>{tr(title)}</button></th>
-      {isotopes.map(iso=><Fragment key={iso}>{effectCell(material.isotopes[iso][effect],"before")}{effectCell(final?.isotopes[iso][effect],"after")}</Fragment>)}
-      <td><button type="button" className="metro-btn station-gear" aria-label={`${tr("Manual linearity control")}: ${tr(title)}`} aria-expanded={editing===effect} aria-controls={`settings-${effect}`} onClick={()=>{clearHoverTimer();setHoverPreview(null);setActive(effect);setEditing(editing===effect?null:effect);}}><Settings size={16}/></button></td>
-    </tr>{editing===effect&&<tr><td colSpan={6}><div id={`settings-${effect}`}><ResidualControls effect={effect} label={title} materialId={material.material_id} overrides={overrides} busy={busy} save={saveOverride}/>{isotopes.map(iso=>{const draft=preview(effect,iso);return draft&&<p key={iso} className="station-preview-result">{isotopeLabel[iso]} · {tr("Manual preview")}: {readable(draft.effect_span)} ‰ · {tr("Preview SD / ‰")}: {readable(draft.after?.sd,4)}</p>;})}{effect==="intensity_dependence"&&<details className="station-original-linearity"><summary>{tr("Original IRMS linearity algorithms and offsets")}</summary>{manualControls}</details>}</div></td></tr>}</Fragment>)}</tbody></table></div>
-    <section className="station-preview-summary" aria-label={tr("Residual correction preview")}>
-      <h3>{tr("Residual correction preview")}</h3>
-      {isotopes.some(iso=>preview("intensity_dependence",iso)?.model)&&<div className="metro-table-wrap"><table className="station-validation-table"><thead><tr><th>{tr("Isotope")}</th><th>{tr("Correction coefficient")}</th><th>{tr(materialId==="__all__"?"Fitting data SD / ‰":"Fitting QC SD / ‰")}</th><th>{tr("Correction standard uncertainty / ‰")}</th></tr></thead><tbody>{isotopes.map(iso=>{
-        const draft=preview("intensity_dependence",iso),range=correctionUncertaintyRange(draft);
-        if(!draft?.model)return null;
-        const reduction=draft.before?.sd&&draft.after?.sd!=null?100*(1-draft.after.sd/draft.before.sd):null;
-        return <tr key={iso}><th scope="row">{isotopeLabel[iso]}</th><td><strong>b = {readable(draft.model.slope,5)} ± {readable(draft.model.u_slope,5)} ‰/V</strong><small>x₀ = {readable(draft.model.x_ref,3)} V{draft.model.degree===2?` · q = ${readable(draft.model.quad,5)} ± ${readable(draft.model.u_quad,5)} ‰/V²`:""}</small></td><td><strong>{readable(draft.before?.sd,4)} → {readable(draft.after?.sd,4)} · {reduction==null?"—":`${reduction.toFixed(1)}%`}</strong><small>{tr(materialId==="__all__"?"Fitted data; independent validation pending":"Fitted QC; independent validation pending")} · n={draft.n}</small></td><td><strong>u_corr = {range?.map(v=>readable(v,4)).join(" … ")??"—"}</strong><small>{tr("Coefficient component; total uncertainty not evaluated")}</small></td></tr>;
-      })}</tbody></table></div>}
-      <div className="metro-actions">{isotopes.map(iso=><button key={iso} type="button" className="metro-btn" disabled={busy} onClick={()=>void saveOverride(material.material_id,"intensity_dependence",iso,{enabled:true,algorithm:"linear",slope:null,quadratic:null,center:null,offset:0,practical_threshold:iso==="d13c"?.01:.02})}>{isotopeLabel[iso]} · {tr(materialId==="__all__"?"Fit a linear correction preview to selected data":"Fit a linear correction preview to session QC")}</button>)}</div>
-      {isotopes.map(iso=>{const draft=preview("intensity_dependence",iso);return draft?.model&&<Inspect key={iso} title={`${isotopeLabel[iso]} · ${tr("Correction model and uncertainty")}`} value={draft}/>;})}
-    </section>
-    <div id="station-residual-charts" className="metro-stack"><Field label={tr("Linearity chart values")}><select value={showResidual?"preview":"recorded"} onChange={e=>setShowResidual(e.target.value==="preview")}><option value="preview">{tr("After residual correction, when enabled")}</option><option value="recorded">{tr("After recorded method")}</option></select></Field><p className="metro-muted">{tr("The three signal plots use the same intensity-corrected observations. Other predictor trends can remain. Preview values do not replace exported results.")}</p><div className="station-linearity-triptych">{isotopes.flatMap(iso=>effects.slice(0,3).map(([effect,title,axisLabel])=><section key={`${iso}-${effect}`} id={iso==="d13c"?`residual-${effect}`:`residual-${effect}-${iso}`} className="station-residual-charts"><Chart title={`${isotopeLabel[iso]}: ${tr(title)}`} x={tr(axisLabel)} y={`${isotopeLabel[iso]} / ‰ VPDB`} height={330} interactions={interact(`session-${effect}-${iso}`)} data={[...traces(material.isotopes[iso][effect],iso,"Before correction"),...traces(displayedLinearity(effect,iso).fit,iso,displayedLinearity(effect,iso).stage)]}/></section>))}</div>{effects.slice(3).map(([effect,title,axisLabel])=><section key={effect} id={`residual-${effect}`} aria-label={tr(title)} className="station-residual-charts"><h3>{tr(title)}</h3><div className="metro-grid station-isotope-pair">{isotopes.map(iso=>{const before=material.isotopes[iso][effect],after=final?.isotopes[iso][effect],draft=preview(effect,iso);return <Chart key={iso} title={isotopeLabel[iso]} x={tr(axisLabel)} y={effect==="pressure_residual"?tr("Isotope residual / ‰"):`${isotopeLabel[iso]} / ‰ VPDB`} height={340} interactions={interact(`session-${effect}-${iso}`)} data={[...traces(before,iso,"Before correction"),...traces(after,iso,"After correction"),...traces(draft,iso,"Manual preview")]} />;})}</div></section>)}</div>
-    <p className="metro-muted">{tr(materialId==="__all__"?"All-data fits use the available observations in each stage. Different sample compositions can influence the pooled slope; this view does not change the session calibration.":"Before/after fits use paired observations on the same VPDB scale. Detection requires a slope interval excluding zero and an effect above the practical threshold; it does not authorize a correction.")}</p>
-
+    <p className="metro-muted">{tr("QC determines the correction. The predictor with the largest QC SD reduction is applied once per isotope to all eligible observations, including outside the method range. Its uncertainty is included in results and exports.")}</p>
+    <p className="metro-muted">{tr("Green: applied. Amber: no SD improvement. Gray: not applied or diagnostic only.")}</p>
+    <p className="metro-muted">{tr("QC SD is compared on the observations used for fitting; this is not independent validation.")}</p>
+    <p className="metro-muted">{tr("Pressure-flagged analyses receive one joint pressure-and-intensity correction fitted on pressure-failed QC. Robust residual screening excludes extreme QC from fitting while keeping observations visible. The reference is zero pressure difference and the median initial intensity of retained nonfailed QC. If the joint fit is unavailable, the nonfailed-QC pressure model is used and labeled as a fallback. Ordinary residual corrections never apply to pressure-flagged analyses. Qualification range warnings remain separate. Coefficient covariance and extrapolation are recorded. A flat fitted QC trend is not independent validation; original review flags remain.")}</p>
+    <div className="metro-table-wrap"><table className="station-residual-table"><thead><tr><th>{tr("Residual effect")}</th>{isotopes.map(iso=><th key={iso}>{isotopeLabel[iso]} · {tr("QC SD / ‰")}</th>)}<th>{tr("Adjustments")}</th></tr></thead><tbody>{effects.map(([effect,label],index)=><Fragment key={effect}>
+      <tr><th scope="row">{tr(label)}{effect==="pressure_dependence"&&analysis.failed_analysis_corrections?.d13c&&<small>{tr("Failed-analysis correction")}</small>}</th>{isotopes.map(iso=>{
+        const d=decision(iso,effect),fit=material.isotopes[iso][effect];
+        return <td key={iso} className={`station-effect-value ${d?.status==="applied"?"effect-small":d?.status==="not_improved"?"effect-relevant":""}`}>
+          {d?.before&&d.after?<strong>{readable(d.before.sd,4)} → {readable(d.after.sd,4)} · {readable((d.sd_reduction_fraction??0)*100,1)}%</strong>:<strong>Δ = {readable(fit?.effect_span)} ‰</strong>}
+          <small>{statusLabel(d?.status)}</small>
+          <small>{d?.model?`b = ${readable(d.model.slope,5)} ± ${readable(d.model.u_slope,5)}`:`b = ${readable(fit?.slope,5)}`} · n={d?.n??fit?.n??0}{d?.status==="applied"?` · ${tr("Corrected observations")}: ${d.applied_n??0}`:""}</small>
+          {effect==="pressure_dependence"&&d&&<small>{tr("Pressure-corrected unknowns")}: {d.unknown_applied_n??0}</small>}
+          {effect==="pressure_dependence"&&d?.training_population&&<small>{tr(d.training_population==="pressure_failed_qc"?"Pressure-failed QC joint fit":"Nonfailed QC fallback")}</small>}
+          {d?.model?.intensity_slope!=null&&<>
+            <small>{tr("Initial-intensity coefficient")}: {readable(d.model.intensity_slope,5)} ± {readable(d.model.u_intensity_slope,5)} · I₀ = {readable(d.model.intensity_ref,3)} V</small>
+            <small>{tr("QC excluded from pressure fit")}: {d.fit_excluded_ids?.length??0}</small>
+            <small>{tr("Pressure-failed QC intensity slope before / after")}: {readable(d.intensity_before?.slope,5)} / {readable(d.intensity_after?.slope,5)}</small>
+          </>}
+          {d?.qc_pool&&<><small>{tr("Recovered QC admitted")}: {d.qc_pool.admitted_ids.length} · {tr("QC pool SD before / with corrected failures")}: {readable(d.qc_pool.before.sd,4)} / {readable(d.qc_pool.after.sd,4)}</small>{d.qc_pool.status==="not_improved"&&<small>{tr("Not admitted: pooled QC SD did not improve")}</small>}</>}
+          {index<3&&<small>{tr("Remaining slope on retained QC")}: {readable(analysis.diagnostics_after.materials.find(m=>m.material_id===qcId)?.isotopes[iso][effect]?.slope,5)}</small>}
+        </td>;
+      })}<td>{index<3?<button type="button" className="metro-btn station-gear" aria-label={`${tr("Correction parameters")}: ${tr(label)}`} aria-expanded={editing===effect} aria-controls={`settings-${effect}`} onClick={()=>setEditing(editing===effect?null:effect)}><Settings size={16}/></button>:"—"}</td></tr>
+      {editing===effect&&<tr><td colSpan={4}><div id={`settings-${effect}`}><ResidualControls effect={effect} materialId={qcId} overrides={overrides} busy={busy} save={saveOverride}/></div></td></tr>}
+    </Fragment>)}</tbody></table></div>
+    <div className="metro-grid station-isotope-pair">{effects.slice(0,3).flatMap(([effect,label,x])=>isotopes.map(iso=><section key={`${iso}-${effect}`} id={iso==="d13c"?`residual-${effect}`:`residual-${effect}-${iso}`}><Chart title={`${isotopeLabel[iso]}: ${tr(label)}`} x={tr(x)} y={`${isotopeLabel[iso]} / ‰ VPDB`} height={330} interactions={interact(`session-${effect}-${iso}`)} data={[...traces(before?.isotopes[iso][effect],iso,"before"),...traces(material.isotopes[iso][effect],iso,"after")]}/></section>))}</div>
+    {effects.slice(3).map(([effect,label,x])=><section key={effect} id={`residual-${effect}`}><h3>{tr(label)}</h3><div className="metro-grid station-isotope-pair">{isotopes.map(iso=><Chart key={iso} title={isotopeLabel[iso]} x={tr(x)} y="‰" height={300} interactions={interact(`session-${effect}-${iso}`)} data={traces(material.isotopes[iso][effect],iso,"after")}/>)}</div></section>)}
   </div>;
 }
 
@@ -191,5 +167,5 @@ export function TraceableExport({ detail, group, ...props }: WorkspaceProps & { 
   const [includeOutliers,setIncludeOutliers]=useState(false);
   const [client,setClient]=useState(detail.client),[series,setSeries]=useState(group||detail.project||detail.name);
   const [identifierSource,setIdentifierSource]=useState("raw_label"),[sampleSource,setSampleSource]=useState("raw_comment");
-  return <Panel title={tr("Traceable results export")}><div className="metro-form-grid"><Field label={tr("Client name for export")}><input value={client} maxLength={180} onChange={e=>setClient(e.target.value)}/></Field><Field label={tr("Series identifier for filename")}><input value={series} maxLength={180} onChange={e=>setSeries(e.target.value)}/></Field></div><div className="metro-form-grid">{[["Client worksheet identifier",identifierSource,setIdentifierSource],["Client worksheet sample",sampleSource,setSampleSource]].map(([label,value,setValue])=><Field key={String(label)} label={tr(String(label))}><select value={String(value)} onChange={e=>(setValue as (value:string)=>void)(e.target.value)}><option value="raw_label">{tr("Original sample label")}</option><option value="raw_comment">{tr("Original comment / sample identifier")}</option></select></Field>)}</div><p className="metro-muted">{tr("IRMS naming convention: Results for [series] series - stable C & O isotopes - P2L - [client] - [DDMMYYYY]. Names are sanitized; source records remain unchanged.")}</p><p className="metro-muted">{tr("The package contains a formatted PDF calculation certificate, Excel results, CSV and the complete calculation JSON. Review and blocked results retain their decision labels.")}</p><label className="metro-check"><input type="checkbox" checked={includeOutliers} onChange={e=>setIncludeOutliers(e.target.checked)}/>{tr("Include excluded results")}</label><div className="metro-actions">{[["zip","Results + calculation dossier"],["pdf","PDF calculation certificate"],["xlsx","Client output Excel","client_output"],["xlsx","Whole results Excel","dataset"],["csv","Results CSV"],["json","Calculation JSON"]].map(([format,label,output_type])=><button className={`metro-btn ${format==="zip"?"primary":""}`} key={output_type??format} disabled={props.busy||(output_type==="dataset"?!detail.runs.some(r=>r.evaluation?.results.length):!hasResults)} onClick={async()=>{const record=await props.act(`/results-sessions/${detail.id}/exports`,{format,output_type:output_type??"combined",include_outliers:includeOutliers,group:group||null,client_name:client,series_name:series,identifier_source:identifierSource,sample_source:sampleSource}) as SessionExport|undefined;if(record){const a=document.createElement("a");a.href=`${METROLOGY_API}/session-exports/${record.id}`;a.download=record.filename;a.click();}}}><Download size={14}/>{tr(label)}</button>)}</div><div className="metro-table-wrap"><table><thead><tr><th>{tr("Generated")}</th><th>{tr("Group / results")}</th><th>{tr("Download")}</th></tr></thead><tbody>{detail.exports.map(item=><tr key={item.id}><td>{item.created_at.slice(0,16).replace("T"," ")}</td><td>{item.group??tr("All groups")} · {item.rows}</td><td><a className="station-session-link" href={`${METROLOGY_API}/session-exports/${item.id}`}>{item.filename}</a></td></tr>)}</tbody></table></div></Panel>;
+  return <Panel title={tr("Traceable results export")}><div className="metro-form-grid"><Field label={tr("Client name for export")}><input value={client} maxLength={180} onChange={e=>setClient(e.target.value)}/></Field><Field label={tr("Series identifier for filename")}><input value={series} maxLength={180} onChange={e=>setSeries(e.target.value)}/></Field></div><div className="metro-form-grid">{[["Client worksheet identifier",identifierSource,setIdentifierSource],["Client worksheet sample",sampleSource,setSampleSource]].map(([label,value,setValue])=><Field key={String(label)} label={tr(String(label))}><select value={String(value)} onChange={e=>(setValue as (value:string)=>void)(e.target.value)}><option value="raw_label">{tr("Sample label (with corrections)")}</option><option value="raw_comment">{tr("Sample identifier (with corrections)")}</option></select></Field>)}</div><p className="metro-muted">{tr("IRMS naming convention: Results for [series] series - stable C & O isotopes - P2L - [client] - [DDMMYYYY]. Names are sanitized; source records remain unchanged.")}</p><p className="metro-muted">{tr("The package contains a formatted PDF calculation certificate, Excel results, CSV and the complete calculation JSON. Review and blocked results retain their decision labels.")}</p><label className="metro-check"><input type="checkbox" checked={includeOutliers} onChange={e=>setIncludeOutliers(e.target.checked)}/>{tr("Include excluded results")}</label><div className="metro-actions">{[["zip","Results + calculation dossier"],["pdf","PDF calculation certificate"],["xlsx","Client output Excel","client_output"],["xlsx","Whole results Excel","dataset"],["csv","Results CSV"],["json","Calculation JSON"]].map(([format,label,output_type])=><button className={`metro-btn ${format==="zip"?"primary":""}`} key={output_type??format} disabled={props.busy||(output_type==="dataset"?!detail.runs.some(r=>r.evaluation?.results.length):!hasResults)} onClick={async()=>{const record=await props.act(`/results-sessions/${detail.id}/exports`,{format,output_type:output_type??"combined",include_outliers:includeOutliers,group:group||null,client_name:client,series_name:series,identifier_source:identifierSource,sample_source:sampleSource}) as SessionExport|undefined;if(record){const a=document.createElement("a");a.href=`${METROLOGY_API}/session-exports/${record.id}`;a.download=record.filename;a.click();}}}><Download size={14}/>{tr(label)}</button>)}</div><div className="metro-table-wrap"><table><thead><tr><th>{tr("Generated")}</th><th>{tr("Group / results")}</th><th>{tr("Download")}</th></tr></thead><tbody>{detail.exports.map(item=><tr key={item.id}><td>{item.created_at.slice(0,16).replace("T"," ")}</td><td>{item.group??tr("All groups")} · {item.rows}</td><td><a className="station-session-link" href={`${METROLOGY_API}/session-exports/${item.id}`}>{item.filename}</a></td></tr>)}</tbody></table></div></Panel>;
 }

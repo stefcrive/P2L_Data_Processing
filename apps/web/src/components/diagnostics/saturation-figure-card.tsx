@@ -1,7 +1,7 @@
 "use client";
 
 import { useTranslation } from "@/components/layout/language-provider";
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { AlertTriangle, Info } from "lucide-react";
 
 import { PlotlyChart } from "@/components/charts/lazy-plotly-chart";
@@ -36,6 +36,7 @@ type SaturationFigureCardProps = {
   legendCollapsed?: boolean;
   verticallyResizable?: boolean;
   deferRenderMs?: number;
+  toolbarControls?: ReactNode;
 };
 
 function deepClone<T>(value: T): T {
@@ -364,6 +365,7 @@ export function SaturationFigureCard({
   legendCollapsed = false,
   verticallyResizable = false,
   deferRenderMs = 0,
+  toolbarControls,
 }: SaturationFigureCardProps) {
   const tr = useTranslation();
   const [swapped, setSwapped] = useState(false);
@@ -372,7 +374,8 @@ export function SaturationFigureCard({
 
   return (
     <div data-chart-panel className="saturation-figure-panel rounded-lg border border-stone-200 p-2">
-      <div className="flex flex-wrap items-start justify-end gap-2 px-1 pb-2">
+      <div data-card-header className="saturation-figure-toolbar">
+        {toolbarControls}
         <Button
           type="button"
           variant="outline"

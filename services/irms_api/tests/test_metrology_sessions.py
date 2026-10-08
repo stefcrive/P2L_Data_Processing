@@ -18,6 +18,472 @@ D = fixtures.DECISION
 
 
 class ResultsSessionTests(unittest.TestCase):
+    def test_joint_pressure_fit_uses_failed_qc_and_preserves_unknown_composition(self):
+        import numpy as np
+        session = self.create()
+        rows = []
+        for i in range(8):
+            p = -.03+.01*i
+            row = fixtures.row(i+1, "SHP2L", 1.+2*p, sample_type="QC Standard")
+            row.update({"i44_v": 5.+.1*i, "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 6.+p})
+            rows.append(row)
+        for i, p in enumerate([-3., -1., 1., 3., 5.]):
+            for j, intensity in enumerate([4., 8., 12., 16.]):
+                row = fixtures.row(len(rows)+1, "SHP2L", 1.+.2*p-.04*intensity+.002*(-1)**(i+j), sample_type="QC Standard")
+                row.update({"i44_v": intensity, "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 6.+p,
+                            "Pressure Adjust failed with Target Intensity": True})
+                rows.append(row)
+        for label, composition in (("unknown A", 2.), ("unknown B", 5.)):
+            row = fixtures.row(len(rows)+1, label, composition+.2*2.-.04*10.)
+            row.update({"i44_v": 10., "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 8.,
+                        "Pressure Adjust failed with Target Intensity": True})
+            rows.append(row)
+        run = self.service.import_run("joint-pressure.xlsx", fixtures.workbook(rows), RunCommand(**D, results_session_id=session["id"]))
+        source = self.service.run_detail(run["id"])["evaluation"]
+        response = self.client.put(f"/metrology/results-sessions/{session['id']}/failed-correction", json={**D, "enabled": True})
+        self.assertEqual(response.status_code, 200)
+        analysis = self.service.results_session_analysis(session["id"])
+        for iso in ("d13c", "d18o"):
+            fit = analysis["failed_analysis_corrections"][iso]
+            self.assertEqual(fit["training_population"], "pressure_failed_qc")
+            self.assertEqual(fit["n"], 20)
+            self.assertEqual(fit["unknown_applied_n"], 2)
+            self.assertAlmostEqual(fit["model"]["slope"], .2, places=3)
+            self.assertAlmostEqual(fit["model"]["intensity_slope"], -.04, places=3)
+            self.assertAlmostEqual(fit["intensity_after"]["slope"], 0., places=12)
+            first, second = [r["isotopes"][iso] for r in analysis["rows"][-2:]]
+            self.assertAlmostEqual(second["value"]-first["value"], 3., places=12)
+            g = np.array([2., 10.-fit["model"]["intensity_ref"]])
+            expected_u2 = float(g@np.array(fit["model"]["coefficient_covariance"])@g)
+            self.assertAlmostEqual(first["u_residual"]**2, expected_u2, places=12)
+            components = [c["name"] for c in first["budget"]["components"]]
+            self.assertEqual(components.count("pressure_adjustment_linearity"), 1)
+            self.assertNotIn("residual_linearity", components)
+        self.assertEqual(self.service.results_session_analysis(session["id"]), analysis)
+        self.assertEqual(self.service.run_detail(run["id"])["evaluation"], source)
+        export = self.service.export_results_session(session["id"], SessionExportCommand(**D, format="json"))
+        payload = json.loads(self.repo.read_blob(export["sha256"]))
+        self.assertEqual(payload["failed_analysis_corrections"], analysis["failed_analysis_corrections"])
+        pdf = self.service.export_results_session(session["id"], SessionExportCommand(**D, format="pdf"))
+        self.assertTrue(self.repo.read_blob(pdf["sha256"]).startswith(b"%PDF"))
+
+    def test_failed_pressure_correction_persists_and_reaches_results_and_exports(self):
+        session = self.create()
+        rows = []
+        for i, x in enumerate((-.03, -.02, -.01, .01, .02, .03)):
+            row = fixtures.row(i+1, "SHP2L", 1.+2*x+(.001 if i%2 else -.001), sample_type="QC Standard")
+            row.update({"Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 6.+x})
+            rows.append(row)
+        for label, x, value, failed in (("SHP2L", .06, 1.12, True), ("pressure failure", .2, 1.4, True),
+                                       ("aborted", .25, 1.5, False), ("missing pressure", None, 1.4, True),
+                                       ("normal sample", .1, 2.2, False)):
+            row = fixtures.row(len(rows)+1, label, value, sample_type="QC Standard" if label == "SHP2L" else "Unknown")
+            row.update({"Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": None if x is None else 6.+x,
+                        "Pressure Adjust failed with Target Intensity": failed})
+            if label == "aborted":
+                row["Status"] = "Aborted"
+            rows.append(row)
+        run = self.service.import_run("failed-pressure.xlsx", fixtures.workbook(rows), RunCommand(**D, results_session_id=session["id"]))
+        source = self.service.run_detail(run["id"])["evaluation"]
+        endpoint = f"/metrology/results-sessions/{session['id']}"
+        default = self.client.get(endpoint + "/analysis").json()
+        self.assertEqual(default["failed_analysis_corrections"], {})
+        response = self.client.put(endpoint + "/failed-correction", json={**D, "enabled": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        restarted = Service(Repository(self.repo.root))
+        self.assertTrue(restarted.results_session_detail(session["id"])["correct_failed_analyses"])
+        corrected = self.client.get(endpoint + "/analysis").json()
+        for iso in ("d13c", "d18o"):
+            fit = corrected["failed_analysis_corrections"][iso]
+            self.assertEqual(fit["status"], "applied")
+            self.assertEqual(fit["n"], 6)
+            self.assertEqual(fit["scope"], "pressure_affected_analyses")
+            self.assertEqual(fit["applied_n"], 2)
+            self.assertEqual(fit["extrapolated_n"], 2)
+            self.assertEqual(fit["unknown_applied_n"], 1)
+            self.assertEqual(fit["model"]["x_ref"], 0.)
+            self.assertAlmostEqual(fit["model"]["slope"], 2., delta=.05)
+            for index in (6, 7):
+                old = default["rows"][index]["isotopes"][iso]
+                new = corrected["rows"][index]["isotopes"][iso]
+                evidence = new["residual_correction"]
+                self.assertTrue(evidence["failed_analysis"])
+                self.assertEqual(evidence["effect"], "pressure_dependence")
+                self.assertAlmostEqual(new["value"], old["value"]-fit["model"]["slope"]*corrected["rows"][index]["pressure_mismatch_v"])
+                self.assertGreater(evidence["u"], 0.)
+                self.assertAlmostEqual(new["budget"]["u_combined"]**2, old["budget"]["u_combined"]**2+evidence["u"]**2)
+                self.assertEqual(sum(c["name"] == "pressure_adjustment_linearity" for c in new["budget"]["components"]), 1)
+                self.assertEqual(corrected["rows"][index]["issues"], default["rows"][index]["issues"])
+            for index in (8, 10):
+                self.assertEqual(corrected["rows"][index]["isotopes"][iso], default["rows"][index]["isotopes"][iso])
+                self.assertEqual(corrected["rows"][index]["failed_correction_attempts"], {})
+            self.assertNotIn("residual_correction", corrected["rows"][9]["isotopes"][iso])
+            self.assertEqual(corrected["rows"][9]["failed_correction_attempts"][iso]["reason"], "Pressure-adjustment difference is missing.")
+            pool = fit["qc_pool"]
+            self.assertEqual(pool["status"], "admitted")
+            self.assertEqual(pool["admitted_ids"], [corrected["rows"][6]["id"]])
+            self.assertLess(pool["after"]["sd"], pool["before"]["sd"])
+            self.assertEqual(corrected["qc_statistics"][iso]["final"]["n"], 7)
+            self.assertEqual(corrected["qc_statistics"][iso]["imported"], default["qc_statistics"][iso]["imported"])
+            self.assertEqual(corrected["diagnostics_before"]["materials"][0]["isotopes"][iso]["pressure_dependence"]["n"], 6)
+            self.assertEqual(corrected["diagnostics_after"]["materials"][0]["isotopes"][iso]["pressure_dependence"]["n"], 7)
+        self.assertEqual([{k: v for k, v in f.items() if k not in ("value", "session_qc_admitted")} for f in corrected["qc_review_flags"]],
+                         [{k: v for k, v in f.items() if k != "value"} for f in default["qc_review_flags"]])
+        self.assertTrue(all(f["session_qc_admitted"] for f in corrected["qc_review_flags"] if f["category"] == "pressure_adjustment"))
+        self.assertEqual(restarted.results_session_analysis(session["id"]), corrected)
+        self.assertEqual(self.service.run_detail(run["id"])["evaluation"], source)
+        exported = restarted.export_results_session(session["id"], SessionExportCommand(**D, format="json"))
+        payload = json.loads(self.repo.read_blob(exported["sha256"]))
+        self.assertTrue(payload["correct_failed_analyses"])
+        self.assertEqual(payload["failed_analysis_corrections"], corrected["failed_analysis_corrections"])
+        sample = next(r for r in payload["results"] if r["sample"] == "pressure failure")
+        self.assertEqual(sample["d13c_value"], corrected["rows"][7]["isotopes"]["d13c"]["value"])
+        self.assertEqual(sample["decision"], "blocked")
+        normal = next(r for r in payload["results"] if r["sample"] == "normal sample")
+        self.assertEqual(normal["d13c_value"], corrected["rows"][10]["isotopes"]["d13c"]["value"])
+        whole = restarted.results_session_detail(session["id"])
+        for iso in ("d13c", "d18o"):
+            self.assertEqual(whole["runs"][0]["evaluation"]["session_qc"][iso], corrected["qc_statistics"][iso]["final"])
+        pdf = restarted.export_results_session(session["id"], SessionExportCommand(**D, format="pdf"))
+        self.assertTrue(self.repo.read_blob(pdf["sha256"]).startswith(b"%PDF"))
+        from services.irms_api.api import main as legacy
+        from services.irms_api.session_store import FileSessionStore
+        from services.irms_api.metrology.plot_bridge import open_plot_bridge
+        from services.irms_api.metrology.models import Decision
+        with patch.object(legacy, "store", FileSessionStore(Path(self.fixture.temp.name)/"failed-tools")):
+            bridge = open_plot_bridge(restarted, session["id"], "all", Decision(**D))
+            frame = legacy.store.load_frame(bridge["session_id"])
+            sample_id = corrected["rows"][7]["id"]
+            self.assertAlmostEqual(frame.loc[int(bridge["row_mapping"][sample_id]), "d 13C/12C  Mean"], sample["d13c_value"])
+            response = self.client.put(endpoint + "/outlier-screening", json={**D, "method": "sigma", "threshold": 3., "pressure_adjustment_as_outlier": True})
+            self.assertEqual(response.status_code, 200, response.text)
+            screened = restarted.results_session_analysis(session["id"])
+            for iso in ("d13c", "d18o"):
+                self.assertEqual(screened["qc_statistics"][iso]["final"]["n"], 6)
+                self.assertEqual(screened["failed_analysis_corrections"][iso]["qc_pool"]["admitted_ids"], [])
+            screened_bridge = open_plot_bridge(restarted, session["id"], "all", Decision(**D))
+            self.assertNotEqual(bridge["session_id"], screened_bridge["session_id"])
+            self.assertTrue(legacy.store.load_metadata(screened_bridge["session_id"])["processing"]["config"]["pressure_adjustment_as_outlier"])
+            response = self.client.put(endpoint + "/outlier-screening", json={**D, "method": "sigma", "threshold": 3., "pressure_adjustment_as_outlier": False})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(restarted.results_session_analysis(session["id"])["qc_statistics"]["d13c"]["final"]["n"], 7)
+            response = self.client.put(endpoint + "/failed-correction", json={**D, "enabled": False})
+            self.assertEqual(response.status_code, 200, response.text)
+            restored_bridge = open_plot_bridge(restarted, session["id"], "all", Decision(**D))
+            self.assertNotEqual(bridge["session_id"], restored_bridge["session_id"])
+            restored = legacy.store.load_frame(restored_bridge["session_id"])
+            self.assertAlmostEqual(restored.loc[int(restored_bridge["row_mapping"][sample_id]), "d 13C/12C  Mean"], default["rows"][7]["isotopes"]["d13c"]["value"])
+        restored_analysis = self.service.results_session_analysis(session["id"])
+        self.assertEqual(restored_analysis["rows"], default["rows"])
+        self.assertEqual(restored_analysis["qc_statistics"], default["qc_statistics"])
+        with self.repo.connect(write=True) as db:
+            self.repo.update(db, "runs", run["id"], status="released")
+        self.assertEqual(self.client.put(endpoint + "/failed-correction", json={**D, "enabled": True}).status_code, 422)
+
+    def test_failed_pressure_correction_requires_usable_qc_and_inputs(self):
+        from services.irms_api.metrology.models import MethodConfig
+        from services.irms_api.metrology.session_processing import correct_failed_results
+        config = MethodConfig.model_validate(self.method["config"])
+        points = [{"id": str(i), "x": i*.01, "y": 1.+i*.02} for i in range(6)]
+        qc = {"isotopes": {iso: {"pressure_dependence": {"points": points}} for iso in ("d13c", "d18o")}}
+        failed = {"0", "failed", "manual"}
+        statistical = {iso: {"1"} for iso in ("d13c", "d18o")}
+        rows = [{"id": "failed", "issues": ["Qtegra pressure adjustment failed"], "pressure_mismatch_v": .2, "isotopes": {}},
+                {"id": "manual", "excluded": True, "issues": ["Qtegra pressure adjustment failed"], "pressure_mismatch_v": .2, "isotopes": {}}]
+        decision = correct_failed_results(rows, qc, failed, statistical, config, 2.)
+        self.assertEqual(decision["d13c"]["n"], 4)
+        self.assertEqual(decision["d13c"]["status"], "unavailable_results")
+        self.assertEqual(decision["d13c"]["attempted_n"], 1)
+        self.assertEqual(rows[0]["failed_correction_attempts"]["d13c"]["reason"], "Isotope value or complete uncertainty budget is missing.")
+        self.assertNotIn("failed_correction_attempts", rows[1])
+        for label, subset, expected in (("too few QC", points[:3], "insufficient_evidence"),
+                                         ("constant pressure", [{**p, "x": .01} for p in points], "insufficient_evidence"),
+                                         ("no delta relationship", [{**p, "y": 1.} for p in points], "not_improved")):
+            with self.subTest(label=label):
+                qc["isotopes"]["d13c"]["pressure_dependence"]["points"] = subset
+                outcome = correct_failed_results(rows, qc, failed, statistical, config, 2.)["d13c"]
+                self.assertEqual(outcome["status"], expected)
+                self.assertEqual(outcome["applied_n"], 0)
+
+    def test_pressure_qc_pool_admission_is_per_isotope_and_preserves_other_exclusions(self):
+        from services.irms_api.metrology.session_processing import admit_pressure_corrected_qc
+        from services.irms_api.metrology.session_analysis import session_analysis
+        session = self.create()
+        self.import_linearity(session)
+        detail = self.service.results_session_detail(session["id"])
+        rows = detail["runs"][0]["evaluation"]["results"]
+        qc = [r for r in rows if r["role"] == "qc"]
+        for i, row in enumerate(qc[:6]):
+            row["issues"] = []
+            for iso in ("d13c", "d18o"):
+                row["isotopes"][iso]["value"] = .01*i
+        recovered, aborted = qc[-2:]
+        recovered["issues"] = ["Qtegra pressure adjustment failed"]
+        aborted["issues"] = ["Qtegra pressure adjustment failed", "Qtegra reports an acquisition failure"]
+        for row in (recovered, aborted):
+            for iso in ("d13c", "d18o"):
+                row["isotopes"][iso].update(value=.025 if iso == "d13c" else 10., residual_correction={"effect": "pressure_dependence"})
+        failed = {recovered["id"], aborted["id"]}
+        decisions = {iso: {} for iso in ("d13c", "d18o")}
+        admit_pressure_corrected_qc(rows, failed, {"d13c": set(), "d18o": set()}, decisions)
+        self.assertEqual(decisions["d13c"]["qc_pool"]["admitted_ids"], [recovered["id"]])
+        self.assertEqual(decisions["d18o"]["qc_pool"]["status"], "not_improved")
+        self.assertFalse(aborted["isotopes"]["d13c"].get("session_qc_admitted"))
+        analysis = session_analysis(detail, outliers={"flags": []})
+        self.assertEqual(analysis["qc_statistics"]["d13c"]["final"]["n"], 7)
+        self.assertEqual(analysis["qc_statistics"]["d18o"]["final"]["n"], 6)
+        ranged = session_analysis(detail, outliers={"flags": []}, range_exclusions={"d13c": [recovered["id"]]})
+        self.assertEqual(ranged["qc_statistics"]["d13c"]["final"]["n"], 6)
+        screened = session_analysis(detail, outliers={"flags": [{"measurement_id": recovered["id"], "isotope": "d13c"}]})
+        self.assertEqual(screened["qc_statistics"]["d13c"]["final"]["n"], 6)
+        recovered["excluded"] = True
+        manual = session_analysis(detail, outliers={"flags": []})
+        self.assertEqual(manual["qc_statistics"]["d13c"]["final"]["n"], 6)
+
+    def test_only_pressure_affected_unknown_gets_pressure_correction_from_method_baseline(self):
+        session = self.create()
+        rows = []
+        for i in range(8):
+            x = -.03+i*.01
+            row = fixtures.row(i+1, "SHP2L", 1.+2*x+(.001 if i%2 else -.001), sample_type="QC Standard")
+            row.update({"i44_v": 4.+i*.1, "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 6.+x})
+            rows.append(row)
+        sample = fixtures.row(9, "normal sample", 2.4)
+        sample.update({"i44_v": 5.5, "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 6.2})
+        rows.append(sample)
+        rows.append({**sample, "Index": 10, "Label": "pressure sample", "Pressure Adjust failed with Target Intensity": True})
+        rows.append({**sample, "Index": 11, "Label": "missing pressure", "Pressure Adjust failed with Target Intensity": True,
+                     "Pressure Adjust Result Intensity": None})
+        run = self.service.import_run("pressure-and-signal.xlsx", fixtures.workbook(rows), RunCommand(**D, results_session_id=session["id"]))
+        original = self.service.run_detail(run["id"])["evaluation"]["results"][-2]
+        default = self.service.results_session_analysis(session["id"])
+        self.assertIn("residual_correction", default["rows"][-3]["isotopes"]["d13c"])
+        response = self.client.put(f"/metrology/results-sessions/{session['id']}/failed-correction", json={**D, "enabled": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        corrected = self.service.results_session_analysis(session["id"])
+        for iso in ("d13c", "d18o"):
+            normal = corrected["rows"][-3]["isotopes"][iso]
+            self.assertEqual(normal, default["rows"][-3]["isotopes"][iso])
+            self.assertIn(normal["residual_correction"]["effect"], ("intensity_dependence", "sample_reference_dependence", "pressure_adjusted_dependence"))
+            self.assertFalse(any(c["name"] == "pressure_adjustment_linearity" for c in normal["budget"]["components"]))
+            self.assertNotIn("residual_correction", default["rows"][-2]["isotopes"][iso])
+            self.assertNotIn("residual_correction", corrected["rows"][-1]["isotopes"][iso])
+            value = corrected["rows"][-2]["isotopes"][iso]
+            fit = corrected["failed_analysis_corrections"][iso]
+            self.assertAlmostEqual(value["value"], original["isotopes"][iso]["value"]-fit["model"]["slope"]*.2)
+            components = value["budget"]["components"]
+            self.assertEqual(sum(c["name"] == "pressure_adjustment_linearity" for c in components), 1)
+            self.assertFalse(any(c["name"] == "residual_linearity" for c in components))
+            self.assertAlmostEqual(value["budget"]["u_combined"]**2, original["isotopes"][iso]["budget"]["u_combined"]**2+value["u_residual"]**2)
+            self.assertEqual(fit["qc_pool"]["status"], "no_eligible_qc")
+
+    def test_qualification_pressure_warnings_do_not_remove_qc_or_trigger_pressure_correction(self):
+        from copy import deepcopy
+        from services.irms_api.metrology.pipeline import evaluate
+        from services.irms_api.metrology.session_processing import process_session_results, SIGNAL_EFFECTS
+        session = self.create()
+        rows = []
+        for i in range(8):
+            x = -.03+i*.01
+            row = fixtures.row(i+1, "SHP2L", 1.+2*x+(.001 if i%2 else -.001), sample_type="QC Standard")
+            row.update({"i44_v": 4.+i*.1, "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 6.+x})
+            rows.append(row)
+        for label, x, flag in (("normal", .02, False), ("range only", .2, False), ("flag only", .01, True),
+                               ("missing metadata", None, False)):
+            row = fixtures.row(len(rows)+1, label, 2.4)
+            row.update({"i44_v": 5.5, "Pressure Adjust Target Intensity": 6.,
+                        "Pressure Adjust Result Intensity": None if x is None else 6.+x,
+                        "Pressure Adjust failed with Target Intensity": flag})
+            rows.append(row)
+        self.service.import_run("qualification-pressure-range.xlsx", fixtures.workbook(rows), RunCommand(**D, results_session_id=session["id"]))
+        detail = self.service.results_session_detail(session["id"])
+        # Evaluate the imported observations under a qualification with pressure limits.
+        detail["method"]["config"]["ranges"]["pressure_mismatch_v"] = {"low": -.001, "high": .001}
+        run = detail["runs"][0]
+        evaluated = evaluate(run, detail["method"], run["evaluation"]["material_snapshots"], run["measurements"], [])
+        evaluated["id"] = run["evaluation"]["id"]
+        run["evaluation"] = evaluated
+        detail.pop("saved_outliers", None)
+        for effect in SIGNAL_EFFECTS:
+            for enabled in (False, True):
+                with self.subTest(effect=effect, pressure_enabled=enabled):
+                    candidate = deepcopy(detail)
+                    candidate["correct_failed_analyses"] = enabled
+                    candidate["residual_overrides"] = {
+                        f"{self.method['config']['qc_id']}:{other}:{iso}": {"enabled": other == effect}
+                        for iso in ("d13c", "d18o") for other in SIGNAL_EFFECTS}
+                    processed = process_session_results(candidate)
+                    results = {r["label"]: r for r in processed["runs"][0]["evaluation"]["results"]}
+                    for iso in ("d13c", "d18o"):
+                        self.assertEqual(processed["residual_corrections"][iso][effect]["n"], 8)
+                        self.assertEqual(processed["residual_corrections"][iso][effect]["status"], "applied")
+                        for label in ("normal", "range only", "missing metadata"):
+                            value = results[label]["isotopes"][iso]
+                            self.assertEqual(value["residual_correction"]["effect"], effect)
+                            self.assertFalse(any(c["name"] == "pressure_adjustment_linearity" for c in value["budget"]["components"]))
+                        for label in ("flag only",):
+                            value = results[label]["isotopes"][iso]
+                            self.assertFalse(any(c["name"] == "residual_linearity" for c in value["budget"]["components"]))
+                            if enabled:
+                                self.assertEqual(value["residual_correction"]["effect"], "pressure_dependence")
+                            else:
+                                self.assertNotIn("residual_correction", value)
+                        if enabled:
+                            self.assertEqual(processed["failed_analysis_corrections"][iso]["applied_n"], 1)
+                            self.assertEqual(processed["failed_analysis_corrections"][iso]["n"], 8)
+
+    def test_import_ignores_evaluate_flag_but_retains_acquisition_failure_checks(self):
+        session = self.create()
+        rows = [fixtures.row(i+1, "SHP2L", .01*i, sample_type="QC Standard") for i in range(4)]
+        rows.extend([fixtures.row(5, "sample", 1.)])
+        for row in rows:
+            row["Evaluate"] = False
+        rows[2]["Pressure Adjust failed with Target Intensity"] = True
+        rows[3]["Status"] = "Aborted"
+        run = self.service.import_run("evaluate-disabled.xlsx", fixtures.workbook(rows), RunCommand(**D, results_session_id=session["id"]))
+        evaluation = self.service.run_detail(run["id"])["evaluation"]
+        results = evaluation["results"]
+        for row in results:
+            self.assertFalse(row["evaluate"])
+            self.assertNotIn("Qtegra Evaluate is disabled", row["issues"])
+        self.assertIn("Qtegra pressure adjustment failed", results[2]["issues"])
+        self.assertIn("Qtegra reports an acquisition failure", results[3]["issues"])
+        for index in (0, 1, 4):
+            self.assertFalse(results[index]["issues"])
+            self.assertTrue(all(iso in results[index]["isotopes"] for iso in ("d13c", "d18o")))
+        analysis = self.service.results_session_analysis(session["id"])
+        self.assertEqual({flag["measurement_id"] for flag in analysis["qc_review_flags"] if flag["category"] == "pressure_adjustment"}, {results[2]["id"]})
+        self.assertEqual({flag["measurement_id"] for flag in analysis["outliers"]["flags"] if flag["category"] == "no_signal"}, {results[3]["id"]})
+        self.assertFalse(any(flag["category"] == "pressure_adjustment" for flag in analysis["outliers"]["flags"]))
+        for iso in ("d13c", "d18o"):
+            self.assertEqual(analysis["qc_statistics"][iso]["final"]["n"], 2)
+
+        endpoint = f"/metrology/results-sessions/{session['id']}/outlier-screening"
+        response = self.client.put(endpoint, json={**D, "method": "iqr", "threshold": 1.5, "pressure_adjustment_as_outlier": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        restarted = Service(Repository(self.repo.root))
+        self.assertTrue(restarted.results_session_detail(session["id"])["outlier_screening"]["pressure_adjustment_as_outlier"])
+        enabled = restarted.results_session_analysis(session["id"])
+        self.assertEqual({f["measurement_id"] for f in enabled["outliers"]["flags"] if f["category"] == "pressure_adjustment"}, {results[2]["id"]})
+        self.assertFalse(any(f["category"] == "pressure_adjustment" for f in enabled["qc_review_flags"]))
+        self.assertEqual(enabled["rows"][2]["failure_categories"], {"d13c": "pressure_adjustment", "d18o": "pressure_adjustment"})
+        self.assertEqual(enabled["rows"][3]["failure_categories"], {"d13c": "no_signal", "d18o": "no_signal"})
+        response = self.client.put(endpoint, json={**D, "method": "iqr", "threshold": 1.5, "pressure_adjustment_as_outlier": False})
+        self.assertEqual(response.status_code, 200, response.text)
+        disabled = restarted.results_session_analysis(session["id"])
+        self.assertFalse(any(f["category"] == "pressure_adjustment" for f in disabled["outliers"]["flags"]))
+        self.assertEqual({f["measurement_id"] for f in disabled["outliers"]["flags"] if f["category"] == "no_signal"}, {results[3]["id"]})
+
+    def test_recovered_qc_is_screened_before_residual_fitting_and_cache_is_invalidated(self):
+        from services.irms_api.metrology.qc_screening import stored_qc_screening
+        from services.irms_api.metrology.repository import encode
+        import hashlib
+        session = self.create()
+        run = self.import_linearity(session)
+        evaluation = self.service.run_detail(run["id"])["evaluation"]
+        # Legacy method-domain rejection erased these isotope results. One is
+        # anomalous but recoverable; a failed acquisition must not skew screening.
+        qc = [r for r in evaluation["results"] if r["role"] == "qc"]
+        recovered, failed = qc[-2:]
+        for iso in ("d13c", "d18o"):
+            evaluation["normalization"][iso]["correction"] = {"name":"Test correction","predictor":"i44_v","slope":0.,"u_slope":.001,"center":5.,"domain":{"low":3.,"high":9.},"anchor_predictor_means":[5.,5.]}
+            recovered[iso] = 5.
+            failed[iso] = 100.
+        recovered.update(isotopes={},i44_v=15.,issues=["correction predictor outside validated domain"])
+        failed.update(isotopes={},i44_v=16.,issues=["Qtegra pressure adjustment failed"])
+        with self.repo.connect(write=True) as db:
+            run_record = self.repo.get(db,"runs",run["id"])
+            data = {k:v for k,v in evaluation.items() if k not in ("id","created_at","run_id","method_id")}
+            record = self.repo.insert(db,"evaluations",data,run_id=run["id"],method_id=run["method_id"])
+            run_record["latest_evaluation_id"] = record["id"]
+            self.repo.update(db,"runs",run["id"],run_record)
+            session = self.repo.get(db,"results_sessions",session["id"])
+            session["outlier_screening"] = {"method":"sigma","threshold":1.}
+            self.repo.update(db,"results_sessions",session["id"],session)
+            population = [(run["id"],record["id"],run_record["revision"])]
+            old_hash = hashlib.sha256(encode({"version":3,"population":population,"settings":session["outlier_screening"]}).encode()).hexdigest()
+            db.execute("INSERT INTO qc_screenings(id,session_id,fingerprint,data,created_at) VALUES(?,?,?,?,?)",("old-screening",session["id"],old_hash,encode({"method":"sigma","threshold":1.,"flags":[]}),self.repo.timestamp()))
+            screening = stored_qc_screening(self.repo,db,session)
+        self.assertNotEqual(screening["id"],"old-screening")
+        for iso in ("d13c","d18o"):
+            flags = [f for f in screening["flags"] if f["isotope"] == iso]
+            self.assertEqual([f["measurement_id"] for f in flags],[recovered["id"]])
+            self.assertEqual(flags[0]["population_n"],7)
+        analysis = self.service.results_session_analysis(session["id"])
+        for iso in ("d13c","d18o"):
+            fit = next(d for d in analysis["residual_corrections"][iso].values() if d["status"] == "applied")
+            self.assertEqual(fit["n"],6)
+            self.assertNotIn(recovered["id"],{p["id"] for p in fit["points"] if not p.get("excluded_from_fit")})
+            actual = next(m for m in analysis["diagnostics_after"]["materials"] if m["material_id"] == self.method["config"]["qc_id"])
+            self.assertAlmostEqual(actual["isotopes"][iso][fit["source_effect"]]["slope"],0.,places=10)
+
+    def test_import_groups_by_identifier1_and_species_across_workbooks(self):
+        session = self.create()
+        content = fixtures.workbook([
+            fixtures.row(1, "SHP2L", 0, sample_type="QC Standard"),
+            fixtures.row(2, "Core A - calcite", 1),
+            fixtures.row(3, "Core A - calcite", 2),
+            fixtures.row(4, "Core A - aragonite", 3),
+            fixtures.row(5, "Core B - calcite", 4),
+        ])
+        first = self.service.import_run("groups.xlsx", content, RunCommand(**D, results_session_id=session["id"]))
+        second = self.service.import_run("more.xlsx", fixtures.workbook([
+            fixtures.row(1, "Core A - calcite", 5),
+        ]), RunCommand(**D, results_session_id=session["id"]))
+        detail = Service(Repository(self.repo.root)).results_session_detail(session["id"])
+        grouped = {}
+        for run in detail["runs"]:
+            for row in run["evaluation"]["results"]:
+                grouped.setdefault(row["label"], set()).add(detail["groups"][row["id"]])
+        self.assertEqual(grouped["Core A - calcite"], {"Core A · calcite"})
+        self.assertEqual(grouped["Core A - aragonite"], {"Core A · aragonite"})
+        self.assertEqual(grouped["Core B - calcite"], {"Core B · calcite"})
+        analysis = self.service.results_session_analysis(session["id"])
+        self.assertEqual(sum(row["sample_group"] == "Core A · calcite" for row in analysis["rows"]), 3)
+        row = next(row for row in analysis["rows"] if row["sample_group"] == "Core A · calcite")
+        self.service.save_session_groups(session["id"], SessionGroupsCommand(**D, groups={row["id"]: "Reviewed group"}))
+        self.service.import_run("duplicate.xlsx", content, RunCommand(**D, results_session_id=session["id"]))
+        updated = self.service.results_session_detail(session["id"])
+        self.assertEqual(updated["groups"][row["id"]], "Reviewed group")
+        self.assertEqual(updated["run_ids"], [first["id"], second["id"]])
+
+    def test_automatic_group_uses_available_identity_when_fields_are_missing(self):
+        from services.irms_api.metrology.sessions import imported_sample_group
+        def row(identifier, species, label=""):
+            return {"identifier1": identifier, "identifier2": "99", "species": species, "label": label}
+        self.assertEqual(imported_sample_group(row(" Core A ", " calcite ")), "Core A · calcite")
+        self.assertEqual(imported_sample_group(row("Core A", "")), "Core A")
+        self.assertEqual(imported_sample_group(row("", "calcite", "Original label")), "Original label · calcite")
+        self.assertEqual(imported_sample_group(row("", "")), "Main batch")
+
+    def test_session_coverage_factor_persists_and_scales_all_budgets_and_exports(self):
+        session = self.create()
+        run, _ = self.import_batch(session)
+        original = self.service.run_detail(run["id"])["evaluation"]
+        endpoint = f"/metrology/results-sessions/{session['id']}/uncertainty"
+        for invalid in (0, -1, "NaN", "Infinity"):
+            self.assertEqual(self.client.put(endpoint, json={**D, "coverage_factor": invalid}).status_code, 422)
+        response = self.client.put(endpoint, json={**D, "coverage_factor": 3.5})
+        self.assertEqual(response.status_code, 200, response.text)
+        restarted = Service(Repository(self.repo.root))
+        detail = restarted.results_session_detail(session["id"])
+        self.assertEqual(detail["coverage_factor"], 3.5)
+        analysis = restarted.results_session_analysis(session["id"])
+        for row in analysis["rows"]:
+            for iso in ("d13c", "d18o"):
+                budget = row["isotopes"][iso]["budget"]
+                self.assertEqual(budget["k"], 3.5)
+                self.assertAlmostEqual(budget["expanded_uncertainty"], 3.5 * budget["u_combined"])
+        self.assertEqual(restarted.run_detail(run["id"])["evaluation"], original)
+        self.assertEqual(detail["method"]["config"]["coverage_factor"], self.method["config"]["coverage_factor"])
+        export = restarted.export_results_session(session["id"], SessionExportCommand(**D, format="json"))
+        payload = json.loads(self.repo.read_blob(export["sha256"]))
+        self.assertEqual(payload["coverage_factor"], 3.5)
+        for row in payload["results"]:
+            for iso in ("d13c", "d18o"):
+                self.assertEqual(row[f"{iso}_k"], 3.5)
+                self.assertAlmostEqual(row[f"{iso}_U"], 3.5 * row[f"{iso}_u_combined"])
+
     def test_review_warnings_do_not_erase_linearity_and_all_data_is_opt_in(self):
         from services.irms_api.metrology.session_analysis import session_analysis
         session=self.create(); self.import_batch(session)
@@ -46,7 +512,7 @@ class ResultsSessionTests(unittest.TestCase):
         self.assertEqual(detail["runs"],[])
         self.assertEqual(detail["detached_runs"][0]["evaluation"],before)
         self.assertEqual(self.client.post(url+"?included=true",json=D).status_code,200)
-        self.assertEqual(self.service.results_session_detail(session["id"])["runs"][0]["evaluation"],before)
+        self.assertEqual(self.service.run_detail(run["id"])["evaluation"],before)
         other=self.create("Other client")
         self.assertEqual(self.client.post(f"/metrology/results-sessions/{other['id']}/workbooks/{run['id']}",json=D).status_code,422)
 
@@ -83,26 +549,113 @@ class ResultsSessionTests(unittest.TestCase):
         self.assertTrue(evaluation["qc"]["passed"])
         self.assertFalse(any("mass_ug" in issue for r in evaluation["results"] for issue in r["issues"]))
 
-    def test_residual_overrides_are_audited_previews_and_can_be_restored(self):
+    def test_residual_overrides_persist_and_can_be_restored(self):
         session = self.create()
         run, _ = self.import_batch(session)
-        detail = self.service.results_session_detail(session["id"])
-        original = detail["runs"][0]["evaluation"]
+        original = self.service.run_detail(run["id"])["evaluation"]
         material = self.method["config"]["qc_id"]
         endpoint = f"/metrology/results-sessions/{session['id']}/residual-overrides"
-        command = {**D, "material_id": material, "effect": "drift", "isotope": "d13c",
-                   "settings": {"enabled": True, "slope": .002, "center": 2}}
+        command = {**D, "material_id": material, "effect": "intensity_dependence", "isotope": "d13c",
+                   "settings": {"enabled": False}}
         response = self.client.put(endpoint, json=command)
         self.assertEqual(response.status_code, 200, response.text)
         analysis = self.client.get(f"/metrology/results-sessions/{session['id']}/analysis").json()
-        key = f"{material}:drift:d13c"
-        self.assertIn(key, analysis["residual_previews"])
+        self.assertEqual(analysis["residual_corrections"]["d13c"]["intensity_dependence"]["status"], "disabled")
+        key = f"{material}:intensity_dependence:d13c"
         persisted = Service(Repository(self.repo.root)).results_session_detail(session["id"])
-        self.assertEqual(persisted["residual_overrides"][key]["slope"], .002)
-        self.assertEqual(persisted["runs"][0]["evaluation"], original)
+        self.assertFalse(persisted["residual_overrides"][key]["enabled"])
+        self.assertEqual(self.service.run_detail(run["id"])["evaluation"], original)
         self.assertEqual(self.client.put(endpoint, json={**command,"material_id":"foreign"}).status_code, 422)
         self.assertEqual(self.client.put(endpoint, json={**command,"settings":None}).status_code, 200)
         self.assertNotIn(key, self.service.results_session_detail(session["id"])["residual_overrides"])
+
+    def import_linearity(self, session):
+        rows = [fixtures.row(i+1, "SHP2L", .03*i + (.001 if i % 2 else -.001), sample_type="QC Standard") for i in range(8)]
+        for i, row in enumerate(rows):
+            row["i44_v"] = 4.+i*.1
+        sample = fixtures.row(9, "sample", 1.2)
+        sample["i44_v"] = 18.  # Beyond both the fit and method intensity range.
+        rows.append(sample)
+        return self.service.import_run("residual-fit.xlsx", fixtures.workbook(rows), RunCommand(**D, results_session_id=session["id"]))
+
+    def test_automatic_residual_reaches_all_results_budgets_charts_and_exports(self):
+        from services.irms_api.api import main as legacy
+        from services.irms_api.session_store import FileSessionStore
+        from services.irms_api.metrology.plot_bridge import open_plot_bridge
+        from services.irms_api.metrology.models import Decision
+        session = self.create()
+        run = self.import_linearity(session)
+        original = self.service.run_detail(run["id"])["evaluation"]
+        restarted = Service(Repository(self.repo.root))
+        detail = restarted.results_session_detail(session["id"])
+        self.assertEqual(detail, restarted.results_session_detail(session["id"]))
+        analysis = restarted.results_session_analysis(session["id"], include_all_data=True)
+        sample = next(r for r in analysis["rows"] if r["role"] == "unknown")
+        original_sample = next(r for r in original["results"] if r["id"] == sample["id"])
+        for iso in ("d13c", "d18o"):
+            applied = [d for d in analysis["residual_corrections"][iso].values() if d["status"] == "applied"]
+            self.assertEqual(len(applied), 1)
+            self.assertLess(applied[0]["after"]["sd"], applied[0]["before"]["sd"])
+            self.assertEqual(applied[0]["applied_n"], 9)
+            value = sample["isotopes"][iso]
+            evidence = value["residual_correction"]
+            self.assertTrue(evidence["extrapolated"])
+            self.assertAlmostEqual(value["value"], original_sample["isotopes"][iso]["value"]+evidence["adjustment"])
+            self.assertGreater(value["u_residual"], 0)
+            self.assertAlmostEqual(value["budget"]["u_combined"]**2,
+                original_sample["isotopes"][iso]["budget"]["u_combined"]**2+value["u_residual"]**2)
+            self.assertEqual(sum(c["name"] == "residual_linearity" for c in value["budget"]["components"]), 1)
+            material = next(m for m in analysis["diagnostics_after"]["materials"] if m["material_id"] == "__all__")
+            for effect in ("intensity_dependence", "sample_reference_dependence", "pressure_adjusted_dependence"):
+                points = material["isotopes"][iso][effect]["points"]
+                if points:
+                    self.assertEqual(next(p["y"] for p in points if p["id"] == sample["id"]), value["value"])
+        with patch.object(legacy, "store", FileSessionStore(Path(self.fixture.temp.name)/"corrected-tools")):
+            bridge = open_plot_bridge(restarted, session["id"], "all", Decision(**D))
+            frame = legacy.store.load_frame(bridge["session_id"])
+            self.assertEqual(frame.loc[int(bridge["row_mapping"][sample["id"]]), "d 13C/12C  Mean"], sample["isotopes"]["d13c"]["value"])
+        exported = restarted.export_results_session(session["id"], SessionExportCommand(**D, format="json"))
+        payload = json.loads(self.repo.read_blob(exported["sha256"]))
+        self.assertEqual(payload["results"][0]["d13c_value"], sample["isotopes"]["d13c"]["value"])
+        self.assertIn("session_residual_corrections", payload)
+        self.assertEqual(restarted.run_detail(run["id"])["evaluation"], original)
+
+    def test_manual_parameters_need_uncertainty_and_must_improve_qc_sd(self):
+        session = self.create()
+        self.import_linearity(session)
+        endpoint = f"/metrology/results-sessions/{session['id']}/residual-overrides"
+        base = {**D, "material_id": self.method["config"]["qc_id"], "isotope": "d13c"}
+        for effect in ("sample_reference_dependence", "pressure_adjusted_dependence"):
+            self.assertEqual(self.client.put(endpoint, json={**base,"effect":effect,"settings":{"enabled":False}}).status_code,200)
+        command = {**base, "effect":"intensity_dependence", "settings":{"enabled":True,"slope":-.3}}
+        self.assertEqual(self.client.put(endpoint,json=command).status_code,200)
+        detail = self.service.results_session_detail(session["id"])
+        self.assertEqual(detail["residual_corrections"]["d13c"]["intensity_dependence"]["status"],"uncertainty_required")
+        command["settings"]["u_slope"] = .01
+        self.assertEqual(self.client.put(endpoint,json=command).status_code,200)
+        detail = self.service.results_session_detail(session["id"])
+        self.assertEqual(detail["residual_corrections"]["d13c"]["intensity_dependence"]["status"],"not_improved")
+        for row in detail["runs"][0]["evaluation"]["results"]:
+            self.assertNotIn("residual_correction",row["isotopes"]["d13c"])
+        command["settings"]["slope"] = .3
+        self.assertEqual(self.client.put(endpoint,json=command).status_code,200)
+        detail = self.service.results_session_detail(session["id"])
+        self.assertEqual(detail["residual_corrections"]["d13c"]["intensity_dependence"]["status"],"applied")
+
+    def test_flat_qc_does_not_apply_correction_or_add_uncertainty(self):
+        session = self.create()
+        rows = [fixtures.row(i+1,"SHP2L",0.,sample_type="QC Standard") for i in range(8)]
+        for i, row in enumerate(rows):
+            row["i44_v"] = 4.+i*.1
+        self.service.import_run("flat-qc.xlsx",fixtures.workbook(rows),RunCommand(**D,results_session_id=session["id"]))
+        detail = self.service.results_session_detail(session["id"])
+        for iso in ("d13c","d18o"):
+            self.assertFalse(any(d["status"] == "applied" for d in detail["residual_corrections"][iso].values()))
+            self.assertEqual(detail["residual_corrections"][iso]["intensity_dependence"]["status"],"not_improved")
+            for row in detail["runs"][0]["evaluation"]["results"]:
+                result = row["isotopes"][iso]
+                self.assertEqual(result["value"],0.)
+                self.assertFalse(any(c["name"] == "residual_linearity" for c in result["budget"]["components"]))
 
     def test_saved_qc_outliers_persist_and_history_is_isotope_specific(self):
         session = self.create()
@@ -142,7 +695,7 @@ class ResultsSessionTests(unittest.TestCase):
         self.assertEqual(len(carbon["points"]), 8)
         self.assertIn("session_qc_outlier", [f["rule"] for f in carbon["flags"]])
         self.assertAlmostEqual(carbon["sd"], .002160246899469287)
-        self.assertEqual(detail["runs"][0]["evaluation"], original)
+        self.assertEqual(self.service.run_detail(run["id"])["evaluation"], original)
         with self.repo.connect(write=True) as db:
             with self.assertRaisesRegex(sqlite3.IntegrityError, "Append-only"):
                 db.execute("DELETE FROM qc_screenings WHERE id=?", (screening["id"],))
@@ -227,9 +780,16 @@ class ResultsSessionTests(unittest.TestCase):
     def test_client_isolation_and_foreign_groups(self):
         a=self.create(); b=self.create("Client B")
         run,content=self.import_batch(a)
-        with self.assertRaisesRegex(ValueError,"Client A"):
-            self.service.import_run("another-name.xlsx",content,RunCommand(**D,results_session_id=b["id"]))
-        self.assertEqual(self.service.results_session_detail(b["id"])["run_ids"],[])
+        other = self.service.import_run("another-name.xlsx",content,RunCommand(**D,results_session_id=b["id"]))
+        self.assertNotEqual(run["id"],other["id"])
+        self.assertEqual(run["raw_import_id"],other["raw_import_id"])
+        self.assertEqual(self.service.results_session_detail(b["id"])["run_ids"],[other["id"]])
+        duplicate = self.service.import_run("renamed-again.xlsx",content,RunCommand(**D,results_session_id=b["id"]))
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["id"],other["id"])
+        ids_a = {r["id"] for r in self.service.run_detail(run["id"])["measurements"]}
+        ids_b = {r["id"] for r in self.service.run_detail(other["id"])["measurements"]}
+        self.assertFalse(ids_a & ids_b)
         with self.assertRaisesRegex(ValueError,"belonging"):
             self.service.save_session_groups(b["id"],SessionGroupsCommand(**D,groups={self.service.run_detail(run["id"])["measurements"][0]["id"]:"Stolen group"}))
 
@@ -258,9 +818,17 @@ class ResultsSessionTests(unittest.TestCase):
 
     def test_release_freezes_client_and_sample_groups(self):
         session=self.create();run,_=self.import_batch(session)
+        endpoint = f"/metrology/results-sessions/{session['id']}/uncertainty"
+        self.assertEqual(self.client.put(endpoint, json={**D, "coverage_factor": 3}).status_code, 200)
         release=self.service.release(run["id"],ReleaseCommand(**D,evaluation_id=run["latest_evaluation_id"]))
         self.assertEqual(release["results_session_snapshot"]["client"],"Client A")
         sample=release["results"][0]
+        for iso in ("d13c", "d18o"):
+            budget = sample["isotopes"][iso]["budget"]
+            self.assertEqual(budget["k"], 3)
+            self.assertAlmostEqual(budget["expanded_uncertainty"], 3 * budget["u_combined"])
+        self.assertEqual(self.client.put(endpoint, json={**D, "coverage_factor": 2}).status_code, 422)
+        self.assertEqual(self.service.results_session_detail(session["id"])["coverage_factor"], 3)
         with self.assertRaisesRegex(ValueError,"frozen"):
             self.service.save_session_groups(session["id"],SessionGroupsCommand(**D,groups={sample["id"]:"Other group"}))
 
@@ -290,6 +858,70 @@ class ResultsSessionTests(unittest.TestCase):
                 guarded=app.post(f"/sessions/{bridge}/calibration/run",json={})
                 self.assertEqual(guarded.status_code,409,guarded.text)
 
+    def test_processing_label_edits_persist_in_results_and_exports(self):
+        from fastapi.testclient import TestClient
+        from services.irms_api.api import main as legacy
+        from services.irms_api.session_store import FileSessionStore
+        from services.irms_api.metrology.plot_bridge import open_plot_bridge
+        from services.irms_api.metrology.models import Decision
+        session = self.create()
+        run, content = self.import_batch(session)
+        other_session = self.create("Client B")
+        other_run = self.service.import_run("same.xlsx", content, RunCommand(**D, results_session_id=other_session["id"]))
+        original = self.service.run_detail(run["id"])["evaluation"]
+        sample = next(r for r in original["results"] if r["role"] == "unknown")
+        with patch.object(legacy, "store", FileSessionStore(Path(self.fixture.temp.name)/"label-tools")):
+            bridge = open_plot_bridge(self.service, session["id"], "all", Decision(**D))
+            target = {"row_label":bridge["row_mapping"][sample["id"]],"isotope_key":"d13C"}
+            edit = {"action":"set_identifier2","identifier2":"Corrected spelling","targets":[target]}
+            with TestClient(legacy.app) as app:
+                response = app.post(f"/sessions/{bridge['session_id']}/processing/edit", json=edit)
+                self.assertEqual(response.status_code, 200, response.text)
+                # A mixed batch is rejected before any identity or numerical edit.
+                batch = {"edits":[{**edit,"identifier2":"Should not be saved"},{"action":"set_value","value":8,"targets":[target]}]}
+                response = app.post(f"/sessions/{bridge['session_id']}/processing/edits", json=batch)
+                self.assertEqual(response.status_code, 409, response.text)
+            restarted = Service(Repository(self.repo.root))
+            detail = restarted.results_session_detail(session["id"])
+            changed = next(r for r in detail["runs"][0]["evaluation"]["results"] if r["id"] == sample["id"])
+            self.assertEqual(changed["identifier2"], "Corrected spelling")
+            self.assertEqual(changed["comment"], sample["comment"])
+            fresh = open_plot_bridge(restarted, session["id"], "all", Decision(**D))
+            self.assertNotEqual(fresh["session_id"],bridge["session_id"])
+            frame = legacy.store.load_frame(fresh["session_id"])
+            self.assertEqual(frame.loc[int(fresh["row_mapping"][sample["id"]]),"Identifier 2"],"Corrected spelling")
+            record = restarted.export_results_session(session["id"], SessionExportCommand(**D, format="json"))
+            exported = json.loads(self.repo.read_blob(record["sha256"]))
+            corrected = next(r for r in exported["results"] if r["measurement_id"] == sample["id"])
+            self.assertEqual(corrected["identifier2"], "Corrected spelling")
+            self.assertEqual(corrected["sample_identifier"], "Corrected spelling")
+            self.assertEqual(restarted.run_detail(run["id"])["evaluation"], original)
+            self.assertFalse(any(r.get("identifier2") == "Corrected spelling" for r in restarted.run_detail(other_run["id"])["measurements"]))
+
+    def test_domain_recovery_supplies_budget_and_preserves_failure_reasons(self):
+        from services.irms_api.metrology.session_processing import process_session_results
+        session = self.create()
+        self.import_linearity(session)
+        detail = self.service.results_session_detail(session["id"])
+        run = detail["runs"][0]
+        # Reproduce a legacy recorded evaluation rejected by the method domain.
+        run["evaluation"] = self.service.run_detail(run["id"])["evaluation"]
+        row = next(r for r in run["evaluation"]["results"] if r["role"] == "unknown")
+        model = run["evaluation"]["normalization"]["d13c"]
+        model["correction"] = {"name":"Test intensity correction","slope":.01,"u_slope":.001,
+            "predictor":"i44_v","center":5.,"domain":{"low":3.,"high":9.},"anchor_predictor_means":[5.,5.]}
+        row["isotopes"] = {}
+        row["issues"] = ["d13c correction predictor outside validated domain", "Qtegra pressure adjustment failed"]
+        row["d18o"] = None
+        process_session_results(detail)
+        result = row["isotopes"]["d13c"]
+        self.assertTrue(result["correction"]["domain_extrapolated"])
+        self.assertGreater(result["budget"]["u_combined"], 0)
+        self.assertNotIn("residual_correction", result)
+        self.assertIn("Qtegra pressure adjustment failed", row["issues"])
+        self.assertNotIn("d18o", row["isotopes"])
+        self.assertEqual(row["calculation_issues"]["d18o"], "The imported isotope value is missing.")
+
     def test_full_session_bridge_maps_all_workbooks_and_invalidates_after_revision(self):
         from services.irms_api.api import main as legacy
         from services.irms_api.session_store import FileSessionStore
@@ -299,6 +931,7 @@ class ResultsSessionTests(unittest.TestCase):
         second=self.service.import_run("routine.xlsx",fixtures.workbook([fixtures.row(1,"SHP2L",.002,sample_type="QC Standard"),fixtures.row(2,"another sample",2)]),RunCommand(**D,results_session_id=session["id"]))
         with patch.object(legacy,"store",FileSessionStore(Path(self.fixture.temp.name)/"session-tools")):
             result=open_plot_bridge(self.service,session["id"],"all",Decision(**D))
+            first_workbook = open_plot_bridge(self.service,session["id"],run["id"],Decision(**D))
             self.assertEqual(len(result["row_mapping"]),8)
             self.assertEqual(len(set(result["row_mapping"].values())),8)
             frame=legacy.store.load_frame(result["session_id"])
@@ -321,6 +954,7 @@ class ResultsSessionTests(unittest.TestCase):
             self.service.annotate(second["id"],AnnotationCommand(**D,acquisition_complete=True))
             changed=open_plot_bridge(self.service,session["id"],"all",Decision(**D))
             self.assertNotEqual(changed["session_id"],result["session_id"])
+            self.assertNotEqual(open_plot_bridge(self.service,session["id"],run["id"],Decision(**D))["session_id"],first_workbook["session_id"])
 
     def test_session_analysis_reuses_qc_outlier_algorithm_and_pressure_fit(self):
         from services.irms_api.metrology.session_analysis import session_analysis

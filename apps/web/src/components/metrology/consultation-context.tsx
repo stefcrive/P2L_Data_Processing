@@ -13,7 +13,7 @@ export const MetrologyChartHeight = createContext(280);
 export const MetrologySymbolSize = createContext<number | null>(null);
 export const MetrologyEvidenceBridge = createContext<{session_id:string;row_mapping:Record<string,string>} | null>(null);
 export const MetrologyToolActive = createContext(true);
-export const MetrologyStationFilters = createContext<{controls:ReactNode;flags:ChartFlag[];ranges:ChartRanges;supplementaryFigures?:{key:string;title:string;figure:Record<string,unknown>}[]} | null>(null);
+export const MetrologyStationFilters = createContext<{controls:ReactNode;flags:ChartFlag[];ranges:ChartRanges;pressureAdjustmentAsOutlier?:boolean;onPressureAdjustmentOutlierChange?:(checked:boolean)=>void;supplementaryFigures?:{key:string;title:string;figure:Record<string,unknown>}[]} | null>(null);
 
 export type ChartInteractions = (key: string) => Pick<PlotlyChartProps, "onPointClick" | "onSelection" | "onPointHover" | "onHoverEnd">;
 export const MetrologyChartWorkspace = createContext<{

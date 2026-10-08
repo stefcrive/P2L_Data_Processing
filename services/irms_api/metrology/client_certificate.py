@@ -153,7 +153,7 @@ def build_client_certificate(snapshot: dict) -> bytes:
         top -= row_h
 
     notes = [
-        ("Measurement details", f"Expanded uncertainty U = k × combined standard uncertainty; k = {config['coverage_factor']}. {config['coverage_rationale']}"),
+        ("Measurement details", f"Expanded uncertainty U = k × combined standard uncertainty; k = {session.get('coverage_factor', config['coverage_factor']) if session else config['coverage_factor']}. {config['coverage_rationale'] if not session or 'coverage_factor' not in session else 'Coverage factor selected for this results session.'}"),
         ("Release review", f"Released by {release['review']['actor']}. Independent QC and validated range checks passed before release."),
         ("Traceability", f"Source SHA-256: {release['raw_sha256']}"),
     ]

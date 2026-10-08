@@ -24,7 +24,9 @@ export function Qualifications(props: WorkspaceProps & {initialQualificationId?:
   const method = props.state.methods.find(m => m.id === methodId);
   const owner=props.state.results_sessions?.find(s=>s.qualification_id===q?.id&&s.context==="qualification");
   const [detail,setDetail]=useState<ResultsSessionDetail|null>(null);
-  useEffect(()=>{if(!owner){setDetail(null);return;}const controller=new AbortController();metroRequest<ResultsSessionDetail>(`/results-sessions/${owner.id}`,{signal:controller.signal}).then(setDetail).catch(e=>{if(!controller.signal.aborted)setError(e.message);});return ()=>controller.abort();},[owner?.id,props.state]);
+  const [identityRefresh,setIdentityRefresh]=useState(0);
+  useEffect(()=>{const refresh=()=>setIdentityRefresh(n=>n+1);window.addEventListener("metrology-identities-updated",refresh);return ()=>window.removeEventListener("metrology-identities-updated",refresh);},[]);
+  useEffect(()=>{if(!owner){setDetail(null);return;}const controller=new AbortController();metroRequest<ResultsSessionDetail>(`/results-sessions/${owner.id}`,{signal:controller.signal}).then(setDetail).catch(e=>{if(!controller.signal.aborted)setError(e.message);});return ()=>controller.abort();},[owner?.id,props.state,identityRefresh]);
   return <div className="metro-stack"><div className="station-qualification-controls">{q&&<div className="station-panel-toolbar"><Field label={tr("Qualification session")}><select value={q.id} onChange={e=>setSelected(e.target.value)}>{[...props.state.qualifications].reverse().map(item=><option key={item.id} value={item.id}>v{props.state.methods.find(m=>m.id===item.method_id)?.version} · {item.id.slice(0,8)} · {tr(item.status)} · {item.approval?.at.slice(0,10)??tr("Under review")}</option>)}</select></Field><Status value={q.status}/></div>}
   <details className="station-create-qualification" open={!q}><summary>{tr("Start a qualification session")}</summary><Panel><form className="metro-form-grid" onSubmit={async e => {
     e.preventDefault(); setError("");

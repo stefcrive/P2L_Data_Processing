@@ -18,6 +18,14 @@ class RangeConfig:
     d13c_range: tuple[float, float] = (-10.0, 10.0)
     d18o_range: tuple[float, float] = (-10.0, 10.0)
     partial_saturated_outliers: bool = False
+    pressure_adjustment_as_outlier: bool = False
+
+
+def pressure_adjustment_mask(df):
+    values = df.get("Pressure Adjust failed with Target Intensity", pd.Series(False, index=df.index))
+    marked = values.astype(str).str.strip().str.lower().isin(("true", "1", "1.0", "yes"))
+    status = df.get("Collector Status", pd.Series("", index=df.index)).astype(str).str.strip()
+    return marked & ~status.eq("Failed Sample")
 
 
 def _partial_saturation_isotope_masks(df: pd.DataFrame | None) -> dict[str, pd.Series]:
@@ -92,6 +100,8 @@ def _range_outlier_mask(df: pd.DataFrame | None, config: RangeConfig | None = No
         leak_vals.notna()
         & ((leak_vals < float(cfg.leak_range[0])) | (leak_vals > float(cfg.leak_range[1])))
     )
+    if cfg.pressure_adjustment_as_outlier:
+        mask |= pressure_adjustment_mask(df)
     return mask.astype(bool)
 
 
@@ -255,10 +265,11 @@ def compute_statistical_outlier_masks(
         empty = pd.Series(False, index=df.index, dtype=bool)
         return empty, empty, empty
 
+    eligible = ~pressure_adjustment_mask(df) & ~df.get("Collector Status", pd.Series("", index=df.index)).eq("Failed Sample")
     for identifier in df["Identifier 1"].dropna().astype(str).unique():
         id_mask = df["Identifier 1"].astype(str) == identifier
         for group_val in groups[id_mask].dropna().astype(str).unique():
-            group_mask = id_mask & groups_str.eq(group_val)
+            group_mask = id_mask & groups_str.eq(group_val) & eligible
             group_data = df.loc[group_mask]
             if len(group_data) <= 1:
                 continue
@@ -323,6 +334,8 @@ def _compute_within_ranges_mask(
         else pd.Series(True, index=df.index, dtype=bool)
     )
     not_failed = status_series != "Failed Sample"
+    if config.pressure_adjustment_as_outlier:
+        not_failed &= ~pressure_adjustment_mask(df)
     within_ranges = (
         pd.to_numeric(df.get("d 13C/12C  Mean"), errors="coerce").between(*config.d13c_range, inclusive="both")
         & pd.to_numeric(df.get("d 18O/16O  Mean"), errors="coerce").between(*config.d18o_range, inclusive="both")
@@ -370,6 +383,10 @@ def build_category_masks(
     )
 
     masks = {
+        "Poor Pressure Adjustment": _apply_manual_outlier_overrides(
+            pressure_adjustment_mask(df) & bool(config.pressure_adjustment_as_outlier),
+            edit_state, row_index=idx, apply_true=False, apply_false=True,
+        ) & ~edited_mask,
         "Statistical": statistical_combined,
         "Statistical d13C": statistical_d13,
         "Statistical d18O": statistical_d18,
@@ -508,7 +525,7 @@ def build_processing_summary(
     fully_saturated = int(category_masks["Fully Saturated Collectors"].sum())
     # Categories overlap. Subtract each acquisition only once, including manual exclusions.
     exclusion_keys = ["Statistical", "d13C Range", "d18O Range", "Signal Intensity",
-                      "Leak Rate", "Failed Sample", "Fully Saturated Collectors", "Manual Override"]
+                      "Leak Rate", "Failed Sample", "Poor Pressure Adjustment", "Fully Saturated Collectors", "Manual Override"]
     if config.partial_saturated_outliers:
         exclusion_keys.append("Partially Saturated Collectors")
     excluded = pd.Series(False, index=data_without_standards.index, dtype=bool)
@@ -547,6 +564,7 @@ def build_processing_summary(
             )
     for label, count in [
         ("Failed Samples", failed_samples),
+        ("Poor Pressure Adjustment", int(category_masks["Poor Pressure Adjustment"].sum())),
         ("Partially Failed (Recovered Mean)", partially_failed),
         ("Fully Saturated Collectors", fully_saturated),
     ]:
@@ -626,6 +644,7 @@ def build_outlier_tables(
         "Partially Saturated Collectors",
         "Fully Saturated Collectors",
         "Failed Sample",
+        "Poor Pressure Adjustment",
         "Manual Override",
     ]
     for name in ordered_keys:
@@ -673,6 +692,7 @@ def is_row_outlier_effective(
             "Partially Saturated Collectors",
             "Fully Saturated Collectors",
             "Failed Sample",
+            "Poor Pressure Adjustment",
             "Manual Override d13C",
         ]
     elif isotope == "d18O":
@@ -684,6 +704,7 @@ def is_row_outlier_effective(
             "Partially Saturated Collectors",
             "Fully Saturated Collectors",
             "Failed Sample",
+            "Poor Pressure Adjustment",
             "Manual Override d18O",
         ]
     else:

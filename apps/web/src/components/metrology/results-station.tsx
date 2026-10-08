@@ -8,7 +8,7 @@ import { Empty, Field, Inspect, Panel, Status } from "./shared";
 import { normalizationEnvelope } from "@/lib/metrology-envelopes";
 
 const colors = ["#1f5fbf", "#6478ba", "#c38835", "#c04d65"];
-const axis = (text: string) => ({ title: { text }, automargin: true, gridcolor: "#e8edf1", zerolinecolor: "#a7b6bf" });
+const axis = (text: string) => ({ title: { text }, automargin: true, gridcolor: "#e8edf1", zerolinecolor: "#e8edf1", zerolinewidth: 1 });
 export function Chart({ data, title, x, y, shapes = [], date = false, height = 340, annotations = [], layout = {}, interactions = {}, legendCollapsed = false }: { data: unknown[]; title: string; x: string; y: string; shapes?: unknown[]; date?: boolean; height?: number; annotations?: unknown[]; layout?: Record<string, unknown>; interactions?: Pick<PlotlyChartProps,"onPointClick"|"onSelection"|"onPointHover"|"onHoverEnd">; legendCollapsed?: boolean }) {
   const tr = useTranslation();
   const hasPoints = data.some(trace => {

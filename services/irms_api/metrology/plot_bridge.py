@@ -13,6 +13,8 @@ from .importer import measurement_identity
 def open_plot_bridge(service, session_id, scope, command):
     from ..api import main as legacy
     from ..domain.constants import ISOTYPE_D13C, ISOTYPE_D18O
+    detail = service.results_session_detail(session_id)
+    effective = {r["id"]: r for run in detail["runs"] for r in (run.get("evaluation") or {}).get("results", [])}
     with service.repo.connect(write=True) as db:
         session = service.repo.get(db, "results_sessions", session_id)
         q = service.repo.get(db, "qualifications", session["qualification_id"]) if session["qualification_id"] else None
@@ -22,12 +24,16 @@ def open_plot_bridge(service, session_id, scope, command):
             raise ValueError("Choose an imported session or its applied qualification")
         runs = [service.repo.get(db, "runs", rid) for rid in run_ids]
         method = service.repo.get(db, "methods", session["method_id"])
-        fingerprint = hashlib.sha256(encode({"runs": [(r["id"], r["revision"], r.get("latest_evaluation_id")) for r in runs], "method": method}).encode()).hexdigest()
+        fingerprint = hashlib.sha256(encode({"runs": [(r["id"], r["revision"], r.get("latest_evaluation_id")) for r in runs], "method": method,
+                                            "session_population": [(r["id"], r["revision"], r.get("latest_evaluation_id")) for r in detail["runs"]],
+                                            "residual_overrides": session.get("residual_overrides", {}), "outlier_screening": session.get("outlier_screening"),
+                                            "correct_failed_analyses": bool(session.get("correct_failed_analyses", False)),
+                                            "identity_revision": session.get("identity_revision", 0), "processing_version": detail.get("residual_processing_version")}).encode()).hexdigest()
         bridge = session.get("bridges", {}).get(scope)
         reuse_parsed = False
         if bridge and legacy.store.session_exists(bridge):
             link = legacy.store.load_metadata(bridge).get("metrology_link", {})
-            if link.get("bridge_version") == 9 and link.get("fingerprint") == fingerprint:
+            if link.get("bridge_version") == 10 and link.get("fingerprint") == fingerprint:
                 return {"session_id": bridge, "run_id": scope, "row_mapping": link.get("row_mapping", {})}
             # Upgrade an unchanged, frozen v7 consultation from its parsed cache.
             # Scientific revisions still create a fresh bridge below.
@@ -69,7 +75,8 @@ def open_plot_bridge(service, session_id, scope, command):
                 original = matches[0]
                 mapping[original["id"]] = str(index)
                 source_run = next(r for r in runs if r["id"] == original["run_id"])
-                identity = measurement_identity(original, source_run.get("source_kind", "qtegra_raw"))
+                current = effective.get(original["id"], original)
+                identity = measurement_identity(current, source_run.get("source_kind", "qtegra_raw"))
                 for field, column in (("identifier1", "Identifier 1"), ("identifier2", "Identifier 2"), ("species", "Species")):
                     frame.loc[index, column] = identity[field]
                 # Keep original cycle-derived summaries available for consultation,
@@ -78,11 +85,12 @@ def open_plot_bridge(service, session_id, scope, command):
                                       ("d13c_sd", "d 13C/12C  Std Dev"), ("d18o_sd", "d 18O/16O  Std Dev"),
                                       ):
                     frame.loc[index, "IRMS cycle summary: " + column] = row.get(column)
-                    frame.loc[index, column] = original.get(field)
+                    frame.loc[index, column] = current.get("isotopes", {}).get(field, {}).get("value") if field in ("d13c", "d18o") and current.get("isotopes") is not None else original.get(field)
         metadata = legacy.store.load_metadata(bridge)
         metadata["session_name"] = f"{session['client']} / {session['name']}"
         metadata["metrology_link"] = {"results_session_id": session_id, "run_id": scope, "run_ids": run_ids,
-            "method_id": session["method_id"], "qualification_id": session["qualification_id"], "bridge_version": 9,
+            "method_id": session["method_id"], "qualification_id": session["qualification_id"], "bridge_version": 10,
+            "repository_root": str(service.repo.root), "demo": service.repo.demo,
             "fingerprint": fingerprint, "row_mapping": mapping}
         method = service.repo.get(db, "methods", session["method_id"])
         materials = service.material_map(db, method)
@@ -99,6 +107,8 @@ def open_plot_bridge(service, session_id, scope, command):
             for m in materials.values() for iso, token in (("d13c", ISOTYPE_D13C), ("d18o", ISOTYPE_D18O)) if m["assigned"][iso]["value"] is not None]
         if not reuse_parsed:
             legacy._set_processing_apply_calibration(metadata, False)
+        metadata.setdefault("processing", {}).setdefault("config", {})["pressure_adjustment_as_outlier"] = bool(
+            session.get("outlier_screening", {}).get("pressure_adjustment_as_outlier", False))
         legacy._persist_session_update(bridge, action="metrology_consultation_linked", metadata=metadata, df=frame)
         session.setdefault("bridges", {})[scope] = bridge
         service.repo.update(db, "results_sessions", session_id, session)

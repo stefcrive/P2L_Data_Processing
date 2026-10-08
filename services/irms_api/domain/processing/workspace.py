@@ -222,6 +222,7 @@ def _range_config_from_processing_config(config: ProcessingWorkspaceConfig) -> R
         d13c_range=config.d13c_range,
         d18o_range=config.d18o_range,
         partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+        pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
     )
 
 
@@ -356,6 +357,7 @@ def _effective_outlier_mask(
         "Partially Saturated Collectors",
         "Fully Saturated Collectors",
         "Failed Sample",
+        "Poor Pressure Adjustment",
         "Manual Override",
     ]
     outlier_mask = pd.Series(False, index=df.index, dtype=bool)
@@ -660,6 +662,7 @@ def _exclude_outliers_from_plot_base(
         "Partially Saturated Collectors",
         "Fully Saturated Collectors",
         "Failed Sample",
+        "Poor Pressure Adjustment",
     ]
     outlier_mask = pd.Series(False, index=unfiltered_df.index, dtype=bool)
     for key in outlier_keys:
@@ -777,6 +780,7 @@ def build_processing_context(
         d13c_range=config.d13c_range,
         d18o_range=config.d18o_range,
         partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+        pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
     )
     filtered_df = _exclude_outliers_from_plot_base(
         filtered_df,

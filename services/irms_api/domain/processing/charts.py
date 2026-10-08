@@ -691,14 +691,16 @@ def _add_processing_summary_overlays(
     if getattr(config.overlays, "show_range_outliers", False):
         range_masks = _exclusive_outlier_masks(
             [
+                ("pressure", summary_masks.get("Poor Pressure Adjustment", pd.Series(False, index=overlays.index))),
                 ("signal", summary_masks.get("Signal Intensity", pd.Series(False, index=overlays.index))),
                 ("leak", summary_masks.get("Leak Rate", pd.Series(False, index=overlays.index))),
                 ("d13c", summary_masks.get("d13C Range", pd.Series(False, index=overlays.index))),
                 ("d18o", summary_masks.get("d18O Range", pd.Series(False, index=overlays.index))),
             ]
         )
-        symbol_map = {"signal": "diamond", "leak": "star", "d13c": "cross", "d18o": "x"}
+        symbol_map = {"pressure": "diamond-open", "signal": "diamond", "leak": "star", "d13c": "cross", "d18o": "x"}
         label_map = {
+            "pressure": "Poor Pressure Adjustment",
             "signal": "Signal Intensity Range",
             "leak": "Leak Rate Range",
             "d13c": "d13C Range",
@@ -864,6 +866,7 @@ def _build_overview_outlier_context(
             d13c_range=config.d13c_range,
             d18o_range=config.d18o_range,
             partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+            pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
         ),
         edit_state=edit_state,
         sigma_level=float(config.sigma_level_data),
@@ -909,6 +912,7 @@ def _visible_overlay_axis_rows(
     if getattr(config.overlays, "show_range_outliers", False):
         range_masks = _exclusive_outlier_masks(
             [
+                ("pressure", summary_masks.get("Poor Pressure Adjustment", pd.Series(False, index=overlay_df.index))),
                 ("signal", summary_masks.get("Signal Intensity", pd.Series(False, index=overlay_df.index))),
                 ("leak", summary_masks.get("Leak Rate", pd.Series(False, index=overlay_df.index))),
                 ("d13c", summary_masks.get("d13C Range", pd.Series(False, index=overlay_df.index))),
@@ -991,14 +995,16 @@ def _add_processing_crossplot_overlays(
     if getattr(config.overlays, "show_range_outliers", False):
         range_masks = _exclusive_outlier_masks(
             [
+                ("pressure", summary_masks.get("Poor Pressure Adjustment", pd.Series(False, index=overlay_df.index))),
                 ("signal", summary_masks.get("Signal Intensity", pd.Series(False, index=overlay_df.index))),
                 ("leak", summary_masks.get("Leak Rate", pd.Series(False, index=overlay_df.index))),
                 ("d13c", summary_masks.get("d13C Range", pd.Series(False, index=overlay_df.index))),
                 ("d18o", summary_masks.get("d18O Range", pd.Series(False, index=overlay_df.index))),
             ]
         )
-        symbol_map = {"signal": "diamond", "leak": "x", "d13c": "cross", "d18o": "square-open"}
+        symbol_map = {"pressure": "diamond-open", "signal": "diamond", "leak": "x", "d13c": "cross", "d18o": "square-open"}
         label_map = {
+            "pressure": "Poor Pressure Adjustment",
             "signal": "Signal Intensity Range",
             "leak": "Leak Rate Range",
             "d13c": "d13C Range",
@@ -1167,14 +1173,16 @@ def _add_processing_3d_overlays(
     if getattr(config.overlays, "show_range_outliers", False):
         range_masks = _exclusive_outlier_masks(
             [
+                ("pressure", summary_masks.get("Poor Pressure Adjustment", pd.Series(False, index=overlay_df.index))),
                 ("signal", summary_masks.get("Signal Intensity", pd.Series(False, index=overlay_df.index))),
                 ("leak", summary_masks.get("Leak Rate", pd.Series(False, index=overlay_df.index))),
                 ("d13c", summary_masks.get("d13C Range", pd.Series(False, index=overlay_df.index))),
                 ("d18o", summary_masks.get("d18O Range", pd.Series(False, index=overlay_df.index))),
             ]
         )
-        symbol_map = {"signal": "diamond", "leak": "x", "d13c": "cross", "d18o": "square-open"}
+        symbol_map = {"pressure": "diamond-open", "signal": "diamond", "leak": "x", "d13c": "cross", "d18o": "square-open"}
         label_map = {
+            "pressure": "Poor Pressure Adjustment",
             "signal": "Signal Intensity Range",
             "leak": "Leak Rate Range",
             "d13c": "d13C Range",
@@ -1607,6 +1615,7 @@ def _build_identifier_figure(
             d13c_range=config.d13c_range,
             d18o_range=config.d18o_range,
             partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+            pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
         ),
         edit_state=edit_state,
         sigma_level=float(config.sigma_level_data),
@@ -1689,6 +1698,7 @@ def _build_identifier_figure(
     # discoverable as a fallback when there are none.
     range_outlier_masks = _exclusive_outlier_masks(
         [
+            ("pressure", summary_masks["Poor Pressure Adjustment"]),
             ("signal", summary_masks["Signal Intensity"]),
             ("leak", summary_masks["Leak Rate"]),
             ("d13c", summary_masks["d13C Range"]),
@@ -1704,12 +1714,14 @@ def _build_identifier_figure(
     )
     if show_range_outliers:
         symbol_map = {
+            "pressure": "triangle-up",
             "signal": "diamond",
             "leak": "star",
             "d13c": "cross",
             "d18o": "x",
         }
         label_map = {
+            "pressure": "Poor Pressure Adjustment",
             "signal": "Signal Intensity Range",
             "leak": "Leak Rate Range",
             "d13c": "d13C Range",
@@ -2020,6 +2032,7 @@ def build_species_sections(
                 d13c_range=config.d13c_range,
                 d18o_range=config.d18o_range,
                 partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+                pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
             ),
             edit_state=edit_state,
             sigma_level=float(config.sigma_level_data),

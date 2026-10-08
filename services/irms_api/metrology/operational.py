@@ -73,7 +73,7 @@ def populate_operational(root, source_root):
                 disposition="Alternative / duplicate raw export; acquisition rows already represented by preferred main-folder exports"
                 run_id=seen[keys[0]][0]; archived_only+=1
             else:
-                run=service.import_run(path.name,content,RunCommand(**REVIEW,results_session_id=session["id"],label=path.stem,sample_group=path.stem))
+                run=service.import_run(path.name,content,RunCommand(**REVIEW,results_session_id=session["id"],label=path.stem))
                 run_id=run["id"]; imported.append(run_id)
                 with service.repo.connect() as db:
                     measurements=service.repo.list(db,"measurements",run_id=run_id)

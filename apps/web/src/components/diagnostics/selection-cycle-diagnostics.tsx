@@ -59,12 +59,12 @@ export function IsotopeCycleDiagnostics({ isotope, diagnostics, loading, display
       {mean.reason ? <p className="cycle-diagnostics-note">{tr(String(mean.reason))}</p> : null}
       {record(mean.value_source).is_proxy ? <p className="cycle-diagnostics-note">{tr("Internal signal proxy")}</p> : null}
       {figure ? <>
-        <label className="cycle-color-control">{tr("Chart color axis")}<select value={colorAxis} onChange={event => setColorAxis(event.target.value as SaturationAxisKey)}>
-          {SATURATION_COLOR_AXIS_OPTIONS.map(option => <option key={option.value} value={option.value}>{tr(option.label)}</option>)}
-        </select></label>
         <SaturationFigureCard chartKey={`${isotope}:cycle_relative_mismatch`} title={tr("Cycle relative mismatch correction")}
           description={tr("Fits a quadratic curve of isotope value versus (Samp44 - Ref44) / Ref44, then predicts where that curve becomes horizontal.")}
-          figure={figure} colorAxis={colorAxis} yAxis={isotope} collapsibleLegend />
+          figure={figure} colorAxis={colorAxis} yAxis={isotope} collapsibleLegend
+          toolbarControls={<label className="cycle-color-control">{tr("Chart color axis")}<select value={colorAxis} onChange={event => setColorAxis(event.target.value as SaturationAxisKey)}>
+            {SATURATION_COLOR_AXIS_OPTIONS.map(option => <option key={option.value} value={option.value}>{tr(option.label)}</option>)}
+          </select></label>} />
       </> : <p className="cycle-diagnostics-note">{tr("not enough cycles for linearity calculation")}</p>}
     </> : <p>{tr("Cycle diagnostics appear here once a point is selected.")}</p>}
   </section>;

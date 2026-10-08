@@ -40,6 +40,13 @@ class DataframeUtilsTests(unittest.TestCase):
     def test_parse_numeric_token_handles_decimal_comma(self) -> None:
         self.assertEqual(_parse_numeric_token("34,26-34,28"), 34.26)
 
+    def test_parse_numeric_token_preserves_three_decimal_strings(self) -> None:
+        for token, expected in [("4,802 ?", 4.802), ("4,479", 4.479),
+                                ("4.802", 4.802), ("-4,802", -4.802),
+                                ("66.537-66.557", 66.537)]:
+            with self.subTest(token=token):
+                self.assertEqual(_parse_numeric_token(token), expected)
+
     def test_parse_numeric_token_preserves_numeric_three_decimal_value(self) -> None:
         self.assertEqual(_parse_numeric_token(19.987), 19.987)
 

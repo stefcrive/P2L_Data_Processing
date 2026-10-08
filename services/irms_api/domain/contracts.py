@@ -334,6 +334,7 @@ class ProcessingWorkspaceConfig(BaseModel):
     d13c_range: tuple[float, float] = (-10.0, 10.0)
     d18o_range: tuple[float, float] = (-10.0, 10.0)
     statistical_outlier_method: Literal["Z-Score", "IQR"] = "Z-Score"
+    pressure_adjustment_as_outlier: bool = False
     sigma_level_data: float = 4.0
     iqr_multiplier_data: float = 1.5
     overlays: ProcessingOverlayConfig = Field(default_factory=ProcessingOverlayConfig)

@@ -10,6 +10,32 @@ new Function('module', 'exports', ts.transpileModule(fs.readFileSync(filename, '
 }).outputText)(compiled, compiled.exports);
 const { cycleIntensityFigure, cycleMolecularRatioFigure } = compiled.exports;
 
+test('ratio panels share a Y interval and span while containing both sample and reference data', () => {
+  const figure = cycleMolecularRatioFigure([1, 2, 3].map(Cycle => ({ Cycle,
+    'SMP Int m/z 44 (V)': 1, 'REF Int m/z 44 (V)': 1,
+    'SMP Int m/z 45 (V)': 1.086 + Cycle * .00001, 'REF Int m/z 45 (V)': 1.066,
+    'SMP Int m/z 46 (V)': 1.427 + Cycle * .00001, 'REF Int m/z 46 (V)': 1.4265,
+  })));
+  const { yaxis, yaxis2 } = figure.layout;
+  assert.equal(yaxis.dtick, yaxis2.dtick);
+  assert.ok(Math.abs((yaxis.range[1] - yaxis.range[0]) - (yaxis2.range[1] - yaxis2.range[0])) < 1e-12);
+  for (const trace of figure.data) {
+    const axis = trace.yaxis === 'y' ? yaxis : yaxis2;
+    assert.ok(trace.y.every(value => value >= axis.range[0] && value <= axis.range[1]));
+  }
+});
+
+test('empty and constant ratio series retain finite, nonzero Y spacing', () => {
+  for (const rows of [[], [{ Cycle: 1, 'SMP Int m/z 44 (V)': 1, 'SMP Int m/z 45 (V)': 1.08 }]]) {
+    const { layout } = cycleMolecularRatioFigure(rows);
+    for (const axis of [layout.yaxis, layout.yaxis2]) {
+      assert.ok(Number.isFinite(axis.dtick) && axis.dtick > 0);
+      assert.ok(axis.range.every(Number.isFinite));
+      assert.ok(axis.range[1] > axis.range[0]);
+    }
+  }
+});
+
 test('sample and reference ratios use their own m/z 44 signal and preserve cycle positions', () => {
   const rows = [
     { Cycle: 1, 'SMP Int m/z 44 (V)': 8, 'SMP Int m/z 45 (V)': 10, 'SMP Int m/z 46 (V)': 12,

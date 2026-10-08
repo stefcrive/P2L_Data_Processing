@@ -26,6 +26,22 @@ test('binary Plotly vectors receive canonical uncertainty and excluded rows brea
   assert.equal(updated.data[1].x.filter(v=>v===null).length,2);
 });
 
+test('final standard dots share the selected numeric color scale instead of inheriting white markers', () => {
+  const rows=Object.fromEntries(['sample','standard'].map(id=>[id,{id,run_id:'r',isotopes:{d13c:{value:1,budget:{expanded_uncertainty:.1}}}}]));
+  const encoded={dtype:'f8',bdata:Buffer.from(new Float64Array([10]).buffer).toString('base64')};
+  const source={data:[
+    {mode:'markers',x:[0],y:[1],customdata:[['sample','d13C','','','',10]],marker:{color:encoded,colorscale:'Viridis',cmin:0,cmax:30}},
+    {mode:'markers',x:[1],y:[2],yaxis:'y2',customdata:[['standard','d13C','','','','20.00']],marker:{color:'white',symbol:'diamond'}},
+  ]};
+  const result=withSessionUncertainty(source,rows,'Final');
+  const finals=result.data.filter(trace=>trace.meta?.sessionUncertainty);
+  assert.deepEqual(finals.map(trace=>trace.marker.color),[[10],[20]]);
+  assert.ok(finals.every(trace=>trace.marker.symbol==='circle'&&trace.marker.colorscale==='Viridis'&&trace.marker.cmin===0&&trace.marker.cmax===30));
+  assert.equal(finals[1].yaxis,'y2');
+  assert.equal(result.data[1].marker.color,'#cbd5e1');
+  assert.equal(source.data[1].marker.color,'white');
+});
+
 test('pointwise intervals retain missing budgets and workbook boundaries', () => {
   const traces = uncertaintyEnvelope([
     { x:1,value:2,uncertainty:.1,segment:'a' },

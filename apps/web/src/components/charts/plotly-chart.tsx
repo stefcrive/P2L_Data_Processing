@@ -500,6 +500,9 @@ export function PlotlyChart({
     if (!styled || symbolSize == null || !Array.isArray(styled.data)) return styled;
     return {...styled, data:styled.data.map((trace:Record<string,unknown>) => String(trace.mode).includes("markers") ? {...trace,marker:{...(trace.marker as object ?? {}),size:symbolSize}} : trace)};
   }, [sourceFigure, appearance, symbolSize]);
+  const hasCorrectionStages = useMemo(() => Array.isArray(figure?.data) && figure.data.some((trace:{meta?:{correctionStage?:string}}) => !!trace?.meta?.correctionStage), [figure]);
+  const [legendColumns,setLegendColumns] = useState(3);
+  const defaultChartHeight = hasCorrectionStages ? Math.max(stationHeight,440) : stationHeight === 280 ? 340 : stationHeight;
   const { language } = useLanguage();
   const plotConfig = useMemo(() => ({responsive:true,displaylogo:false,displayModeBar:"hover" as const,locale:language === "pt" ? "pt-BR" : "en-US"}), [language]);
   const [isDeferredReady, setIsDeferredReady] = useState(deferRenderMs <= 0);
@@ -569,13 +572,16 @@ export function PlotlyChart({
       layout.meta = { ...(typeof layout.meta === "object" && layout.meta ? layout.meta : {}), equalStandardScale: true };
     }
     // Presentation only: never modify data, axis ranges, scales or assignments.
-    layout.height = stationHeight === 280 ? 340 : stationHeight;
+    layout.height = defaultChartHeight;
     layout.title = {text:""};
     layout.font = { ...(layout.font as object ?? {}), family: "Segoe UI, sans-serif", size: 11, color: "#475569" };
     layout.paper_bgcolor = "#ffffff";
     layout.plot_bgcolor = "#ffffff";
     layout.margin = { ...(layout.margin as object ?? {}), l: 54, r: secondaryAxis ? 58 : 18, t: isLegendVisible ? 28 : 8, b: 42, pad: 0, autoexpand: true };
-    layout.legend = { ...(layout.legend as object ?? {}), orientation:"h", x:0, xanchor:"left", y:1.01, yanchor:"bottom", font:{size:legendFontSize}, itemsizing:"constant", tracegroupgap:0, borderwidth:0, entrywidth:undefined, entrywidthmode:"pixels" };
+    const originalLegend = (layout.legend ?? {}) as Record<string,unknown>;
+    layout.legend = { ...originalLegend, orientation:"h", x:0, xanchor:"left", y:1.01, yanchor:"bottom", font:{size:hasCorrectionStages?9:legendFontSize}, itemsizing:hasCorrectionStages?"trace":"constant", tracegroupgap:0, borderwidth:0,
+      entrywidth:hasCorrectionStages ? 0.96 / legendColumns : undefined,entrywidthmode:hasCorrectionStages?"fraction":"pixels",
+      ...(hasCorrectionStages?{traceorder:"normal",title:{...(originalLegend.title as object??{}),side:"top",font:{size:9}}}:{}) };
     // Boundary markers already have named legend entries. Duplicate annotations
     // at y=1 overlap the horizontal legend when its entries wrap.
     const boundaryLabels = new Set(figureData.filter((trace): trace is Record<string, unknown> => !!trace && typeof trace === "object")
@@ -650,7 +656,11 @@ export function PlotlyChart({
       fillContainerHeight: shouldFillContainer,
       hasExplicitHeight,
     };
-  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, tr, uiRevision, metrologyConsultation, stationHeight, legendFontSize]);
+  }, [figure, hasCollapsibleLegend, isLegendVisible, shouldFillContainer, tr, uiRevision, metrologyConsultation, defaultChartHeight, legendFontSize,hasCorrectionStages,legendColumns]);
+
+  useEffect(()=>{
+    if(hasCorrectionStages)setChartHeight(current=>current===null?null:Math.max(current,defaultChartHeight));
+  },[hasCorrectionStages,defaultChartHeight]);
 
   useEffect(() => {
     if (!verticallyResizable || chartHeight !== null) {
@@ -661,13 +671,13 @@ export function PlotlyChart({
       return;
     }
     const measuredHeight = Math.round(container.getBoundingClientRect().height);
-    const requestedHeight = initialHeight ?? (metrologyConsultation
-      ? (stationHeight === 280 ? 340 : stationHeight)
+    const requestedHeight = initialHeight ?? (metrologyConsultation || hasCorrectionStages
+      ? defaultChartHeight
       : 340);
     const startingHeight = Math.min(normalizedMaxHeight, Math.max(normalizedMinHeight, requestedHeight));
     initialHeightRef.current = startingHeight;
     setChartHeight(startingHeight);
-  }, [chartHeight, isDeferredReady, normalizedMaxHeight, normalizedMinHeight, preparedFigure, verticallyResizable, fitContainer, metrologyConsultation, stationHeight, initialHeight]);
+  }, [chartHeight, isDeferredReady, normalizedMaxHeight, normalizedMinHeight, preparedFigure, verticallyResizable, fitContainer, metrologyConsultation, defaultChartHeight, hasCorrectionStages, initialHeight]);
 
   useEffect(() => {
     if (!shouldDeferRender) {
@@ -691,6 +701,8 @@ export function PlotlyChart({
     let resizeFrame: number | null = null;
     let lastWidth = resizeTarget.getBoundingClientRect().width;
     let lastHeight = resizeTarget.getBoundingClientRect().height;
+    const updateColumns=(width:number)=>setLegendColumns(width>=1000?4:width>=650?3:width>=420?2:1);
+    if(hasCorrectionStages&&lastWidth>0)updateColumns(lastWidth);
 
     const observer = new ResizeObserver(([entry]) => {
       if (!entry) {
@@ -698,6 +710,7 @@ export function PlotlyChart({
       }
       const { width, height } = entry.contentRect;
       if(width<=0||height<=0)return;
+      if(hasCorrectionStages)updateColumns(width);
       if (Math.abs(width - lastWidth) < 0.5 && Math.abs(height - lastHeight) < 0.5) {
         return;
       }
@@ -730,7 +743,7 @@ export function PlotlyChart({
         window.cancelAnimationFrame(resizeFrame);
       }
     };
-  }, [isDeferredReady, isNearViewport, preparedFigure]);
+  }, [isDeferredReady, isNearViewport, preparedFigure,hasCorrectionStages]);
 
   useEffect(() => {
     if (!hasCollapsibleLegend || !isDeferredReady) {

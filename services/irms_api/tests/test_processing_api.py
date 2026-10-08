@@ -146,6 +146,35 @@ class ProcessingApiTests(unittest.TestCase):
         api_main.store = self.original_store
         self.temp_dir.cleanup()
 
+    def test_pressure_outlier_toggle_persists_and_updates_tables_and_charts(self) -> None:
+        frame = sample_processing_df()
+        frame["Pressure Adjust failed with Target Intensity"] = [True, False, False, True]
+        frame.loc[3, "Collector Status"] = "Failed Sample"
+        api_main.store.save_frames(self.session_id, frame, sample_cycles_df())
+        client = TestClient(api_main.app)
+        config = processing_config_payload()
+        endpoint = f"/sessions/{self.session_id}/processing/config"
+        response = client.post(endpoint, json=config)
+        self.assertEqual(response.status_code, 200, response.text)
+        before = response.json()
+        self.assertFalse(before["config"]["pressure_adjustment_as_outlier"])
+        tables = lambda workspace: [t for section in workspace["species_sections"] for t in section["outlier_tables"]]
+        self.assertFalse(any(t["rows"] for t in tables(before) if t["name"] == "Poor Pressure Adjustment"))
+        config["pressure_adjustment_as_outlier"] = True
+        response = client.post(endpoint, json=config)
+        self.assertEqual(response.status_code, 200, response.text)
+        enabled = response.json()
+        pressure_rows = [r for t in tables(enabled) if t["name"] == "Poor Pressure Adjustment" for r in t["rows"]]
+        no_signal_rows = [r for t in tables(enabled) if t["name"] == "Failed Sample" for r in t["rows"]]
+        self.assertEqual([r["__row_label"] for r in pressure_rows], ["0"])
+        self.assertEqual([r["__row_label"] for r in no_signal_rows], ["3"])
+        self.assertEqual(before["summary"]["final_analyses"] - enabled["summary"]["final_analyses"], 1)
+        self.assertTrue(api_main.store.load_metadata(self.session_id)["processing"]["config"]["pressure_adjustment_as_outlier"])
+        names = [trace["name"] for figure in enabled["overview_figures"].values() for trace in figure.get("data", [])]
+        self.assertIn("Poor Pressure Adjustment", names)
+        preview = api_main._processing_linearity_preview_rows(frame, {}, "1  Cycle Int  Samp  44")
+        self.assertEqual(preview[0]["attributes"]["Pressure Adjust failed with Target Intensity"], 1.)
+
     def test_processing_workspace_and_edit_endpoint(self) -> None:
         workspace = api_main.processing_workspace(self.session_id)
         self.assertEqual(workspace.session_id, self.session_id)

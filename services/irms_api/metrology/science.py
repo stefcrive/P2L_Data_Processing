@@ -160,7 +160,7 @@ def normalize(x: float, model: dict, *, monte_carlo: bool = False, draws: int = 
     return result
 
 
-def corrected_normalize(x: float, predictor: float | None, model: dict, *, monte_carlo=False, draws=20000, seed=253) -> dict:
+def corrected_normalize(x: float, predictor: float | None, model: dict, *, monte_carlo=False, draws=20000, seed=253, allow_extrapolation=False) -> dict:
     """Propagate a shared correction coefficient through sample AND both anchors.
 
     Anchor covariance is conditional on the independently estimated coefficient.
@@ -170,7 +170,8 @@ def corrected_normalize(x: float, predictor: float | None, model: dict, *, monte
     correction = model.get("correction")
     if correction is None:
         return normalize(x, model, monte_carlo=monte_carlo, draws=draws, seed=seed)
-    if predictor is None or not correction["domain"]["low"] <= predictor <= correction["domain"]["high"]:
+    outside = predictor is not None and not correction["domain"]["low"] <= predictor <= correction["domain"]["high"]
+    if predictor is None or (outside and not allow_extrapolation):
         raise ValueError("Correction predictor is missing or outside its validated domain")
     c, uc = correction["slope"], correction["u_slope"]
     d0 = predictor - correction["center"]
@@ -185,6 +186,7 @@ def corrected_normalize(x: float, predictor: float | None, model: dict, *, monte
     if abs(m2 - m1) <= max(1e-9, 6 * separation_u):
         raise ValueError("Anchor separation is too small including correction coefficient uncertainty")
     result["correction"] = {"name": correction["name"], "raw_value": x, "predictor": predictor,
+                            "domain_extrapolated": outside,
                             "adjustment": -c * d0, "corrected_value": corrected_x,
                             "coefficient_sensitivity": sensitivity, "u": abs(sensitivity) * uc,
                             "formula": "z=x-c(p-p0); dy/dc=b*((1-t)*(P1-p0)+t*(P2-p0)-(p-p0))"}

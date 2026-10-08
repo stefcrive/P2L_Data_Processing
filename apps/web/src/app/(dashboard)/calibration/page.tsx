@@ -3,7 +3,7 @@
 import { SelectionCycleDiagnostics } from "@/components/diagnostics/selection-cycle-diagnostics";
 
 import { filterStationFigure, fitVisibleMarkers, scopeColorRows, stationMarkerColors } from "@/lib/station-chart-filters";
-import { qcOutlierDisplay, partiallySaturatedOverlay } from "@/lib/qc-outlier-display";
+import { qcOutlierDisplay, partiallySaturatedOverlay, correctionStageLegends } from "@/lib/qc-outlier-display";
 import { memo } from "react";
 
 import { useTranslation } from "@/components/layout/language-provider";
@@ -3207,7 +3207,7 @@ function CalibrationPage() {
     const bounds = colorScaleBounds;
     const fullRange: [number, number] = [bounds.min, bounds.max];
     const defaultRange = colorScaleTwoSigmaRange ?? fullRange;
-    const colorScope=station?.colorRowLabels?.join("|")??"all";
+    const colorScope=JSON.stringify([station?.colorRowLabels??"all",station?.colorScaleRowLabels??"all"]);
     const parameterChanged = colorScaleRangeParam !== `${activeColorParam}:${colorScope}`;
     setColorScaleRange((current) => {
       if (!current || parameterChanged) {
@@ -3226,7 +3226,7 @@ function CalibrationPage() {
     if (parameterChanged) {
       setColorScaleRangeParam(`${activeColorParam}:${colorScope}`);
     }
-  }, [activeColorParam, colorScaleBounds, colorScaleRangeParam, colorScaleTwoSigmaRange,station?.colorRowLabels]);
+  }, [activeColorParam, colorScaleBounds, colorScaleRangeParam, colorScaleTwoSigmaRange,station?.colorRowLabels,station?.colorScaleRowLabels]);
 
   const runMutation = useMutation({
     mutationFn: (payload: CalibrationConfig) => api.runCalibration(sessionId!, payload, setCalibrationJob),
@@ -4369,23 +4369,8 @@ function CalibrationPage() {
       if (!Array.isArray(trace.customdata) || !String(trace.mode ?? "").includes("markers")) return {...trace};
       return qcOutlierDisplay(stationMarkerColors(trace,colorState?.valuesByRow,effectiveColorScaleRange),station?.outliers?.rows??[]);
     });
-    // Scalar legend markers make before/after readable with per-point colors and symbols.
-    const stageLegends=new Map<string,Record<string,unknown>>();
-    for(const trace of data) {
-      const stage=(trace.meta as {correctionStage?:string})?.correctionStage;
-      if(!stage)continue;
-      const group=`correction-${stage}`;
-      trace.legendgroup=group; trace.showlegend=false;
-      if(!String(trace.mode).includes("markers"))continue;
-      const symbols=(trace.marker as {symbol?:unknown})?.symbol;
-      const uniqueSymbols=new Set(Array.isArray(symbols)?symbols:[symbols]);
-      const legendSymbol=uniqueSymbols.size===1?[...uniqueSymbols][0]:stage==="before"?"circle-open":stage==="preview"?"diamond":"circle";
-      const traceMarker=trace.marker as Record<string,unknown>??{};
-      const legendColor=stage==="before"?"#c4c4c4":Array.isArray(traceMarker.color)?traceMarker.color.find(value=>value!=null)??"#475569":traceMarker.color??"#475569";
-      if(!stageLegends.has(group))stageLegends.set(group,{type:trace.type??"scatter",mode:"markers",name:trace.name,legendgroup:group,x:[null],y:[null],...(trace.type==="scatter3d"?{z:[null]}:{}),marker:{size:stage==="before"?11:7,symbol:legendSymbol,color:legendColor,...(stage!=="before"&&traceMarker.coloraxis?{coloraxis:traceMarker.coloraxis}:{}),opacity:stage==="before"?.9:.94,line:{width:stage==="before"?1.8:.7}},hoverinfo:"skip",showlegend:true});
-    }
     const partialOverlays = data.map(trace => partiallySaturatedOverlay(trace, partiallySaturatedRows)).filter((trace): trace is Record<string, unknown> => trace != null);
-    data.push(...partialOverlays, ...stageLegends.values());
+    data.push(...partialOverlays);
     const layout = {...(figure.layout as Record<string,unknown> ?? {})};
     layout.title = {...(typeof layout.title==="object"?layout.title as object:{text:layout.title??""}),font:{size:13},x:.02,xanchor:"left"};
     layout.font = {family:"Segoe UI, sans-serif",size:12,color:"#475569"};
@@ -4393,6 +4378,13 @@ function CalibrationPage() {
     const scene = layout.scene as Record<string,unknown> | undefined;
     if (scene) layout.scene = {...scene, bgcolor:"transparent", ...Object.fromEntries(["xaxis","yaxis","zaxis"].map(key=>[key,{...(scene[key] as object??{}),gridcolor:"#e8edf1",zerolinecolor:"#a7b6bf",showbackground:false}]))};
     const result:Record<string,unknown>=filterStationFigure({...figure,data,layout},stationFilters?.flags??[]);
+    result.data=correctionStageLegends((Array.isArray(result.data)?result.data:[]) as Record<string,unknown>[],tr);
+    if(data.some(trace=>(trace.meta as {correctionStage?:string})?.correctionStage)) {
+      const current=result.layout as Record<string,unknown>;
+      current.legend={...(current.legend as object??{}),title:{text:`${tr("Color")}: ${tr(activeConfig.color_param)}`},y:1.02,yanchor:"bottom"};
+      current.margin={...(current.margin as object??{}),t:125};
+      current.height=Math.max(Number(current.height)||340,400);
+    }
     const markerTraces=(Array.isArray(result.data)?result.data:[]).filter((trace:Record<string,unknown>)=>Array.isArray(trace.customdata)&&String(trace.mode).includes("markers"));
     if(markerTraces.length&&markerTraces.every((trace:Record<string,unknown>)=>!coerceVector(trace.y)?.some(value=>value!=null))) {
       const resultLayout=result.layout as Record<string,unknown>;

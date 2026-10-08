@@ -672,8 +672,8 @@ def apply_edit_action(
                 edited_rows.add(row_token)
     elif edit.action == "set_species":
         next_species = str(edit.species or "").strip()
-        if not next_species:
-            raise ValueError("Species is required")
+        if edit.species is None:
+            raise ValueError("Species is required; use an empty string to clear it")
         if "Species" not in work.columns:
             raise ValueError("Dataset has no Species column")
         work["Species"] = work["Species"].astype(object)

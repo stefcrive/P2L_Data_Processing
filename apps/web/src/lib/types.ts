@@ -219,6 +219,7 @@ export type ProcessingConfig = {
   d13c_range: [number, number];
   d18o_range: [number, number];
   statistical_outlier_method: "Z-Score" | "IQR";
+  pressure_adjustment_as_outlier?: boolean;
   sigma_level_data: number;
   iqr_multiplier_data: number;
   overlays: {

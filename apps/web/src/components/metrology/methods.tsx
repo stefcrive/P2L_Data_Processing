@@ -35,7 +35,7 @@ function MethodEditor({ method, ...props }: WorkspaceProps & { method: Method; s
       await props.act(newVersion ? "/methods" : `/methods/${method.id}`, { config: payload }, newVersion ? "POST" : "PUT");
     } catch (e) { setError(e instanceof Error ? e.message : "Could not save method"); }
   }
-  return <form className="metro-stack station-method-form" onSubmit={e => { e.preventDefault(); void save(); }}>
+  return <form className="metro-stack station-method-form station-readable-method" onSubmit={e => { e.preventDefault(); void save(); }}>
     {!locked && <div className="station-panel-toolbar"><span className="metro-muted">{tr("Qualification method draft; approval freezes these parameters.")}</span><BusyButton busy={props.busy}>{tr("Save method draft")}</BusyButton></div>}
     <details><summary>{tr("Method identity and acquisition")}</summary>
     <Panel title={tr("Method definition")}><div className="metro-actions" style={{ marginTop: 0, marginBottom: 18 }}><Status value={method.status} /><span className="metro-muted">{tr("Version ")}{method.version}{tr(", revision ")}{method.revision}</span>{locked && !props.sessionScoped && <button type="button" className="metro-btn" disabled={props.busy} onClick={() => void save(true)}>{tr("Create next draft from this version")}</button>}{!props.sessionScoped && method.status === "validated" && <button type="button" className="metro-btn" disabled={props.busy} onClick={() => void props.act(`/methods/${method.id}/activate`)}>{tr("Activate validated method")}</button>}{!props.sessionScoped && ["active", "validated", "superseded"].includes(method.status) && <button type="button" className="metro-btn danger" disabled={props.busy} onClick={() => void props.act(`/methods/${method.id}/retire`)}>{tr("Retire method")}</button>}</div>
@@ -47,17 +47,37 @@ function MethodEditor({ method, ...props }: WorkspaceProps & { method: Method; s
       </fieldset>
     </Panel>
     </details>
-    <Panel title={tr("Validated ranges and QC criteria")}><fieldset disabled={locked} className="metro-stack">
+    <Panel title={tr("Validated ranges and QC criteria")}><fieldset disabled={locked} className="method-criteria-grid">
       {!locked && <div className="station-preset"><div className="station-panel-toolbar"><Field label={tr("Planned mass range")}><select value={massPreset} onChange={e=>setMassPreset(e.target.value)}><option value="40,80">40–80 µg</option><option value="60,140">60–140 µg</option><option value="100,200">100–200 µg</option></select></Field><Field label={tr("Precision requirement preset")}><select value={precisionPreset} onChange={e=>setPrecisionPreset(e.target.value)}><option value="routine">{tr("Routine laboratory criteria")}</option><option value="high">{tr("Higher precision · proposed limits")}</option><option value="screening">{tr("Screening · proposed limits")}</option></select></Field><button type="button" className="metro-btn" onClick={()=>{setRanges(p=>({...p,mass_ug:massPreset.split(",")}));const limits=precisionPreset==="high"?[.04,.06,.025,.035]:precisionPreset==="screening"?[.10,.15,.06,.08]:[.07,.10,.04,.05];patch("qc",{...c.qc,external_sd:{d13c:limits[0],d18o:limits[1]},internal_sd:{d13c:limits[2],d18o:limits[3]}});}}>{tr("Apply preset to draft")}</button></div><p className="metro-muted">{tr("Presets set proposed mass and SD limits only. Bias, intensity range and all validation evidence remain subject to qualification approval.")}</p></div>}
-      <div className="metro-note">{tr("SD limits use a strict less-than comparison. Bias is a separate acceptance criterion. Leaving a required value unset blocks qualification and release.")}</div>
-      <div className="metro-form-grid">{Object.entries(ranges).map(([key, value]) => <Field key={key} label={tr(`${({ mass_ug: "Mass / µg", i44_v: "Sample I44 / V", d13c: "δ¹³C / ‰ VPDB", d18o: "δ¹⁸O / ‰ VPDB", pressure_mismatch_v: "Pressure-adjustment mismatch / V" } as Record<string,string>)[key] || key}: minimum and maximum`)}><div style={{ display: "flex", gap: 8 }}><input aria-label={tr(`${key} minimum`)} type="number" step="any" value={value[0]} onChange={e => setRanges(p => ({ ...p, [key]: [e.target.value, p[key][1]] }))} /><input aria-label={tr(`${key} maximum`)} type="number" step="any" value={value[1]} onChange={e => setRanges(p => ({ ...p, [key]: [p[key][0], e.target.value] }))} /></div></Field>)}</div>
-      <div className="metro-form-grid">{isotopes.map(iso => <div key={iso} className="metro-stack"><h3>{tr(isotopeLabel[iso])}</h3>{(["internal_sd", "external_sd", "bias"] as const).map(key => <Field key={key} label={tr(`${({ internal_sd: "Individual internal SD", external_sd: "Run-level QC SD", bias: "Absolute QC mean bias" })[key]} limit / ‰`)}><Num unit="‰" min={0} value={c.qc[key][iso]} onChange={n => patch("qc", { ...c.qc, [key]: { ...c.qc[key], [iso]: n } })} /></Field>)}</div>)}</div>
-      <div className="metro-form-grid"><Field label={tr("Maximum unknowns between QCs, including edges")}><Num min={1} value={c.qc.max_unknowns_between_qc} onChange={n => patch("qc", { ...c.qc, max_unknowns_between_qc: n ?? 4 })} /></Field><Field label={tr("Minimum independent QC aliquots per run")}><Num min={2} value={c.qc.minimum_qc} onChange={n => patch("qc", { ...c.qc, minimum_qc: n ?? 3 })} /></Field></div>
+      <section className="method-section method-ranges" aria-labelledby="method-ranges-heading">
+        <header className="method-section-heading"><h3 id="method-ranges-heading">{tr("Measurement ranges")}</h3><p>{tr("Set the lower and upper bounds covered by qualification.")}</p></header>
+        <div className="method-range-heading" aria-hidden="true"><span>{tr("Parameter")}</span><span>{tr("Minimum")}</span><span>{tr("Maximum")}</span></div>
+        {Object.entries(ranges).map(([key, value]) => {
+          const [label, unit] = ({ mass_ug: ["Mass", "µg"], i44_v: ["Sample I44", "V"], d13c: ["δ¹³C", "‰ VPDB"], d18o: ["δ¹⁸O", "‰ VPDB"], pressure_mismatch_v: ["Pressure-adjustment mismatch", "V"] } as Record<string, string[]>)[key] ?? [key, ""];
+          return <div className="method-range-row" key={key} role="group" aria-label={`${tr(label)} / ${unit}`}>
+            <div className="method-parameter"><strong>{tr(label)}</strong><span>{unit}</span></div>
+            {[0, 1].map(index => <label className="metro-field" key={index}><span className="method-cell-label">{tr(index === 0 ? "Minimum" : "Maximum")}</span><input aria-label={`${tr(label)} / ${unit}: ${tr(index === 0 ? "Minimum" : "Maximum")}`} type="number" step="any" value={value[index]} onChange={e => setRanges(p => ({ ...p, [key]: index === 0 ? [e.target.value, p[key][1]] : [p[key][0], e.target.value] }))} /></label>)}
+          </div>;
+        })}
+      </section>
+      <section className="method-section method-qc" aria-labelledby="method-qc-heading">
+        <header className="method-section-heading"><h3 id="method-qc-heading">{tr("Precision and bias limits")}</h3><p>{tr("Compare the acceptance limits for both isotopes. All values are in ‰.")}</p></header>
+        <div className="method-qc-heading" aria-hidden="true"><span>{tr("Acceptance criterion")}</span>{isotopes.map(iso => <strong key={iso}>{isotopeLabel[iso]} <small>‰</small></strong>)}</div>
+        {(["internal_sd", "external_sd", "bias"] as const).map(key => {
+          const label = ({ internal_sd: "Individual internal SD", external_sd: "Run-level QC SD", bias: "Absolute QC mean bias" })[key];
+          return <div className="method-qc-row" key={key} role="group" aria-label={tr(label)}><div className="method-parameter"><strong>{tr(label)}</strong><span>{tr(key === "bias" ? "Separate bias acceptance criterion" : "SD must be below this limit")}</span></div>{isotopes.map(iso => <label className="metro-field" key={iso}><span className="method-cell-label">{isotopeLabel[iso]}<span className="sr-only"> · {tr(label)} / ‰</span></span><Num unit="‰" min={0} value={c.qc[key][iso]} onChange={n => patch("qc", { ...c.qc, [key]: { ...c.qc[key], [iso]: n } })} /></label>)}</div>;
+        })}
+        <p className="method-help">{tr("A required value left blank blocks qualification and release.")}</p>
+      </section>
+      <section className="method-section method-sequence" aria-labelledby="method-sequence-heading">
+        <header className="method-section-heading"><h3 id="method-sequence-heading">{tr("QC placement in the sequence")}</h3></header>
+        <div className="method-rule-grid"><Field label={tr("Maximum unknowns between QCs, including edges")}><Num min={1} value={c.qc.max_unknowns_between_qc} onChange={n => patch("qc", { ...c.qc, max_unknowns_between_qc: n ?? 4 })} /></Field><Field label={tr("Minimum independent QC aliquots per run")}><Num min={2} value={c.qc.minimum_qc} onChange={n => patch("qc", { ...c.qc, minimum_qc: n ?? 3 })} /></Field></div>
+      </section>
     </fieldset></Panel>
     <details><summary>{tr("Secondary correction models")}</summary>
     <Panel title={tr("Secondary correction models")}><fieldset disabled={locked} className="metro-stack"><p className="metro-muted">{tr("An optional centered linear correction is applied before anchoring. Supply coefficients estimated independently of this qualification carousel and the routine QC. Approval requires supporting files and an explicit effect review. Choose one predictor per isotope; fitting a diagnostic slope never enables it.")}</p>{isotopes.map(iso => <CorrectionEditor key={iso} title={tr(isotopeLabel[iso])} value={c.corrections?.[iso] ?? null} onChange={value => patch("corrections", { d13c: c.corrections?.d13c ?? null, d18o: c.corrections?.d18o ?? null, [iso]: value })} assets={props.state.qualifications.filter(q => q.method_id === method.id).flatMap(q => q.assets)} />)}</fieldset></Panel>
     </details>
-    <Panel title={tr("Correction verification criteria")}><fieldset disabled={locked} className="metro-form-grid">
+    <Panel title={tr("Correction verification criteria")}><fieldset disabled={locked} className="metro-form-grid method-correction-grid">
       <Field label={tr("Minimum paired independent QC aliquots")}><Num min={3} value={c.correction_validation?.minimum_qc??6} onChange={n=>patch("correction_validation",{minimum_sd_reduction_fraction:.05,practical_effect:{d13c:.01,d18o:.02},...c.correction_validation,minimum_qc:n??6})}/></Field>
       <Field label={tr("Minimum QC SD reduction / %")}><Num min={0} unit="%" value={100*(c.correction_validation?.minimum_sd_reduction_fraction??.05)} onChange={n=>patch("correction_validation",{minimum_qc:6,practical_effect:{d13c:.01,d18o:.02},...c.correction_validation,minimum_sd_reduction_fraction:(n??5)/100})}/></Field>
       {isotopes.map(iso=><Field key={iso} label={`${isotopeLabel[iso]} · ${tr("Practical residual effect / ‰")}`}><Num min={0} unit="‰" value={c.correction_validation?.practical_effect[iso]??(iso==="d13c"?.01:.02)} onChange={n=>patch("correction_validation",{minimum_qc:6,minimum_sd_reduction_fraction:.05,...c.correction_validation,practical_effect:{d13c:.01,d18o:.02,...c.correction_validation?.practical_effect,[iso]:n??.01}})}/></Field>)}
@@ -76,8 +96,10 @@ function MethodEditor({ method, ...props }: WorkspaceProps & { method: Method; s
       <div className="metro-note">{tr("Qtegra drift correction is disabled. Normalization already propagates assigned-value uncertainty. Instrumental linearity is not added again as an independent budget term.")}</div>
       <details className="wide"><summary>{tr("Advanced uncertainty components and anchor covariance")}</summary><Field label={tr("Model JSON")}><textarea rows={13} value={advanced} onChange={e => setAdvanced(e.target.value)} /></Field><p className="metro-muted">{tr("Covariance order: assigned anchor 1, assigned anchor 2, measured anchor mean 1, measured anchor mean 2. Each extra component needs a standard uncertainty, covered sources and rationale. Overlapping sources are rejected.")}</p></details>
       <Field label={tr("Required qualification tests, one per line")} wide><textarea value={c.required_tests.join("\n")} onChange={e => patch("required_tests", e.target.value.split("\n"))} /></Field>
-    </fieldset>{tr(error && <p role="alert" className="metro-note error">{tr(error)}</p>)}{!locked && <div className="metro-actions"><BusyButton busy={props.busy}>{tr("Save method draft")}</BusyButton></div>}<Inspect title={tr("Stored method and normalization")} value={method} /></Panel>
+    </fieldset><Inspect title={tr("Stored method and normalization")} value={method} /></Panel>
     </details>
+    {error && <p role="alert" className="metro-note error">{tr(error)}</p>}
+    {!locked && <div className="metro-actions method-save-actions"><BusyButton busy={props.busy}>{tr("Save method draft")}</BusyButton></div>}
   </form>;
 }
 

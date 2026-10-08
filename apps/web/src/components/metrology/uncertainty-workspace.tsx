@@ -1,17 +1,17 @@
 "use client";
 
-import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { PlotlyChart } from "@/components/charts/plotly-chart";
 import { useTranslation } from "@/components/layout/language-provider";
 import { api } from "@/lib/api";
 import { isotopeLabel, isotopes, type Isotope, type ResultsSessionDetail, type SessionAnalysis } from "@/lib/metrology";
-import { buildUncertaintyFigure } from "@/lib/uncertainty-chart";
+import { buildUncertaintyFigure, type UncertaintyXAxis } from "@/lib/uncertainty-chart";
 import { MetrologyEvidenceBridge } from "./consultation-context";
 import { Empty, Field, Inspect, Panel } from "./shared";
 
-const labels:Record<string,string>={precision:"Intermediate precision",normalization:"Dual-anchor normalization",secondary_correction:"Residual correction"};
-const symbols:Record<string,string>={precision:"u_prec",normalization:"u_norm",secondary_correction:"u_corr"};
+const labels:Record<string,string>={precision:"Intermediate precision",normalization:"Dual-anchor normalization",secondary_correction:"Registered method correction",residual_linearity:"Residual linearity correction"};
+const symbols:Record<string,string>={precision:"u_prec",normalization:"u_norm",secondary_correction:"u_method",residual_linearity:"u_residual"};
 const number=(n:number|null|undefined)=>n==null?"—":n.toFixed(4);
 type Component={name:string;u:number;rationale?:string};
 
@@ -24,8 +24,13 @@ function BudgetTable({components,iso}:{components:Component[];iso:Isotope}) {
   })}</tbody></table>;
 }
 
-export function UncertaintyWorkspace({detail,group,analysis}:{detail:ResultsSessionDetail;group:string;analysis?:SessionAnalysis|null}) {
+export function UncertaintyWorkspace({detail,group,analysis,busy,saveCoverageFactor,toolbarControls}:{toolbarControls?:ReactNode;detail:ResultsSessionDetail;group:string;analysis?:SessionAnalysis|null;busy?:boolean;saveCoverageFactor:(k:number)=>Promise<void>}) {
   const tr=useTranslation(),bridge=useContext(MetrologyEvidenceBridge);
+  const savedFactor=detail.coverage_factor??detail.method?.config.coverage_factor??2;
+  const [factor,setFactor]=useState(String(savedFactor));
+  const [xAxis,setXAxis]=useState<UncertaintyXAxis>("By Sequence");
+  useEffect(()=>setFactor(String(savedFactor)),[detail.id,savedFactor]);
+  const frozen=detail.runs.some(run=>run.status==="released");
   const [selectedId,setSelectedId]=useState("");
   const [popup,setPopup]=useState<{x:number;y:number;pinned:boolean}|null>(null);
   const popover=useRef<HTMLDivElement>(null);
@@ -33,7 +38,7 @@ export function UncertaintyWorkspace({detail,group,analysis}:{detail:ResultsSess
   const closeTimer=useRef<ReturnType<typeof setTimeout>|null>(null);
   const clearCloseTimer=()=>{if(closeTimer.current)clearTimeout(closeTimer.current);};
   const closeHover=()=>{clearCloseTimer();closeTimer.current=setTimeout(()=>setPopup(current=>current?.pinned?current:null),200);};
-  const workspace=useQuery({queryKey:["uncertainty-processing-workspace",bridge?.session_id],queryFn:({signal})=>api.getProcessingWorkspace(bridge!.session_id,undefined,signal),enabled:!!bridge,staleTime:Infinity});
+  const workspace=useQuery({queryKey:["processing-workspace",bridge?.session_id],queryFn:({signal})=>api.getProcessingWorkspace(bridge!.session_id,[],signal),enabled:!!bridge,staleTime:Infinity});
   const rows=useMemo(()=>(analysis?.rows??[]).filter(r=>!group||r.role!=="unknown"||r.sample_group===group),[analysis,group]);
   const selected=rows.find(r=>r.id===selectedId)??rows.find(r=>r.role==="unknown")??rows[0];
   const byLabel=useMemo(()=>Object.fromEntries(rows.filter(r=>bridge?.row_mapping[r.id]).map(r=>[bridge!.row_mapping[r.id],r])),[rows,bridge]);
@@ -43,8 +48,8 @@ export function UncertaintyWorkspace({detail,group,analysis}:{detail:ResultsSess
   ],[analysis,bridge,rows]);
   const figures=useMemo(()=>isotopes.map((_,i)=>{
     const source=workspace.data?.overview_figures[i?"d18_summary":"d13_summary"];
-    return source&&buildUncertaintyFigure(source,byLabel,tr("Final ± U"),flags);
-  }),[workspace.data,byLabel,tr,flags]);
+    return source&&buildUncertaintyFigure(source,byLabel,tr("Final"),flags,xAxis);
+  }),[workspace.data,byLabel,tr,flags,xAxis]);
   useLayoutEffect(()=>{
     const element=popover.current;
     if(!element)return;
@@ -78,12 +83,24 @@ export function UncertaintyWorkspace({detail,group,analysis}:{detail:ResultsSess
       clearCloseTimer();setSelectedId(byLabel[label].id);setPopup({...anchor,pinned});
     }
   };
-  if(analysis&&!rows.length)return <Empty>{tr("Evaluate imported data to view individual uncertainty budgets.")}</Empty>;
   return <div className="metro-stack">
-    {!!Object.keys(analysis?.residual_previews??{}).length&&<p className="metro-muted">{tr("These budgets belong to the recorded method results. Residual preview coefficient uncertainties are shown in Residual corrections and are not added to these budgets.")}</p>}
+    <div className="station-uncertainty-controls">
+      {toolbarControls}
+      <section className="station-uncertainty-settings" aria-label={tr("Uncertainty settings")}>
+        <h2>{tr("Uncertainty settings")}</h2>
+        <form onSubmit={event=>{event.preventDefault();if(Number.isFinite(Number(factor))&&Number(factor)>0)void saveCoverageFactor(Number(factor));}}>
+          <Field label={tr("Global coverage factor k")}><input type="number" min={0} step="any" required value={factor} disabled={busy||frozen} onChange={event=>setFactor(event.target.value)}/></Field>
+          <button type="submit" className="metro-btn primary" disabled={busy||frozen||!Number.isFinite(Number(factor))||Number(factor)<=0||Number(factor)===savedFactor}>{tr("Save coverage factor")}</button>
+          <small>k = {savedFactor}</small>
+        </form>
+      </section>
+      <Field label={tr("X axis")}><select value={xAxis} onChange={event=>setXAxis(event.target.value as UncertaintyXAxis)}><option value="By Identifier 2">{tr("By Identifier 2")}</option><option value="By Sequence">{tr("By Sequence")}</option></select></Field>
+    </div>
+    <p className="metro-muted">{tr("Applies to both isotopes and all uncertainty budgets in this session, including charts and exports. U = k times u_c.")}</p>
+    <p className="metro-muted">{tr("Applied residual corrections and their coefficient uncertainties are included in these results.")}</p>
     <div className="metro-stack station-uncertainty-charts" onPointerDownCapture={event=>{hoverPoint.current={x:event.clientX,y:event.clientY};}}>{isotopes.map((iso,i)=>{
       const figure=figures[i];
-      return <Panel key={iso} title={`${tr("Summary")} ${isotopeLabel[iso]}`}>{figure?<PlotlyChart figure={figure} minHeight={320}
+      return <Panel key={iso} chartPanel title={`${tr("Summary")} ${isotopeLabel[iso]}`}>{figure?<PlotlyChart figure={{...figure,layout:{...(figure.layout as Record<string,unknown>??{}),title:{text:""}}}} minHeight={320}
         onPointHover={({points,clientX,clientY})=>{hoverPoint.current={x:clientX,y:clientY};inspect(points[0]?.customdata,hoverPoint.current,false);}}
         onHoverEnd={closeHover}
         onPointClick={points=>{if(hoverPoint.current)inspect(points[0]?.customdata,hoverPoint.current,true);}}
@@ -94,11 +111,11 @@ export function UncertaintyWorkspace({detail,group,analysis}:{detail:ResultsSess
       const population=rows.filter(r=>r.role==="unknown"&&!r.excluded&&r.isotopes?.[iso]?.budget);
       const names=[...new Set(population.flatMap(r=>r.isotopes![iso]!.budget!.components.map(c=>c.name)))];
       const components=names.map(name=>({name,u:Math.sqrt(population.reduce((sum,r)=>sum+(r.isotopes![iso]!.budget!.components.find(c=>c.name===name)?.u??0)**2,0)/population.length)}));
-      return <section key={iso}><h3>{isotopeLabel[iso]} · n={population.length}</h3>{population.length?<BudgetTable components={components} iso={iso}/>:<Empty>{tr("No complete uncertainty budget. Review this analysis in Import.")}</Empty>}</section>;
+      return <section key={iso}><h3>{isotopeLabel[iso]} · n={population.length}</h3>{population.length?<BudgetTable components={components} iso={iso}/>:<Empty>{tr("No calculated sample budgets are available. Check the individual calculation reasons below.")}</Empty>}</section>;
     })}</div></Panel>
-    <div ref={popover} id="station-budget-popover" popover="manual" role="dialog" className="station-budget-popover" aria-labelledby="station-budget-title" onMouseEnter={clearCloseTimer} onMouseLeave={closeHover} onFocus={()=>{clearCloseTimer();setPopup(current=>current?{...current,pinned:true}:null);}}><div className="station-panel-toolbar"><h2 id="station-budget-title">{selected?.label} {selected?.comment} · {tr("Uncertainty budget")}</h2><button className="metro-btn" onClick={()=>setPopup(null)}>{tr("Close")}</button></div><div className="metro-stack">{isotopes.map(iso=>{
+    <div ref={popover} id="station-budget-popover" popover="manual" role="dialog" className="station-budget-popover" aria-labelledby="station-budget-title" onMouseEnter={clearCloseTimer} onMouseLeave={closeHover} onFocus={()=>{clearCloseTimer();setPopup(current=>current?{...current,pinned:true}:null);}}><div className="station-panel-toolbar"><h2 id="station-budget-title">{selected?.identifier1??selected?.label} {selected?.identifier2??selected?.comment} · {tr("Uncertainty budget")}</h2><button className="metro-btn" onClick={()=>setPopup(null)}>{tr("Close")}</button></div><div className="metro-stack">{!!selected?.issues?.length&&<details><summary>{tr("Recorded review findings")}</summary><ul>{selected.issues.map(issue=><li key={issue}>{tr(issue)}</li>)}</ul></details>}{isotopes.map(iso=>{
       const result=selected?.isotopes?.[iso],budget=result?.budget;
-      return <section key={iso} className="station-budget-isotope"><h3>{isotopeLabel[iso]}</h3>{budget?<><div className="station-result-value"><b>{number(result?.value)} ± {number(budget.expanded_uncertainty)} ‰</b><small>VPDB · k = {budget.k}</small></div><div className="metro-table-wrap"><BudgetTable components={budget.components} iso={iso}/></div><p>u_c = {number(budget.u_combined)} ‰ · U = k × u_c</p><Inspect title={tr("Recorded calculation and component evidence")} value={result}/></>:<Empty>{tr("No complete uncertainty budget. Review this analysis in Import.")}</Empty>}</section>;
+      return <section key={iso} className="station-budget-isotope"><h3>{isotopeLabel[iso]}</h3>{budget?<><div className="station-result-value"><b>{number(result?.value)} ± {number(budget.expanded_uncertainty)} ‰</b><small>VPDB · k = {budget.k}</small></div><div className="metro-table-wrap"><BudgetTable components={budget.components} iso={iso}/></div><p>u_c = {number(budget.u_combined)} ‰ · U = k × u_c</p><Inspect title={tr("Recorded calculation and component evidence")} value={result}/></>:<Empty>{tr(selected?.calculation_issues?.[iso]??result?.budget_issue??"A required uncertainty component is unavailable.")}</Empty>}</section>;
     })}</div></div>
   </div>;
 }

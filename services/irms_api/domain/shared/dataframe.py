@@ -69,25 +69,10 @@ def _parse_numeric_token(token):
         if num.count(",") > 1:
             num = num.replace(",", "")
         else:
-            left, right = num.split(",", 1)
-            if right.isdigit():
-                # Treat comma as decimal when precision is >= 1 digit and not a clear thousands group.
-                if len(right) in (1, 2):
-                    num = left + "." + right
-                elif len(right) == 3 and left.isdigit() and left not in ("0", "+0", "-0"):
-                    num = left + right
-                else:
-                    num = left + "." + right
-            else:
-                num = left + right
-    elif "." in num:
-        if num.count(".") > 1:
-            num = num.replace(".", "")
-        else:
-            left, right = num.split(".", 1)
-            # If it looks like a thousands separator (e.g., 1.234), collapse it.
-            if right.isdigit() and len(right) == 3 and left.isdigit() and len(left) <= 3:
-                num = left + right
+            # A single separator denotes decimals, including three-digit precision.
+            num = num.replace(",", ".")
+    elif num.count(".") > 1:
+        num = num.replace(".", "")
 
     try:
         return float(num)
@@ -778,7 +763,7 @@ def _get_species_series(df):
     """Resolve per-row species labels with fallback for missing values.
 
     Order of preference per row:
-    1) explicit ``Species`` value when non-empty
+    1) explicit ``Species`` value, including an intentionally empty string
     2) parsed species from ``Label``
     3) parsed identifier from ``Label``
     4) ``Identifier 1``
@@ -807,7 +792,6 @@ def _get_species_series(df):
         species = df['Species'].copy()
         return species.where(
             species.notna()
-            & (species.astype(str).str.strip() != '')
             & (~species.astype(str).str.strip().str.lower().eq('nan')),
             fallback,
         )

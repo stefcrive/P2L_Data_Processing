@@ -60,3 +60,14 @@ test('all translated templates retain their interpolation slots', () => {
     assert.deepEqual((value.match(/\{\d+\}/g) ?? []).sort(), (key.match(/\{\d+\}/g) ?? []).sort(), key);
   }
 });
+
+test('Portuguese UI text preserves accents and contains no encoding damage', () => {
+  const dictionary = require('../src/lib/i18n/pt-BR.json');
+  const damaged = /\uFFFD|\p{L}\?\p{L}|\?{2,}|\u00C3[\u0080-\u00BF]|\u00C2[\u0080-\u00BF]|\u00E2\u20AC/u;
+  for (const [key, value] of Object.entries(dictionary)) {
+    assert.doesNotMatch(value, damaged, `Damaged Portuguese translation: ${key}`);
+  }
+  assert.equal(translate('Sample label (with corrections)', 'pt'), 'R\u00f3tulo da amostra (com corre\u00e7\u00f5es)');
+  assert.equal(translate('Sample identifier (with corrections)', 'pt'), 'Identificador da amostra (com corre\u00e7\u00f5es)');
+  assert.equal(translate('Uncertainty settings', 'pt'), 'Configura\u00e7\u00f5es de incerteza');
+});

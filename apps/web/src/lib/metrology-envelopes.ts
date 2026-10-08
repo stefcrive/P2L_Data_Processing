@@ -50,12 +50,29 @@ export function uncertaintyEnvelope(points: EnvelopePoint[], name: string, fillc
     legendgroup: name, meta: { uncertaintyEnvelope: true }, name, fill: "toself", fillcolor, showlegend: true }];
 }
 
-/** Add canonical final results to the reused processing figures; raw traces stay unchanged. */
+/** Add canonical final results to the reused processing figures without mutating inputs. */
 export function withSessionUncertainty(figure: Record<string, unknown> | undefined, rows: Record<string, SessionRow>, label: string,
   exclusions: {row:string;isotope:string;hidden?:boolean;excludeFromFit?:boolean}[] = []) {
   if (!figure || !Array.isArray(figure.data) || !Object.keys(rows).length) return figure;
   const data = figure.data as Record<string, unknown>[];
   if (data.some(trace => (trace.meta as Record<string, unknown>)?.sessionUncertainty)) return figure;
+  const colorSources = data.flatMap(trace => {
+    const marker = (trace.marker ?? {}) as Record<string, unknown>, colors = vector(marker.color);
+    return colors?.some(finite) && Array.isArray(trace.customdata) ? [{marker,colors,custom:trace.customdata as unknown[][]}] : [];
+  });
+  const colorByRow = new Map(colorSources.flatMap(({colors,custom})=>custom.map((point,i)=>[String(point[0]),colors[i]] as const)));
+  const colorByLabel = new Map(colorSources.flatMap(({colors,custom})=>custom.flatMap((point,i)=>point[5]!=null?[[String(point[5]),colors[i]] as const]:[])));
+  const scaleMarker = colorSources[0]?.marker;
+  const colorValue = (point:unknown[]) => {
+    const stored = colorByRow.get(String(point[0])) ?? colorByLabel.get(String(point[5]));
+    if (stored != null) return stored;
+    const label = String(point[5] ?? "").trim();
+    if (!label) return null;
+    const numeric = Number(label);
+    if (Number.isFinite(numeric)) return numeric;
+    const date = /^\d{4}-\d{2}-\d{2}/.test(label) ? Date.parse(label) : NaN;
+    return Number.isFinite(date) ? Math.floor(date/86400000)+719163 : null;
+  };
   const seen = new Set<string>(), overlays: Record<string, unknown>[] = [];
   const excluded = new Set(exclusions.filter(flag=>flag.hidden || (rows[flag.row]?.role === "qc" && flag.excludeFromFit !== false))
     .map(flag=>`${rows[flag.row]?.id}:${flag.isotope.toLowerCase()}`));
@@ -83,18 +100,32 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
     const u = selected.map(row => usable(row, iso)?.budget?.expanded_uncertainty ?? null);
     const shade = iso === "d13c" ? "rgba(33,94,197,0.18)" : "rgba(22,125,135,0.18)";
     const yaxis = String(trace.yaxis ?? "y");
+    const sourceMarker = (trace.marker ?? {}) as Record<string, unknown>;
+    const sourceColors = vector(sourceMarker.color);
+    const inheritedColors = sourceColors ? indices.map(i=>sourceColors[i]) : scaleMarker ? indices.map(i=>colorValue(custom[i])) : null;
+    const marker = {...(scaleMarker ?? {}),...sourceMarker,
+      color:inheritedColors?.some(value=>value!=null) ? inheritedColors : (iso==="d13c"?"#215ec5":"#167d87"),
+      size:three?4:6,symbol:"circle",opacity:1,line:{width:0}};
     if (!cross && !three) overlays.push(...uncertaintyEnvelope(selected.map((row, i) => ({ x:x[i], value:y[i], uncertainty:u[i], segment:row.run_id })), label, shade, yaxis).map(t => ({...t, xaxis:trace.xaxis, showlegend:false})));
     overlays.push({ type: three ? "scatter3d" : "scatter", mode:"markers", name:label,
-      x, y, ...(three ? {z:indices.map(i => traceZ?.[i]), scene:trace.scene} : {xaxis:trace.xaxis, yaxis}),
-      marker:{size:three?4:6,color:iso==="d13c"?"#215ec5":"#167d87"},
-      error_y:{type:"data",array:u,visible:true,thickness:1,width:2},
-      ...(cross ? {error_x:{type:"data",array:selected.map(row=>usable(row,"d18o")?.budget?.expanded_uncertainty??null),visible:true,thickness:1,width:2}} : {}),
+      x, y, ...(three ? {z:indices.map(i => traceZ?.[i]), scene:trace.scene} : {xaxis:trace.xaxis, yaxis,zorder:1}),
+      marker,
+      error_y:{type:"data",array:u,visible:true,thickness:1,width:2,color:"#64748b"},
+      ...(cross ? {error_x:{type:"data",array:selected.map(row=>usable(row,"d18o")?.budget?.expanded_uncertainty??null),visible:true,thickness:1,width:2,color:"#64748b"}} : {}),
       customdata:indices.map(i=>custom[i]), text:selected.map(row=>`${row.identifier1??row.label} · ${row.identifier2??row.comment} · ${row.species??""}`),
       hovertemplate:"%{text}<br>%{y:.3f} ‰<extra>%{fullData.name}</extra>",
       legendgroup:"session-uncertainty",showlegend:!overlays.some(t=>(t.meta as Record<string,unknown>)?.sessionUncertainty),meta:{sessionUncertainty:true},
     });
   }
-  return {...figure,data:[...data,...overlays]};
+  const before = data.map(trace => {
+    if (/outlier|failed|range/i.test(String(trace.name ?? "")) || !Array.isArray(trace.customdata)
+      || !trace.customdata.some(point => Array.isArray(point) && rows[String(point[0])] && ["d13C", "d18O", "cross"].includes(String(point[1])))) return trace;
+    return {...trace, ...(trace.type==="scatter3d"?{}:{zorder:0}),
+      marker:{...(trace.marker as object ?? {}),color:"#cbd5e1",coloraxis:undefined,cmin:undefined,cmax:undefined,showscale:false,line:{...(trace.marker as {line?:object})?.line,color:"#cbd5e1"}},
+      line:{...(trace.line as object ?? {}),color:"#cbd5e1"},
+      ...Object.fromEntries(["error_x","error_y","error_z"].filter(key=>trace[key]).map(key=>[key,{...(trace[key] as object),color:"#cbd5e1"}]))};
+  });
+  return {...figure,data:[...before,...overlays]};
 }
 
 /** Display the frozen anchor model's pointwise k*u_norm; never refit or normalize samples. */

@@ -170,6 +170,9 @@ class Service(ResultsSessions):
             duplicates = self.repo.list(db, "raw_imports", sha256=digest)
             if duplicates:
                 existing = [r for r in self.repo.list(db, "runs") if r["raw_import_id"] == duplicates[0]["id"]]
+                if session:
+                    member_ids = set(session["run_ids"] + session.get("detached_run_ids", []))
+                    existing = [r for r in existing if r["id"] in member_ids]
                 if existing:
                     if existing[0].get("carbonate_material", "calcite") != command.carbonate_material or existing[0].get("carbonate_correction_preapplied", False) != command.carbonate_correction_preapplied:
                         raise ValueError("This workbook is already imported with a different carbonate basis; retain its original processing record")
@@ -191,7 +194,7 @@ class Service(ResultsSessions):
                 raise ValueError("Routine runs cannot be attached as qualification data")
             if method and command.context == "routine" and method["status"] != "active":
                 raise ValueError("Routine runs use the active method; import unassigned until a method is approved")
-            source = self.repo.insert(db, "raw_imports", {k: v for k, v in parsed.items() if k != "measurements"} |
+            source = duplicates[0] if duplicates else self.repo.insert(db, "raw_imports", {k: v for k, v in parsed.items() if k != "measurements"} |
                                      {"filename": Path(filename.replace("\\", "/")).name, "size": len(content), "operator": command.actor}, sha256=digest)
             acquisition = [str(r["acquired_at"])[:10] for r in parsed["measurements"] if r["acquired_at"]]
             events = self.repo.list(db, "interventions")
@@ -531,6 +534,13 @@ class Service(ResultsSessions):
             source = self.repo.get(db, "raw_imports", run["raw_import_id"])
             self.repo.read_blob(source["sha256"])
             session = next((s for s in self.repo.list(db,"results_sessions") if id_ in s["run_ids"]),None)
+            if session and session.get("coverage_factor") is not None:
+                for row in evaluation["results"]:
+                    for result in row.get("isotopes", {}).values():
+                        budget = result.get("budget")
+                        if budget:
+                            budget["k"] = session["coverage_factor"]
+                            budget["expanded_uncertainty"] = budget["u_combined"] * budget["k"]
             record = self.repo.insert(db, "releases", {"review": command.model_dump(), "at": self.repo.timestamp(), "evaluation": evaluation,
                                       "results_session_snapshot": session,
                                       "simulation": self.repo.demo, "raw_sha256": source["sha256"], "run_snapshot": run, "software_version": SOFTWARE_VERSION,

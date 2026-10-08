@@ -45,10 +45,10 @@ def number(value, *, dimension: str | None = None, column: str = "") -> float | 
     if value is None or isinstance(value, bool):
         return None
     text = str(value).strip().replace("−", "-").replace("μ", "µ")
-    match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?)\s*(.*)", text)
+    match = re.fullmatch(r"([+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[Ee][+-]?\d+)?)\s*(.*)", text)
     if not match:
         return None
-    val = float(match.group(1))
+    val = float(match.group(1).replace(",", "."))
     if not math.isfinite(val):
         return None
     unit = (match.group(2) or column).lower().replace("μ", "µ")

@@ -223,6 +223,29 @@ textarea {
   }
 }
 
+.scientific-color-ticks {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.range-field .range-field__controls {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.range-field .range-field__number {
+  grid-row: 1;
+}
+
+.range-field .dual-range {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  width: 100%;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -335,6 +358,13 @@ textarea {
 .cycle-drift-values dd { font-variant-numeric:tabular-nums; color:var(--foreground); }
 .cycle-color-control { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin:6px 0; font-size:11px; color:var(--muted-foreground); }
 .cycle-color-control select { max-width:180px; border:1px solid var(--input); background:var(--card); }
+.saturation-figure-toolbar { display:flex; align-items:center; justify-content:flex-end; gap:8px; min-width:0; padding:0 4px 8px; }
+.saturation-figure-toolbar.analytical-panel-header { flex-wrap:nowrap; padding:0 4px 8px !important; }
+.saturation-figure-toolbar > :first-child { flex:0 1 auto; }
+.saturation-figure-toolbar > button { flex-shrink:0; white-space:nowrap; }
+.saturation-figure-toolbar .cycle-color-control { flex:1; min-width:0; margin:0; white-space:nowrap; }
+.saturation-figure-toolbar .cycle-color-control select { width:120px; min-width:60px; flex:0 1 120px; }
+.saturation-figure-toolbar .analytical-chart-actions { flex-shrink:0; margin-left:0; }
 .cycle-isotope-diagnostics .saturation-figure-panel { border:0; padding:0; }
 .cycle-isotope-diagnostics .saturation-figure-panel > :last-child { padding-top:2px; }
 .cycle-isotope-diagnostics .saturation-figure-panel > :last-child :is(button,div) { font-size:11px; }

@@ -29,6 +29,7 @@ from services.irms_api.domain.processing.cycles import (
     get_cycles_for_selected_point,
 )
 from services.irms_api.domain.processing.charts import _date_aligned_standard_rows
+from services.irms_api.domain.processing.outliers import build_processing_summary, is_row_outlier_effective
 from services.irms_api.domain.processing.edits import (
     _interpolate_single_target_within_identifier_group,
     apply_edit_action,
@@ -891,6 +892,24 @@ class ProcessingCoreTests(unittest.TestCase):
         self.assertEqual(str(reset_df.loc[0, "Species"]), "Coral")
         self.assertEqual(reset_state["original_species_values"], {})
         self.assertNotIn("0", reset_state["edited_rows"])
+
+    def test_clear_qc_species_preserves_blank_and_can_reset(self) -> None:
+        from services.irms_api.domain.shared.dataframe import _get_species_series
+
+        frame = sample_processing_df()
+        frame.loc[0, "Identifier 1"] = "SHP2L"
+        updated, state = apply_edit_action(
+            frame, {}, EditAction(action="set_species",
+                targets=[{"row_label": "0", "isotope_key": "d13C"}], species=""),
+        )
+        self.assertEqual(updated.loc[0, "Species"], "")
+        self.assertEqual(_get_species_series(updated).loc[0], "")
+        self.assertEqual(state["original_species_values"], {"0": "Coral"})
+        reset, reset_state = apply_edit_action(updated, state,
+            EditAction(action="reset_to_original",
+                targets=[{"row_label": "0", "isotope_key": "d13C"}]))
+        self.assertEqual(reset.loc[0, "Species"], "Coral")
+        self.assertEqual(reset_state["original_species_values"], {})
 
     def test_apply_edit_action_accepts_manual_species_value(self) -> None:
         updated_df, updated_state = apply_edit_action(
@@ -3193,6 +3212,40 @@ class ProcessingCoreTests(unittest.TestCase):
         # Identifier B rows have missing Species, but should still be grouped (Label/Identifier fallback)
         # and detect Identifier 2 == "4" as statistical outlier.
         self.assertTrue(bool(masks["Statistical"].loc[6]))
+
+    def test_pressure_adjustment_outlier_toggle_preserves_no_signal_category(self) -> None:
+        df = pd.DataFrame({
+            "Identifier 1": ["A"] * 8, "Identifier 2": list(map(str, range(8))), "Species": ["QC"] * 8,
+            "d 13C/12C  Mean": [0., .1, -.1, 0., 0., 2., 1000., 1000.],
+            "d 18O/16O  Mean": [0., .1, -.1, 0., 0., 2., 1000., 1000.],
+            "1  Cycle Int  Samp  44": [15.] * 8, "leak_rate": [5.] * 8,
+            "Collector Status": [""] * 7 + ["Failed Sample"],
+            "Pressure Adjust failed with Target Intensity": [False] * 6 + [True, True],
+        })
+        # Wide physical ranges isolate this status toggle from independent range rules.
+        off = RangeConfig(d13c_range=(-2000., 2000.), d18o_range=(-2000., 2000.))
+        on = RangeConfig(d13c_range=off.d13c_range, d18o_range=off.d18o_range, pressure_adjustment_as_outlier=True)
+        for method in ("Z-Score", "IQR"):
+            with self.subTest(method=method):
+                default = build_category_masks(df, off, sigma_level=1.5, statistical_outlier_method=method)
+                enabled = build_category_masks(df, on, sigma_level=1.5, statistical_outlier_method=method)
+                self.assertEqual(list(df.index[default["Statistical"]]), [5])
+                self.assertTrue(default["Statistical"].equals(enabled["Statistical"]))
+                self.assertFalse(default["Poor Pressure Adjustment"].any())
+                self.assertEqual(list(df.index[enabled["Poor Pressure Adjustment"]]), [6])
+                self.assertEqual(list(df.index[default["Failed Sample"]]), [7])
+                self.assertTrue(default["Failed Sample"].equals(enabled["Failed Sample"]))
+        self.assertFalse(is_row_outlier_effective(df, 6, off))
+        self.assertTrue(is_row_outlier_effective(df, 6, on))
+        self.assertTrue(is_row_outlier_effective(df, 7, off))
+        summary_off = build_processing_summary(df, off)
+        summary_on = build_processing_summary(df, on)
+        self.assertEqual(summary_off.final_analyses - summary_on.final_analyses, 1)
+        self.assertFalse(normalize_processing_config({}).pressure_adjustment_as_outlier)
+        self.assertTrue(normalize_processing_config({"pressure_adjustment_as_outlier": True}).pressure_adjustment_as_outlier)
+        from services.irms_api.api.main import _processing_linearity_preview_rows
+        preview = _processing_linearity_preview_rows(df, {}, "1  Cycle Int  Samp  44")
+        self.assertEqual(preview[6]["attributes"]["Pressure Adjust failed with Target Intensity"], 1.)
 
 
 if __name__ == "__main__":

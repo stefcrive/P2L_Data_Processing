@@ -11,13 +11,29 @@ from .models import ISOTOPES
 from .repository import encode, uid
 
 
-def detect_qc_outliers(rows, method="sigma", threshold=3.0):
+def failure_category(row, iso=None):
+    """Classify acquisition evidence before method-stage values replace raw deltas."""
+    if iso in row.get("failure_categories", {}):
+        return row["failure_categories"][iso]
+    issues = row.get("issues", [])
+    signal = row.get("i44_v")
+    if ("Qtegra reports an acquisition failure" in issues or row.get("collector_status") == "Failed Sample"
+            or (isinstance(signal, (int, float)) and (not math.isfinite(signal) or signal <= 0))
+            or (iso in row and row[iso] is None and row.get("isotopes", {}).get(iso, {}).get("value") is None)):
+        return "no_signal"
+    # Qualification range warnings are not acquisition failure evidence.
+    if row.get("pressure_failed") or "Qtegra pressure adjustment failed" in issues:
+        return "pressure_adjustment"
+    return None
+
+
+def detect_qc_outliers(rows, method="sigma", threshold=3.0, pressure_adjustment_as_outlier=False):
     if method not in ("sigma", "iqr") or not math.isfinite(threshold) or not .5 <= threshold <= 10:
         raise ValueError("Choose sigma or IQR screening and a threshold between 0.5 and 10")
     flags = []
     for iso in ISOTOPES:
         selected = [r for r in rows if r.get("role") == "qc" and not r.get("excluded")
-                    and r.get(iso) is not None and math.isfinite(r[iso])]
+                    and not failure_category(r, iso) and r.get(iso) is not None and math.isfinite(r[iso])]
         for material in sorted({r.get("material_id") for r in selected}, key=str):
             subset = [r for r in selected if r.get("material_id") == material]
             frame = pd.DataFrame({"value": [r[iso] for r in subset]})
@@ -34,7 +50,16 @@ def detect_qc_outliers(rows, method="sigma", threshold=3.0):
                           "material_id": material, "lower": float(lower), "upper": float(upper),
                           "population_n": len(subset), "type": iso, "category": "statistical"}
                          for r, flagged in zip(subset, mask) if flagged)
-    return {"method": method, "threshold": threshold, "flags": flags,
+        for row in rows:
+            category = failure_category(row, iso)
+            if row.get("excluded") or row.get("role") not in ("qc", "unknown", "anchor"):
+                continue
+            if category == "no_signal" or (category == "pressure_adjustment" and pressure_adjustment_as_outlier):
+                flags.append({"measurement_id": row["id"], "run_id": row["run_id"], "evaluation_id": row.get("evaluation_id"),
+                              "isotope": iso, "value": row.get(iso), "material_id": row.get("material_id"),
+                              "type": iso, "category": category, "is_outlier": True,
+                              "reasons": ["No signal or failed acquisition" if category == "no_signal" else "Poor pressure adjustment classified as an outlier by session setting"]})
+    return {"method": method, "threshold": threshold, "pressure_adjustment_as_outlier": pressure_adjustment_as_outlier, "flags": flags,
             "basis": "Final session QC, separate material and isotope populations; excluded from long-term QC statistics, retained in source results"}
 
 
@@ -60,11 +85,13 @@ def qc_review_flags(rows, config=None):
             categories = {
                 "manual": ["Manually excluded analysis"] if row.get("excluded") else [],
                 "range": [s for s in issues if "outside validated" in s or "internal SD" in s],
-                "failed": [s for s in issues if s in ("Qtegra Evaluate is disabled", "Qtegra pressure adjustment failed", "Qtegra reports an acquisition failure")],
+                "pressure_adjustment": ["Qtegra pressure adjustment failed"] if failure_category(row, iso) == "pressure_adjustment" else [],
+                "no_signal": ["No signal or failed acquisition"] if failure_category(row, iso) == "no_signal" else [],
             }
             flags.extend({"measurement_id": row["id"], "run_id": row["run_id"], "evaluation_id": row.get("evaluation_id"),
                           "isotope": iso, "category": category, "value": row.get("isotopes", {}).get(iso, {}).get("value"),
                           "reasons": reasons, "metadata_only": category == "range" and all(missing_metadata(row, reason, iso) for reason in reasons)}
+                         | ({"session_qc_admitted": True} if category == "pressure_adjustment" and row.get("isotopes", {}).get(iso, {}).get("session_qc_admitted") else {})
                          for category, reasons in categories.items() if reasons)
     return flags
 
@@ -73,7 +100,9 @@ def stored_qc_screening(repo, db, session, runs=None):
     runs = runs if runs is not None else [repo.get(db, "runs", rid) for rid in session["run_ids"]]
     settings = session.get("outlier_screening", {"method": "sigma", "threshold": 3.0})
     population = sorted((r["id"], r.get("latest_evaluation_id"), r.get("revision")) for r in runs)
-    fingerprint = hashlib.sha256(encode({"version": 2, "population": population, "settings": settings}).encode()).hexdigest()
+    # Screen the same complete method-stage population used by residual fitting.
+    # Replace screenings that incorrectly classified qualification range warnings as failures.
+    fingerprint = hashlib.sha256(encode({"version": 7, "population": population, "settings": settings}).encode()).hexdigest()
     previous = db.execute("SELECT * FROM qc_screenings WHERE session_id=? AND fingerprint=?", (session["id"], fingerprint)).fetchone()
     if previous:
         return repo.unpack(previous)
@@ -82,10 +111,24 @@ def stored_qc_screening(repo, db, session, runs=None):
         if not run.get("latest_evaluation_id"):
             continue
         evaluation = repo.get(db, "evaluations", run["latest_evaluation_id"])
-        rows.extend({**r, "run_id": run["id"], "evaluation_id": evaluation["id"],
-                     **{iso: r.get("isotopes", {}).get(iso, {}).get("value") for iso in ISOTOPES}}
-                    for r in evaluation["results"])
+        from .pipeline import process_value
+        for row in evaluation["results"]:
+            if row.get("excluded"):
+                continue
+            values = {}
+            for iso in ISOTOPES:
+                value = row.get("isotopes", {}).get(iso, {}).get("value")
+                model = evaluation.get("normalization", {}).get(iso)
+                if value is None and row.get(iso) is not None and model:
+                    try:
+                        value = process_value(row, iso, model, run, allow_extrapolation=True)["value"]
+                    except (ValueError, KeyError):
+                        pass
+                values[iso] = value
+            rows.append({**row, "run_id": run["id"], "evaluation_id": evaluation["id"],
+                         "failure_categories": {iso: failure_category(row, iso) for iso in ISOTOPES}, **values})
     result = detect_qc_outliers(rows, **settings)
+    result["basis"] = "Session method-stage QC; pressure-adjustment and no-signal analyses excluded from statistical estimation. No-signal analyses are outliers; poor pressure adjustment is classified as an outlier only when enabled."
     db.execute("INSERT INTO qc_screenings(id,session_id,fingerprint,data,created_at) VALUES(?,?,?,?,?) ON CONFLICT(session_id,fingerprint) DO NOTHING",
                (uid(), session["id"], fingerprint, encode({**result, "population": population}), repo.timestamp()))
     return repo.unpack(db.execute("SELECT * FROM qc_screenings WHERE session_id=? AND fingerprint=?", (session["id"], fingerprint)).fetchone())

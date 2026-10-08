@@ -3,6 +3,20 @@ from services.irms_api.metrology.science import control_summary
 
 
 class HistoryOutlierTests(unittest.TestCase):
+    def test_pressure_range_warning_is_not_an_acquisition_failure(self):
+        from services.irms_api.metrology.qc_screening import failure_category, qc_review_flags
+        issue = "pressure_mismatch_v missing or outside validated range"
+        row = {"id": "q", "run_id": "r", "role": "qc", "issues": [issue], "pressure_mismatch_v": .2}
+        self.assertIsNone(failure_category(row, "d13c"))
+        flags = qc_review_flags([row])
+        self.assertTrue(all(f["reasons"] == [issue] for f in flags))
+        self.assertTrue(all(f["category"] == "range" for f in flags))
+        self.assertEqual(failure_category({**row, "pressure_failed": True}, "d13c"), "pressure_adjustment")
+        for pressure in (None, float("nan"), float("inf")):
+            self.assertIsNone(failure_category({**row, "pressure_mismatch_v": pressure}, "d13c"))
+        self.assertIsNone(failure_category({**row, "issues": []}, "d13c"))
+        self.assertEqual(failure_category({**row, "issues": [issue, "Qtegra reports an acquisition failure"]}, "d13c"), "no_signal")
+
     def test_review_categories_use_recorded_issues_and_keep_isotopes_independent(self):
         from services.irms_api.metrology.qc_screening import qc_review_flags
         rows = [{"id":"q", "run_id":"run", "role":"qc", "issues":["d13c internal SD missing or at/above limit", "Acquisition completion needs confirmation"],
@@ -13,7 +27,7 @@ class HistoryOutlierTests(unittest.TestCase):
         flags = qc_review_flags(rows)
         self.assertEqual([(f["category"], f["isotope"]) for f in flags if f["measurement_id"]=="q"], [("range","d13c")])
         self.assertEqual(len([f for f in flags if f["category"]=="manual"]),2)
-        self.assertEqual(len([f for f in flags if f["category"]=="failed"]),2)
+        self.assertEqual(len([f for f in flags if f["category"]=="no_signal"]),2)
         self.assertFalse(any(f["measurement_id"]=="sample" for f in flags))
 
     def test_missing_metadata_does_not_hide_available_qc_measurements(self):
@@ -28,7 +42,28 @@ class HistoryOutlierTests(unittest.TestCase):
         actual_range = {**base, "i44_v": 90, "issues": [*base["issues"], "i44_v missing or outside validated range"]}
         self.assertTrue(all(not flag["metadata_only"] for flag in qc_review_flags([actual_range])))
         failed = {**base, "issues": [*base["issues"], "Qtegra reports an acquisition failure"]}
-        self.assertTrue(all(not flag["metadata_only"] for flag in qc_review_flags([failed]) if flag["category"] == "failed"))
+        self.assertTrue(all(not flag["metadata_only"] for flag in qc_review_flags([failed]) if flag["category"] == "no_signal"))
+
+    def test_pressure_toggle_is_separate_from_no_signal_and_statistical_screening(self):
+        from services.irms_api.metrology.qc_screening import detect_qc_outliers, failure_category
+        rows = [{"id": str(i), "run_id": "run", "role": "qc", "material_id": "qc",
+                 "d13c": value, "d18o": value} for i, value in enumerate([0., .1, -.1, 0., 0., 2.])]
+        rows += [{**rows[0], "id": "pressure", "d13c": 1000., "d18o": 1000., "pressure_failed": True},
+                 {**rows[0], "id": "missing", "d13c": None, "d18o": None, "pressure_failed": True},
+                 {**rows[0], "id": "aborted", "issues": ["Qtegra reports an acquisition failure"], "pressure_failed": True},
+                 {**rows[0], "id": "unknown-pressure", "role": "unknown", "pressure_failed": True}]
+        self.assertEqual(failure_category(rows[-3], "d13c"), "no_signal")
+        for method, threshold in (("sigma", 1.5), ("iqr", 1.5)):
+            with self.subTest(method=method):
+                default = detect_qc_outliers(rows, method, threshold)
+                enabled = detect_qc_outliers(rows, method, threshold, True)
+                stats = lambda result: [f for f in result["flags"] if f["category"] == "statistical"]
+                self.assertEqual(stats(default), stats(enabled))
+                self.assertEqual({f["measurement_id"] for f in stats(default)}, {"5"})
+                self.assertTrue(all(f["population_n"] == 6 for f in stats(default)))
+                self.assertEqual({f["measurement_id"] for f in default["flags"] if f["category"] == "no_signal"}, {"missing", "aborted"})
+                self.assertFalse(any(f["category"] == "pressure_adjustment" for f in default["flags"]))
+                self.assertEqual({f["measurement_id"] for f in enabled["flags"] if f["category"] == "pressure_adjustment"}, {"pressure", "unknown-pressure"})
 
     def test_individual_outlier_removed_from_statistics_but_not_points_or_flags(self):
         points = [{"id": str(i), "value": v} for i, v in enumerate([-.1, 0, .1, 9])]

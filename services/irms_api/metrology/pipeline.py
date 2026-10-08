@@ -12,6 +12,19 @@ from .correction_review import comparison_rows, correction_review, screen_effect
 
 
 def identify(record: dict, config: MethodConfig, materials: dict) -> tuple[str, str | None]:
+    # Identifier 1 identifies the session QC even when the export says Unknown
+    # or the full label contains an incorrectly attributed species.
+    from .importer import measurement_identity
+
+    identifier1 = record.get("identifier1")
+    if identifier1 is None:
+        identifier1 = measurement_identity(record).get("identifier1")
+    qc = materials.get(config.qc_id)
+    if qc and str(identifier1 or "").strip().casefold() in {
+        str(name).strip().casefold() for name in [qc["name"], *qc.get("aliases", [])]
+        if str(name).strip()
+    }:
+        return "qc", config.qc_id
     role = record["source_role"]
     if role not in ("unknown", "qc", "carbonate_standard"):
         return role, None
@@ -156,8 +169,6 @@ def evaluate(run: dict, method: dict, materials: dict, measurements: list[dict],
         issues = result["issues"]
         if not row["label"].strip():
             issues.append("Missing sample identifier")
-        if row.get("evaluate") in (False, "False", "false", 0):
-            issues.append("Qtegra Evaluate is disabled")
         if row.get("pressure_failed"):
             issues.append("Qtegra pressure adjustment failed")
         status = str(row.get("status") or "").lower()
@@ -332,7 +343,7 @@ def evaluate(run: dict, method: dict, materials: dict, measurements: list[dict],
             "normalization_uncertainty_basis": "A1,A2,M1,M2 with full input covariance. No residual regression uncertainty from two means."}
 
 
-def process_value(result, isotope, model, run, *, monte_carlo=False):
+def process_value(result, isotope, model, run, *, monte_carlo=False, allow_extrapolation=False):
     """Evaluate the documented processing chain once, including imported stages."""
     value = result[isotope]
     imported_value = value
@@ -353,7 +364,7 @@ def process_value(result, isotope, model, run, *, monte_carlo=False):
         raise ValueError("Pre-applied correction has no matching approved coefficient")
     if preapplied and predictor is not None:
         raw_x += correction["slope"] * (predictor - correction["center"])
-    norm = corrected_normalize(raw_x, predictor, model, monte_carlo=monte_carlo)
+    norm = corrected_normalize(raw_x, predictor, model, monte_carlo=monte_carlo, allow_extrapolation=allow_extrapolation)
     if external and (not correction or preapplied):
         norm["value"] = value  # Retain the exported value exactly, including its rounding.
     norm["processing"] = {"input_value": value, "input_basis": run.get("input_basis", "instrument_delta"),

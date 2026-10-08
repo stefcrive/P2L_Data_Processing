@@ -25,13 +25,30 @@ export function cycleMolecularRatioFigure(rows: CycleRow[]): Record<string, unkn
     marker: { size: 6, symbol: role === "REF" ? "circle-open" : "circle" },
     hovertemplate: "%{x}: %{y:.6f}<extra>%{fullData.name}</extra>",
   })));
+  // Equal spans and tick intervals make vertical changes comparable across masses.
+  const bounds = ["y", "y2"].map(axis => {
+    const values = data.filter(trace => trace.yaxis === axis).flatMap(trace => trace.y)
+      .filter((value): value is number => value != null);
+    return values.length ? [Math.min(...values), Math.max(...values)] : [0, 0];
+  });
+  const spread = Math.max(...bounds.map(([min, max]) => max - min));
+  const targetStep = (spread || Math.max(...bounds.flat().map(Math.abs), 1) * 0.001) / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(targetStep));
+  const tickStep = ([1, 2, 2.5, 5, 10].find(step => step * magnitude >= targetStep) ?? 10) * magnitude;
+  const rangeWidth = (Math.ceil(spread / tickStep) + 2) * tickStep;
+  const ranges = bounds.map(([min, max]) => {
+    const lower = Math.floor(((min + max) / 2 - rangeWidth / 2) / tickStep) * tickStep;
+    return [lower, lower + rangeWidth];
+  });
   return { data, layout: {
     title: "Molecular ratios per cycle",
     margin: { l: 65, r: 15, t: 40, b: 40 },
     xaxis: { anchor: "y", dtick: 1, showticklabels: false },
-    yaxis: { title: "m/z 45/44", domain: [0.57, 1], tickformat: ".4f", automargin: true },
+    yaxis: { title: "m/z 45/44", domain: [0.57, 1], tickformat: ".4f", automargin: true,
+      range: ranges[0], autorange: false, tickmode: "linear", dtick: tickStep },
     xaxis2: { title: "Cycle", anchor: "y2", matches: "x", dtick: 1 },
-    yaxis2: { title: "m/z 46/44", domain: [0, 0.43], tickformat: ".4f", automargin: true },
+    yaxis2: { title: "m/z 46/44", domain: [0, 0.43], tickformat: ".4f", automargin: true,
+      range: ranges[1], autorange: false, tickmode: "linear", dtick: tickStep },
     showlegend: true,
     hovermode: "x unified",
   } };

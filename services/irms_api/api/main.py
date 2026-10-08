@@ -197,7 +197,7 @@ async def add_performance_headers(request: Request, call_next):
     if len(parts) >= 3 and parts[0] == "sessions" and request.method in ("POST", "PUT", "PATCH", "DELETE"):
         suffix = "/".join(parts[2:])
         protected = suffix.startswith(("calibration/run", "calibration/reset", "processing/edit", "processing/calibration/remove", "exports/dataset", "append", "exclude-file"))
-        if protected and store.session_exists(parts[1]) and store.load_metadata(parts[1]).get("metrology_link"):
+        if protected and not suffix.startswith("processing/edit") and store.session_exists(parts[1]) and store.load_metadata(parts[1]).get("metrology_link"):
             return JSONResponse(status_code=409, content={"detail":"This is a consultation copy linked to an approved metrological method. Use Results Station for scientific review, re-evaluation and traceable result export."})
     response = await call_next(request)
     duration_ms = (time.perf_counter() - started) * 1000.0
@@ -535,6 +535,7 @@ def _build_interpolation_source_frame(
         d13c_range=config.d13c_range,
         d18o_range=config.d18o_range,
         partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+        pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
     )
     sigma_level = float(config.sigma_level_data)
     statistical_method = str(getattr(config, "statistical_outlier_method", "Z-Score"))
@@ -563,6 +564,7 @@ def _build_interpolation_source_frame(
         "Partially Saturated Collectors",
         "Fully Saturated Collectors",
         "Failed Sample",
+        "Poor Pressure Adjustment",
     ]:
         excluded_common = excluded_common | category_masks.get(key, pd.Series(False, index=working_df.index, dtype=bool))
     target_mask = working_df.index.to_series().astype(str).isin(target_row_tokens)
@@ -732,6 +734,7 @@ def _build_processing_summary(df: pd.DataFrame, config: ProcessingConfig) -> dic
         d13c_range=config.d13c_range,
         d18o_range=config.d18o_range,
         partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+        pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
     )
     subset = _processing_subset(df, config)
     range_mask = _range_outlier_mask(subset, range_config)
@@ -877,6 +880,7 @@ def _chart_visible_client_output_frame(
         d13c_range=config.d13c_range,
         d18o_range=config.d18o_range,
         partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+        pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
     )
     filtered_df = _exclude_outliers_from_plot_base(
         filtered_df,
@@ -2905,6 +2909,7 @@ def _processing_linearity_preview_rows(
                         intensity_cols.add(value)
     attribute_cols = {
         "Date",
+        "Pressure Adjust failed with Target Intensity",
         "Identifier 1",
         "Identifier 2",
         "Species",
@@ -3125,6 +3130,9 @@ def _apply_processing_edit_batch(
         context.report(5, "loading_session", "Loading processing data")
     metadata = store.load_metadata(session_id)
     updated_df = store.load_frame(session_id)
+    metrology_link = metadata.get("metrology_link")
+    if metrology_link and any(edit.action not in ("set_identifier1", "set_identifier2", "set_species") for edit in edits):
+        raise HTTPException(status_code=409, detail="Only identifier and species label edits are supported here. Use Results Station for scientific changes.")
     cycles_df = store.load_cycles_frame(session_id)
     config = _load_processing_config(metadata)
     updated_edit_state = metadata.setdefault(
@@ -3179,6 +3187,24 @@ def _apply_processing_edit_batch(
     metadata["edit_state"] = updated_edit_state
     if context is not None:
         context.begin_commit(75, "saving_edits", "Saving processing edits")
+    if metrology_link:
+        from ..metrology.api import get_service
+        from ..metrology.repository import Repository
+        from ..metrology.service import Service
+        service = Service(Repository(metrology_link["repository_root"], demo=metrology_link.get("demo", False))) if metrology_link.get("repository_root") else get_service()
+        inverse = {label: mid for mid, label in metrology_link.get("row_mapping", {}).items()}
+        changes = {}
+        for edit in edits:
+            field = edit.action.removeprefix("set_")
+            for target in edit.targets:
+                mid = inverse.get(str(target.row_label))
+                if mid is None:
+                    raise HTTPException(status_code=422, detail="This observation is not linked to the results session")
+                changes.setdefault(mid, {})[field] = str(getattr(edit, field) or "").strip()
+        try:
+            service.edit_session_identities(metrology_link["results_session_id"], changes)
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     _persist_session_update(
         session_id,
         action="processing_edit" if len(edits) == 1 else "processing_edit_batch",
@@ -3290,6 +3316,7 @@ def processing_cycle_diagnostics(session_id: str, request: CycleDiagnosticsReque
             d13c_range=config.d13c_range,
             d18o_range=config.d18o_range,
             partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+            pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
         ),
         edit_state=metadata.get("edit_state", {}),
         sigma_level=float(config.sigma_level_data),
@@ -3388,6 +3415,7 @@ def _prepare_client_output_preview(
         d13c_range=config.d13c_range,
         d18o_range=config.d18o_range,
         partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+        pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
     )
     category_masks = build_category_masks(
         data_to_process,
@@ -3521,6 +3549,7 @@ def _export_dataset_sync(
         d13c_range=config.d13c_range,
         d18o_range=config.d18o_range,
         partial_saturated_outliers=not bool(config.overlays.show_saturated_collectors),
+        pressure_adjustment_as_outlier=bool(config.pressure_adjustment_as_outlier),
     )
     selected_standards = metadata.get("calibration", {}).get("selected_standards", [])
     all_standards = StandardsRepository.default().standards_list() + list(selected_standards)

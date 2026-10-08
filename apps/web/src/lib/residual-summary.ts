@@ -19,8 +19,8 @@ export function qcSdEvidence(review: CorrectionReview) {
   return review.reduction_interval95 && review.reduction_interval95[0] > 0 ? "SD reduction demonstrated" : "SD reduction inconclusive";
 }
 
-export function correctionUncertaintyRange(fit?: Fit) {
-  const points = fit?.points?.filter(point => !point.excluded_from_fit) ?? [];
+export function correctionUncertaintyRange(fit?: Fit & {application_points?: {u_correction?:number|null}[]}) {
+  const points = fit?.application_points ?? fit?.points?.filter(point => !point.excluded_from_fit) ?? [];
   // Missing uncertainty, including manual coefficients, must remain unavailable.
   if (!points.length || points.some(point => point.u_correction == null || !Number.isFinite(point.u_correction))) return null;
   const values = points.map(point => point.u_correction!);

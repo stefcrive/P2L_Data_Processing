@@ -12,7 +12,7 @@ class ProcessingOutlierCountTests(unittest.TestCase):
         df = pd.DataFrame({"Identifier 1": ["sample"] * 4, "Identifier 2": ["1", "2", "3", "4"]})
         masks = {key: pd.Series([False] * 4) for key in [
             "Statistical", "d13C Range", "d18O Range", "Signal Intensity", "Leak Rate",
-            "Failed Sample", "Partially Saturated Collectors", "Fully Saturated Collectors", "Manual Override",
+            "Failed Sample", "Poor Pressure Adjustment", "Partially Saturated Collectors", "Fully Saturated Collectors", "Manual Override",
         ]}
         for key in ["Statistical", "Signal Intensity", "Leak Rate", "Failed Sample"]:
             masks[key].iloc[0] = True

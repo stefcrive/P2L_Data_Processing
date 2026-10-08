@@ -269,7 +269,7 @@ class RunCommand(Decision):
     carbonate_material: Literal["calcite", "aragonite"] = "calcite"
     carbonate_correction_preapplied: bool = False
     results_session_id: str | None = None
-    sample_group: str = "Main batch"
+    sample_group: str = ""
     method_id: str | None = None
     qualification_id: str | None = None
     context: Literal["qualification", "routine"] = "routine"
@@ -348,6 +348,11 @@ class ResidualOverride(StrictModel):
     center: float | None = None
     offset: float = 0
     practical_threshold: float = Field(default=.01, gt=0)
+    application_scope: Literal["fit_population", "all_data"] = "fit_population"
+    extrapolate: bool = False
+    include_statistical_outliers: bool = False
+    u_slope: float | None = Field(default=None, ge=0)
+    u_quadratic: float | None = Field(default=None, ge=0)
 
 
 class ResidualOverrideCommand(Decision):
@@ -360,6 +365,15 @@ class ResidualOverrideCommand(Decision):
 class OutlierScreeningCommand(Decision):
     method: Literal["sigma", "iqr"] = "sigma"
     threshold: float = Field(default=3, ge=.5, le=10, allow_inf_nan=False)
+    pressure_adjustment_as_outlier: bool = False
+
+
+class SessionUncertaintyCommand(Decision):
+    coverage_factor: float = Field(gt=0, allow_inf_nan=False)
+
+
+class SessionFailedCorrectionCommand(Decision):
+    enabled: bool
 
 
 class SessionChartSettingsCommand(Decision):
