@@ -48,8 +48,12 @@ class AssignedValue(StrictModel):
     k: float | None = Field(default=None, gt=0)
     scale: str = "VPDB"
     coverage_probability: float | None = Field(default=None, gt=0, lt=1)
+    classification: Literal["certified", "recommended", "information", "defined", "unassigned"] = "recommended"
+    notes: str = ""
 
     def standard_uncertainty(self) -> float:
+        if self.classification in ("information", "unassigned"):
+            raise ValueError("Information-only values cannot define a calibration uncertainty")
         if self.value is None or self.uncertainty is None or self.uncertainty_type == "unset":
             raise ValueError("Assigned value and uncertainty interpretation must be verified")
         if self.scale != "VPDB":
@@ -73,6 +77,11 @@ class Material(StrictModel):
     traceability: str = ""
     verified: bool = False
     revision_of: str | None = None
+    catalog_code: str = ""
+    catalog_version: str = ""
+    availability: str = ""
+    source_url: str = ""
+    documents: list[dict[str, str]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_isotopes(self):
@@ -315,9 +324,11 @@ class ReleaseCommand(Decision):
 
 
 class PeriodCommand(Decision):
-    method_id: str
+    method_id: str | None = None
+    method_ids: list[str] = Field(default_factory=list)
+    session_ids: list[str] = Field(default_factory=list)
     name: str = Field(min_length=1)
-    evaluation_ids: list[str] = Field(min_length=2)
+    evaluation_ids: list[str] = Field(default_factory=list)
 
 
 class ResultsSessionCommand(Decision):

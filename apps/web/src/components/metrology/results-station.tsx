@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { PlotlyChart, type PlotlyChartProps } from "@/components/charts/plotly-chart";
 import { useTranslation } from "@/components/layout/language-provider";
-import { fmt, isotopeLabel, isotopes, metroRequest, type Fit, type Isotope, type RunDetail, type State } from "@/lib/metrology";
+import { fmt, isotopeLabel, isotopes, metroRequest, type Fit, type HistoryGroup, type Isotope, type RunDetail, type State } from "@/lib/metrology";
 import { Empty, Field, Inspect, Panel, Status } from "./shared";
 import { normalizationEnvelope } from "@/lib/metrology-envelopes";
 
@@ -24,6 +24,21 @@ export function Chart({ data, title, x, y, shapes = [], date = false, height = 3
   } }} /></div>;
 }
 const line = (y: number, color = "#a7b6bf", dash = "dot") => ({ type: "line", xref: "paper", x0: 0, x1: 1, y0: y, y1: y, line: { color, dash, width: 1 } });
+export function QcControlChart({ group, iso }: { group: HistoryGroup; iso: Isotope }) {
+  const tr = useTranslation();
+  const s = group.isotopes[iso];
+  const omitted = new Set(s.outlier_ids ?? []), flagged = new Set(s.flags.map(f=>f.id));
+  const points = s.points.filter(p=>!omitted.has(p.id));
+  const x = [points[0]?.at, points.at(-1)?.at];
+  const reference = (name: string, value: number | null, color: string, dash: string, showlegend = true) => value == null ? [] : [{type:"scatter", mode:"lines", name:tr(name), legendgroup:name, showlegend, x, y:[value,value], line:{color,dash,width:1.5}}];
+  return <Chart title={`${isotopeLabel[iso]} · ${group.material.name}`} x={tr("Acquisition date")} y={`${isotopeLabel[iso]} / ‰ VPDB`} date data={[
+    {type:"scatter",mode:"lines+markers",name:group.material.name,x:points.map(p=>p.at),y:points.map(p=>p.value),marker:{size:8,color:points.map(p=>flagged.has(p.id)||!p.qc_passed?"#bd4356":"#16827b")},line:{color:"#16827b",width:1}},
+    ...reference("True value",s.target,"#64748b","dash"), ...reference("Average",s.mean,"#16827b","solid"),
+    ...reference("Average ±1σ",s.mean!=null&&s.sd!=null?s.mean+s.sd:null,"#16827b","dot"),
+    ...reference("Average ±1σ",s.mean!=null&&s.sd!=null?s.mean-s.sd:null,"#16827b","dot",false),
+    ...(s.limits??[]).flatMap((v,i)=>reference("±3 SD limits",v,"#bd4356","dash",i===0)),
+  ]}/>;
+}
 function fitTraces(fit: Fit | undefined, name: string, color: string, offset = 0) {
   if (!fit?.points?.length) return [];
   const xx = fit.points.map(p => p.x), yy = fit.points.map(p => p.y - offset);
@@ -173,15 +188,15 @@ export function LongTermCharts({ state, openRun, highlightRunIds = [] }: { state
     <Field label={tr("QC isotope")}><select value={iso} onChange={e=>setIso(e.target.value as Isotope)}>{isotopes.map(i=><option key={i} value={i}>{isotopeLabel[i]}</option>)}</select></Field>
     {openRun && history.filter(h=>h.isotopes[iso].flags.length).slice(0,1).map(h=>{const p=h.isotopes[iso].points.find(p=>h.isotopes[iso].flags.some(f=>f.id===p.id));return p&&<button className="metro-btn" key={h.key} onClick={()=>openRun(p.run_id)}>{tr("Inspect control signal")}</button>;})}
     </div><div className="station-qc-layout"><div>
-    <Chart title={`${isotopeLabel[iso]} · SHP2L`} x={tr("Acquisition date")} y="QC − assigned / ‰" date legendCollapsed data={qcHistoryTraces}/>
+    <Chart title={`${isotopeLabel[iso]} · ${[...new Set(history.map(h=>h.material.name))].join(", ") || "CQ"}`} x={tr("Acquisition date")} y="QC − assigned / ‰" date legendCollapsed data={qcHistoryTraces}/>
     </div><aside className="station-qc-statistics"><dl>
-      <div><dt>{tr("Individual SHP2L observations")}</dt><dd>{count}</dd></div>
-      <div><dt>{tr("Outliers omitted from SD")}</dt><dd>{history.reduce((n,h)=>n+(h.isotopes[iso].outlier_ids?.length??0),0)}</dd></div><div><dt>{tr("Routine runs")}</dt><dd>{new Set(history.flatMap(h=>h.isotopes[iso].points.map(p=>p.run_id))).size}</dd></div>
+      <div><dt>{tr("Individual QC observations")}</dt><dd>{count}</dd></div>
+      <div><dt>{tr("Outliers omitted from SD")}</dt><dd>{history.reduce((n,h)=>n+(h.isotopes[iso].outlier_ids?.length??0),0)}</dd></div><div><dt>{tr("Analytical acquisitions")}</dt><dd>{new Set(history.flatMap(h=>h.isotopes[iso].points.map(p=>p.run_id))).size}</dd></div>
       <div><dt>{tr("Method populations")}</dt><dd>{history.length}</dd></div>
       <div><dt>{tr("Active frozen u_prec")}</dt><dd>{numberText(state.active_method?.config.precision[iso],4)} ‰</dd></div>
       <div><dt>{tr("Current population SD without outliers")}</dt><dd>{numberText(active?.isotopes[iso].sd,4)} ‰</dd></div>
-    </dl><p className="metro-muted">{tr(selectedOrigin==="synthetic"?"Mock QC history":"Observed QC from raw exports")} · {tr("Saved outliers and points outside the frozen target ±3 SD limits are excluded from the chart and SD.")}</p></aside></div>
-    <details className="station-help"><summary>{tr("QC interpretation and evidence")}</summary><p className="metro-muted">{tr(active?.value_basis??"Corrected and normalized results")}. {tr("Observed and mock QC are kept in separate populations.")}</p><p className="metro-muted">{tr("Each method retains its own frozen ±3 SD limits. Qualification carousels are excluded from routine history. Red points mark failed run QC or control signals; no failed data are silently removed.")}</p><p className="metro-muted">{tr("Historical SD is adopted only through a reviewed period and a new method version.")}</p>
+    </dl><p className="metro-muted">{tr(selectedOrigin==="synthetic"?"Mock QC history":"Observed QC from raw exports")} · {tr("Session outliers are excluded from the chart and SD. Retained control-limit violations remain visible.")}</p></aside></div>
+    <details className="station-help"><summary>{tr("QC interpretation and evidence")}</summary><p className="metro-muted">{tr(active?.value_basis??"Corrected and normalized results")}. {tr("Observed and mock QC are kept in separate populations.")}</p><p className="metro-muted">{tr("Each method retains its own frozen ±3 SD limits. Qualification carousels appear as separate populations. Red points mark failed run QC or control signals; no failed data are silently removed.")}</p><p className="metro-muted">{tr("Historical SD is adopted only through a reviewed period and a new method version.")}</p>
     {openRun && <div className="metro-actions">{history.filter(h=>h.isotopes[iso].flags.length).map(h=>{const p=h.isotopes[iso].points.find(p=>h.isotopes[iso].flags.some(f=>f.id===p.id));return p&&<button className="metro-btn" key={h.key} onClick={()=>openRun(p.run_id)}>{tr("Inspect control signal")} · {h.population_label??`v${h.method_version}`}</button>;})}</div>}</details>
   </Panel>;
 }

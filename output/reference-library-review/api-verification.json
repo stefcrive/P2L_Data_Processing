@@ -1,0 +1,9 @@
+{
+  "materials": 11,
+  "history_groups": 13,
+  "pdf_status": 200,
+  "pdf_hash_valid": true,
+  "frontend_url": "http://127.0.0.1:3230",
+  "proxy_pdf_status": 200,
+  "proxy_pdf_hash_valid": true
+}

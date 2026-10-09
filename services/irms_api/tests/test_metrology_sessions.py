@@ -80,6 +80,12 @@ class ResultsSessionTests(unittest.TestCase):
                 row.update({"i44_v": intensity, "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 6.+p,
                             "Pressure Adjust failed with Target Intensity": True})
                 rows.append(row)
+        # A clustered low-signal failure must neither define nor receive this fit.
+        for i in range(12):
+            row = fixtures.row(len(rows)+1, "SHP2L", -10.-i, sample_type="QC Standard")
+            row.update({"i44_v": .01+.001*i, "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 6.1+.01*i,
+                        "Pressure Adjust failed with Target Intensity": True})
+            rows.append(row)
         for label, composition in (("unknown A", 2.), ("unknown B", 5.)):
             row = fixtures.row(len(rows)+1, label, composition+.2*2.-.04*10.)
             row.update({"i44_v": 10., "Pressure Adjust Target Intensity": 6., "Pressure Adjust Result Intensity": 8.,
@@ -95,6 +101,11 @@ class ResultsSessionTests(unittest.TestCase):
             self.assertEqual(fit["training_population"], "pressure_failed_qc")
             self.assertEqual(fit["n"], 20)
             self.assertEqual(fit["unknown_applied_n"], 2)
+            self.assertEqual(len(fit["screening"]["signal_excluded_ids"]), 12)
+            self.assertTrue(fit["validation"]["passed"])
+            for row in analysis["rows"][28:40]:
+                self.assertNotIn("residual_correction", row["isotopes"][iso])
+                self.assertIn("below the qualification minimum", row["failed_correction_attempts"][iso]["reason"])
             self.assertAlmostEqual(fit["model"]["slope"], .2, places=3)
             self.assertAlmostEqual(fit["model"]["intensity_slope"], -.04, places=3)
             self.assertAlmostEqual(fit["intensity_after"]["slope"], 0., places=12)

@@ -81,15 +81,20 @@ Missing pressure metadata alone does not establish a pressure issue. Failed acqu
 and no-signal analyses remain ineligible for either session correction.
 For each isotope, pressure-failed QC estimates a joint model of method-stage delta
 against pressure-adjustment result minus target and initial sample intensity.
-Manual and saved statistical exclusions do not train the model. Huber weights
-initialize the fit, then iterative three-MAD residual screening precedes final OLS.
+Manual and saved statistical exclusions do not train the model. Signals below the
+qualification's minimum I44 neither train nor receive pressure correction. Their
+original values and flags remain visible. A deterministic least-median plane
+initializes Huber refinement, then iterative three-MAD residual screening precedes final OLS.
 Screened QC IDs remain recorded and their observations remain visible. At least four
 QC, the method minimum, full predictor rank and residual degrees of freedom are required.
 The correction is `y_final = y - b*pressure - c*(initial_intensity-I0)`, with zero
 pressure difference and the median initial intensity of retained nonfailed QC as
 references. Unknown sample deltas never estimate these coefficients. Both predictors
 are part of one correction with their complete coefficient covariance. A reduction
-in fitting QC SD is required. If a joint model cannot be estimated, the pressure-only
+in fitting QC SD and leave-one-out corrected QC SD is required. Each held-out QC
+is corrected with coefficients estimated without that observation. Screening still
+uses the whole QC group, so this is internal cross-validation, not independent
+validation. A failed check blocks the joint correction. If a joint model cannot be estimated, the pressure-only
 model on nonfailed QC is explicitly labeled as a fallback. It requires at least three
 QC, the method minimum, predictor variation and a reduction in fitting QC SD.
 Pressure-affected analyses never receive ordinary residual linearity corrections,
@@ -215,6 +220,14 @@ Implemented: local persistence, immutable imports, material revisions, method fr
 The supported applied correction is a centered linear model selected and reviewed by the scientist. Memory corrections, jointly fitted multiple effects, nonlinear equations, non-negligible predictor uncertainty and correlations between coefficient estimates and anchor inputs require an expanded measurement model. This version supports their investigation and range restriction but cannot apply them. Automatic change-point estimation, authenticated electronic signatures and multi-user deployment are outside this local release.
 
 ## Reports and audit
+
+The reference-material library includes issuer records for IAEA-603, IAEA-610/611/612, NBS18, NBS19, IAEA-CO-1/8/9, USGS44 and LSVEC, researched on 2026-10-09. Archived and withdrawn materials remain identified as such. The current IAEA-603 certificate is dated 2026-06-30. Original issuer PDFs are bundled in `services/irms_api/metrology/reference_assets`, copied into the content-addressed store and attached to each immutable material revision. The source URLs are recorded alongside each attachment. IAEA's older TECDOC and archived NIST reports are explicitly identified as supporting or historical documents, not current lot certificates.
+
+The catalogue concerns bulk carbonate carbon/oxygen isotope reference materials from IAEA, NIST and USGS. Clumped-isotope community standards, enriched tracer bicarbonates, gases and radiocarbon-only materials are outside this catalogue. Carbon-only assignments and oxygen information values are not promoted to two-isotope certified calibrators. IAEA-610/611/612 use the issuer's approximately 100 µg carbon uncertainties; the approximately 10 mg alternatives are documented. An issuer-reported SD with no explicit combined-uncertainty interpretation remains pending laboratory review. USGS44 retains its VPDB-LSVEC scale. Physical lot verification remains required before qualification.
+
+Carousel matching accepts the material name or an exact registered alias in the sample label or Identifier 1. Approved methods retain their pinned reference revisions. Other recognized library materials are identified as reference standards with their assigned value and uncertainty metadata, without becoming calibration anchors automatically.
+
+Long-term QC uses the final session residual corrections and each session's saved isotope-specific outlier screening. It does not discard additional observations solely because they cross a frozen control limit. Qualification and routine sessions remain separate populations. Detached workbooks are omitted. Precision-period review selects complete sessions from compatible method versions, checks acquisition dates and intervention state, and freezes the corrected observations and exclusions with the reviewed statistics.
 
 Qualification dossiers include method conditions, material lots, carousel, test/effect reviews, QC, uncertainty and diagnostics. Client PDFs require a released result and contain final values, expanded uncertainties, k, VPDB, method and reviewer. Historical PDFs include separate QC populations and charts. Each PDF and JSON calculation snapshot is content-addressed and downloaded from stored bytes. Source and asset downloads verify their SHA-256 hashes. SQLite records and hash-linked audit entries resist accidental application-level changes; this is not an external tamper-proof archive against a database administrator.
 

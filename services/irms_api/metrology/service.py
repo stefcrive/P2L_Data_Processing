@@ -38,7 +38,12 @@ class Service(ResultsSessions):
 
     def material_map(self, db, method):
         ids = [*method["config"]["anchor_ids"], method["config"]["qc_id"]]
-        return {id_: self.repo.get(db, "materials", id_) for id_ in ids if id_}
+        selected = {id_: self.repo.get(db, "materials", id_) for id_ in ids if id_}
+        pinned_names = {m["name"].casefold() for m in selected.values()}
+        records = self.repo.list(db, "materials")
+        superseded = {m.get("revision_of") for m in records}
+        selected.update({m["id"]: m for m in records if m["id"] not in superseded and m["name"].casefold() not in pinned_names})
+        return selected
 
     def check_aliases(self, db, config):
         seen = {}
@@ -499,6 +504,8 @@ class Service(ResultsSessions):
             errors.append("Targeted verification is required after an intervention")
         # Session consultation shares this read; release() always loads fresh QC.
         for group in (self.qc_history(db, method["id"]) if history is None else history):
+            if group.get("context", "routine") != "routine":
+                continue
             if group.get("data_origin")!=("synthetic" if run.get("synthetic") else "observed"):
                 continue
             if group["period_key"] == run["period_key"] and any(s["status"] == "out_of_control" for s in group["isotopes"].values()):
@@ -558,21 +565,45 @@ class Service(ResultsSessions):
             return record
 
     def qc_history(self, db, method_id=None, period_id=None):
+        if period_id:
+            saved = self.repo.get(db, "periods", period_id)
+            if saved.get("corrected_qc_snapshot"):
+                if method_id and method_id not in saved["method_ids"]:
+                    return []
+                method = self.repo.get(db, "methods", saved["method_id"])
+                material = self.repo.get(db, "materials", saved["material_id"])
+                isotopes = {}
+                for iso, evidence in saved["corrected_qc_snapshot"].items():
+                    points = [*evidence["points"], *[{**p, "session_outlier": True} for p in evidence["excluded_session_outliers"]]]
+                    points.sort(key=lambda p: (p["at"], p["id"]))
+                    isotopes[iso] = control_summary(points, material["assigned"][iso]["value"], method["config"]["precision"][iso], exclude_outliers=True, session_outliers_only=True)
+                return [{"key": period_id, "method_id": method["id"], "method_version": method["version"],
+                         "material": material, "configuration": saved["configuration"], "period_key": saved["period_key"],
+                         "context": "routine", "population_label": saved["name"], "isotopes": isotopes,
+                         "observations": [], "run_count": len(saved["evaluation_ids"]), "precision_eligible": True,
+                         "value_basis": "Frozen corrected QC at period approval"}]
         filters = {"method_id": method_id} if method_id else {}
         observations = self.repo.list(db, "qc_observations", **filters)
         runs = {r["id"]: r for r in self.repo.list(db, "runs")}
         period = self.repo.get(db, "periods", period_id) if period_id else None
         owners={run_id:session for session in self.repo.list(db,"results_sessions") for run_id in session["run_ids"]}
-        from .qc_screening import stored_qc_screening
-        session_flags = set()
+        detached = {rid for session in self.repo.list(db, "results_sessions") for rid in session.get("detached_run_ids", [])} - owners.keys()
+        from .qc_screening import failure_category
+        session_flags, corrected = set(), {}
         for session in {s["id"]: s for r in observations if (s := owners.get(r["run_id"]))}.values():
-            screening = stored_qc_screening(self.repo, db, session, [runs[rid] for rid in session["run_ids"]])
-            session_flags.update((f["evaluation_id"], f["measurement_id"], f["isotope"]) for f in screening["flags"])
+            detail = self.processed_history_session(db, session)
+            session_flags.update((f["evaluation_id"], f["measurement_id"], f["isotope"])
+                                 for f in detail["residual_outliers"]["flags"])
+            for run in detail["runs"]:
+                evaluation = run.get("evaluation")
+                for row in (evaluation or {}).get("results", []):
+                    corrected[(evaluation["id"], row["id"])] = row
         groups = {}
         for row in observations:
             run = runs[row["run_id"]]
-            # Deliberate qualification mass levels are not a routine precision population.
-            if run["context"] != "routine":
+            if run["id"] in detached:
+                continue
+            if run["context"] != "routine" and run["id"] not in owners:
                 continue
             if period:
                 if row["evaluation_id"] not in period["evaluation_ids"]:
@@ -585,7 +616,7 @@ class Service(ResultsSessions):
             # Retrospective series do not demonstrate one homogeneous calibration
             # period. Keep their observed populations separate from each other too.
             population=owner["id"] if unverified and owner else "qualified"
-            key = f"{row['method_id']}:{row['material_id']}:{row['period_key']}:{origin}:{population}"
+            key = f"{row['method_id']}:{row['material_id']}:{row['period_key']}:{origin}:{population}:{run['context']}"
             if key not in groups:
                 method = self.repo.get(db, "methods", row["method_id"])
                 material = self.repo.get(db, "materials", row["material_id"])
@@ -593,29 +624,34 @@ class Service(ResultsSessions):
                                "material": material, "configuration": row["configuration"], "period_key": row["period_key"],
                                "rows": [], "config": method["config"],"data_origin":origin,
                                "results_session_id":owner["id"] if unverified and owner else None,
-                               "population_label":owner["project"] if unverified and owner else f"v{method['version']}",
-                               "value_basis":"Original externally referenced exports; historical calibration unverified" if run.get("calibration_verification")=="simulation_assumption" else "Corrected and normalized results",
-                               "use_original":run.get("calibration_verification")=="simulation_assumption"}
+                               "context": run["context"],
+                               "population_label": (owner["project"] if unverified and owner else f"v{method['version']}") + (" / qualification" if run["context"] == "qualification" else ""),
+                               "value_basis":"Final session results after residual correction"}
+            final = corrected.get((row["evaluation_id"], row["measurement_id"]))
+            if final:
+                row = {**row, "isotopes": final.get("isotopes", {}), "excluded": final.get("excluded", False),
+                       "history_excluded": {iso: bool(failure_category(final, iso)) and not final.get("isotopes", {}).get(iso, {}).get("session_qc_admitted") for iso in ISOTOPES}}
             groups[key]["rows"].append(row)
         output = []
         for group in groups.values():
             rows = sorted(group.pop("rows"), key=lambda r: (r["acquired_at"] or r["created_at"], r["sequence"]))
             config = group.pop("config")
-            use_original=group.pop("use_original")
             group["isotopes"] = {}
             for iso in ISOTOPES:
-                points = [{"id": r["id"], "value": r["raw"][iso] if use_original else r["isotopes"][iso]["value"], "run_id": r["run_id"],
-                           "at": r["acquired_at"] or r["created_at"], "qc_passed": r["qc_passed"], "issues": r["issues"],
+                points = [{"id": r["id"], "value": r["isotopes"][iso]["value"], "run_id": r["run_id"],
+                           "session_id": owners.get(r["run_id"], {}).get("id"), "at": r["acquired_at"] or r["created_at"], "qc_passed": r["qc_passed"], "issues": r["issues"],
                            "session_outlier": (r["evaluation_id"], r["measurement_id"], iso) in session_flags}
-                          for r in rows if not r["excluded"] and (r["raw"].get(iso) is not None if use_original else iso in r["isotopes"])]
-                group["isotopes"][iso] = control_summary(points, group["material"]["assigned"][iso]["value"], config["precision"][iso], exclude_outliers=True)
+                          for r in rows if not r["excluded"] and iso in r["isotopes"] and not r.get("history_excluded", {}).get(iso)]
+                group["isotopes"][iso] = control_summary(points, group["material"]["assigned"][iso]["value"], config["precision"][iso], exclude_outliers=True, session_outliers_only=True)
             group["observations"] = rows
             group["run_count"] = len({r["run_id"] for r in rows})
             group["precision_eligible"] = period is not None
             output.append(group)
-        return output
+        return sorted(output, key=lambda g: g["context"] != "routine")
 
     def create_period(self, command):
+        if command.session_ids:
+            return self.create_session_period(command)
         with self.repo.connect(write=True) as db:
             evaluations = [self.repo.get(db, "evaluations", id_) for id_ in dict.fromkeys(command.evaluation_ids)]
             if len({e["run_id"] for e in evaluations}) != len(evaluations) or len(evaluations) < 2:
@@ -642,6 +678,61 @@ class Service(ResultsSessions):
             record = self.repo.insert(db, "periods", {**command.model_dump(exclude={"method_id"}), "statistics": stats,
                                       "period_key": runs[0]["period_key"], "configuration": method["config"]["configuration"],
                                       "material_id": material["id"], "estimator": "SD of individual observations, not SE of mean"}, method_id=command.method_id)
+            self.repo.audit(db, "qc_period_reviewed", record["id"], command.actor, command.reason, after=record)
+            return record
+
+    def create_session_period(self, command):
+        """Freeze corrected QC from complete sessions, with method compatibility checked."""
+        with self.repo.connect(write=True) as db:
+            sessions = [self.repo.get(db, "results_sessions", sid) for sid in dict.fromkeys(command.session_ids)]
+            selected_methods = set(command.method_ids or ([command.method_id] if command.method_id else []))
+            if not selected_methods or any(s["method_id"] not in selected_methods or s["context"] != "routine" for s in sessions):
+                raise ValueError("Select routine sessions from the selected method versions")
+            methods = {s["method_id"]: self.repo.get(db, "methods", s["method_id"]) for s in sessions}
+            baseline = next(iter(methods.values()))
+            # Different version numbers are allowed, but changes to these properties
+            # require separate reviewed precision populations.
+            keys = ("instrument", "configuration", "qc_id", "anchor_ids", "reaction_temperature_c", "preparation", "acquisition", "corrections")
+            if any(any(m["config"].get(k) != baseline["config"].get(k) for k in keys) for m in methods.values()):
+                raise ValueError("Selected methods have incompatible instrument, preparation, calibration or QC material settings")
+            runs = [self.repo.get(db, "runs", rid) for s in sessions for rid in s["run_ids"]]
+            if len({r["id"] for r in runs}) != len(runs) or len(runs) < 2:
+                raise ValueError("Select complete sessions containing at least two distinct acquisitions")
+            if any(not r.get("latest_evaluation_id") for r in runs):
+                raise ValueError("Evaluate every acquisition in the selected sessions first")
+            if len({bool(r.get("synthetic")) for r in runs}) > 1:
+                raise ValueError("Observed and synthetic QC cannot share a precision period")
+            if len({r["period_key"] for r in runs}) != 1 or len({r.get("acquired_date") for r in runs}) < 2 or any(not r.get("acquired_date") for r in runs):
+                raise ValueError("Use multiple acquisition dates within one intervention period")
+            evaluations = [self.repo.get(db, "evaluations", r["latest_evaluation_id"]) for r in runs]
+            if any(e["run_revision"] != r["revision"] or not e["ready"] for r, e in zip(runs, evaluations)):
+                raise ValueError("Use current passing evaluations with unchanged inputs")
+            history = self.qc_history(db)
+            selected_run_ids = {r["id"] for r in runs}
+            stats, evidence = {}, {}
+            material = self.repo.get(db, "materials", baseline["config"]["qc_id"])
+            for iso in ISOTOPES:
+                retained, omitted = [], []
+                for group in history:
+                    summary_ = group["isotopes"][iso]
+                    for point in summary_["points"]:
+                        if point["run_id"] in selected_run_ids:
+                            (omitted if point["id"] in summary_["outlier_ids"] else retained).append(point)
+                retained.sort(key=lambda p: (p["at"], p["id"]))
+                if len(retained) < 2:
+                    raise ValueError("Insufficient retained corrected QC observations")
+                for mid, method in methods.items():
+                    points = [p for p in retained if next(r for r in runs if r["id"] == p["run_id"])["method_id"] == mid]
+                    control = control_summary(points, material["assigned"][iso]["value"], method["config"]["precision"][iso])
+                    if control["flags"]:
+                        raise ValueError("Investigate retained QC control signals before approving a precision period")
+                stats[iso] = summary([p["value"] for p in retained])
+                evidence[iso] = {"points": retained, "excluded_session_outliers": omitted}
+            record = self.repo.insert(db, "periods", {**command.model_dump(exclude={"method_id"}),
+                "method_ids": sorted(methods), "evaluation_ids": [e["id"] for e in evaluations],
+                "statistics": stats, "corrected_qc_snapshot": evidence, "period_key": runs[0]["period_key"],
+                "configuration": baseline["config"]["configuration"], "material_id": material["id"],
+                "estimator": "SD of individual final session QC observations after session outlier exclusions"}, method_id=baseline["id"])
             self.repo.audit(db, "qc_period_reviewed", record["id"], command.actor, command.reason, after=record)
             return record
 
@@ -682,7 +773,7 @@ class Service(ResultsSessions):
                 state = "requalification_triggered"
             active_events = [e for e in interventions if active and e["instrument"] == active["config"]["instrument"]]
             current_period = active_events[-1]["id"] if active_events else "initial"
-            active_history = [h for h in history if active and h["method_id"] == active["id"] and h["period_key"] == current_period and
+            active_history = [h for h in history if h.get("context") == "routine" and active and h["method_id"] == active["id"] and h["period_key"] == current_period and
                               (not self.repo.demo or h.get("data_origin")=="synthetic")]
             if any(s["status"] == "out_of_control" for h in active_history for s in h["isotopes"].values()):
                 state = "out_of_control"

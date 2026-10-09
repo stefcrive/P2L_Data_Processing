@@ -59,7 +59,7 @@ try {
     $ready = $false
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
         if ($backend.HasExited) { throw "Backend stopped. See $runtimeDirectory" }
-        try { $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$BackendPort/metrology/state" -TimeoutSec 2; if ($response.StatusCode -eq 200) { $ready = $true; break } } catch { }
+        try { $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$BackendPort/health" -TimeoutSec 2; if ($response.StatusCode -eq 200) { $ready = $true; break } } catch { }
         Start-Sleep -Milliseconds 500
     }
     if (-not $ready) { throw "Backend did not become ready. See $runtimeDirectory" }

@@ -122,6 +122,14 @@ test('joint pressure correction identifies its training population and remaining
   assert.match(html,/-0.05000 \/ 0.00000/);
 });
 
+test('pressure fit reports minimum signal and rejected cross-validation',()=>{
+  const failed={status:'not_improved',n:20,minimum_sample_intensity:3.55,
+    validation:{before:{sd:.72},after:{sd:.77},passed:false}};
+  const html=renderToStaticMarkup(React.createElement(SessionResiduals,{...props,analysis:{...context,failed_analysis_corrections:{d13c:failed}}}));
+  for(const label of ['Minimum sample signal for pressure correction','Leave-one-out QC SD before / after','Not applied: cross-validation did not improve QC SD'])assert.ok(html.includes(translate(label)));
+  assert.match(html,/0.7200 \/ 0.7700/);
+});
+
 test('gear parameters supply manual coefficient uncertainties and recalculate directly',()=>{
   const {ResidualControls}=load('components/metrology/residual-controls.tsx');
   const override={enabled:true,algorithm:'quadratic',slope:.01,quadratic:.001,offset:0,u_slope:.002,u_quadratic:.0001};

@@ -48,6 +48,16 @@ class PressureCorrectionTests(unittest.TestCase):
         self.assertIsNone(fit_pressure_failed_qc([{**p, "intensity": 2*p["x"]+20} for p in self.points()], 3, 6.))
         self.assertIsNone(fit_pressure_failed_qc([{**p, "x": 0.} for p in self.points()], 3, 6.))
 
+    def test_training_sd_reduction_does_not_override_failed_cross_validation(self):
+        rng = np.random.default_rng(1)
+        points = [{"id": str(k), "x": float(p), "intensity": float(i), "y": float(y)}
+                  for k, (p, i, y) in enumerate(zip(rng.normal(size=20), rng.uniform(4, 20, 20), rng.normal(size=20)))]
+        fit = fit_pressure_failed_qc(points, 3, 6.)
+        self.assertLess(fit["after"]["sd"], fit["before"]["sd"])
+        self.assertGreater(fit["validation"]["after"]["sd"], fit["before"]["sd"])
+        self.assertFalse(fit["validation"]["passed"])
+        self.assertEqual(fit["status"], "not_improved")
+
 
 if __name__ == "__main__":
     unittest.main()

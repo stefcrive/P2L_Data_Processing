@@ -4,6 +4,7 @@ Robust residual screening precedes the final OLS fit. Report that screening and
 the in-sample slopes; neither is independent validation of corrected samples.
 """
 import math
+from itertools import combinations
 
 import numpy as np
 
@@ -23,10 +24,28 @@ def fit_pressure_failed_qc(points, minimum_qc, intensity_ref):
     design = np.column_stack((np.ones(len(points)), (predictors-origin)/scale))
     if np.linalg.matrix_rank(design) != 3:
         return None
-    # Huber weights keep extreme isotope observations from defining the initial
-    # trend. Screening is on regression residuals, not on raw deltas with a trend.
-    weights = np.ones(len(points))
     floor = max(1e-12, float(np.max(np.abs(y)))*1e-12)
+    # OLS initialization can let a cluster of near-zero-signal failures mask
+    # itself and reverse the fitted trend. Start from a least-median residual
+    # plane, then refine with Huber weights. Sampling is deterministic.
+    if len(points) <= 16:
+        subsets = combinations(range(len(points)), 3)
+    else:
+        rng = np.random.default_rng(0)
+        subsets = (rng.choice(len(points), 3, replace=False) for _ in range(512))
+    best_beta = np.linalg.lstsq(design, y, rcond=None)[0]
+    best_score = float(np.median(np.square(y-design@best_beta)))
+    for subset in subsets:
+        indices = list(subset)
+        if np.linalg.matrix_rank(design[indices]) != 3:
+            continue
+        candidate = np.linalg.solve(design[indices], y[indices])
+        score = float(np.median(np.square(y-design@candidate)))
+        if score < best_score:
+            best_beta, best_score = candidate, score
+    residual = y-design@best_beta
+    spread = max(floor, 1.4826*float(np.median(np.abs(residual-np.median(residual)))))
+    weights = np.minimum(1., 1.345*spread/np.maximum(np.abs(residual), floor))
     for _ in range(100):
         weighted = design*np.sqrt(weights[:, None])
         beta = np.linalg.lstsq(weighted, y*np.sqrt(weights), rcond=None)[0]
@@ -60,6 +79,19 @@ def fit_pressure_failed_qc(points, minimum_qc, intensity_ref):
     corrected = y+adjustments
     before, after = summary(y[keep].tolist()), summary(corrected[keep].tolist())
     improved = before["sd"] and before["sd"]-after["sd"] > max(1e-12, before["sd"]*1e-9)
+    # Check each retained QC with coefficients estimated without that observation.
+    # This is internal cross-validation after screening, not independent validation.
+    held_out = []
+    retained_indices = np.flatnonzero(keep)
+    for index in retained_indices:
+        train = retained_indices[retained_indices != index]
+        if np.linalg.matrix_rank(design[train]) != 3:
+            break
+        coefficients_loo = np.linalg.lstsq(design[train], y[train], rcond=None)[0][1:]/scale
+        held_out.append(float(y[index]-contrast[index]@coefficients_loo))
+    cross_validated = summary(held_out)
+    validated = (len(held_out) == n and before["sd"] and cross_validated["sd"] is not None
+                 and before["sd"]-cross_validated["sd"] > max(1e-12, before["sd"]*1e-9))
     result = regression(predictors[keep, 0].tolist(), corrected[keep].tolist())
     intensity_after = regression(predictors[keep, 1].tolist(), corrected[keep].tolist())
     # Fitting removes these slopes by construction; do not present their
@@ -68,14 +100,17 @@ def fit_pressure_failed_qc(points, minimum_qc, intensity_ref):
         diagnostic.update(slope_se=None, slope_ci95=None, covariance=None, hc3_covariance=None,
                           intercept_se=None, interpretation="In-sample corrected-QC diagnostic")
     result.update(
-        status="ready" if improved else "not_improved", n=n,
+        status="ready" if improved and validated else "not_improved", n=n,
+        validation={"method": "Leave-one-out QC after residual screening", "before": before,
+                    "after": cross_validated, "passed": bool(validated),
+                    "limitation": "Screening uses the full QC group; this is internal cross-validation, not independent validation."},
         before=before, after=after, sd_reduction_fraction=1-after["sd"]/before["sd"] if before["sd"] else 0.,
         fit_range=[float(predictors[keep, 0].min()), float(predictors[keep, 0].max())],
         intensity_fit_range=[float(predictors[keep, 1].min()), float(predictors[keep, 1].max())],
         training_population="pressure_failed_qc", screening_status="robust_residual_screening",
         training_ids=[p["id"] for p, retained in zip(points, keep) if retained],
         fit_excluded_ids=[p["id"] for p, retained in zip(points, keep) if not retained],
-        screening={"method": "Huber initialization, then iterative 3-MAD residual screening and OLS",
+        screening={"method": "Least-median plane initialization, Huber refinement, iterative 3-MAD residual screening and OLS",
                    "candidate_n": len(points), "retained_n": n, "residual_threshold": 3*spread},
         intensity_before=regression(predictors[keep, 1].tolist(), y[keep].tolist()),
         intensity_after=intensity_after,

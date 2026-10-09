@@ -205,7 +205,8 @@ class WorkflowTests(unittest.TestCase):
 
     def prepare(self, mass_effect=0.):
         state = self.service.state()
-        for original in state["materials"]:
+        selected_ids = {*state["methods"][0]["config"]["anchor_ids"], state["methods"][0]["config"]["qc_id"]}
+        for original in (m for m in state["materials"] if m["id"] in selected_ids):
             assigned = {iso: AssignedValue(value={"NBS18": -10., "NBS19": 10., "SHP2L": 0.}[original["name"]], uncertainty=.02, uncertainty_type="standard") for iso in ("d13c", "d18o")}
             self.service.save_material(MaterialCommand(**DECISION, material=Material(name=original["name"], aliases=[original["name"]], lot="TEST-ONLY", certificate="Synthetic test certificate", assigned=assigned, verified=True, revision_of=original["id"])))
         method = self.service.state()["methods"][0]
@@ -258,7 +259,7 @@ class WorkflowTests(unittest.TestCase):
         state = self.service.state()
         self.assertIsNone(state["active_method"])
         anchors = [m for m in state["materials"] if m["name"].startswith("NBS")]
-        self.assertTrue(all(m["assigned"]["d13c"]["value"] is None for m in anchors))
+        self.assertTrue(all(not m["verified"] for m in anchors))
         qc = next(m for m in state["materials"] if m["name"] == "SHP2L")
         self.assertEqual(qc["assigned"]["d13c"]["value"], -.75)
         self.assertEqual(qc["assigned"]["d13c"]["uncertainty_type"], "unset")

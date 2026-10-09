@@ -231,7 +231,7 @@ def budget(components: list[dict], k: float, covariance=None) -> dict:
             "covariance": cov.tolist(), "unit": "per mille"}
 
 
-def control_summary(points: list[dict], target: float | None, baseline_sd: float | None, *, exclude_outliers: bool = False) -> dict:
+def control_summary(points: list[dict], target: float | None, baseline_sd: float | None, *, exclude_outliers: bool = False, session_outliers_only: bool = False) -> dict:
     values = [p["value"] for p in points]
     stats_ = summary(values)
     flags = []
@@ -248,7 +248,7 @@ def control_summary(points: list[dict], target: float | None, baseline_sd: float
                 if np.all(diff > 0) or np.all(diff < 0):
                     flags.append({"id": p["id"], "rule": "six_point_trend"})
     # A trend/run signal is not an individual outlier. Keep those observations.
-    outlier_ids = {flag["id"] for flag in flags if flag["rule"] == "outside_3sd"} if exclude_outliers else set()
+    outlier_ids = {flag["id"] for flag in flags if flag["rule"] == "outside_3sd"} if exclude_outliers and not session_outliers_only else set()
     if exclude_outliers:
         for point in points:
             if point.get("session_outlier"):
@@ -256,7 +256,7 @@ def control_summary(points: list[dict], target: float | None, baseline_sd: float
                 flags.append({"id": point["id"], "rule": "session_qc_outlier"})
         stats_ = summary([p["value"] for p in points if p["id"] not in outlier_ids])
     return {**stats_, "total_n": len(points), "outlier_ids": sorted(outlier_ids),
-            "outlier_rule": "outside frozen target ±3 SD or saved session QC screening" if exclude_outliers else None,
+            "outlier_rule": ("saved session QC screening" if session_outliers_only else "outside frozen target ±3 SD or saved session QC screening") if exclude_outliers else None,
             "target": target, "baseline_sd": baseline_sd, "flags": flags, "points": points,
             "limits": [target - 3 * baseline_sd, target + 3 * baseline_sd] if target is not None and baseline_sd else None,
             "status": "out_of_control" if flags else ("no_signal_detected" if baseline_sd and len(points) >= 2 else "insufficient_history")}

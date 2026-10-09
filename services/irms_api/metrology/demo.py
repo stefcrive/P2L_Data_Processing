@@ -39,7 +39,8 @@ def populate(root: Path):
     initial = service.state()
     materials = []
     uncertainties = {"NBS18": [.035, .070], "NBS19": [.020, .040], "SHP2L": [.047, .089]}
-    for previous in initial["materials"]:
+    selected_ids = {*initial["methods"][0]["config"]["anchor_ids"], initial["methods"][0]["config"]["qc_id"]}
+    for previous in (m for m in initial["materials"] if m["id"] in selected_ids):
         name = previous["name"]
         material = Material(name=name, lot="DEMO-2026-01", aliases=previous["aliases"],
             supplier="Synthetic reference-material library", certificate=f"DEMO-{name}-001: illustrative values only",
@@ -134,6 +135,16 @@ def populate(root: Path):
             at(book["date"])
             run = service.import_run(book["filename"],(examples/book["filename"]).read_bytes(),RunCommand(**REVIEW,
                 method_id=method["id"],label=f"DEMO {book['scenario'].replace('_',' ')} · {book['date']}"))
+            # These fixtures already apply their independently validated intensity
+            # equation in the method. Do not fit an additional model to random QC noise.
+            from .session_processing import SIGNAL_EFFECTS
+            with service.repo.connect(write=True) as db:
+                session = next(s for s in service.repo.list(db, "results_sessions") if run["id"] in s["run_ids"])
+                session["residual_overrides"] = {f"{method['config']['qc_id']}:{effect}:{iso}": {"enabled": False}
+                    for effect in SIGNAL_EFFECTS for iso in ("d13c", "d18o")}
+                service.repo.update(db, "results_sessions", session["id"], session)
+                service.repo.audit(db, "demo_processing_configured", session["id"], REVIEW["actor"],
+                    "Synthetic study uses its independently validated method correction without an additional fit to random QC noise", after=session["residual_overrides"])
             ev = service.evaluate_run(run["id"],EvaluateCommand(**REVIEW))
             if book["scenario"] in ("released","ready_for_review"):
                 if not ev["ready"]:

@@ -76,6 +76,8 @@ class Repository:
                     db.execute(f"CREATE TRIGGER IF NOT EXISTS immutable_{table}_{operation} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, 'Append-only scientific record'); END")
             db.execute("CREATE TRIGGER IF NOT EXISTS frozen_method BEFORE UPDATE OF data ON methods WHEN OLD.status != 'draft' BEGIN SELECT RAISE(ABORT, 'Approved method is frozen'); END")
         self.seed()
+        from .reference_catalog import seed_catalog
+        seed_catalog(self)
         self.migrate_results_sessions()
 
     def instant(self):

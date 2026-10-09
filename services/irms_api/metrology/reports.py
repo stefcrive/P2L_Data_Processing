@@ -80,6 +80,7 @@ def build_session_dossier(snapshot: dict) -> bytes:
                for iso, effects in snapshot["session_residual_corrections"].items() for effect, fit in effects.items()], [34, 8, 16, 16, 26])
     if snapshot.get("correct_failed_analyses"):
         heading("Failed-analysis pressure correction")
+        story.append(p("Sample signals below the qualification minimum neither train nor receive pressure correction. A deterministic least-median plane initializes Huber refinement. A joint model must reduce both fitting QC SD and leave-one-out corrected QC SD. This check is conditional on the full-group residual screening and is not independent validation."))
         story.extend([p("Pressure-failed QC estimates one joint pressure-and-initial-intensity model after Huber initialization and iterative 3-MAD residual screening. y_final = y - b*pressure - c*(initial_intensity-I0), where I0 is the median initial intensity of retained nonfailed QC. Unknown samples never estimate coefficients. If the joint model is unavailable, the nonfailed-QC pressure-only model is labeled as a fallback. Only Qtegra pressure-flagged analyses receive this correction; ordinary session linearity is never stacked with it. Original review flags and observations remain. Corrected QC joins the session pool only if pooled SD decreases. A flat fitted trend is an in-sample result, not independent validation. The complete coefficient covariance contributes g Cov(beta) gT to the budget once; extrapolation is recorded."), Spacer(1, 6)])
         table(["Isotope", "QC n", "Slope", "Corrected", "Extrapolated", "Decision"],
               [[iso, fit.get("n", 0), number(fit.get("model", {}).get("slope")), fit.get("applied_n", 0),
@@ -90,6 +91,11 @@ def build_session_dossier(snapshot: dict) -> bytes:
                 number(fit.get("model", {}).get("intensity_slope")), len(fit.get("fit_excluded_ids", [])),
                 number(fit.get("intensity_after", {}).get("slope"))]
                for iso, fit in snapshot.get("failed_analysis_corrections", {}).items()], [12, 30, 18, 20, 20])
+        table(["Isotope", "Minimum signal / V", "Leave-one-out SD", "Check passed"],
+              [[iso, number(fit.get("minimum_sample_intensity")),
+                number(fit.get("validation", {}).get("after", {}).get("sd")),
+                str(fit.get("validation", {}).get("passed", "not available"))]
+               for iso, fit in snapshot.get("failed_analysis_corrections", {}).items()], [15, 30, 30, 25])
         table(["Isotope", "Unknowns corrected", "QC admitted", "Pool SD before", "Pool SD with candidates", "Admission"],
               [[iso, fit.get("unknown_applied_n", 0), len(fit.get("qc_pool", {}).get("admitted_ids", [])),
                 number(fit.get("qc_pool", {}).get("before", {}).get("sd")), number(fit.get("qc_pool", {}).get("after", {}).get("sd")),

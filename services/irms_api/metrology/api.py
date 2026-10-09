@@ -76,6 +76,16 @@ def material(command: MaterialCommand, s: Service = Depends(get_service)):
     return invoke(s.save_material, command)
 
 
+@router.get("/materials/{material_id}/documents/{digest}")
+def material_document(material_id: str, digest: str, s: Service = Depends(get_service)):
+    with s.repo.connect() as db:
+        record = invoke(s.repo.get, db, "materials", material_id)
+        document = next((d for d in record.get("documents", []) if d["sha256"] == digest), None)
+        if document is None:
+            raise HTTPException(404, "Document is not attached to this material revision")
+        return download(invoke(s.repo.read_blob, digest), document["filename"], "application/pdf")
+
+
 @router.post("/results-sessions")
 def create_results_session(command: ResultsSessionCommand, s: Service = Depends(get_service)):
     return invoke(s.save_results_session,command)

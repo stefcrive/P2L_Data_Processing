@@ -100,6 +100,8 @@ def apply_residual_correction(row, iso, x, selected, k, *, failed_analysis=False
 def correct_failed_results(rows, qc, failed, statistical, config, k):
     """Estimate pressure-mismatch bias on eligible QC; apply only to pressure issues."""
     decisions = {}
+    signal_limits = config.ranges.get("i44_v")
+    minimum_signal = max(0., signal_limits.low) if signal_limits else 0.
     for iso in ISOTOPES:
         targets = [row for row in rows if not row.get("excluded")
                    and failure_category(row, iso) == "pressure_adjustment"]
@@ -110,6 +112,7 @@ def correct_failed_results(rows, qc, failed, statistical, config, k):
         decision = {"status": "insufficient_evidence", "n": n, "applied_n": 0,
                     "source_effect": "pressure_dependence", "scope": "pressure_affected_analyses",
                     "training_population": "nonfailed_qc_fallback",
+                    "minimum_sample_intensity": minimum_signal,
                     "unknown_applied_n": 0, "failed_applied_n": 0}
         if n >= max(3, config.qc.minimum_qc):
             settings = ResidualOverride(enabled=True, center=0., application_scope="all_data", extrapolate=True)
@@ -122,13 +125,18 @@ def correct_failed_results(rows, qc, failed, statistical, config, k):
                 decision["status"] = "ready" if before_sd and before_sd-after_sd > max(1e-12, before_sd*1e-9) else "not_improved"
         by_id = {r["id"]: r for r in rows}
         affected_points = []
+        signal_excluded_ids = []
         for point in (qc or {}).get("isotopes", {}).get(iso, {}).get("pressure_dependence", {}).get("points", []):
             row = by_id.get(point["id"], {})
             intensity = row.get("initial_i44_v", row.get("i44_v"))
+            signal = row.get("i44_v", intensity)
             if (row.get("role") == "qc" and not row.get("excluded") and row["id"] not in statistical[iso]
                     and failure_category(row, iso) == "pressure_adjustment"
                     and intensity is not None and math.isfinite(intensity) and intensity > 0):
-                affected_points.append({**point, "intensity": intensity})
+                if signal is None or not math.isfinite(signal) or signal < minimum_signal:
+                    signal_excluded_ids.append(point["id"])
+                else:
+                    affected_points.append({**point, "intensity": intensity})
         reference_intensities = [by_id[p["id"]].get("initial_i44_v", by_id[p["id"]].get("i44_v"))
                                  for p in retained if p["id"] in by_id]
         reference_intensities = [x for x in reference_intensities if x is not None and math.isfinite(x) and x > 0]
@@ -136,15 +144,23 @@ def correct_failed_results(rows, qc, failed, statistical, config, k):
             joint_fit = fit_pressure_failed_qc(affected_points, config.qc.minimum_qc, float(np.median(reference_intensities)))
             if joint_fit is not None:
                 decision.update(joint_fit)
+                decision["fit_excluded_ids"] = [*signal_excluded_ids, *joint_fit["fit_excluded_ids"]]
+                decision["screening"].update(signal_excluded_ids=signal_excluded_ids,
+                                             minimum_sample_intensity=minimum_signal,
+                                             candidate_n=len(affected_points)+len(signal_excluded_ids))
                 decision["settings"] = ResidualOverride(enabled=True, center=0., application_scope="all_data", extrapolate=True).model_dump()
         extrapolated = 0
         for row in targets:
             reason = None
             x = row.get("pressure_mismatch_v")
+            intensity = row.get("initial_i44_v", row.get("i44_v"))
+            signal = row.get("i44_v", intensity)
             if decision["status"] != "ready":
                 reason = "No usable QC relationship between pressure-adjustment difference and delta."
             elif x is None or not math.isfinite(x):
                 reason = "Pressure-adjustment difference is missing."
+            elif signal is not None and math.isfinite(signal) and signal < minimum_signal:
+                reason = "Sample intensity is below the qualification minimum; pressure correction is not supported."
             elif "intensity_slope" in decision.get("model", {}) and (
                     row.get("initial_i44_v", row.get("i44_v")) is None or
                     not math.isfinite(row.get("initial_i44_v", row.get("i44_v"))) or
@@ -316,7 +332,7 @@ def process_session_results(detail):
     detail["residual_corrections"] = decisions
     admit_pressure_corrected_qc(rows, failed, statistical, pressure_decisions)
     detail["failed_analysis_corrections"] = pressure_decisions
-    detail["residual_processing_version"] = 9
+    detail["residual_processing_version"] = 10
     detail["residual_outliers"] = outliers
     for run in detail["runs"]:
         evaluation = run.get("evaluation")

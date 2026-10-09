@@ -6,7 +6,7 @@ from collections import defaultdict
 import numpy as np
 
 from ..domain.calibration.core import CARBONATE_ACID_FRACTIONATION_FACTORS, convert_d18o_carbonate_material
-from .models import ISOTOPES, Material, MethodConfig
+from .models import ISOTOPES, AssignedValue, Material, MethodConfig
 from .science import anchor_model, budget, corrected_normalize, regression, partial_regression, summary
 from .correction_review import comparison_rows, correction_review, screen_effects
 
@@ -29,19 +29,21 @@ def identify(record: dict, config: MethodConfig, materials: dict) -> tuple[str, 
     if role not in ("unknown", "qc", "carbonate_standard"):
         return role, None
     # A Reference cell can name the processing reference for an unknown, not its identity.
-    # Only the sample label is used for material matching.
-    identity = record["label"].strip().casefold()
+    # Match the sample label or Identifier 1, never the processing Reference cell.
+    identities = {record["label"].strip().casefold(), str(identifier1 or "").strip().casefold()} - {""}
     matches = [key for key, material in materials.items()
-               if identity in {s.strip().casefold() for s in [material["name"], *material["aliases"]]}]
+               if identities & {s.strip().casefold() for s in [material["name"], *material["aliases"]]}]
     if len(matches) > 1:
         return "ambiguous_material", None
     material_id = matches[0] if matches else None
-    if material_id == config.qc_id:
+    if material_id is not None and material_id == config.qc_id:
         return "qc", material_id
     if role == "qc":
         return "unassigned_qc", material_id
     if material_id in config.anchor_ids:
         return "anchor", material_id
+    if material_id:
+        return "reference_standard", material_id
     if role == "carbonate_standard":
         return "unassigned_standard", material_id
     return "unknown", None
@@ -84,11 +86,11 @@ def diagnostics(rows: list[dict], excluded_outlier_ids=None, *, include_all_data
     groups = defaultdict(list)
     by_sequence = {r["sequence"]: r for r in rows}
     for r in rows:
-        if r.get("excluded") or r["role"] not in ("anchor", "qc"):
+        if r.get("excluded") or r["role"] not in ("anchor", "qc", "reference_standard"):
             continue
         groups[r.get("material_id") or r["label"]].append(r)
     if include_all_data:
-        groups["__all__"] = [r for r in rows if not r.get("excluded") and r.get("role") in ("unknown", "qc", "anchor")]
+        groups["__all__"] = [r for r in rows if not r.get("excluded") and r.get("role") in ("unknown", "qc", "anchor", "reference_standard")]
     result = {"materials": [], "automatic_corrections": False,
               "note": "Fits use one material at a time. Associations are evidence for review, not proof of causation or a correction."}
     for material_id, points in groups.items():
@@ -164,7 +166,7 @@ def evaluate(run: dict, method: dict, materials: dict, measurements: list[dict],
         results.append(result)
         if role in ("unsupported_drift", "unrecognized", "ambiguous_material", "unassigned_qc", "unassigned_standard"):
             blockers.append(f"Analysis {row['source_index']}: resolve {role.replace('_', ' ')}")
-        if result["excluded"] or role not in ("anchor", "qc", "unknown"):
+        if result["excluded"] or role not in ("anchor", "qc", "unknown", "reference_standard"):
             continue
         issues = result["issues"]
         if not row["label"].strip():
@@ -241,7 +243,7 @@ def evaluate(run: dict, method: dict, materials: dict, measurements: list[dict],
     if not qc_material or not qc_material.get("verified"):
         blockers.append("Independent QC lot and assigned-value metadata are not verified")
     for result in results:
-        if result["excluded"] or result["role"] not in ("anchor", "qc", "unknown"):
+        if result["excluded"] or result["role"] not in ("anchor", "qc", "unknown", "reference_standard"):
             continue
         for iso, model in models.items():
             if result[iso] is None:
@@ -329,6 +331,11 @@ def evaluate(run: dict, method: dict, materials: dict, measurements: list[dict],
         for iso, value in result["isotopes"].items():
             target = material["assigned"][iso]["value"] if material else None
             value["assigned_value"] = target
+            value["assigned_uncertainty"] = material["assigned"][iso] if material else None
+            try:
+                value["assigned_standard_uncertainty"] = AssignedValue.model_validate(material["assigned"][iso]).standard_uncertainty() if material else None
+            except ValueError:
+                value["assigned_standard_uncertainty"] = None
             value["residual_to_assigned"] = value["value"] - target if target is not None else None
     comparable = comparison_rows(results, models, run)
     screened_before = screen_effects(diagnostics(comparable), config.correction_validation.practical_effect)

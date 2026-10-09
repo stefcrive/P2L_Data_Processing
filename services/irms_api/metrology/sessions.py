@@ -229,6 +229,47 @@ class ResultsSessions:
                            "sample_groups":sorted(set(session["groups"].values()) or {"Main batch"})})
         return result
 
+    def processed_history_session(self, db, session):
+        """Use the same session corrections and acquisition-cycle inputs as Results Station."""
+        from .analysis_evidence import analysis_evidence
+        from .qc_screening import stored_qc_screening
+        from .session_processing import process_session_results
+        from .repository import encode
+        from copy import deepcopy
+        import hashlib
+        method = self.repo.get(db, "methods", session["method_id"])
+        source_runs = [self.repo.get(db, "runs", rid) for rid in session["run_ids"]]
+        fingerprint = hashlib.sha256(encode({"session": session, "runs": source_runs, "method": method}).encode()).hexdigest()
+        cache = getattr(self, "_processed_history_cache", {})
+        cached = cache.get(session["id"])
+        if cached and cached[0] == fingerprint:
+            return deepcopy(cached[1])
+        runs = []
+        for run in source_runs:
+            rid = run["id"]
+            run["measurements"] = self.repo.list(db, "measurements", run_id=rid)
+            run["evaluation"] = self.repo.get(db, "evaluations", run["latest_evaluation_id"]) if run.get("latest_evaluation_id") else None
+            if run["evaluation"]:
+                source = self.repo.get(db, "raw_imports", run["raw_import_id"])
+                initial = {}
+                for row in run["measurements"]:
+                    cycles = analysis_evidence(row, source)["cycles"]
+                    if cycles:
+                        initial[row["id"]] = cycles[0]
+                for row in run["evaluation"]["results"]:
+                    cycle = initial.get(row["id"], {})
+                    row["initial_i44_v"] = cycle.get("i44_v", row.get("i44_v"))
+                    row["initial_reference_i44_v"] = cycle.get("reference_i44_v", row.get("reference_i44_v"))
+            runs.append(run)
+        detail = {**session, "runs": runs, "method": method,
+                  "saved_outliers": stored_qc_screening(self.repo, db, session, runs)}
+        process_session_results(detail)
+        if session["id"] not in cache and len(cache) >= 128:
+            cache.pop(next(iter(cache)))
+        cache[session["id"]] = (fingerprint, deepcopy(detail))
+        self._processed_history_cache = cache
+        return detail
+
     @reuse_measurement_identities()
     def results_session_detail(self, session_id, include_analysis=False):
         with self.repo.connect() as db:
