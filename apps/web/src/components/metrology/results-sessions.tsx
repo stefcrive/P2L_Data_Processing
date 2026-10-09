@@ -49,7 +49,7 @@ export function ResultsSessions(props:Props) {
     setError("");
     if(!selectedId){setDetail(null);return;}
     const controller=new AbortController();
-    metroRequest<ResultsSessionDetail>(`/results-sessions/${selectedId}`,{signal:controller.signal}).then(setDetail).catch(e=>{if(!controller.signal.aborted)setError(e.message);});
+    metroRequest<ResultsSessionDetail>(`/results-sessions/${selectedId}?include_analysis=true`,{signal:controller.signal}).then(setDetail).catch(e=>{if(!controller.signal.aborted)setError(e.message);});
     return ()=>controller.abort();
   },[selectedId,props.state,identityRefresh]);
   if(selectedId) return <div className="metro-stack">{error&&<div className="metro-note error" role="alert">{tr(error)} <button className="metro-btn" onClick={()=>props.navigate("results")}>{tr("All results sessions")}</button></div>}{detail?.id===selectedId?<SessionDetail key={detail.id} {...props} detail={detail} sessionNavigation={<button className="metro-btn" onClick={()=>props.navigate("results")}><ArrowLeft size={14}/>{tr("All results sessions")}</button>}/>:<p role="status">{tr("Opening saved results session…")}</p>}</div>;
@@ -116,7 +116,7 @@ export function SessionDetail({detail, qualificationReview, sessionNavigation, .
   const [groups,setGroups]=useState(detail.groups);
   const [toolId,setTool]=useState("");const [toolsError,setToolsError]=useState("");
   const [toolsAttempt,setToolsAttempt]=useState(0);
-  const [analysis,setAnalysis]=useState<SessionAnalysis|null>(null);
+  const [analysis,setAnalysis]=useState<SessionAnalysis|null>(detail.analysis??null);
   const [analysisError,setAnalysisError]=useState("");
   const [outlierMethod,setOutlierMethod]=useState(detail.outlier_screening?.method??"sigma");
   const [threshold,setThreshold]=useState(detail.outlier_screening?.threshold??3);
@@ -161,10 +161,11 @@ export function SessionDetail({detail, qualificationReview, sessionNavigation, .
   const analysisUrl=`/results-sessions/${detail.id}/${rangeQuery?"analysis-preview":"analysis"}?include_all_data=${includeAllData}`;
   const analysisRequest=useMemo(()=>rangeQuery?{method:"POST",body:rangeQuery}:undefined,[rangeQuery]);
   useEffect(()=>{
+    if(detail.analysis&&!rangeQuery&&!includeAllData){setAnalysis(detail.analysis);setAnalysisError("");return;}
     const controller=new AbortController();setAnalysisError("");
     const timer=setTimeout(()=>metroRequest<SessionAnalysis>(analysisUrl,{...analysisRequest,signal:controller.signal}).then(setAnalysis).catch(e=>{if(!controller.signal.aborted)setAnalysisError(e.message);}),rangeQuery?180:0);
     return ()=>{clearTimeout(timer);controller.abort();};
-  },[detail.id,revisionKey,analysisSettingsKey,analysisUrl,analysisRequest]);
+  },[detail.id,detail.analysis,revisionKey,analysisSettingsKey,analysisUrl,analysisRequest,rangeQuery,includeAllData]);
   const setLegacySession=useSessionStore(s=>s.setSessionId);
   const run=detail.runs.find(r=>r.id===runId)??detail.runs.at(-1);
   useEffect(()=>setGroups(detail.groups),[detail.groups]);
@@ -246,7 +247,7 @@ export function SessionDetail({detail, qualificationReview, sessionNavigation, .
           colorRowLabels:includeAllData?undefined:rangeRows.map(row=>row.row_label),
           colorScaleRowLabels:[...new Set(isotopes.flatMap(iso=>analysis.diagnostics_after.materials.find(m=>m.material_id===(includeAllData?"__all__":linearityMaterialId))?.isotopes[iso].intensity_dependence.points?.filter(p=>!p.excluded_from_fit&&p.id&&mapping[p.id]).map(p=>mapping[p.id!])??[]))],
           materialLabels:[...new Set(analysis.rows.filter(row=>row.material_id===materialId).map(row=>row.identifier1||row.label))],
-          outliers:{method:analysis.outliers.method,threshold:analysis.outliers.threshold,rows:[...analysis.outliers.flags,...analysis.qc_review_flags??[]].map(f=>({row:mapping[f.measurement_id],isotope:f.isotope==="d13c"?"d13C":"d18O",category:f.category??"statistical",excludeFromFit:f.category!=="range"&&!f.session_qc_admitted,reasons:f.reasons,hidden:!f.metadata_only&&(!outlierVisibility[f.isotope]||!outlierTypes[f.category??"statistical"])}))},
+          outliers:{method:analysis.outliers.method,threshold:analysis.outliers.threshold,rows:[...analysis.outliers.flags,...analysis.qc_review_flags??[]].map(f=>({row:mapping[f.measurement_id],isotope:f.isotope==="d13c"?"d13C":"d18O",category:f.category??"statistical",excludeFromFit:f.category!=="range"&&!f.session_qc_admitted,metadataOnly:f.metadata_only,reasons:f.reasons,hidden:!f.metadata_only&&(!outlierVisibility[f.isotope]||!outlierTypes[f.category??"statistical"])}))},
           outlierTable:<SessionOutlierTable analysis={analysis} review={(measurementId,runId)=>{const run=detail.runs.find(r=>r.id===runId);const row=run?.evaluation?.results.find(r=>r.id===measurementId);return run&&row?<RowReview {...props} row={row} run={run}/>:null;}}/>,
           controls:<div className="metro-stack">{tab!=="diagnostics"&&<Field label={tr("Symbol size")}><input type="number" min={2} max={24} value={symbolSize} onChange={e=>setSymbolSize(Math.max(2,Math.min(24,Number(e.target.value)||8)))}/></Field>}{tab==="calibration"&&<>
             <label className="metro-check"><input type="checkbox" checked={includeAllData} onChange={e=>setIncludeAllData(e.target.checked)}/>{tr("Include all available data in linearity analysis")}</label>

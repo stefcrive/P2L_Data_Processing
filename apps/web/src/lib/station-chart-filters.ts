@@ -4,7 +4,7 @@ import type { LinearityPreviewRow } from "./types";
 
 export type RangeKey = "signal" | "leak_rate" | "d13_raw" | "d18_raw";
 export type ChartRanges = Partial<Record<RangeKey, [number, number]>>;
-export type ChartFlag = {row:string; isotope:string; hidden?:boolean; excludeFromFit?:boolean; category?:string; reasons?:string[]};
+export type ChartFlag = {row:string; isotope:string; hidden?:boolean; excludeFromFit?:boolean; category?:string; reasons?:string[]; metadataOnly?:boolean; source?:"processing"};
 
 export function rangeFlags(rows: LinearityPreviewRow[], ranges: ChartRanges): ChartFlag[] {
   return rows.flatMap(row => {
@@ -64,12 +64,13 @@ export function fitVisibleMarkers(figure: Record<string, unknown>): Record<strin
   return {...figure, layout};
 }
 
-export function filterStationFigure(figure: Record<string, unknown>, flags: ChartFlag[], excludeStandardCurve = false) {
+export function filterStationFigure(figure: Record<string, unknown>, flags: ChartFlag[], excludeStandardCurve = false, standardVisibilityIndependent = false) {
   if (!Array.isArray(figure.data) || !flags.length) return figure;
   let filtered = false;
   const data = figure.data.map((trace: Record<string,unknown>) => {
-    const standard = excludeStandardCurve && String(trace.name).startsWith("Standard measured ");
-    const effective = standard ? flags.map(flag => ({...flag, hidden:flag.excludeFromFit !== false || flag.hidden})) : flags;
+    const standard = excludeStandardCurve && (String(trace.name).startsWith("Standard measured ") || (trace.meta as {standardOverlay?:boolean})?.standardOverlay || trace.yaxis === "y2");
+    const effective = standard && standardVisibilityIndependent ? flags.filter(flag => flag.excludeFromFit !== false).map(flag => ({...flag, hidden:true}))
+      : standard ? flags.map(flag => ({...flag, hidden:flag.excludeFromFit !== false || flag.hidden})) : flags;
     const next = qcOutlierDisplay(trace, effective);
     if (next !== trace && effective.some(flag => flag.hidden)) filtered = true;
     return next;

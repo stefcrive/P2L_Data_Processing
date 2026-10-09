@@ -3,9 +3,11 @@
 import { parseNumericToken } from "@/lib/numeric-token";
 
 import { SelectionCycleDiagnostics } from "@/components/diagnostics/selection-cycle-diagnostics";
-import { orderTraceByX } from "@/lib/plotly-order";
+import { orderTraceByX, alignedIsotopeAxes } from "@/lib/plotly-order";
 import { useContext } from "react";
 import { filterStationFigure, fitVisibleMarkers } from "@/lib/station-chart-filters";
+import { processingChartFlags, processingTraceVisibility, restoreProcessingOutlierRows, finalProcessingFigure } from "@/lib/processing-chart-display";
+import { processingOutlierHighlights } from "@/lib/qc-outlier-display";
 import { withSessionUncertainty } from "@/lib/metrology-envelopes";
 
 import { useTranslation } from "@/components/layout/language-provider";
@@ -1636,7 +1638,7 @@ function applyDuplicateHighlightsToFigure(
   for (const trace of cloned.data) {
     const traceName = String(trace.name ?? "").trim();
     const customdata = coerceVector(trace.customdata);
-    if (!customdata?.length || traceName === "Duplicate Samples" || traceName === "Edited Samples") {
+    if (!customdata?.length || trace.yaxis === "y2" || traceName === "Duplicate Samples" || traceName === "Edited Samples") {
       continue;
     }
     const x = coerceVector(trace.x);
@@ -1680,7 +1682,8 @@ function applyDuplicateHighlightsToFigure(
       y: points2d.map((point) => point.y),
       customdata: points2d.map((point) => point.customdata),
       hovertemplate,
-      marker: { color: "#c2410c", symbol: "diamond-open", size: 15, opacity: 1, line: { color: "#c2410c", width: 3 } },
+      meta: {duplicateHighlight: true}, zorder: 3,
+      marker: { color: "#92400e", symbol: "diamond", size: 12, opacity: 1, line: { color: "#451a03", width: 1.5 } },
     });
   }
   if (points3d.length) {
@@ -1694,7 +1697,8 @@ function applyDuplicateHighlightsToFigure(
       z: points3d.map((point) => point.z),
       customdata: points3d.map((point) => point.customdata),
       hovertemplate,
-      marker: { color: "#c2410c", symbol: "diamond-open", size: 10, opacity: 1, line: { color: "#c2410c", width: 3 } },
+      meta: {duplicateHighlight: true},
+      marker: { color: "#92400e", symbol: "diamond", size: 10, opacity: 1, line: { color: "#451a03", width: 1.5 } },
     });
   }
   return { ...cloned, data: nextData };
@@ -2285,6 +2289,7 @@ function getColorwayColor(layout: Record<string, unknown>, index: number): strin
 }
 
 function hideTraceSymbols(trace: Record<string, unknown>, traceIndex: number, layout: Record<string, unknown>): Record<string, unknown> | null {
+  if ((trace.meta as {qcHighlight?:boolean})?.qcHighlight || (trace.meta as {duplicateHighlight?:boolean})?.duplicateHighlight || isProcessingOverlayTrace(String(trace.name ?? ""))) return trace;
   if (!hasTraceMode(trace, "markers")) {
     return trace;
   }
@@ -2379,12 +2384,15 @@ function applyDisplayState(
   if (!Array.isArray(cloned.data)) {
     return cloned;
   }
+  // Compute both axes from the same population before changing standard visibility.
+  const standardAxisAlignment = alignedIsotopeAxes(cloned.data as Record<string, unknown>[], /18o/i.test(JSON.stringify(cloned.layout.yaxis)));
+  if (standardAxisAlignment) cloned.layout.meta = {...(cloned.layout.meta as object ?? {}), standardAxisAlignment};
   let traces = (cloned.data as Array<Record<string, unknown>>).map((trace, index) => ({ trace, index }));
   if (display.hideCalibrated) {
     traces = traces.filter(({ trace }) => !String(trace.name ?? "").startsWith("Calibrated"));
   }
   if (!display.overlayStandards) {
-    traces = traces.filter(({ trace }) => !String(trace.name ?? "").startsWith(STANDARD_MEASURED_TRACE_PREFIX));
+    traces = traces.filter(({ trace }) => !(trace.meta as {standardOverlay?:boolean})?.standardOverlay && !String(trace.name ?? "").startsWith(STANDARD_MEASURED_TRACE_PREFIX));
   }
   if (display.hideSymbols) {
     traces = traces
@@ -2394,7 +2402,9 @@ function applyDisplayState(
       })
       .filter((item): item is { trace: Record<string, unknown>; index: number } => item != null);
   }
-  let displayTraces = traces.map(({ trace }) => trace);
+  let displayTraces = traces.map(({ trace }) => String(trace.name ?? "").startsWith(STANDARD_MEASURED_TRACE_PREFIX)
+    ? {...trace, marker: {...(trace.marker as object ?? {}), color: "#0369a1", symbol: "diamond-open", size: 11, line: {color: "#0369a1", width: 2}}, line: {...(trace.line as object ?? {}), color: "#0369a1", dash: "dot"}}
+    : trace);
   if (display.runningAverage) {
     const averageTraces = displayTraces
       .map((trace, index) => buildRunningAverageTrace(trace, display.runningAveragePeriod, index))
@@ -2684,7 +2694,7 @@ function highlightSelectionSourceFigure(
     const preferred =
       target.isotopeKey === "cross"
         ? !traceName.startsWith("calibrated")
-        : traceName.startsWith("raw ");
+        : traceName.startsWith("raw ") || traceName === "final" || Boolean((trace.meta as {sessionUncertainty?:boolean})?.sessionUncertainty);
     matchedTraces.push({ trace, indexes, customdata, x, y, z, preferred });
   }
   const preferredMatches = matchedTraces.filter((item) => item.preferred);
@@ -4354,6 +4364,7 @@ function CheckboxField({
 function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }) {
   const tr = useTranslation();
   const consultation = useMetrologyConsultation();
+  const [isExpanded, setIsExpanded] = useState(false);
   if (!workspace.summary.metrics.length) {
     return null;
   }
@@ -4367,22 +4378,29 @@ function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }
 
   return (
     <section className={`overflow-hidden rounded-lg border border-stone-200 bg-white shadow-sm ${consultation ? "station-processing-summary" : ""}`} aria-labelledby="processing-summary-title">
-      <div className="flex flex-col gap-2 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex items-center gap-3">
-          <div>
-            <h2 id="processing-summary-title" className="text-sm font-semibold text-stone-900">{tr("Processing summary")}</h2>
-            <div className="text-xs text-stone-500">{tr("Metrics for the current processing configuration.")}</div>
-          </div>
-        </div>
-        {!consultation&&<div className="flex flex-wrap gap-1.5 text-xs text-stone-600">
+      <button
+        type="button"
+        className="flex w-full flex-col gap-2 px-4 py-3 text-left lg:flex-row lg:items-center lg:justify-between"
+        aria-expanded={isExpanded}
+        aria-controls="processing-summary-content"
+        onClick={() => setIsExpanded((expanded) => !expanded)}
+      >
+        <span className="flex items-center gap-3">
+          <span aria-hidden="true" className="text-xs text-stone-500">{isExpanded ? "▼" : "▶"}</span>
+          <span>
+            <span id="processing-summary-title" className="block text-sm font-semibold text-stone-900">{tr("Processing summary")}</span>
+            <span className="block text-xs text-stone-500">{tr("Metrics for the current processing configuration.")}</span>
+          </span>
+        </span>
+        {!consultation&&<span className="flex flex-wrap gap-1.5 text-xs text-stone-600">
           {summaryBadges.map((badge) => (
             <span key={badge.label} className="rounded-md bg-stone-100 px-2 py-1">
               {tr(badge.label)} <strong className="font-semibold text-stone-800">{tr(String(badge.value))}</strong>
             </span>
           ))}
-        </div>}
-      </div>
-      <div className="border-t border-stone-200">
+        </span>}
+      </button>
+      {isExpanded && <div id="processing-summary-content" className="border-t border-stone-200">
         <div className="grid divide-y divide-stone-200 sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-4">
           {workspace.summary.metrics.map((metric) => (
             <div key={metric.metric} className="min-w-0 px-3 py-2.5">
@@ -4396,7 +4414,7 @@ function ProcessingSummaryHero({ workspace }: { workspace: ProcessingWorkspace }
             </div>
           ))}
         </div>
-      </div>
+      </div>}
     </section>
   );
 }
@@ -6418,7 +6436,7 @@ function ProcessingPage() {
     activeConfig.identifier1_name_map,
     activeConfig.species_name_map,
   );
-  const applyPreviewFigure = (figure: Record<string, unknown> | undefined) => {
+  const applyPreviewFigure = (figure: Record<string, unknown> | undefined, chartKey?: string) => {
     if (!figure) return figure;
     const cached = previewFigureCache.get(figure);
     if (cached) return cached;
@@ -6437,17 +6455,32 @@ function ProcessingPage() {
     const draftFigure = hasPendingSelectionDrafts
       ? applySelectionDraftPreviewToFigure(processingFigure, selectionDraftValues, activeConfig, selectionDraftRowLabels)
       : processingFigure;
-    const displayed = hideDuplicateSymbology
-      ? draftFigure
-      : applyDuplicateHighlightsToFigure(draftFigure, duplicateSampleState.rowLabels);
-    const standardFlags = standardMasks ? [...standardMasks.rowsByLabel.keys()].flatMap(row=>ISOTOPE_KEYS.flatMap(isotope=>{
+    const displayed = draftFigure;
+    const processingFlags = standardMasks ? [...standardMasks.rowsByLabel.keys()].flatMap(row=>ISOTOPE_KEYS.flatMap(isotope=>{
       const keep=isotope==="d13C"?standardMasks.baseD13:standardMasks.baseD18;
-      return !keep.has(row)&&metrologyResults[row]?.role==="qc"?[{row,isotope,hidden:true}]:[];
+      if (keep.has(row)) return [];
+      const statistical = (isotope === "d13C" ? standardMasks.statisticalD13 : standardMasks.statisticalD18).has(row);
+      const manual = (isotope === "d13C" ? standardMasks.manualD13 : standardMasks.manualD18).has(row);
+      const failed = standardMasks.failed.has(row);
+      const full = standardMasks.full.has(row);
+      const partial = standardMasks.partialExcluded.has(row);
+      const pressure = standardMasks.poorPressure.has(row);
+      const category = manual ? "manual" : full ? "full" : partial ? "partial" : failed ? "failed" : pressure ? "pressure_adjustment" : statistical ? "statistical" : "range";
+      const reasons = standardMasks.leak.has(row) ? ["Leak Rate Range"]
+        : standardMasks.signal.has(row) ? ["Signal Intensity Range"]
+        : standardMasks.d13Range.has(row) ? ["d13C Range"]
+        : standardMasks.d18Range.has(row) ? ["d18O Range"] : [];
+      return [{row, isotope, category, reasons, source: "processing" as const}];
     })) : [];
-    const flags=[...(stationFilters?.flags??[]).map(flag=>({...flag,hidden:flag.hidden || (flag.category==="statistical"?!activeConfig.overlays.show_statistical_outliers:flag.category==="range"?!activeConfig.overlays.show_range_outliers:flag.category==="manual"?!activeConfig.overlays.show_manual_outliers:flag.category==="failed"||flag.category==="no_signal"?!activeConfig.overlays.show_failed_samples:false)})),...standardFlags];
-    const withUncertainty = withSessionUncertainty(displayed, metrologyResults, tr("Final"), flags);
-    const filtered = withUncertainty ? filterStationFigure(withUncertainty,flags,true) : withUncertainty;
-    const result = filtered && (!activeConfig.overlays.show_statistical_outliers || !activeConfig.overlays.show_range_outliers || !activeConfig.overlays.show_manual_outliers) ? fitVisibleMarkers(filtered) : filtered;
+    const flags = processingChartFlags([...(stationFilters?.flags ?? []), ...processingFlags], metrologyResults, activeConfig);
+    const recovered = displayed ? restoreProcessingOutlierRows(displayed, linearityPreviewDataQuery.data?.rows ?? [], flags, activeConfig, chartKey, standardMasks?.rowsByLabel) : displayed;
+    const withUncertainty = withSessionUncertainty(recovered, metrologyResults, tr("Final"), flags, {standardVisibilityIndependent: true});
+    const filtered = withUncertainty ? filterStationFigure(withUncertainty,flags,true,true) : withUncertainty;
+    const finalOnly = filtered ? finalProcessingFigure(filtered, metrologyResults) : filtered;
+    const visible = finalOnly ? processingTraceVisibility(finalOnly, metrologyResults, activeConfig) : finalOnly;
+    const outliers = visible ? processingOutlierHighlights(visible) : visible;
+    const highlighted = hideDuplicateSymbology ? outliers : applyDuplicateHighlightsToFigure(outliers, duplicateSampleState.rowLabels);
+    const result = highlighted && (recovered !== displayed || !activeConfig.overlays.show_statistical_outliers || !activeConfig.overlays.show_range_outliers || !activeConfig.overlays.show_manual_outliers) ? fitVisibleMarkers(highlighted) : highlighted;
     if (result) previewFigureCache.set(figure, result);
     return result;
   };
@@ -6893,25 +6926,25 @@ function ProcessingPage() {
       key: "processing_3d",
       title: "3D Processing Overview",
       description: "Global 3D view for the filtered processing scope.",
-      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.processing_3d)),
+      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.processing_3d, "processing_3d")),
     },
     d13Summary: {
       key: "d13_summary",
       title: "δ¹³C Summary",
       description: "Summary curve for δ¹³C across the active scope.",
-      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.d13_summary)),
+      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.d13_summary, "d13_summary")),
     },
     d18Summary: {
       key: "d18_summary",
       title: "δ¹⁸O Summary",
       description: "Summary curve for δ¹⁸O across the active scope.",
-      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.d18_summary)),
+      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.d18_summary, "d18_summary")),
     },
     crossplot: {
       key: "crossplot",
       title: "Crossplot",
       description: "δ¹³C vs δ¹⁸O selection surface for dual-isotope edits.",
-      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.crossplot)),
+      figure: withColorScaleRange(applyPreviewFigure(workspace.overview_figures.crossplot, "crossplot")),
     },
   };
   const d13SummaryState = normalizeDisplayState(displayState[overviewCards.d13Summary.key]);
@@ -6937,8 +6970,8 @@ function ProcessingPage() {
           const d18Key = `${section.species}|${figureSet.identifier}|d18O`;
           const d13State = normalizeDisplayState(displayState[d13Key]);
           const d18State = normalizeDisplayState(displayState[d18Key]);
-          const d13FigureBase = withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d13c)), d13State);
-          const d18FigureBase = withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d18o)), d18State);
+          const d13FigureBase = withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d13c, `${section.species}|${figureSet.identifier}|d13C`)), d13State);
+          const d18FigureBase = withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d18o, `${section.species}|${figureSet.identifier}|d18O`)), d18State);
           const containsSelectedRow =
             figureContainsRowLabel(d13FigureBase, activeTarget.rowLabel) || figureContainsRowLabel(d18FigureBase, activeTarget.rowLabel);
           if (!containsSelectedRow) {
@@ -7011,7 +7044,7 @@ function ProcessingPage() {
     }
     const section = resolvedSpeciesSections.find((item) => item.species === species);
     const figureSet = section?.identifier_figures.find((item) => item.identifier === identifier);
-    if (!figureSet) {
+    if (!section || !figureSet) {
       return null;
     }
     const state = normalizeDisplayState(displayState[activeSelectionChartKey]);
@@ -7021,8 +7054,8 @@ function ProcessingPage() {
       chartKey: activeSelectionChartKey,
       figure: highlightSelectionSourceFigure(
         isotopeKey === "d13C"
-          ? withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d13c)), state)
-          : withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d18o)), state),
+          ? withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d13c, `${section.species}|${figureSet.identifier}|d13C`)), state)
+          : withDisplayState(withColorScaleRange(applyPreviewFigure(figureSet.d18o, `${section.species}|${figureSet.identifier}|d18O`)), state),
         activeTarget,
       ),
     };
@@ -8848,7 +8881,7 @@ function ProcessingPage() {
                         </CardHeader>
                         <CardContent className="space-y-4">
                           <div className="space-y-3">
-                            <div className="space-y-3">
+                            <div data-chart-panel className="space-y-3">
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
                                   <div className="text-sm font-medium text-stone-800">{tr("δ¹³C chart")}</div>
@@ -8863,7 +8896,7 @@ function ProcessingPage() {
                               <div className="w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
                                   lazy
-                                  figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d13c))), d13State)}
+                                  figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d13c, `${section.species}|${figureSet.identifier}|d13C`))), d13State)}
                                   className="h-[380px] w-full"
                                   fitContainer
                                   collapsibleLegend
@@ -8877,7 +8910,7 @@ function ProcessingPage() {
                               </div>
                             </div>
 
-                            <div className="space-y-3">
+                            <div data-chart-panel className="space-y-3">
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div>
                                   <div className="text-sm font-medium text-stone-800">{tr("δ¹⁸O chart")}</div>
@@ -8892,7 +8925,7 @@ function ProcessingPage() {
                               <div className="w-full overflow-hidden rounded-lg border border-stone-200/80">
                                 <PlotlyChart
                                   lazy
-                                  figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d18o))), d18State)}
+                                  figure={withDisplayState(withColorScaleRange(normalizeProcessingMarkerOpacity(applyPreviewFigure(figureSet.d18o, `${section.species}|${figureSet.identifier}|d18O`))), d18State)}
                                   className="h-[380px] w-full"
                                   fitContainer
                                   collapsibleLegend

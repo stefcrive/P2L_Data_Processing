@@ -52,7 +52,8 @@ export function uncertaintyEnvelope(points: EnvelopePoint[], name: string, fillc
 
 /** Add canonical final results to the reused processing figures without mutating inputs. */
 export function withSessionUncertainty(figure: Record<string, unknown> | undefined, rows: Record<string, SessionRow>, label: string,
-  exclusions: {row:string;isotope:string;hidden?:boolean;excludeFromFit?:boolean}[] = []) {
+  exclusions: {row:string;isotope:string;hidden?:boolean;excludeFromFit?:boolean}[] = [],
+  options: {standardVisibilityIndependent?: boolean} = {}) {
   if (!figure || !Array.isArray(figure.data) || !Object.keys(rows).length) return figure;
   const data = figure.data as Record<string, unknown>[];
   if (data.some(trace => (trace.meta as Record<string, unknown>)?.sessionUncertainty)) return figure;
@@ -76,6 +77,8 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
   const seen = new Set<string>(), overlays: Record<string, unknown>[] = [];
   const excluded = new Set(exclusions.filter(flag=>flag.hidden || (rows[flag.row]?.role === "qc" && flag.excludeFromFit !== false))
     .map(flag=>`${rows[flag.row]?.id}:${flag.isotope.toLowerCase()}`));
+  const excludedStandards = new Set(exclusions.filter(flag => flag.excludeFromFit !== false)
+    .map(flag => `${rows[flag.row]?.id}:${flag.isotope.toLowerCase()}`));
   for (const trace of data) {
     const traceX=vector(trace.x), traceY=vector(trace.y), traceZ=vector(trace.z);
     if (!Array.isArray(trace.customdata) || !traceX || !traceY) continue;
@@ -84,8 +87,10 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
     if (!["d13C", "d18O", "cross"].includes(String(token))) continue;
     const iso: Isotope = token === "d18O" ? "d18o" : "d13c";
     const cross = token === "cross", three = trace.type === "scatter3d";
+    const standard = trace.yaxis === "y2" || String(trace.name ?? "").startsWith("Standard measured ");
+    const axisKey = three ? String(trace.scene ?? "scene") : `${trace.xaxis ?? "x"}:${trace.yaxis ?? "y"}`;
     const indices = custom.flatMap((point, index) => {
-      const id = String(point?.[0] ?? ""), row = rows[id], key = `${token}:${id}`;
+      const id = String(point?.[0] ?? ""), row = rows[id], key = `${axisKey}:${token}:${id}`;
       if (!row || seen.has(key)) return [];
       seen.add(key); return [index];
     });
@@ -93,7 +98,8 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
     const selected = indices.map(i => rows[String(custom[i][0])]);
     const usable = (row: SessionRow, isotope: Isotope) => {
       const result = row.isotopes?.[isotope];
-      return !row.excluded && !excluded.has(`${row.id}:${isotope}`) && result?.budget && finite(result.budget.expanded_uncertainty) && finite(result.value) ? result : undefined;
+      const activeExclusions = standard && options.standardVisibilityIndependent ? excludedStandards : excluded;
+      return !row.excluded && !activeExclusions.has(`${row.id}:${isotope}`) && result && finite(result.value) && (standard || result.budget && finite(result.budget.expanded_uncertainty)) ? result : undefined;
     };
     const x = indices.map((i, n) => cross ? usable(selected[n], "d18o")?.value ?? null : traceX[i] as number|string);
     const y = selected.map(row => usable(row, iso)?.value ?? null);
@@ -106,7 +112,7 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
     const marker = {...(scaleMarker ?? {}),...sourceMarker,
       color:inheritedColors?.some(value=>value!=null) ? inheritedColors : (iso==="d13c"?"#215ec5":"#167d87"),
       size:three?4:6,symbol:"circle",opacity:1,line:{width:0}};
-    if (!cross && !three) overlays.push(...uncertaintyEnvelope(selected.map((row, i) => ({ x:x[i], value:y[i], uncertainty:u[i], segment:row.run_id })), label, shade, yaxis).map(t => ({...t, xaxis:trace.xaxis, showlegend:false})));
+    if (!cross && !three) overlays.push(...uncertaintyEnvelope(selected.map((row, i) => ({ x:x[i], value:y[i], uncertainty:u[i], segment:row.run_id })), label, shade, yaxis).map(t => ({...t, xaxis:trace.xaxis, showlegend:false, meta:{...(t.meta as object ?? {}),standardOverlay:standard}})));
     overlays.push({ type: three ? "scatter3d" : "scatter", mode:"markers", name:label,
       x, y, ...(three ? {z:indices.map(i => traceZ?.[i]), scene:trace.scene} : {xaxis:trace.xaxis, yaxis,zorder:1}),
       marker,
@@ -114,7 +120,7 @@ export function withSessionUncertainty(figure: Record<string, unknown> | undefin
       ...(cross ? {error_x:{type:"data",array:selected.map(row=>usable(row,"d18o")?.budget?.expanded_uncertainty??null),visible:true,thickness:1,width:2,color:"#64748b"}} : {}),
       customdata:indices.map(i=>custom[i]), text:selected.map(row=>`${row.identifier1??row.label} · ${row.identifier2??row.comment} · ${row.species??""}`),
       hovertemplate:"%{text}<br>%{y:.3f} ‰<extra>%{fullData.name}</extra>",
-      legendgroup:"session-uncertainty",showlegend:!overlays.some(t=>(t.meta as Record<string,unknown>)?.sessionUncertainty),meta:{sessionUncertainty:true},
+      legendgroup:standard ? "session-standard" : "session-uncertainty",showlegend:!overlays.some(t=>(t.meta as Record<string,unknown>)?.sessionUncertainty && Boolean((t.meta as Record<string,unknown>)?.standardOverlay) === standard),meta:{sessionUncertainty:true,standardOverlay:standard},
     });
   }
   const before = data.map(trace => {

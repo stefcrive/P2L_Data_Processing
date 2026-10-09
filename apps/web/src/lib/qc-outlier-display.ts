@@ -1,5 +1,43 @@
 import { plotlyVector } from "./plotly-order";
 
+/** Draw filled flag symbols above the observation colors with matching legend entries. */
+export function processingOutlierHighlights(figure: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(figure.data)) return figure;
+  const overlays: Record<string, unknown>[] = [];
+  const labeled = new Set<string>();
+  for (const trace of figure.data as Record<string, unknown>[]) {
+    if (trace.yaxis === "y2" || String(trace.name ?? "").startsWith("Standard measured ")) continue;
+    const categories = (trace.meta as {qcCategories?: string[]})?.qcCategories;
+    if (!categories || !String(trace.mode).includes("markers")) continue;
+    const x = plotlyVector(trace.x), y = plotlyVector(trace.y), z = plotlyVector(trace.z);
+    if (!x || !y) continue;
+    const marker = trace.marker as Record<string, unknown> ?? {};
+    const symbols = categories.map((_, i) => String(Array.isArray(marker.symbol) ? marker.symbol[i] : marker.symbol ?? "square").replace(/-open$/, ""));
+    const groups = new Map<string, {category: string; symbol: string; indices: number[]}>();
+    categories.forEach((category, i) => {
+      const symbol = symbols[i], key = `${category}:${symbol}`;
+      const group = groups.get(key) ?? {category, symbol, indices: []};
+      if (x[i] != null && y[i] != null && (trace.type !== "scatter3d" || z?.[i] != null)) group.indices.push(i);
+      groups.set(key, group);
+    });
+    for (const {category, symbol, indices} of groups.values()) {
+      if (category === "Unflagged observations") continue;
+      if (!indices.length) continue;
+      const key = `${category}:${symbol}`;
+      const color = category === "Manual exclusions" ? "#c026d3" : category === "Partially Saturated Collectors" ? "#ea580c" : "#dc2626";
+      overlays.push({type: trace.type ?? "scatter", mode: "markers", name: category,
+        x: indices.map(i => x[i]), y: indices.map(i => y[i]),
+        ...(trace.type === "scatter3d" ? {z: indices.map(i => z?.[i]), scene: trace.scene} : {xaxis: trace.xaxis, yaxis: trace.yaxis, zorder: 5}),
+        customdata: Array.isArray(trace.customdata) ? indices.map(i => (trace.customdata as unknown[])[i]) : undefined,
+        marker: {symbol, color, size: 12, opacity: 1, line: {color: "#7f1d1d", width: 1.2}},
+        legendgroup: `processing-flag-${category}`, showlegend: !labeled.has(key),
+        meta: {qcHighlight: true}, hovertemplate: "%{y:.3f}<extra>%{fullData.name}</extra>"});
+      labeled.add(key);
+    }
+  }
+  return {...figure, data: [...figure.data, ...overlays]};
+}
+
 /** Display-only masking preserves point identity, errors and trace visibility controls. */
 export function qcOutlierDisplay(trace: Record<string, unknown>, flags: {row:string;isotope:string;hidden?:boolean;category?:string;reasons?:string[]}[]): Record<string, unknown> {
   if (!Array.isArray(trace.customdata) || !/markers|lines/.test(String(trace.mode ?? ""))) return trace;
@@ -11,13 +49,17 @@ export function qcOutlierDisplay(trace: Record<string, unknown>, flags: {row:str
     if(found.some(f=>f.category==="no_signal"))return "x";
     if(found.some(f=>f.category==="pressure_adjustment"))return trace.type==="scatter3d"?"diamond":"triangle-up";
     if(found.some(f=>f.category==="failed"))return trace.type==="scatter3d"?"cross":"triangle-down";
+    if(found.some(f=>f.category==="full"))return trace.type==="scatter3d"?"cross":"triangle-down";
+    if(found.some(f=>f.category==="partial"))return "diamond";
     if(found.some(f=>f.category==="manual"))return "circle-open";
     if(found.some(f=>!f.category||f.category==="statistical"))return "square";
     const reasons=found.flatMap(f=>f.reasons??[]).join(" ").toLowerCase();
     if(reasons.includes("leak"))return trace.type==="scatter3d"?"cross":"star";
+    if(reasons.includes("d13c range"))return "cross";
+    if(reasons.includes("d18o range"))return "x";
     return "diamond";
   };
-  const categoryFor=(found:typeof flags)=>found.some(f=>f.category==="no_signal")?"No-signal samples":found.some(f=>f.category==="pressure_adjustment")?"Poor pressure adjustment samples":found.some(f=>f.category==="failed")?"Failed analyses":found.some(f=>f.category==="manual")?"Manual exclusions":found.some(f=>!f.category||f.category==="statistical")?"Statistical outliers":found.length?"Validity-range flags":"Unflagged observations";
+  const categoryFor=(found:typeof flags)=>found.some(f=>f.category==="no_signal")?"No-signal samples":found.some(f=>f.category==="pressure_adjustment")?"Poor pressure adjustment samples":found.some(f=>f.category==="full")?"Failed Samples (Fully Saturated)":found.some(f=>f.category==="partial")?"Partially Saturated Collectors":found.some(f=>f.category==="failed")?"Failed analyses":found.some(f=>f.category==="manual")?"Manual exclusions":found.some(f=>!f.category||f.category==="statistical")?"Statistical outliers":found.length?"Validity-range flags":"Unflagged observations";
   const next:Record<string,unknown>&{marker:Record<string,unknown>}={...trace,marker:{...marker,
     symbol:(trace.meta as {partialSaturation?:boolean})?.partialSaturation ? marker.symbol : matches.map((found,i)=>found.length?symbolFor(found):Array.isArray(marker.symbol)?marker.symbol[i]:marker.symbol??"circle")}};
   next.meta={...(trace.meta as object??{}),qcCategories:matches.map(categoryFor)};

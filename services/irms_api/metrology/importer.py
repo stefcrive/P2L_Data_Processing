@@ -4,6 +4,8 @@ import io
 import math
 import re
 from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +17,22 @@ from .models import SAMPLE_TYPES
 from .science import summary
 
 
+_identity_cache = ContextVar("measurement_identity_cache", default=None)
+
+
+@contextmanager
+def reuse_measurement_identities():
+    """Reuse parsing only within one computation, including nested callers."""
+    if _identity_cache.get() is not None:
+        yield
+        return
+    token = _identity_cache.set({})
+    try:
+        yield
+    finally:
+        _identity_cache.reset(token)
+
+
 def measurement_identity(record: dict, source_kind: str = "qtegra_raw") -> dict:
     """Use the original importer rules, including for older stored acquisitions."""
     from ..domain.import_session import _suggest_import_parsing_config, _apply_import_parsing_config
@@ -24,11 +42,23 @@ def measurement_identity(record: dict, source_kind: str = "qtegra_raw") -> dict:
     raw = record.get("raw_rows") or []
     values = raw[0]["values"] if raw else ({"Identifier 1": record.get("label"), "Identifier 2": record.get("comment")}
         if source_kind == "isodat_raw" else {"Label": record.get("label"), "Comment": record.get("comment")})
+    cache = _identity_cache.get()
+    # Stored JSON scalars have stable representations. Bypass the cache for
+    # richer caller-supplied values rather than guessing their equivalence.
+    if any(type(value) not in (str, int, float, bool, type(None)) for value in values.values()):
+        cache = None
+    # Types, column order and signed zero can affect the parsed strings.
+    key = (source_kind, tuple((column, type(value), repr(value)) for column, value in values.items())) if cache is not None else None
+    if cache is not None and key in cache:
+        return dict(cache[key])
     frame = pd.DataFrame([values])
     software = "isodat" if source_kind == "isodat_raw" else "qtegra" if "Label" in frame else "generic"
     config = _suggest_import_parsing_config(frame, file_index=0, file_name="acquisition", software=software)
     parsed = _apply_import_parsing_config(frame, config).iloc[0]
-    return {key: scalar(parsed[column]) or "" for key, column in zip(keys, ("Identifier 1", "Identifier 2", "Species"))}
+    identity = {key: scalar(parsed[column]) or "" for key, column in zip(keys, ("Identifier 1", "Identifier 2", "Species"))}
+    if cache is not None:
+        cache[key] = identity
+    return dict(identity)
 
 
 def scalar(value):

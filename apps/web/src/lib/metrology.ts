@@ -64,7 +64,7 @@ export type ResultsSession = {
   acquired_date: string | null; created_at: string; sample_groups: string[]; simulation: boolean;
 };
 export type SessionExport = { id: string; filename: string; format: string; group: string | null; rows: number; created_at: string };
-export type ResultsSessionDetail = ResultsSession & { runs: RunDetail[]; detached_runs?:RunDetail[]; method: Method | null; qualification: Qualification | null;
+export type ResultsSessionDetail = ResultsSession & { analysis?:SessionAnalysis; runs: RunDetail[]; detached_runs?:RunDetail[]; method: Method | null; qualification: Qualification | null;
   qualification_run_id: string | null; history: HistoryGroup[]; exports: SessionExport[]; sources?:{id:string;filename:string;relative_path:string;sha256:string;size:number;disposition:string;run_id:string|null}[] };
 
 export type SessionRow = Measurement & { failure_categories?:Partial<Record<Isotope,"pressure_adjustment"|"no_signal"|null>>;run_id: string; run_label: string; workbook_sequence: number; sample_group: string; evaluation_id: string | null; accepted_issues?: string[];calculation_issues?:Partial<Record<Isotope,string>> };

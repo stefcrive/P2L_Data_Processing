@@ -15,7 +15,7 @@ from .reports import build_session_dossier
 
 from .models import Decision
 from .repository import encode
-from .importer import measurement_identity
+from .importer import measurement_identity, reuse_measurement_identities
 
 
 def imported_sample_group(row, source_kind="qtegra_raw"):
@@ -80,9 +80,12 @@ class ResultsSessions:
             return result
 
     def results_session_analysis(self, session_id, outlier_method=None, threshold=None, range_exclusions=None, include_all_data=False):
-        from .qc_screening import stored_qc_screening
-        from .session_analysis import session_analysis
         detail = self.results_session_detail(session_id)
+        return self._analysis_from_detail(detail, outlier_method, threshold, range_exclusions, include_all_data)
+
+    @staticmethod
+    def _analysis_from_detail(detail, outlier_method=None, threshold=None, range_exclusions=None, include_all_data=False):
+        from .session_analysis import session_analysis
         # Explicit query parameters remain a non-persistent preview for existing clients.
         if outlier_method is not None or threshold is not None:
             settings = detail.get("outlier_screening", {"method": "sigma", "threshold": 3.0})
@@ -226,18 +229,20 @@ class ResultsSessions:
                            "sample_groups":sorted(set(session["groups"].values()) or {"Main batch"})})
         return result
 
-    def results_session_detail(self, session_id):
+    @reuse_measurement_identities()
+    def results_session_detail(self, session_id, include_analysis=False):
         with self.repo.connect() as db:
             session=self.repo.get(db,"results_sessions",session_id)
             method=self.repo.get(db,"methods",session["method_id"]) if session["method_id"] else None
             q=self.qualification_detail(db,session["qualification_id"]) if session["qualification_id"] else None
             reference_run=self.repo.get(db,"evaluations",q["approval"]["evaluation_id"])["run_id"] if q and q.get("approval") else None
             history=self.qc_history(db,session["method_id"]) if session["method_id"] else []
+            release_history = history
             if session.get("calibration_verification")=="simulation_assumption":
                 history=[h for h in history if h.get("data_origin")=="observed" and h.get("results_session_id")==session_id]
             sources=[a for a in self.repo.list(db,"session_sources") if a["session_id"]==session_id]
             exports=[e for e in self.repo.list(db,"session_exports") if e["session_id"]==session_id]
-        runs = [self.run_detail(r) for r in session["run_ids"]]
+        runs = [self.run_detail(r, history=release_history) for r in session["run_ids"]]
         from .analysis_evidence import analysis_evidence
         with self.repo.connect() as db:
             for run in runs:
@@ -260,7 +265,7 @@ class ResultsSessions:
                             budget["expanded_uncertainty"] = budget["u_combined"] * budget["k"]
         detail = {**session,"method":method,"qualification":q,"qualification_run_id":reference_run,
                 "runs":runs,
-                "detached_runs":[self.run_detail(r) for r in session.get("detached_run_ids", [])],
+                "detached_runs":[self.run_detail(r, history=release_history) for r in session.get("detached_run_ids", [])],
                 "history":history,"exports":exports,"sources":sources}
         if method:
             from .qc_screening import stored_qc_screening
@@ -269,6 +274,8 @@ class ResultsSessions:
             from .session_processing import process_session_results
             process_session_results(detail)
             detail.pop("saved_outliers", None)
+        if include_analysis and method:
+            detail["analysis"] = self._analysis_from_detail(detail)
         return detail
 
     def archive_session_source(self, session_id, filename, content, command, *, relative_path, disposition, run_id=None):
@@ -301,7 +308,7 @@ class ResultsSessions:
 
     def export_results_session(self, session_id, command):
         detail=self.results_session_detail(session_id)
-        analysis=self.results_session_analysis(session_id)
+        analysis=self._analysis_from_detail(detail)
         flagged={flag["measurement_id"] for flag in analysis["outliers"]["flags"]}
         rows, whole_rows = [], []
         for run in detail["runs"]:

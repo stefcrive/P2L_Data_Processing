@@ -55,7 +55,7 @@ export function alignedIsotopeAxes(traces: Record<string, unknown>[], reversed =
     const plus = error?.visible === false ? null : plotlyVector(error?.array);
     const minus = error?.visible === false ? null : plotlyVector(error?.arrayminus) ?? plus;
     const meta = trace.meta as Record<string, unknown> | undefined;
-    const observation = String(trace.mode ?? "").includes("markers") && !meta?.sessionUncertainty
+    const observation = String(trace.mode ?? "").includes("markers") && (!meta?.sessionUncertainty || meta?.finalOnly)
       && !meta?.uncertaintyEnvelope && !/duplicate|duplicat|calibrated|running average/i.test(String(trace.name));
     y?.forEach((value, i) => {
       if (typeof value !== "number" || !Number.isFinite(value)) return;

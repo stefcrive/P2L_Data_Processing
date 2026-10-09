@@ -87,8 +87,8 @@ def update_results_session(id_: str, command: ResultsSessionCommand, s: Service 
 
 
 @router.get("/results-sessions/{id_}")
-def results_session(id_: str, s: Service = Depends(get_service)):
-    return invoke(s.results_session_detail,id_)
+def results_session(id_: str, include_analysis: bool = False, s: Service = Depends(get_service)):
+    return invoke(s.results_session_detail, id_, include_analysis)
 
 
 @router.post("/results-sessions/{id_}/groups")

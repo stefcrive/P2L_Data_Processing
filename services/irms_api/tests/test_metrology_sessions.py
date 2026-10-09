@@ -18,6 +18,53 @@ D = fixtures.DECISION
 
 
 class ResultsSessionTests(unittest.TestCase):
+    def test_bundled_analysis_reuses_detail_and_stays_fresh_after_edits(self):
+        session = self.create()
+        run, _ = self.import_batch(session)
+        endpoint = f"/metrology/results-sessions/{session['id']}"
+        before = self.service.results_session_detail(session["id"])
+        analysis = self.service.results_session_analysis(session["id"])
+        from services.irms_api.metrology import session_processing
+        with patch.object(session_processing, "process_session_results", wraps=session_processing.process_session_results) as process:
+            response = self.client.get(endpoint + "?include_analysis=true")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(process.call_count, 1)
+        bundled = response.json()
+        self.assertEqual(bundled.pop("analysis"), analysis)
+        self.assertEqual(bundled, before)
+        mid = before["runs"][0]["evaluation"]["results"][-1]["id"]
+        self.service.edit_session_identities(session["id"], {mid: {"identifier1": "Corrected sample"}})
+        self.assertEqual(self.client.put(endpoint + "/uncertainty", json={**D, "coverage_factor": 3.5}).status_code, 200)
+        self.assertEqual(self.client.put(endpoint + "/outlier-screening", json={**D, "method": "iqr", "threshold": 1.5}).status_code, 200)
+        updated = self.client.get(endpoint + "?include_analysis=true").json()
+        self.assertEqual(updated["analysis"], self.client.get(endpoint + "/analysis").json())
+        row = next(r for r in updated["analysis"]["rows"] if r["id"] == mid)
+        self.assertEqual(row["identifier1"], "Corrected sample")
+        self.assertEqual(row["isotopes"]["d13c"]["budget"]["k"], 3.5)
+        self.assertNotIn("analysis", self.client.get(endpoint).json())
+
+    def test_session_reuses_unfiltered_qc_history_without_changing_release_gates(self):
+        session = self.create()
+        run, _ = self.import_batch(session)
+        other = self.service.import_run("second.xlsx", fixtures.workbook([
+            fixtures.row(1, "SHP2L", 0, sample_type="QC Standard"), fixtures.row(2, "other", 2)
+        ]), RunCommand(**D, results_session_id=session["id"]))
+        expected = {rid: self.service.run_detail(rid)["release_blockers"] for rid in (run["id"], other["id"])}
+        with patch.object(self.service, "qc_history", wraps=self.service.qc_history) as history:
+            detail = self.service.results_session_detail(session["id"])
+            self.assertEqual(history.call_count, 1)
+        self.assertEqual({r["id"]: r["release_blockers"] for r in detail["runs"]}, expected)
+        with patch.object(self.service, "qc_history", wraps=self.service.qc_history) as history:
+            self.service.run_detail(run["id"])
+            self.assertEqual(history.call_count, 1)
+
+    def test_export_computes_session_detail_once(self):
+        session = self.create()
+        self.import_batch(session)
+        with patch.object(self.service, "results_session_detail", wraps=self.service.results_session_detail) as detail:
+            self.service.export_results_session(session["id"], SessionExportCommand(**D, format="json"))
+            self.assertEqual(detail.call_count, 1)
+
     def test_joint_pressure_fit_uses_failed_qc_and_preserves_unknown_composition(self):
         import numpy as np
         session = self.create()

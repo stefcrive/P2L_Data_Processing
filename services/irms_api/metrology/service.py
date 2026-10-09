@@ -474,7 +474,7 @@ class Service(ResultsSessions):
             self.repo.audit(db, "method_activated", method_id, command.actor, command.reason, before={"status": "validated"}, after={"status": "active"})
             return self.repo.get(db, "methods", method_id)
 
-    def release_gates(self, db, run, evaluation):
+    def release_gates(self, db, run, evaluation, *, history=None):
         errors = list(evaluation["blockers"])
         method = self.repo.get(db, "methods", evaluation["method_id"])
         if run["context"] != "routine":
@@ -497,7 +497,8 @@ class Service(ResultsSessions):
         events = [e for e in self.repo.list(db, "interventions", status="open") if e["instrument"] == method["config"]["instrument"]]
         if events:
             errors.append("Targeted verification is required after an intervention")
-        for group in self.qc_history(db, method["id"]):
+        # Session consultation shares this read; release() always loads fresh QC.
+        for group in (self.qc_history(db, method["id"]) if history is None else history):
             if group.get("data_origin")!=("synthetic" if run.get("synthetic") else "observed"):
                 continue
             if group["period_key"] == run["period_key"] and any(s["status"] == "out_of_control" for s in group["isotopes"].values()):
@@ -644,7 +645,7 @@ class Service(ResultsSessions):
             self.repo.audit(db, "qc_period_reviewed", record["id"], command.actor, command.reason, after=record)
             return record
 
-    def run_detail(self, id_):
+    def run_detail(self, id_, *, history=None):
         with self.repo.connect() as db:
             run = self.repo.get(db, "runs", id_)
             run["source"] = self.repo.get(db, "raw_imports", run["raw_import_id"])
@@ -653,7 +654,7 @@ class Service(ResultsSessions):
             run["exclusions"] = self.repo.list(db, "exclusions", run_id=id_)
             run["evaluation"] = self.repo.get(db, "evaluations", run["latest_evaluation_id"]) if run["latest_evaluation_id"] else None
             run["releases"] = self.repo.list(db, "releases", run_id=id_)
-            run["release_blockers"] = self.release_gates(db, run, run["evaluation"]) if run["evaluation"] and run["context"] == "routine" else []
+            run["release_blockers"] = self.release_gates(db, run, run["evaluation"], history=history) if run["evaluation"] and run["context"] == "routine" else []
             if not run["evaluation"]:
                 # Descriptive QC diagnostics remain available before certificates are supplied.
                 draft = self.repo.list(db, "methods", status="draft")
